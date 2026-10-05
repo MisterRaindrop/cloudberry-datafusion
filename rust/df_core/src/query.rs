@@ -38,7 +38,9 @@
 //!         | {"filter": {"input": <node>, "pred": <expr>}}
 //!         | {"aggregate": {"input": <node>, "group": [<expr>...],
 //!                          "aggs": [...], "having": <expr> | null}}
-//!         | {"join": {"type": "inner", "left": <node>, "right": <node>,
+//!         | {"join": {"type": "inner" | "left" | "right" | "full" | "leftsemi"
+//!                           | "rightsemi" | "leftanti" | "rightanti",
+//!                     "left": <node>, "right": <node>,
 //!                     "on": [[<left expr>, <right expr>], ...],
 //!                     "filter": <expr> | null}}
 //!           (an equi-join; DataFusion builds its hash table on the left,
@@ -70,6 +72,7 @@
 //!         | {"op": "+", "type": t, "args": [<expr>, <expr>]}
 //!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
+//!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
 //! ```
 
 use std::collections::HashMap;
@@ -363,6 +366,10 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(e) = v.get("isnotnull") {
         return Ok(expr(e)?.is_not_null());
+    }
+    if let Some(e) = v.get("cast") {
+        let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
+        return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(expr(e)?), ty)));
     }
     Err(format!("plan spec: unknown expression {v}"))
 }
@@ -791,9 +798,18 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
         return Ok(b);
     }
     if let Some(j) = node.get("join") {
-        if field(j, "type")?.as_str() != Some("inner") {
-            return Err(format!("plan spec: unsupported join {j}"));
-        }
+        use datafusion::logical_expr::JoinType;
+        let join_type = match field(j, "type")?.as_str().unwrap_or("") {
+            "inner" => JoinType::Inner,
+            "left" => JoinType::Left,
+            "right" => JoinType::Right,
+            "full" => JoinType::Full,
+            "leftsemi" => JoinType::LeftSemi,
+            "rightsemi" => JoinType::RightSemi,
+            "leftanti" => JoinType::LeftAnti,
+            "rightanti" => JoinType::RightAnti,
+            other => return Err(format!("plan spec: unsupported join type {other}")),
+        };
         let left = build_node(field(j, "left")?, tables)?;
         let right = build_node(field(j, "right")?, tables)?.build().map_err(df)?;
         let mut lkeys = Vec::new();
@@ -808,7 +824,7 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
             None => None,
         };
         return left
-            .join_with_expr_keys(right, datafusion::logical_expr::JoinType::Inner, (lkeys, rkeys), filter)
+            .join_with_expr_keys(right, join_type, (lkeys, rkeys), filter)
             .map_err(df);
     }
     Err(format!("plan spec: unknown node {node}"))

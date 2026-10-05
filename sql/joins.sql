@@ -15,9 +15,9 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Inner hash joins (J2, J3): both sides scanned locally (tables colocated
--- on the join key) or received through a Redistribute or Broadcast Motion,
--- under an optional aggregate.  DataFusion builds its hash table on
+-- Hash joins (J2-J4): inner, outer, semi and anti, both sides scanned
+-- locally (tables colocated on the join key) or received through a
+-- Redistribute or Broadcast Motion, under an optional aggregate.  DataFusion builds its hash table on
 -- PostgreSQL's Hash side, which is also fed first.
 -- Each query runs with datafusion.mode off, then on; the results must match.
 --
@@ -48,8 +48,10 @@ SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
 EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
 -- These stay on PostgreSQL, with the reason.
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.b;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FROM df_jb);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::real;
+EXPLAIN (COSTS OFF) SELECT count(*), count(s.isn) FROM df_ja ja
+LEFT JOIN (SELECT k, b IS NULL AS isn FROM df_jb) s ON ja.k = s.k;
 SET work_mem = '64kB';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
 RESET work_mem;
@@ -110,6 +112,40 @@ SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
 SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr;
+-- Outer, semi and anti joins, and keys of two types (J4).
+CREATE TABLE df_jf (k8 int8, f4 real, k int4) DISTRIBUTED BY (k);
+INSERT INTO df_jf SELECT i * 4, (i * 4)::real, i * 4 FROM generate_series(1, 5000) i;
+INSERT INTO df_jf VALUES (NULL, NULL, NULL);
+ANALYZE df_jf;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
+SET datafusion.mode = off;
+SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
+SELECT ja.k, jb.b, jb.b IS NULL AS missing FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k
+WHERE ja.k < 8 OR ja.k IS NULL;
+SELECT count(*), count(ja.k), count(jb.k) FROM df_jb jb RIGHT JOIN df_ja ja ON ja.k = jb.k;
+SELECT count(*), count(ja.k), count(jb.k), max(jb.b) FROM df_ja ja FULL JOIN df_jb jb ON ja.k = jb.k;
+SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k AND jb.e > 25;
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE ja.k IN (SELECT k FROM df_jb);
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
+SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
+SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
+SET datafusion.mode = on;
+SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
+SELECT ja.k, jb.b, jb.b IS NULL AS missing FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k
+WHERE ja.k < 8 OR ja.k IS NULL;
+SELECT count(*), count(ja.k), count(jb.k) FROM df_jb jb RIGHT JOIN df_ja ja ON ja.k = jb.k;
+SELECT count(*), count(ja.k), count(jb.k), max(jb.b) FROM df_ja ja FULL JOIN df_jb jb ON ja.k = jb.k;
+SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k AND jb.e > 25;
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE ja.k IN (SELECT k FROM df_jb);
+SELECT count(*), sum(ja.a) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
+SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
+SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
+
+DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

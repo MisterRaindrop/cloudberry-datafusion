@@ -425,6 +425,27 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 	}
 }
 
+/* A join key, cast to 'type' if it has another. */
+static void
+df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type)
+{
+	const char *tag = df_type_tag(type);
+
+	if (tag == NULL)
+	{
+		df_fail(b, "a join key");
+		return;
+	}
+	if (exprType(key) == type)
+	{
+		df_emit(b, out, key, DF_LEVEL_SCAN);
+		return;
+	}
+	appendStringInfoString(out, "{\"cast\":");
+	df_emit(b, out, key, DF_LEVEL_SCAN);
+	appendStringInfo(out, ",\"type\":\"%s\"}", tag);
+}
+
 /*
  * The plan node 'plan' of the slice, below its aggregate, as a node of the
  * spec.  Inputs are added in the order they are met: a join's Hash side
@@ -463,14 +484,44 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				HashJoin   *hj = (HashJoin *) plan;
 				ListCell   *lc;
 				bool		first = true;
+				const char *type;
 
 				/*
 				 * DataFusion builds its hash table on the left: PostgreSQL's
-				 * Hash side.  Its hash clauses read outer = inner.
+				 * Hash side, its inner.  PostgreSQL's outer is DataFusion's
+				 * right, so the join type turns around.  Its hash clauses read
+				 * outer = inner.
 				 */
+				switch (hj->join.jointype)
+				{
+					case JOIN_INNER:
+						type = "inner";
+						break;
+					case JOIN_LEFT:
+						type = "right";
+						break;
+					case JOIN_RIGHT:
+						type = "left";
+						break;
+					case JOIN_FULL:
+						type = "full";
+						break;
+					case JOIN_SEMI:
+						type = "rightsemi";
+						break;
+					case JOIN_ANTI:
+						type = "rightanti";
+						break;
+					case JOIN_RIGHT_ANTI:
+						type = "leftanti";
+						break;
+					default:
+						df_fail(b, "this kind of join");
+						return;
+				}
 				if (plan->qual != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
-				appendStringInfoString(out, "{\"join\":{\"type\":\"inner\",\"left\":");
+				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
 				df_emit_node(b, out, innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
 				df_emit_node(b, out, outerPlan(plan));
@@ -479,12 +530,16 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				foreach(lc, hj->hashclauses)
 				{
 					OpExpr	   *op = lfirst_node(OpExpr, lc);
+					Node	   *inner = lsecond(op->args);
+					Node	   *outer = linitial(op->args);
+					Oid			type = df_join_key_type(exprType(inner), exprType(outer));
 
+					/* Keys of two types are compared in the wider one. */
 					appendStringInfoString(out, first ? "[" : ",[");
 					first = false;
-					df_emit(b, out, lsecond(op->args), DF_LEVEL_SCAN);
+					df_emit_key(b, out, inner, type);
 					appendStringInfoChar(out, ',');
-					df_emit(b, out, linitial(op->args), DF_LEVEL_SCAN);
+					df_emit_key(b, out, outer, type);
 					appendStringInfoChar(out, ']');
 				}
 				appendStringInfoString(out, "],\"filter\":");

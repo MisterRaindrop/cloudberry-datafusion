@@ -452,6 +452,83 @@ df_collect_inner_refs(Node *node, Bitmapset **refs)
 	return expression_tree_walker(node, df_collect_inner_refs, refs);
 }
 
+/* The type both sides of a join key are compared in, or InvalidOid. */
+Oid
+df_join_key_type(Oid a, Oid b)
+{
+	static const Oid ints[] = {INT2OID, INT4OID, INT8OID};
+	static const Oid floats[] = {FLOAT4OID, FLOAT8OID};
+	int			ia = -1,
+				ib = -1,
+				i;
+
+	if (a == b)
+		return a;
+	for (i = 0; i < lengthof(ints); i++)
+	{
+		if (ints[i] == a)
+			ia = i;
+		if (ints[i] == b)
+			ib = i;
+	}
+	if (ia >= 0 && ib >= 0)
+		return ints[Max(ia, ib)];
+	ia = ib = -1;
+	for (i = 0; i < lengthof(floats); i++)
+	{
+		if (floats[i] == a)
+			ia = i;
+		if (floats[i] == b)
+			ib = i;
+	}
+	if (ia >= 0 && ib >= 0)
+		return floats[Max(ia, ib)];
+	return InvalidOid;
+}
+
+/*
+ * Are output columns 'attnos' of 'plan' plain columns all the way down?
+ * Expressions on the side an outer join fills with NULLs must be computed
+ * before it does (x IS NULL is false for a row, true once nulled), which
+ * DataFusion, evaluating them above the join, would not do.
+ */
+static bool
+df_plain_outputs(Plan *plan, Bitmapset *attnos)
+{
+	Bitmapset  *outer = NULL;
+	Bitmapset  *inner = NULL;
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return false;
+	if (IsA(plan, Motion))
+		return true;
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Var		   *var = (Var *) tle->expr;
+
+		if (!bms_is_member(tle->resno, attnos))
+			continue;
+		if (!IsA(var, Var))
+			return false;
+		if (var->varno == OUTER_VAR)
+			outer = bms_add_member(outer, var->varattno);
+		else if (var->varno == INNER_VAR)
+			inner = bms_add_member(inner, var->varattno);
+		else if (!(IsA(plan, SeqScan) && var->varno == ((Scan *) plan)->scanrelid))
+			return false;
+	}
+	if (IsA(plan, SeqScan))
+		return true;
+	if (IsA(plan, Hash))
+		return inner == NULL && df_plain_outputs(outerPlan(plan), outer);
+	if (IsA(plan, HashJoin))
+		return (outer == NULL || df_plain_outputs(outerPlan(plan), outer)) &&
+			(inner == NULL || df_plain_outputs(innerPlan(plan), inner));
+	return false;
+}
+
 /*
  * Bytes a Hash node's table is estimated to take: the planner's rows and
  * width, plus a per-row allowance for DataFusion's hash table.
@@ -662,17 +739,18 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				ListCell   *lc;
 
 				/*
-				 * J2: an inner equi-join, DataFusion's hash table on
-				 * PostgreSQL's Hash side.  IS NOT DISTINCT FROM joins
-				 * (hashqualclauses) match NULLs and stay on PostgreSQL.
+				 * An equi-join, DataFusion's hash table on PostgreSQL's Hash
+				 * side: inner, outer, semi or anti (J4).  NOT IN anti joins
+				 * (LASJ) and IS NOT DISTINCT FROM joins (hashqualclauses)
+				 * treat NULLs their own way and stay on PostgreSQL.
 				 */
-				if (join->jointype != JOIN_INNER)
+				if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
+					join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL &&
+					join->jointype != JOIN_SEMI && join->jointype != JOIN_ANTI &&
+					join->jointype != JOIN_RIGHT_ANTI)
 				{
-					df_reject(cxt, "%s join", join->jointype == JOIN_LEFT ? "left" :
-							  join->jointype == JOIN_RIGHT ? "right" :
-							  join->jointype == JOIN_FULL ? "full" :
-							  join->jointype == JOIN_SEMI ? "semi" :
-							  join->jointype == JOIN_ANTI ? "anti" : "non-inner");
+					df_reject(cxt, "%s", join->jointype == JOIN_LASJ_NOTIN ?
+							  "NOT IN anti join" : "this kind of join");
 					return;
 				}
 				if (hj->hashqualclauses != NIL)
@@ -696,7 +774,8 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						df_reject(cxt, "Hash Join condition other than =");
 						return;
 					}
-					if (exprType(linitial(op->args)) != exprType(lsecond(op->args)))
+					if (!OidIsValid(df_join_key_type(exprType(linitial(op->args)),
+													 exprType(lsecond(op->args)))))
 					{
 						df_reject(cxt, "Hash Join on %s = %s",
 								  format_type_be(exprType(linitial(op->args))),
@@ -735,6 +814,33 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				df_collect_inner_refs((Node *) join->joinqual, &inner_needed);
 				df_collect_outer_refs((Node *) plan->qual, &outer_needed);
 				df_collect_inner_refs((Node *) plan->qual, &inner_needed);
+
+				/* Above an outer join, the nulled side's columns must be plain. */
+				{
+					Bitmapset  *above_outer = NULL;
+					Bitmapset  *above_inner = NULL;
+
+					foreach(lc, plan->targetlist)
+					{
+						TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+						if (needed == NULL || bms_is_member(tle->resno, needed))
+						{
+							df_collect_outer_refs((Node *) tle->expr, &above_outer);
+							df_collect_inner_refs((Node *) tle->expr, &above_inner);
+						}
+					}
+					df_collect_outer_refs((Node *) plan->qual, &above_outer);
+					df_collect_inner_refs((Node *) plan->qual, &above_inner);
+					if (((join->jointype == JOIN_LEFT || join->jointype == JOIN_FULL) &&
+						 !df_plain_outputs(inner, above_inner)) ||
+						((join->jointype == JOIN_RIGHT || join->jointype == JOIN_FULL) &&
+						 !df_plain_outputs(outer, above_outer)))
+					{
+						df_reject(cxt, "expression on the nullable side of an outer join");
+						return;
+					}
+				}
 				outer_needed = bms_add_member(outer_needed, 0);
 				inner_needed = bms_add_member(inner_needed, 0);
 				cxt->agg_input = false;

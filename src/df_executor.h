@@ -141,6 +141,7 @@ extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
 								 bool *is_sender);
 extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);
 extern double df_hash_budget(Plan *hash);
+extern Oid	df_join_key_type(Oid a, Oid b);
 
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);

@@ -333,18 +333,25 @@ offers no non-blocking receive to interleave with.
 
 ### Joins
 
-Milestones J2 and J3 run inner hash joins whose inputs are scanned locally
+Milestones J2 to J4 run hash joins, inner, outer (left, right, full),
+semi and anti, whose inputs are scanned locally
 (tables colocated on the join key) or received through a Redistribute or
 Broadcast Motion, several levels deep, under an optional aggregate.  DataFusion builds its hash table on PostgreSQL's Hash
 side; the main thread feeds the inputs one after the other, the Hash side
-first, as PostgreSQL's Hash Join reads them.  Join keys must be of one type
-(no int4 = int8 yet); a join filter and a filter above the join are
-evaluated as in PostgreSQL; NULL keys match nothing.  Reading the Hash side to its
+first, as PostgreSQL's Hash Join reads them; since the Hash side is
+DataFusion's left, the join type turns around (a PostgreSQL left join is
+DataFusion's right join, a semi join its right semi join).  Keys of two
+integer or two float types are compared in the wider one; a join filter
+and a filter above the join are evaluated as in PostgreSQL; NULL keys match
+nothing.  Expressions that the side an outer join fills with NULLs computes
+below the join (a subquery's `b IS NULL`, say) would be evaluated above it
+by DataFusion and give another result for nulled rows, so such a join stays
+on PostgreSQL.  Reading the Hash side to its
 end before the other, also from the interconnect, keeps the deadlock
 properties of PostgreSQL's plans.  With `datafusion.motion_batches` the
 Motions feeding a join carry batches too, Broadcast included (its one
-stream goes to every receiver).  Outer, semi and anti joins and IS NOT
-DISTINCT FROM joins stay on PostgreSQL for now.
+stream goes to every receiver).  NOT IN anti joins (with their NULL rule)
+and IS NOT DISTINCT FROM joins stay on PostgreSQL.
 
 DataFusion's hash join does not spill.  A slice qualifies only if the Hash
 node's estimated size (planner rows times width plus a per-row allowance)
@@ -370,6 +377,14 @@ redistributed on the join key:
 |---|---|---|---|
 | `count(*), sum, max` over the join | 3.17 s | 0.36 s | 0.31 s |
 | `GROUP BY` a column of the build side | 4.29 s | 0.39 s | 0.32 s |
+
+Outer, semi and anti joins over the same tables (colocated unless noted):
+
+| Query | PostgreSQL | DataFusion |
+|---|---|---|
+| `LEFT JOIN`, `count(*), count(b), sum(a)` | 3.68 s | 0.25 s |
+| `NOT EXISTS` | 3.20 s | 0.25 s |
+| `EXISTS`, redistributed, batch Motions | 2.99 s | 0.31 s |
 
 Broadcasting it instead (joining on another column) would put about 100 MB
 in each segment's hash table, beyond the 64 MB budget, so that slice stays
@@ -404,6 +419,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | J1 | Plan tree over several inputs (groundwork for joins) |
 | J2 | Inner hash joins over local scans, with a memory guard |
 | J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
+| J4 | Outer, semi and anti joins; keys of two integer or float types |
 
 ## Build
 
