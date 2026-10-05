@@ -1,0 +1,54 @@
+# cloudberry-datafusion
+
+`datafusion_executor` is a PostgreSQL extension that adds a vectorized
+execution backend to [Apache Cloudberry](https://github.com/apache/cloudberry),
+built on [Apache DataFusion](https://datafusion.apache.org/).
+
+Design constraints:
+
+- **Extension only.** No changes to the Cloudberry kernel; it plugs in through
+  the executor and planner hooks.
+- **Reuse the interconnect.** Motion data still travels over Cloudberry's
+  interconnect; DataFusion parallelises the work before sending and after
+  receiving.
+- **Cloudberry memory accounting.** DataFusion's memory pool is bounded by the
+  per-operator memory the coordinator assigns, and leased from the vmem
+  tracker.
+
+## Status
+
+Milestone M0: the Rust static library links into the extension, and a panic
+inside Rust surfaces as an ordinary `ERROR` without taking the backend down.
+Nothing executes queries yet.
+
+| Milestone | Scope |
+|---|---|
+| M0 | Link Rust into the extension; panic safety across FFI |
+| M1 | Tokio runtime inside a backend; signals and cancellation |
+| M2 | Executor hooks, `datafusion.mode` GUC, eligibility check |
+| M3 | Heap scan on the main thread, Filter and Aggregate in DataFusion, results back to PostgreSQL |
+| M4 | Memory pool bound to `operatorMemKB`, vmem lease, SQLSTATE mapping |
+
+## Build
+
+Requires a Cloudberry installation (for `pg_config` and server headers) and a
+Rust toolchain; the version is pinned in `rust/rust-toolchain.toml`.
+
+```sh
+make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
+make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config install
+make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config installcheck
+make df-rust-test
+```
+
+## FFI contract
+
+Every function the Rust library exports never calls into PostgreSQL, never
+lets a panic escape, and reports failure as a status code plus a message in
+the caller's buffer. The C side raises the `ereport` after the call returns,
+so PostgreSQL's `longjmp` never unwinds through Rust frames. See
+`src/df_ffi.h`.
+
+## License
+
+Apache License 2.0. See `LICENSE`.

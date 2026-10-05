@@ -1,0 +1,12 @@
+# C build
+*.o
+*.so
+*.bc
+*.dylib
+# Rust build
+/rust/target/
+# pg_regress output
+/results/
+/regression.diffs
+/regression.out
+/log/
