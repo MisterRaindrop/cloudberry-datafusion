@@ -331,6 +331,35 @@ against 8% with tuples, which interleaves receiving and output row by row).
 The coordinator is the bottleneck of such queries and the motion layer
 offers no non-blocking receive to interleave with.
 
+### Joins
+
+Milestone J2 runs inner hash joins within a slice whose inputs are scanned
+locally (tables colocated on the join key), several levels deep, under an
+optional aggregate.  DataFusion builds its hash table on PostgreSQL's Hash
+side; the main thread feeds the inputs one after the other, the Hash side
+first, as PostgreSQL's Hash Join reads them.  Join keys must be of one type
+(no int4 = int8 yet); a join filter and a filter above the join are
+evaluated as in PostgreSQL; NULL keys match nothing.  Outer, semi and anti
+joins, IS NOT DISTINCT FROM joins and joins over Motions stay on
+PostgreSQL for now.
+
+DataFusion's hash join does not spill.  A slice qualifies only if the Hash
+node's estimated size (planner rows times width plus a per-row allowance)
+fits its budget, `min(operatorMemKB, work_mem) * hash_mem_multiplier`, as a
+PostgreSQL hash table's would; EXPLAIN gives the figures otherwise.  An
+underestimate (stale statistics) can still end in an "out of memory" error
+(53200) naming DataFusion's reservation, where PostgreSQL would have
+spilled.
+
+Over a 30-million-row table joined to a 2-million-row one, colocated, 3
+DataFusion threads per QE (results identical):
+
+| Query | PostgreSQL | DataFusion |
+|---|---|---|
+| `count(*), sum, max` over the join | 3.01 s | 0.26 s |
+| the same with filters on both sides | 0.89 s | 0.23 s |
+| `GROUP BY` a column of the build side | 4.17 s | 0.24 s |
+
 Limits: only Gather and Redistribute Motions between DataFusion slices (a
 slice that only receives stays on tuples, see above;
 Broadcast Motions come with joins, which DataFusion does not run yet);
@@ -357,6 +386,8 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M7b | Arrow IPC batches through Gather Motions between DataFusion slices |
 | M7c | Redistribute Motions with batches, routed by a checked transcription of cdbhash |
 | M7d | Split avg through batch Motions with DataFusion's state |
+| J1 | Plan tree over several inputs (groundwork for joins) |
+| J2 | Inner hash joins over local scans, with a memory guard |
 
 ## Build
 

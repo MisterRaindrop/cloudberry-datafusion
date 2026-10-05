@@ -38,6 +38,11 @@
 //!         | {"filter": {"input": <node>, "pred": <expr>}}
 //!         | {"aggregate": {"input": <node>, "group": [<expr>...],
 //!                          "aggs": [...], "having": <expr> | null}}
+//!         | {"join": {"type": "inner", "left": <node>, "right": <node>,
+//!                     "on": [[<left expr>, <right expr>], ...],
+//!                     "filter": <expr> | null}}
+//!           (an equi-join; DataFusion builds its hash table on the left,
+//!           NULL keys match nothing)
 //! ```
 //!
 //! {"col": k, "input": j} is column k of input j ("input" defaults to 0);
@@ -714,6 +719,10 @@ fn has_grouped_aggregate(node: &Value) -> bool {
     if let Some(f) = node.get("filter") {
         return f.get("input").map_or(false, has_grouped_aggregate);
     }
+    if let Some(j) = node.get("join") {
+        return j.get("left").map_or(false, has_grouped_aggregate)
+            || j.get("right").map_or(false, has_grouped_aggregate);
+    }
     false
 }
 
@@ -780,6 +789,27 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
             b = b.filter(expr(h)?).map_err(df)?;
         }
         return Ok(b);
+    }
+    if let Some(j) = node.get("join") {
+        if field(j, "type")?.as_str() != Some("inner") {
+            return Err(format!("plan spec: unsupported join {j}"));
+        }
+        let left = build_node(field(j, "left")?, tables)?;
+        let right = build_node(field(j, "right")?, tables)?.build().map_err(df)?;
+        let mut lkeys = Vec::new();
+        let mut rkeys = Vec::new();
+        for pair in field(j, "on")?.as_array().ok_or("plan spec: bad join keys")? {
+            let pair = pair.as_array().filter(|p| p.len() == 2).ok_or("plan spec: bad join key")?;
+            lkeys.push(expr(&pair[0])?);
+            rkeys.push(expr(&pair[1])?);
+        }
+        let filter = match j.get("filter").filter(|v| !v.is_null()) {
+            Some(f) => Some(expr(f)?),
+            None => None,
+        };
+        return left
+            .join_with_expr_keys(right, datafusion::logical_expr::JoinType::Inner, (lkeys, rkeys), filter)
+            .map_err(df);
     }
     Err(format!("plan spec: unknown node {node}"))
 }

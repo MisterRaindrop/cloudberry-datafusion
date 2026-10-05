@@ -61,9 +61,8 @@
 
 typedef enum DfLevel
 {
-	DF_LEVEL_SCAN,				/* expressions over the scanned table */
-	DF_LEVEL_AGG,				/* expressions over the aggregate's output */
-	DF_LEVEL_AGGARG				/* aggregate arguments: over the scan */
+	DF_LEVEL_SCAN,				/* expressions of node b->ctx, over its inputs */
+	DF_LEVEL_AGG				/* expressions over the aggregate's output */
 } DfLevel;
 
 /* An input being described: its leaf and the columns read so far. */
@@ -77,8 +76,7 @@ typedef struct DfInputDesc
 
 typedef struct DfBuilder
 {
-	Index		scanrelid;		/* 0 when the input is a Motion */
-	Plan	   *scan;			/* the Seq Scan or the receiving Motion */
+	Plan	   *ctx;			/* the node whose expressions are emitted */
 	Agg		   *agg;
 	List	   *inputs;			/* DfInputDesc, in input order */
 	List	   *aggrefs;		/* distinct aggregate calls, in first-use order */
@@ -216,18 +214,16 @@ df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type)
 		appendStringInfo(out, "{\"col\":%d,\"input\":%d}", k, j);
 }
 
-/* The input scanning range table entry 'varno', or -1. */
+/* The input reading 'leaf', or -1. */
 static int
-df_scan_input(DfBuilder *b, Index varno)
+df_input_of(DfBuilder *b, Plan *leaf)
 {
 	ListCell   *lc;
 	int			j = 0;
 
 	foreach(lc, b->inputs)
 	{
-		Plan	   *leaf = ((DfInputDesc *) lfirst(lc))->leaf;
-
-		if (IsA(leaf, SeqScan) && ((Scan *) leaf)->scanrelid == varno)
+		if (((DfInputDesc *) lfirst(lc))->leaf == leaf)
 			return j;
 		j++;
 	}
@@ -235,21 +231,28 @@ df_scan_input(DfBuilder *b, Index varno)
 }
 
 /*
- * Output column 'resno' of the aggregate's child, as an input expression:
- * the scan's targetlist entry, or the Motion's column itself.
+ * Output column 'resno' of plan node 'child', as an expression over the
+ * inputs: the Motion's column itself, or the child's targetlist entry
+ * emitted in the child's own terms, down to the scanned columns.
  */
 static void
-df_emit_child_column(DfBuilder *b, StringInfo out, AttrNumber resno)
+df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 {
-	TargetEntry *tle = get_tle_by_resno(b->scan->targetlist, resno);
+	TargetEntry *tle = child ? get_tle_by_resno(child->targetlist, resno) : NULL;
+	Plan	   *saved = b->ctx;
 
 	if (tle == NULL)
-		df_fail(b, "a reference to the child's output");
-	else if (IsA(b->scan, Motion))
-		df_emit_column(b, out, 0, df_motion_stream_column((Motion *) b->scan, resno) + 1,
+		df_fail(b, "a reference to a child's output");
+	else if (IsA(child, Motion))
+		df_emit_column(b, out, df_input_of(b, child),
+					   df_motion_stream_column((Motion *) child, resno) + 1,
 					   exprType((Node *) tle->expr));
 	else
+	{
+		b->ctx = child;
 		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		b->ctx = saved;
+	}
 }
 
 /* Index of aggregate call ('agg', 'fn'), adding it if new. */
@@ -331,11 +334,15 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && df_scan_input(b, var->varno) >= 0)
-					df_emit_column(b, out, df_scan_input(b, var->varno),
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
+					df_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
+				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
+					df_emit_output_of(b, out, innerPlan(b->ctx), var->varattno);
+				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SeqScan) &&
+						 ((Scan *) b->ctx)->scanrelid == var->varno &&
+						 df_input_of(b, b->ctx) >= 0)
+					df_emit_column(b, out, df_input_of(b, b->ctx),
 								   var->varattno, var->vartype);
-				else if (level == DF_LEVEL_AGGARG && var->varno == OUTER_VAR)
-					df_emit_child_column(b, out, var->varattno);
 				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
 				{
 					int			k;
@@ -418,6 +425,88 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 	}
 }
 
+/*
+ * The plan node 'plan' of the slice, below its aggregate, as a node of the
+ * spec.  Inputs are added in the order they are met: a join's Hash side
+ * first, which is the order they are fed in.
+ */
+static void
+df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
+{
+	if (b->failed)
+		return;
+	switch (nodeTag(plan))
+	{
+		case T_SeqScan:
+		case T_Motion:
+			{
+				int			j = df_add_input(b, plan);
+
+				if (plan->qual == NIL)
+				{
+					appendStringInfo(out, "{\"input\":%d}", j);
+					return;
+				}
+				appendStringInfo(out, "{\"filter\":{\"input\":{\"input\":%d},\"pred\":", j);
+				b->ctx = plan;
+				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				appendStringInfoString(out, "}}");
+				return;
+			}
+
+		case T_Hash:
+			df_emit_node(b, out, outerPlan(plan));
+			return;
+
+		case T_HashJoin:
+			{
+				HashJoin   *hj = (HashJoin *) plan;
+				ListCell   *lc;
+				bool		first = true;
+
+				/*
+				 * DataFusion builds its hash table on the left: PostgreSQL's
+				 * Hash side.  Its hash clauses read outer = inner.
+				 */
+				if (plan->qual != NIL)
+					appendStringInfoString(out, "{\"filter\":{\"input\":");
+				appendStringInfoString(out, "{\"join\":{\"type\":\"inner\",\"left\":");
+				df_emit_node(b, out, innerPlan(plan));
+				appendStringInfoString(out, ",\"right\":");
+				df_emit_node(b, out, outerPlan(plan));
+				appendStringInfoString(out, ",\"on\":[");
+				b->ctx = plan;
+				foreach(lc, hj->hashclauses)
+				{
+					OpExpr	   *op = lfirst_node(OpExpr, lc);
+
+					appendStringInfoString(out, first ? "[" : ",[");
+					first = false;
+					df_emit(b, out, lsecond(op->args), DF_LEVEL_SCAN);
+					appendStringInfoChar(out, ',');
+					df_emit(b, out, linitial(op->args), DF_LEVEL_SCAN);
+					appendStringInfoChar(out, ']');
+				}
+				appendStringInfoString(out, "],\"filter\":");
+				b->ctx = plan;
+				df_emit_qual(b, out, hj->join.joinqual, DF_LEVEL_SCAN);
+				appendStringInfoString(out, "}}");
+				if (plan->qual != NIL)
+				{
+					appendStringInfoString(out, ",\"pred\":");
+					b->ctx = plan;
+					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					appendStringInfoString(out, "}}");
+				}
+				return;
+			}
+
+		default:
+			df_fail(b, "this plan node");
+			return;
+	}
+}
+
 static void
 df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 				DfSliceSpec *spec)
@@ -473,7 +562,7 @@ bool
 df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen)
 {
 	DfBuilder	b;
-	StringInfoData filter,
+	StringInfoData node,
 				group,
 				having,
 				outputs,
@@ -485,43 +574,34 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 	b.reason = reason;
 	b.reasonlen = reasonlen;
 	memset(spec, 0, sizeof(*spec));
-	initStringInfo(&filter);
 	initStringInfo(&group);
 	initStringInfo(&having);
 	initStringInfo(&outputs);
 
+	initStringInfo(&node);
 	if (IsA(root, Agg))
 	{
 		b.agg = (Agg *) root;
-		b.scan = outerPlan(root);
-	}
-	else
-		b.scan = root;
-	if (b.scan != NULL && IsA(b.scan, SeqScan))
-		b.scanrelid = ((Scan *) b.scan)->scanrelid;
-	else if (!(b.agg && b.scan != NULL && IsA(b.scan, Motion)))
-	{
-		snprintf(reason, reasonlen, "cannot translate this slice shape");
-		return false;
-	}
-	df_add_input(&b, b.scan);
-
-	df_emit_qual(&b, &filter, b.scan->qual, DF_LEVEL_SCAN);
-	if (b.agg)
-	{
+		df_emit_node(&b, &node, outerPlan(root));
 		appendStringInfoChar(&group, '[');
 		for (i = 0; i < b.agg->numCols; i++)
 		{
 			if (i > 0)
 				appendStringInfoChar(&group, ',');
-			df_emit_child_column(&b, &group, b.agg->grpColIdx[i]);
+			df_emit_output_of(&b, &group, outerPlan(root), b.agg->grpColIdx[i]);
 		}
 		appendStringInfoChar(&group, ']');
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
 		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_AGG, spec);
 	}
 	else
+	{
+		df_emit_node(&b, &node, root);
+		b.ctx = root;
 		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_SCAN, spec);
+	}
+	if (b.failed)
+		return false;
 
 	/*
 	 * Aggregate calls were collected while emitting the above.  Emit them
@@ -549,16 +629,18 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 				int			pos;
 
-				if (!IsA(b.scan, Motion) || !IsA(arg, Var))
+				Plan	   *child = outerPlan(b.agg);
+
+				if (!IsA(child, Motion) || !IsA(arg, Var))
 				{
 					df_fail(&b, "a combining avg");
 					break;
 				}
-				pos = df_motion_stream_column((Motion *) b.scan, ((Var *) arg)->varattno);
+				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
 				appendStringInfoString(&aggs, "{\"fn\":\"avg_merge\",\"arg\":");
-				df_emit_column(&b, &aggs, 0, pos + 1, FLOAT8OID);
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 1, FLOAT8OID);
 				appendStringInfoString(&aggs, ",\"arg2\":");
-				df_emit_column(&b, &aggs, 0, pos + 2, INT8OID);
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 2, INT8OID);
 				appendStringInfoChar(&aggs, '}');
 				continue;
 			}
@@ -572,9 +654,13 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 			if ((agg->aggstar && !combine) || agg->args == NIL)
 				appendStringInfoString(&aggs, "null");
 			else
+			{
+				/* arguments are expressions of the aggregate over its child */
+				b.ctx = (Plan *) b.agg;
 				df_emit(&b, &aggs,
 						(Node *) linitial_node(TargetEntry, agg->args)->expr,
-						DF_LEVEL_AGGARG);
+						DF_LEVEL_SCAN);
+			}
 			appendStringInfoChar(&aggs, '}');
 		}
 		if (b.failed)
@@ -607,33 +693,18 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 			appendStringInfoChar(&json, '}');
 		}
 
-		/* the plan: the input, filtered, aggregated */
+		/* the plan, under the aggregate if there is one */
+		if (b.agg)
 		{
-			StringInfoData node;
+			StringInfoData a;
 
-			initStringInfo(&node);
-			appendStringInfoString(&node, "{\"input\":0}");
-			if (strcmp(filter.data, "null") != 0)
-			{
-				StringInfoData f;
-
-				initStringInfo(&f);
-				appendStringInfo(&f, "{\"filter\":{\"input\":%s,\"pred\":%s}}",
-								 node.data, filter.data);
-				node = f;
-			}
-			if (b.agg)
-			{
-				StringInfoData a;
-
-				initStringInfo(&a);
-				appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,\"group\":%s,"
-								 "\"aggs\":[%s],\"having\":%s}}",
-								 node.data, group.data, aggs.data, having.data);
-				node = a;
-			}
-			appendStringInfo(&json, "],\"plan\":%s,\"output\":%s}", node.data, outputs.data);
+			initStringInfo(&a);
+			appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,\"group\":%s,"
+							 "\"aggs\":[%s],\"having\":%s}}",
+							 node.data, group.data, aggs.data, having.data);
+			node = a;
 		}
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s}", node.data, outputs.data);
 	}
 
 	spec->json = json.data;

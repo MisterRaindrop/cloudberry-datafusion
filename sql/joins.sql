@@ -1,0 +1,86 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Inner hash joins within a slice (J2): both sides scanned locally (tables
+-- colocated on the join key), under an optional aggregate.  DataFusion
+-- builds its hash table on PostgreSQL's Hash side, which is also fed first.
+-- Each query runs with datafusion.mode off, then on; the results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+
+CREATE TABLE df_ja (k int4, a int4, c float8) DISTRIBUTED BY (k);
+CREATE TABLE df_jb (k int4, b int8, e int2) DISTRIBUTED BY (k);
+CREATE TABLE df_jc (k int4, d int8) DISTRIBUTED BY (k);
+CREATE TABLE df_jempty (k int4, d int8) DISTRIBUTED BY (k);
+INSERT INTO df_ja SELECT i, i % 100, i / 4.0 FROM generate_series(1, 20000) i;
+INSERT INTO df_ja VALUES (NULL, 1, 1.0);
+INSERT INTO df_jb SELECT i * 2, i * 10, (i % 50)::int2 FROM generate_series(1, 10000) i;
+INSERT INTO df_jb VALUES (NULL, 1, 1);
+INSERT INTO df_jc SELECT i * 3, i FROM generate_series(1, 7000) i;
+-- duplicate keys on both sides
+CREATE TABLE df_jdup (k int4, v int4) DISTRIBUTED BY (k);
+INSERT INTO df_jdup SELECT i % 10, i FROM generate_series(1, 100) i;
+ANALYZE df_ja; ANALYZE df_jb; ANALYZE df_jc; ANALYZE df_jempty; ANALYZE df_jdup;
+
+-- Which slices qualify.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
+EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
+-- These stay on PostgreSQL, with the reason.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.b;
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
+RESET work_mem;
+
+SET datafusion.mode = off;
+SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
+SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
+SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
+SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
+SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE ja.a + jb.e > 100;
+SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k + 1 = jb.k + 1;
+SELECT count(*), sum(x.v), sum(y.v) FROM df_jdup x JOIN df_jdup y ON x.k = y.k;
+SELECT count(*) FROM df_ja ja JOIN df_jempty je ON ja.k = je.k;
+SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
+SET datafusion.mode = on;
+SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
+SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
+SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
+SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
+SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE ja.a + jb.e > 100;
+SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k + 1 = jb.k + 1;
+SELECT count(*), sum(x.v), sum(y.v) FROM df_jdup x JOIN df_jdup y ON x.k = y.k;
+SELECT count(*) FROM df_ja ja JOIN df_jempty je ON ja.k = je.k;
+SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
+-- An error in the join filter carries PostgreSQL's message.
+SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a / (jb.e - jb.e) > 0;
+
+-- With batch Motions, the joined rows' partial aggregates go out as batches.
+SET datafusion.motion_batches = on;
+SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
+RESET datafusion.motion_batches;
+
+DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

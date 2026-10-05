@@ -48,6 +48,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "executor/execUtils.h"
+#include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
@@ -65,6 +66,7 @@ typedef struct DfCheckContext
 	PlannedStmt *stmt;
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
 	bool		agg_input;		/* checking the child of an Agg node */
+	bool		join_input;		/* checking an input of a join */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
@@ -436,6 +438,44 @@ df_collect_outer_refs(Node *node, Bitmapset **refs)
 	return expression_tree_walker(node, df_collect_outer_refs, refs);
 }
 
+/* The same for a join's inner child (INNER_VAR). */
+static bool
+df_collect_inner_refs(Node *node, Bitmapset **refs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) && ((Var *) node)->varno == INNER_VAR)
+	{
+		*refs = bms_add_member(*refs, ((Var *) node)->varattno);
+		return false;
+	}
+	return expression_tree_walker(node, df_collect_inner_refs, refs);
+}
+
+/*
+ * Bytes a Hash node's table is estimated to take: the planner's rows and
+ * width, plus a per-row allowance for DataFusion's hash table.
+ */
+static double
+df_hash_estimate(Plan *hash)
+{
+	return hash->plan_rows * (hash->plan_width + 48.0);
+}
+
+/*
+ * Bytes the executor would give a Hash node's table: like a hashed Agg's
+ * budget, min(operatorMemKB, work_mem) * hash_mem_multiplier.
+ */
+double
+df_hash_budget(Plan *hash)
+{
+	double		kb = work_mem;
+
+	if (hash->operatorMemKB > 0 && hash->operatorMemKB < kb)
+		kb = hash->operatorMemKB;
+	return kb * hash_mem_multiplier * 1024.0;
+}
+
 /*
  * Check the targetlist entries at the positions in 'needed', or all of them
  * if 'needed' is NULL.  A scan often emits every column of the table (a
@@ -541,6 +581,11 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "sorted or mixed aggregation");
 					return;
 				}
+				if (cxt->join_input)
+				{
+					df_reject(cxt, "aggregate below a join");
+					return;
+				}
 				/*
 				 * Single-stage, or the first stage of a split aggregate: its
 				 * output is the transition state, which for the supported
@@ -606,6 +651,124 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_HashJoin:
+			{
+				HashJoin   *hj = (HashJoin *) plan;
+				Join	   *join = &hj->join;
+				Plan	   *outer = outerPlan(plan);
+				Plan	   *inner = innerPlan(plan);
+				Bitmapset  *outer_needed = NULL;
+				Bitmapset  *inner_needed = NULL;
+				ListCell   *lc;
+
+				/*
+				 * J2: an inner equi-join, DataFusion's hash table on
+				 * PostgreSQL's Hash side.  IS NOT DISTINCT FROM joins
+				 * (hashqualclauses) match NULLs and stay on PostgreSQL.
+				 */
+				if (join->jointype != JOIN_INNER)
+				{
+					df_reject(cxt, "%s join", join->jointype == JOIN_LEFT ? "left" :
+							  join->jointype == JOIN_RIGHT ? "right" :
+							  join->jointype == JOIN_FULL ? "full" :
+							  join->jointype == JOIN_SEMI ? "semi" :
+							  join->jointype == JOIN_ANTI ? "anti" : "non-inner");
+					return;
+				}
+				if (hj->hashqualclauses != NIL)
+				{
+					df_reject(cxt, "IS NOT DISTINCT FROM join");
+					return;
+				}
+				if (inner == NULL || !IsA(inner, Hash) || outer == NULL)
+				{
+					df_reject(cxt, "Hash Join without a Hash node");
+					return;
+				}
+				foreach(lc, hj->hashclauses)
+				{
+					OpExpr	   *op = lfirst(lc);
+					char	   *name;
+
+					if (!IsA(op, OpExpr) || list_length(op->args) != 2 ||
+						(name = get_opname(op->opno)) == NULL || strcmp(name, "=") != 0)
+					{
+						df_reject(cxt, "Hash Join condition other than =");
+						return;
+					}
+					if (exprType(linitial(op->args)) != exprType(lsecond(op->args)))
+					{
+						df_reject(cxt, "Hash Join on %s = %s",
+								  format_type_be(exprType(linitial(op->args))),
+								  format_type_be(exprType(lsecond(op->args))));
+						return;
+					}
+				}
+				if (df_hash_estimate(inner) > df_hash_budget(inner))
+				{
+					df_reject(cxt, "Hash Join build side of about %.0f kB exceeds its %.0f kB",
+							  df_hash_estimate(inner) / 1024, df_hash_budget(inner) / 1024);
+					return;
+				}
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				df_check_expr_list(hj->hashclauses, cxt);
+				df_check_expr_list(join->joinqual, cxt);
+				df_check_expr_list(plan->qual, cxt);
+				if (cxt->failed)
+					return;
+
+				/* What each side must produce. */
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+					{
+						df_collect_outer_refs((Node *) tle->expr, &outer_needed);
+						df_collect_inner_refs((Node *) tle->expr, &inner_needed);
+					}
+				}
+				df_collect_outer_refs((Node *) hj->hashclauses, &outer_needed);
+				df_collect_inner_refs((Node *) hj->hashclauses, &inner_needed);
+				df_collect_outer_refs((Node *) join->joinqual, &outer_needed);
+				df_collect_inner_refs((Node *) join->joinqual, &inner_needed);
+				df_collect_outer_refs((Node *) plan->qual, &outer_needed);
+				df_collect_inner_refs((Node *) plan->qual, &inner_needed);
+				outer_needed = bms_add_member(outer_needed, 0);
+				inner_needed = bms_add_member(inner_needed, 0);
+				cxt->agg_input = false;
+				cxt->join_input = true;
+				df_check_plan(inner, cxt, inner_needed, false);
+				cxt->join_input = true;
+				df_check_plan(outer, cxt, outer_needed, false);
+				cxt->join_input = false;
+				return;
+			}
+
+		case T_Hash:
+			{
+				Bitmapset  *child_needed = NULL;
+				ListCell   *lc;
+
+				if (plan->qual != NIL)
+				{
+					df_reject(cxt, "filter on a Hash node");
+					return;
+				}
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+				}
+				child_needed = bms_add_member(child_needed, 0);
+				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				return;
+			}
+
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
@@ -621,6 +784,11 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * Motion's targetlist is evaluated by the sending slice;
 					 * here only the types of the columns read matter.
 					 */
+					if (cxt->join_input)
+					{
+						df_reject(cxt, "join input from a %s", df_plan_name(plan));
+						return;
+					}
 					if (!cxt->agg_input)
 					{
 						df_reject(cxt, "receives rows from a %s with nothing to compute on them",

@@ -258,31 +258,46 @@ df_raise_query(int32 status, const char *sqlstate, char *msg)
 
 /*
  * Operator memory budget of the slice, in bytes: what the executor would
- * give its hashed Agg node (see hash_agg_set_limits in nodeAgg.c), or
- * work_mem for a plain aggregate or a scan alone.
+ * give its hashed Agg node (see hash_agg_set_limits in nodeAgg.c) and its
+ * Hash nodes, or work_mem for a plain aggregate or a scan alone.
  */
-static int64
-df_slice_memory(PlanState *root)
+/* Bytes for the hash tables of the slice's nodes from 'ps' down. */
+static double
+df_hash_memory(PlanState *ps)
 {
-	double		kb = work_mem;
+	double		bytes = 0;
 
-	/*
-	 * Only a hashed aggregate holds a hash table that the executor would
-	 * limit.  A plain aggregate, like a scan, holds just the batches in
-	 * flight; the resource queue rates it a light operator (100 kB), far
-	 * too little for those, and DataFusion's repartitioning would spill
-	 * them to disk.
-	 */
-	if (IsA(root, AggState) &&
-		((Agg *) root->plan)->aggstrategy == AGG_HASHED)
+	if (ps == NULL || IsA(ps, MotionState))
+		return 0;
+	if (IsA(ps, AggState) && ((Agg *) ps->plan)->aggstrategy == AGG_HASHED)
 	{
-		uint64		op = PlanStateOperatorMemKB(root);
+		double		kb = work_mem;
+		uint64		op = PlanStateOperatorMemKB(ps);
 
 		if (op < kb)
 			kb = op;
-		kb *= hash_mem_multiplier;
+		bytes += kb * hash_mem_multiplier * 1024.0;
 	}
-	return (int64) (kb * 1024.0);
+	else if (IsA(ps, HashState))
+		bytes += df_hash_budget(ps->plan);
+	return bytes + df_hash_memory(outerPlanState(ps)) + df_hash_memory(innerPlanState(ps));
+}
+
+static int64
+df_slice_memory(PlanState *root)
+{
+	double		bytes = df_hash_memory(root);
+
+	/*
+	 * Only hashed aggregates and Hash Join tables are limited by the
+	 * executor; their budgets add up.  Without them, as for a plain
+	 * aggregate or a scan, only the batches in flight need room: the
+	 * resource queue rates a plain Agg a light operator (100 kB), far too
+	 * little for those, and DataFusion's repartitioning would spill them.
+	 */
+	if (bytes <= 0)
+		bytes = work_mem * 1024.0;
+	return (int64) bytes;
 }
 
 /* The query produced all its rows: keep its figures. */

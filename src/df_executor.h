@@ -140,6 +140,7 @@ extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
 								 bool *is_sender);
 extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);
+extern double df_hash_budget(Plan *hash);
 
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);

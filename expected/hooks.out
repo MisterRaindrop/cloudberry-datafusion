@@ -120,8 +120,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relnatts IN (1, 2);
 (5 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid;
-                          QUERY PLAN                          
---------------------------------------------------------------
+                     QUERY PLAN                      
+-----------------------------------------------------
  Aggregate
    ->  Hash Join
          Hash Cond: (a.attrelid = c.oid)
@@ -129,7 +129,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.att
          ->  Hash
                ->  Seq Scan on pg_class c
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: Hash Join is not supported
+ DataFusion: slice 0 not eligible: operator = on oid
 (8 rows)
 
 -- Distributed tables: the coordinator's slice receives from a Motion and
