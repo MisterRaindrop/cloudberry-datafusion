@@ -32,13 +32,13 @@
 #   make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
 
 MODULE_big = datafusion_executor
-OBJS = src/df_init.o
+OBJS = src/df_init.o src/df_runtime.o src/df_debug.o
 
 EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor
+REGRESS = datafusion_executor runtime
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
 PG_CPPFLAGS = -Isrc
@@ -80,7 +80,7 @@ $(DF_RUST_LIB): df-rust
 $(shlib): $(DF_RUST_LIB)
 
 df-rust-test:
-	cd rust && $(CARGO) test -p df_ffi $(DF_CARGO_FLAGS)
+	cd rust && $(CARGO) test --workspace $(DF_CARGO_FLAGS)
 
 df-rust-clean:
 	-cd rust && $(CARGO) clean

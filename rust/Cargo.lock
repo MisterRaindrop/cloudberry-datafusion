@@ -1003,10 +1003,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "df_core"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "df_ffi"
 version = "0.1.0"
 dependencies = [
  "datafusion",
+ "df_core",
 ]
 
 [[package]]

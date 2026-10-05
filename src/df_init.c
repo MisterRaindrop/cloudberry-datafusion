@@ -28,8 +28,9 @@
 
 #include "fmgr.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 
-#include "df_ffi.h"
+#include "df_executor.h"
 
 PG_MODULE_MAGIC;
 
@@ -38,13 +39,24 @@ void		_PG_init(void);
 PG_FUNCTION_INFO_V1(datafusion_version);
 PG_FUNCTION_INFO_V1(datafusion_debug_panic);
 
-static void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
-
 void
 _PG_init(void)
 {
+	DefineCustomIntVariable("datafusion.worker_threads",
+							"Number of DataFusion worker threads per backend.",
+							"0 means one per CPU.  Takes effect when a backend "
+							"first uses DataFusion; changing it later does not "
+							"resize a running backend's runtime.",
+							&df_worker_threads,
+							0, 0, 1024,
+							PGC_SUSET,
+							GUC_GPDB_NEED_SYNC,
+							NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("datafusion");
+
 	/*
-	 * Executor hooks and GUCs are installed here from milestone M2 on.
+	 * Executor hooks are installed here from milestone M2 on.
 	 *
 	 * Never start threads here.  When the library is listed in
 	 * shared_preload_libraries this runs in the postmaster, and every
@@ -57,7 +69,7 @@ _PG_init(void)
  * Turn a failed FFI call into a PostgreSQL error.  Called only after the
  * Rust frames have returned.
  */
-static void
+void
 df_raise(int32 status, const char *msg)
 {
 	if (status == DF_PANIC)

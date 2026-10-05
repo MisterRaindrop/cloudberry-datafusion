@@ -17,9 +17,16 @@ Design constraints:
 
 ## Status
 
-Milestone M0: the Rust static library links into the extension, and a panic
-inside Rust surfaces as an ordinary `ERROR` without taking the backend down.
-Nothing executes queries yet.
+Milestones M0 and M1: the Rust static library links into the extension, and
+each backend starts a Tokio runtime on first use.  The runtime's threads block
+every signal, so cancel, statement timeout and terminate requests still reach
+the backend's main thread, which stops the runtime's work before reporting
+the error.  A panic inside Rust, on the main thread or on a worker, surfaces
+as an ordinary `ERROR` without taking the backend down.  Nothing executes
+queries yet.
+
+`datafusion.worker_threads` sets the runtime size (0 = one thread per CPU).
+It takes effect when a backend first uses DataFusion.
 
 | Milestone | Scope |
 |---|---|

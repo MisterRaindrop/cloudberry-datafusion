@@ -43,10 +43,35 @@
 #define DF_OK		0
 #define DF_ERROR	1
 #define DF_PANIC	2
+#define DF_PENDING	3			/* df_ffi_task_wait: still running */
+#define DF_CANCELLED 4			/* df_ffi_task_wait: stopped by cancel */
 
 #define DF_MSG_BUFLEN 1024
 
+#include <stdbool.h>
+
 extern int32_t df_ffi_version(char *buf, size_t buflen);
 extern int32_t df_ffi_debug_panic(char *buf, size_t buflen);
+
+/*
+ * Per-backend runtime.  The caller must block all signals around
+ * df_ffi_runtime_init so that the runtime's threads start with every signal
+ * blocked.  workers == 0 means one thread per CPU.
+ */
+extern int32_t df_ffi_runtime_init(uint32_t workers, uint32_t *out_workers,
+								   char *buf, size_t buflen);
+extern void df_ffi_runtime_shutdown(uint32_t timeout_ms);
+
+/* A running group of tasks; owned by the caller until df_ffi_task_free. */
+typedef struct DfTask DfTask;
+
+extern int32_t df_ffi_debug_spin_start(double seconds, uint32_t ntasks,
+									   bool panic_in_worker, DfTask **out_task,
+									   char *buf, size_t buflen);
+extern int32_t df_ffi_task_wait(DfTask *task, uint32_t timeout_ms,
+								char *buf, size_t buflen);
+extern void df_ffi_task_cancel(DfTask *task);
+extern void df_ffi_task_free(DfTask *task);
+extern uint64_t df_ffi_debug_active_tasks(void);
 
 #endif							/* DF_FFI_H */

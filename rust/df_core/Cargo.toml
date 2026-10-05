@@ -16,15 +16,12 @@
 # under the License.
 
 [package]
-name = "df_ffi"
+name = "df_core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lib]
-crate-type = ["staticlib"]
-
 [dependencies]
-datafusion.workspace = true
-df_core.workspace = true
+tokio.workspace = true
+libc.workspace = true

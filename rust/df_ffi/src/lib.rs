@@ -35,6 +35,10 @@ compile_error!("df_ffi must be built with panic = \"unwind\"");
 pub const DF_OK: i32 = 0;
 pub const DF_ERROR: i32 = 1;
 pub const DF_PANIC: i32 = 2;
+/// `df_ffi_task_wait` only: the task is still running.
+pub const DF_PENDING: i32 = 3;
+/// `df_ffi_task_wait` only: the task stopped because it was cancelled.
+pub const DF_CANCELLED: i32 = 4;
 
 /// Copy `msg` into a C buffer of `buflen` bytes as a NUL-terminated string,
 /// truncating on a UTF-8 character boundary.
@@ -97,6 +101,141 @@ pub extern "C" fn df_ffi_version(buf: *mut c_char, buflen: usize) -> i32 {
 #[no_mangle]
 pub extern "C" fn df_ffi_debug_panic(buf: *mut c_char, buflen: usize) -> i32 {
     guard(buf, buflen, || panic!("datafusion_debug_panic requested"))
+}
+
+// ---------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------
+
+/// Start the per-backend runtime with `workers` threads (0 = one per CPU) if
+/// it is not running yet, and store its actual worker count in `*out_workers`.
+/// The caller must block all signals around this call; see df_core::runtime.
+#[no_mangle]
+pub extern "C" fn df_ffi_runtime_init(
+    workers: u32,
+    out_workers: *mut u32,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    guard(buf, buflen, || {
+        let n = df_core::runtime::init(workers as usize)?;
+        if !out_workers.is_null() {
+            // SAFETY: the caller passes a valid pointer or NULL.
+            unsafe { *out_workers = n as u32 };
+        }
+        Ok(String::new())
+    })
+}
+
+/// Stop the runtime, waiting at most `timeout_ms` for running tasks.
+/// Never fails; a panic during shutdown is swallowed.
+#[no_mangle]
+pub extern "C" fn df_ffi_runtime_shutdown(timeout_ms: u32) {
+    let _ = catch_unwind(|| {
+        df_core::runtime::shutdown(std::time::Duration::from_millis(timeout_ms as u64))
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Debug tasks (M1): spawn, wait, cancel, free
+// ---------------------------------------------------------------------------
+
+/// Opaque handle owned by the C caller; release it with `df_ffi_task_free`.
+pub struct DfTask(df_core::debug::Task);
+
+/// Start `ntasks` CPU-bound tasks that spin for `seconds` (`panic_in_worker`:
+/// the first one panics instead).  On success stores a handle in `*out_task`.
+#[no_mangle]
+pub extern "C" fn df_ffi_debug_spin_start(
+    seconds: f64,
+    ntasks: u32,
+    panic_in_worker: bool,
+    out_task: *mut *mut DfTask,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    guard(buf, buflen, || {
+        if out_task.is_null() {
+            return Err("out_task is NULL".into());
+        }
+        let task = df_core::debug::spin(seconds, ntasks as usize, panic_in_worker)?;
+        // SAFETY: checked non-NULL above.
+        unsafe { *out_task = Box::into_raw(Box::new(DfTask(task))) };
+        Ok(String::new())
+    })
+}
+
+/// Wait up to `timeout_ms` for `task`.  Returns DF_PENDING if it is still
+/// running; otherwise DF_OK (result text in `buf`), DF_CANCELLED, DF_ERROR
+/// or DF_PANIC (message in `buf`).  After a non-pending return, do not wait
+/// on the same task again.
+#[no_mangle]
+pub extern "C" fn df_ffi_task_wait(
+    task: *mut DfTask,
+    timeout_ms: u32,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    use df_core::debug::{Outcome, Poll};
+    if task.is_null() {
+        write_message(buf, buflen, "task is NULL");
+        return DF_ERROR;
+    }
+    // SAFETY: `task` came from df_ffi_debug_spin_start and is not yet freed.
+    let task = unsafe { &*task };
+    let polled = catch_unwind(AssertUnwindSafe(|| {
+        task.0.wait(std::time::Duration::from_millis(timeout_ms as u64))
+    }));
+    match polled {
+        Ok(Poll::Pending) => DF_PENDING,
+        Ok(Poll::Ready(Outcome::Done(text))) => {
+            write_message(buf, buflen, &text);
+            DF_OK
+        }
+        Ok(Poll::Ready(Outcome::Cancelled)) => {
+            write_message(buf, buflen, "cancelled");
+            DF_CANCELLED
+        }
+        Ok(Poll::Ready(Outcome::Failed(msg))) => {
+            write_message(buf, buflen, &msg);
+            DF_ERROR
+        }
+        Ok(Poll::Ready(Outcome::Panicked(msg))) => {
+            write_message(buf, buflen, &msg);
+            DF_PANIC
+        }
+        Err(payload) => {
+            write_message(buf, buflen, panic_message(payload.as_ref()));
+            DF_PANIC
+        }
+    }
+}
+
+/// Ask `task` to stop.  Safe to call more than once.
+#[no_mangle]
+pub extern "C" fn df_ffi_task_cancel(task: *mut DfTask) {
+    if !task.is_null() {
+        // SAFETY: as in df_ffi_task_wait.
+        let task = unsafe { &*task };
+        let _ = catch_unwind(AssertUnwindSafe(|| task.0.cancel()));
+    }
+}
+
+/// Release `task`, cancelling it if it is still running.  The running work
+/// owns what it uses, so it may finish after this returns.
+#[no_mangle]
+pub extern "C" fn df_ffi_task_free(task: *mut DfTask) {
+    if !task.is_null() {
+        // SAFETY: `task` came from Box::into_raw and is freed exactly once.
+        let task = unsafe { Box::from_raw(task) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(task)));
+    }
+}
+
+/// Number of debug worker tasks still running on the runtime.
+#[no_mangle]
+pub extern "C" fn df_ffi_debug_active_tasks() -> u64 {
+    df_core::debug::active_tasks() as u64
 }
 
 #[cfg(test)]

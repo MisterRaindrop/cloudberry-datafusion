@@ -20,7 +20,7 @@
 
 [workspace]
 resolver = "2"
-members = ["df_ffi"]
+members = ["df_core", "df_ffi"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,6 +30,9 @@ publish = false
 
 [workspace.dependencies]
 datafusion = { version = "55", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+libc = "0.2"
+df_core = { path = "df_core" }
 
 # panic must stay "unwind": every FFI entry point relies on catch_unwind to
 # turn a panic into an ordinary PostgreSQL ERROR.  "abort" would take the

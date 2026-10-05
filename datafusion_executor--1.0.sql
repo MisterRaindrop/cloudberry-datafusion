@@ -34,3 +34,37 @@ AS 'MODULE_PATHNAME', 'datafusion_debug_panic'
 LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION datafusion_debug_panic() FROM PUBLIC;
+
+-- Runtime test functions (M1).  They run CPU-bound work on the backend's
+-- DataFusion runtime so tests can check cancellation, panics inside worker
+-- threads, and the workers' signal masks.
+
+-- Spin on ntasks runtime tasks for the given number of seconds.
+CREATE FUNCTION datafusion_debug_spin(seconds float8, ntasks int DEFAULT 4)
+RETURNS text
+AS 'MODULE_PATHNAME', 'datafusion_debug_spin'
+LANGUAGE C STRICT VOLATILE;
+
+-- Panic inside a runtime worker thread.
+CREATE FUNCTION datafusion_debug_worker_panic()
+RETURNS text
+AS 'MODULE_PATHNAME', 'datafusion_debug_worker_panic'
+LANGUAGE C VOLATILE;
+
+-- Number of debug tasks still running on this backend's runtime.
+CREATE FUNCTION datafusion_debug_active_tasks()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'datafusion_debug_active_tasks'
+LANGUAGE C VOLATILE;
+
+-- This backend's runtime threads, and whether all of them block the signals
+-- PostgreSQL handles on the main thread.
+CREATE FUNCTION datafusion_debug_runtime_threads(OUT threads int, OUT signals_blocked bool)
+RETURNS record
+AS 'MODULE_PATHNAME', 'datafusion_debug_runtime_threads'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_spin(float8, int) FROM PUBLIC;
+REVOKE ALL ON FUNCTION datafusion_debug_worker_panic() FROM PUBLIC;
+REVOKE ALL ON FUNCTION datafusion_debug_active_tasks() FROM PUBLIC;
+REVOKE ALL ON FUNCTION datafusion_debug_runtime_threads() FROM PUBLIC;
