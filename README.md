@@ -28,6 +28,25 @@ queries yet.
 `datafusion.worker_threads` sets the runtime size (0 = one thread per CPU).
 It takes effect when a backend first uses DataFusion.
 
+Milestone M2 adds the executor and EXPLAIN hooks.  `datafusion.mode` is
+`off` (default), `explain` or `on`.  With `explain` or `on`, text-format
+EXPLAIN ends with one line per slice saying whether DataFusion can run it,
+and if not, why:
+
+```
+ Aggregate
+   ->  Seq Scan on pg_class
+         Filter: (relpages > 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+```
+
+With `on`, eligible slices are routed to DataFusion at `ExecutorRun`; until
+M3 they are still executed by PostgreSQL.  Load the library in every
+backend, including the segments' QEs, by adding `datafusion_executor` to
+`shared_preload_libraries`; otherwise the hooks only exist in sessions that
+have called one of its functions.
+
 | Milestone | Scope |
 |---|---|
 | M0 | Link Rust into the extension; panic safety across FFI |

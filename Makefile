@@ -32,13 +32,14 @@
 #   make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
 
 MODULE_big = datafusion_executor
-OBJS = src/df_init.o src/df_runtime.o src/df_debug.o
+OBJS = src/df_init.o src/df_runtime.o src/df_debug.o \
+	src/df_hooks.o src/df_plan_check.o
 
 EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor runtime
+REGRESS = datafusion_executor runtime hooks
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
 PG_CPPFLAGS = -Isrc

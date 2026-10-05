@@ -39,9 +39,28 @@ void		_PG_init(void);
 PG_FUNCTION_INFO_V1(datafusion_version);
 PG_FUNCTION_INFO_V1(datafusion_debug_panic);
 
+static const struct config_enum_entry df_mode_options[] = {
+	{"off", DF_MODE_OFF, false},
+	{"explain", DF_MODE_EXPLAIN, false},
+	{"on", DF_MODE_ON, false},
+	{NULL, 0, false}
+};
+
 void
 _PG_init(void)
 {
+	DefineCustomEnumVariable("datafusion.mode",
+							 "Whether DataFusion runs the slices it supports.",
+							 "off: never.  explain: EXPLAIN reports which slices "
+							 "qualify, but nothing runs in DataFusion.  on: "
+							 "qualifying slices run in DataFusion.",
+							 &df_mode,
+							 DF_MODE_OFF,
+							 df_mode_options,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
 	DefineCustomIntVariable("datafusion.worker_threads",
 							"Number of DataFusion worker threads per backend.",
 							"0 means one per CPU.  Takes effect when a backend "
@@ -55,9 +74,9 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("datafusion");
 
+	df_install_hooks();
+
 	/*
-	 * Executor hooks are installed here from milestone M2 on.
-	 *
 	 * Never start threads here.  When the library is listed in
 	 * shared_preload_libraries this runs in the postmaster, and every
 	 * backend would inherit the threads' memory without the threads.  The

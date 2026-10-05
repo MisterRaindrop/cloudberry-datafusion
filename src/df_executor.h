@@ -28,12 +28,35 @@
 #define DF_EXECUTOR_H
 
 #include "df_ffi.h"
+#include "executor/execdesc.h"
+#include "lib/stringinfo.h"
+#include "nodes/plannodes.h"
+
+/* GUC datafusion.mode */
+typedef enum DfMode
+{
+	DF_MODE_OFF,				/* hooks pass everything through */
+	DF_MODE_EXPLAIN,			/* EXPLAIN reports eligibility; nothing runs */
+	DF_MODE_ON					/* eligible slices run in DataFusion */
+} DfMode;
+
+extern int	df_mode;
 
 /* GUC datafusion.worker_threads */
 extern int	df_worker_threads;
 
 /* df_init.c */
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
+
+/* df_hooks.c */
+extern void df_install_hooks(void);
+
+/* df_plan_check.c */
+extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+						   char *reason, size_t reasonlen);
+extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
+								 bool *is_sender);
+extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);
 
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);

@@ -68,3 +68,12 @@ REVOKE ALL ON FUNCTION datafusion_debug_spin(float8, int) FROM PUBLIC;
 REVOKE ALL ON FUNCTION datafusion_debug_worker_panic() FROM PUBLIC;
 REVOKE ALL ON FUNCTION datafusion_debug_active_tasks() FROM PUBLIC;
 REVOKE ALL ON FUNCTION datafusion_debug_runtime_threads() FROM PUBLIC;
+
+-- Hook test function (M2): number of times this backend routed a slice to
+-- DataFusion.
+CREATE FUNCTION datafusion_debug_takeovers()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'datafusion_debug_takeovers'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_takeovers() FROM PUBLIC;
