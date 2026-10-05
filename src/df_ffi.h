@@ -46,6 +46,11 @@
 #define DF_PENDING	3			/* df_ffi_task_wait: still running */
 #define DF_CANCELLED 4			/* df_ffi_task_wait: stopped by cancel */
 #define DF_DONE		5			/* df_ffi_query_poll: all rows produced */
+#define DF_BYTES	6			/* df_ffi_query_poll: IPC bytes available */
+
+/* Query flags (M7b) */
+#define DF_QUERY_IPC_INPUT	1	/* input: Arrow IPC streams from a Motion */
+#define DF_QUERY_IPC_OUTPUT 2	/* results: one Arrow IPC stream */
 
 #define DF_MSG_BUFLEN 1024
 
@@ -91,8 +96,8 @@ typedef struct DfColumn
 /* The message may be followed by a newline and an error detail. */
 extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  uint64_t memory_limit, const char *spill_dir,
-								  DfQuery **out_query, char *sqlstate,
-								  char *buf, size_t buflen);
+								  uint32_t flags, DfQuery **out_query,
+								  char *sqlstate, char *buf, size_t buflen);
 /* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfColumn *cols);
 typedef void (*DfPaxAccount) (void *ctx, int64_t delta);
@@ -105,12 +110,24 @@ typedef void (*DfPaxEnd) (void *scan);
 extern int32_t df_ffi_query_start_pax(const char *spec, uint32_t partitions,
 									  uint64_t memory_limit, const char *spill_dir,
 									  void *scan, uint32_t nblocks,
-									  DfPaxRead read, DfPaxEnd end,
+									  DfPaxRead read, DfPaxEnd end, uint32_t flags,
 									  DfQuery **out_query, char *sqlstate,
 									  char *buf, size_t buflen);
 extern int32_t df_ffi_query_push(DfQuery *query, const DfColumn *cols,
 								 uint32_t ncols, uint32_t nrows,
 								 char *sqlstate, char *buf, size_t buflen);
+typedef struct DfSlice
+{
+	const uint8_t *data;
+	size_t		len;
+} DfSlice;
+
+/* Copies the bytes; DF_PENDING when the queue is full (nothing taken). */
+extern int32_t df_ffi_query_push_ipc(DfQuery *query, int32_t route,
+									 const DfSlice *parts, uint32_t nparts,
+									 char *sqlstate, char *buf, size_t buflen);
+/* The bytes of the last DF_BYTES poll, valid until the next poll. */
+extern void df_ffi_query_bytes(DfQuery *query, const uint8_t **data, size_t *len);
 extern void df_ffi_query_finish_input(DfQuery *query);
 extern int32_t df_ffi_query_poll(DfQuery *query, uint32_t timeout_ms,
 								 uint32_t *nrows, char *sqlstate,

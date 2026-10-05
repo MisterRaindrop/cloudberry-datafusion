@@ -139,15 +139,29 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		 * and DataFusion runs the subtree it pulls rows from.
 		 */
 		PlanState  *attach = queryDesc->planstate;
+		MotionState *send = NULL;
 
-		if (is_sender)
-			attach = IsA(attach, MotionState) ? outerPlanState(attach) : NULL;
+		if (is_sender && IsA(attach, MotionState))
+		{
+			/* M7b: a Gather to another DataFusion slice carries batches. */
+			if (df_motion_sends_batches(queryDesc->plannedstmt, (Motion *) root))
+				send = (MotionState *) attach;
+			attach = outerPlanState(attach);
+		}
+		else if (is_sender)
+			attach = NULL;
 
 		if (df_check_slice(queryDesc->plannedstmt, root, is_sender,
 						   reason, sizeof(reason)) &&
 			attach != NULL &&
-			df_exec_attach(queryDesc, attach, reason, sizeof(reason)))
+			df_exec_attach(queryDesc, attach, send, reason, sizeof(reason)))
 			df_takeover_record(queryDesc, slice_index);
+		else if (send != NULL)
+			/* the receiver expects batches; tuples would only fail there */
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("datafusion: slice %d cannot send the batches its receiver expects: %s",
+							slice_index, reason)));
 		else
 			elog(DEBUG1, "datafusion: slice %d stays on the PostgreSQL executor: %s",
 				 slice_index, reason);

@@ -83,6 +83,17 @@ _PG_init(void)
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("datafusion.motion_batches",
+							 "Experimental: send Arrow batches through Gather Motions between DataFusion slices.",
+							 "When both the sending and the receiving slice of a Gather Motion run "
+							 "in DataFusion, the rows travel over the interconnect as Arrow IPC "
+							 "batches instead of one tuple at a time.",
+							 &df_motion_batches,
+							 false,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();

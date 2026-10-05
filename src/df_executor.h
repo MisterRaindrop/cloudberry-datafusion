@@ -30,6 +30,7 @@
 #include "df_ffi.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
+#include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
 #include "utils/rel.h"
 #include "utils/snapshot.h"
@@ -64,7 +65,7 @@ typedef struct DfSliceSpec
 
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
-						   char *reason, size_t reasonlen);
+						   MotionState *send, char *reason, size_t reasonlen);
 extern uint64 df_runs_completed;	/* slices DataFusion ran to the end */
 extern DfQueryStats df_last_run;	/* figures of the latest one */
 
@@ -112,6 +113,11 @@ extern const DfPaxReader *df_pax_reader_get(void);
 extern uint64 df_pax_direct_scans;	/* scans read through it */
 extern bool df_last_run_pax;	/* df_last_run read PAX directly */
 extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */
+
+/* M7b: Gather Motions between DataFusion slices carry Arrow IPC batches */
+extern bool df_motion_batches;	/* GUC datafusion.motion_batches */
+extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);
+extern uint64 df_motion_signature(Motion *motion);
 
 /* df_hooks.c */
 extern void df_install_hooks(void);

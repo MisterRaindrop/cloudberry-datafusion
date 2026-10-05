@@ -26,7 +26,9 @@
 //! The plan arrives as JSON built by the C side (src/df_translate.c):
 //!
 //! ```text
-//! { "scan":      { "columns": [ {"type": "int4"}, ... ] },
+//! { "scan":      { "columns": [ {"type": "int4"}, ... ],
+//!                  "motion_columns": [k, ...] },   (input from a Motion: the
+//!                  0-based Motion column behind each input column)
 //!   "filter":    <expr> | null,
 //!   "aggregate": { "group": [<expr>...], "aggs": [ {"fn": "sum", "arg": <expr>} ... ] } | null,
 //!                fn: count, sum, min, max, avg, or count_merge (adds up partial
@@ -41,6 +43,7 @@
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
 //! ```
 
+use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -51,12 +54,14 @@ use std::time::Duration;
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray,
 };
-use datafusion::arrow::buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
+use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type,
     Int64Type, Schema, SchemaRef,
 };
+use datafusion::arrow::ipc::reader::StreamDecoder;
+use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::ScalarValue;
@@ -88,6 +93,13 @@ pub const BATCH_ROWS: usize = 8192;
 
 /// Batches buffered in each direction.
 const CHANNEL_DEPTH: usize = 4;
+
+/// Depth of the queue of received IPC bytes: the interconnect hands them
+/// over a chunk (a few kB) at a time.
+const IPC_CHANNEL_DEPTH: usize = 64;
+
+/// How long `push_ipc` waits for room in a full queue.
+const IPC_PUSH_WAIT: Duration = Duration::from_millis(1);
 
 /// Operator memory each partition of a grouped aggregate needs at least.
 /// The pool is shared fairly among the operators that can spill, two per
@@ -154,6 +166,8 @@ struct OutColumn {
 
 pub enum Poll {
     Batch(usize),
+    /// Arrow IPC stream bytes of the results (`output_bytes`).
+    Bytes(usize),
     Pending,
     Done,
     Failed(PgError),
@@ -368,7 +382,7 @@ fn session_state(config: SessionConfig, pool: Arc<TrackingPool>, spill_dir: &str
 /// Single-use stream fed by the main thread.
 struct ChannelPartition {
     schema: SchemaRef,
-    rx: Mutex<Option<mpsc::Receiver<RecordBatch>>>,
+    rx: Mutex<Option<mpsc::Receiver<Result<RecordBatch, DataFusionError>>>>,
 }
 
 impl fmt::Debug for ChannelPartition {
@@ -386,8 +400,8 @@ impl PartitionStream for ChannelPartition {
         let rx = self.rx.lock().ok().and_then(|mut g| g.take());
         let stream = futures::stream::unfold(rx, |rx| async move {
             let mut rx = rx?;
-            let batch = rx.recv().await?;
-            Some((Ok(batch), Some(rx)))
+            let item = rx.recv().await?;
+            Some((item, Some(rx)))
         });
         Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
     }
@@ -592,6 +606,9 @@ impl PartitionStream for PaxPartition {
 pub enum Source {
     /// Batches the main thread pushes (any table AM).
     Pushed,
+    /// Arrow IPC streams the main thread pushes as it receives them from a
+    /// Motion, one stream per sending route (`push_ipc`).
+    Ipc,
     /// PAX micro-partitions read by the partitions themselves.
     Pax(PaxScan),
 }
@@ -600,15 +617,26 @@ pub enum Source {
 // Query
 // ---------------------------------------------------------------------------
 
+/// What the plan's task hands the main thread.
+enum Out {
+    Batch(RecordBatch),
+    /// Results encoded as Arrow IPC stream bytes (`ipc_output`).
+    Bytes(Vec<u8>),
+}
+
 pub struct Query {
     handle: Handle,
-    in_tx: Option<mpsc::Sender<RecordBatch>>,
+    in_tx: Option<mpsc::Sender<Result<RecordBatch, DataFusionError>>>,
+    /// Source::Ipc: received stream bytes, by route, for the decoding task.
+    ipc_tx: Option<mpsc::Sender<(i32, Vec<u8>)>>,
+    decoder: Option<JoinHandle<()>>,
     in_schema: SchemaRef,
     in_types: Vec<PgType>,
-    out_rx: mpsc::Receiver<Result<RecordBatch, PgError>>,
+    out_rx: mpsc::Receiver<Result<Out, PgError>>,
     out_types: Vec<PgType>,
     task: Option<JoinHandle<()>>,
     current: Vec<OutColumn>,
+    current_bytes: Vec<u8>,
     pool: Arc<TrackingPool>,
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
@@ -642,16 +670,19 @@ impl Query {
     /// `partitions` partitions, an operator memory budget of `memory_limit`
     /// bytes, and spill files under `spill_dir`.
     pub fn start(spec: &str, partitions: usize, memory_limit: usize, spill_dir: &str) -> Result<Query, PgError> {
-        Self::start_with(spec, partitions, memory_limit, spill_dir, Source::Pushed)
+        Self::start_with(spec, partitions, memory_limit, spill_dir, Source::Pushed, false)
     }
 
-    /// Like `start`, reading from `source`.
+    /// Like `start`, reading from `source`.  With `ipc_output`, results come
+    /// back as one Arrow IPC stream (Poll::Bytes) instead of batches; the
+    /// stream always holds the schema and the end marker, even without rows.
     pub fn start_with(
         spec: &str,
         partitions: usize,
         memory_limit: usize,
         spill_dir: &str,
         source: Source,
+        ipc_output: bool,
     ) -> Result<Query, PgError> {
         let handle = runtime::handle()
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
@@ -689,9 +720,27 @@ impl Query {
         };
         let pax_memory = match &source {
             Source::Pax(scan) => Some(scan.memory.clone()),
-            Source::Pushed => None,
+            Source::Pushed | Source::Ipc => None,
         };
+        let mut ipc_tx = None;
+        let mut decoder = None;
         let (in_tx, table) = match source {
+            Source::Ipc => {
+                let positions: Vec<usize> = field(&spec, "scan")
+                    .and_then(|s| field(s, "motion_columns"))
+                    .map_err(internal)?
+                    .as_array()
+                    .ok_or_else(|| internal("bad motion columns".into()))?
+                    .iter()
+                    .map(|v| v.as_u64().map(|k| k as usize).ok_or_else(|| internal("bad motion column".into())))
+                    .collect::<Result<_, _>>()?;
+                let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
+                let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
+                decoder = Some(handle.spawn(decode_ipc(rx, in_tx, in_schema.clone(), positions)));
+                ipc_tx = Some(tx);
+                let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
+                (None, StreamingTable::try_new(in_schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
+            }
             Source::Pushed => {
                 let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
                 let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
@@ -778,10 +827,31 @@ impl Query {
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(physical.clone());
                 }
+                let schema = physical.schema();
                 let mut stream = execute_stream(physical, ctx.task_ctx())?;
+                if ipc_output {
+                    // Encode here, on a worker; the main thread only copies
+                    // the bytes into the interconnect.
+                    let mut w = StreamWriter::try_new(Vec::new(), &schema)?;
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        if batch.num_rows() == 0 {
+                            continue;
+                        }
+                        w.write(&batch)?;
+                        let bytes = std::mem::take(w.get_mut());
+                        if out_tx.send(Ok(Out::Bytes(bytes))).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    w.finish()?;
+                    let bytes = std::mem::take(w.get_mut());
+                    let _ = out_tx.send(Ok(Out::Bytes(bytes))).await;
+                    return Ok(());
+                }
                 while let Some(batch) = stream.next().await {
                     let batch = batch?;
-                    if batch.num_rows() > 0 && out_tx.send(Ok(batch)).await.is_err() {
+                    if batch.num_rows() > 0 && out_tx.send(Ok(Out::Batch(batch))).await.is_err() {
                         return Ok(()); // the main thread is gone
                     }
                 }
@@ -795,12 +865,15 @@ impl Query {
         Ok(Query {
             handle,
             in_tx,
+            ipc_tx,
+            decoder,
             in_schema,
             in_types,
             out_rx,
             out_types,
             task: Some(task),
             current: Vec::new(),
+            current_bytes: Vec::new(),
             pool,
             physical: physical_slot,
             partitions,
@@ -851,7 +924,7 @@ impl Query {
             arrays.push(build_array(*ty, *c, nrows));
         }
         let batch = make_batch(&self.in_schema, arrays, nrows)?;
-        match tx.try_send(batch) {
+        match tx.try_send(Ok(batch)) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
             // The plan stopped reading (finished early or failed); poll tells.
@@ -859,14 +932,49 @@ impl Query {
         }
     }
 
+    /// Offer Arrow IPC stream bytes received from `route`, given as the
+    /// consecutive pieces `parts` (Source::Ipc).  A full queue is waited on
+    /// for up to IPC_PUSH_WAIT, waking as soon as the decoder makes room:
+    /// the receiver has nothing else to do meanwhile, and waiting for
+    /// output instead would sleep the whole time (an aggregate's results
+    /// come only at the end).  Ok(false): still full; nothing was taken.
+    pub fn push_ipc(&mut self, route: i32, parts: &[&[u8]]) -> Result<bool, PgError> {
+        let tx = self.ipc_tx.as_ref().ok_or_else(|| PgError::internal("not reading Arrow IPC input"))?;
+        let permit = match tx.try_reserve() {
+            Ok(p) => p,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                match self.handle.block_on(async { tokio::time::timeout(IPC_PUSH_WAIT, tx.reserve()).await }) {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(_)) => return Ok(true), // the decoder stopped; poll tells why
+                    Err(_) => return Ok(false),
+                }
+            }
+            // The decoder stopped (the plan finished early or failed).
+            Err(mpsc::error::TrySendError::Closed(())) => return Ok(true),
+        };
+        let mut bytes = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+        for p in parts {
+            bytes.extend_from_slice(p);
+        }
+        permit.send((route, bytes));
+        Ok(true)
+    }
+
     /// No more input.
     pub fn finish_input(&mut self) {
         self.in_tx = None;
+        self.ipc_tx = None;
+    }
+
+    /// The bytes returned by the last Poll::Bytes.
+    pub fn output_bytes(&self) -> &[u8] {
+        &self.current_bytes
     }
 
     /// Wait up to `timeout` for the next result batch.
     pub fn poll(&mut self, timeout: Duration) -> Poll {
         self.current.clear();
+        self.current_bytes = Vec::new();
         let next = if timeout.is_zero() {
             match self.out_rx.try_recv() {
                 Ok(v) => Some(v),
@@ -881,10 +989,14 @@ impl Query {
             }
         };
         match next {
-            Some(Ok(batch)) => match self.convert(&batch) {
+            Some(Ok(Out::Batch(batch))) => match self.convert(&batch) {
                 Ok(()) => Poll::Batch(batch.num_rows()),
                 Err(e) => Poll::Failed(e),
             },
+            Some(Ok(Out::Bytes(bytes))) => {
+                self.current_bytes = bytes;
+                Poll::Bytes(self.current_bytes.len())
+            }
             Some(Err(e)) => Poll::Failed(e),
             None => {
                 // The task ended.  Make sure it did not die in a panic.
@@ -945,8 +1057,63 @@ impl Query {
 impl Drop for Query {
     fn drop(&mut self) {
         self.in_tx = None;
+        self.ipc_tx = None;
+        if let Some(t) = self.decoder.take() {
+            t.abort();
+        }
         if let Some(t) = self.task.take() {
             t.abort();
+        }
+    }
+}
+
+/// Decode the Arrow IPC streams arriving from a Motion, one per route, and
+/// feed their rows to the plan: input column i is the stream's column
+/// `positions[i]`.  A malformed stream fails the plan.
+async fn decode_ipc(
+    mut rx: mpsc::Receiver<(i32, Vec<u8>)>,
+    tx: mpsc::Sender<Result<RecordBatch, DataFusionError>>,
+    schema: SchemaRef,
+    positions: Vec<usize>,
+) {
+    let mut decoders: HashMap<i32, StreamDecoder> = HashMap::new();
+    let fail = |e: String| Err(DataFusionError::External(Box::new(PgError::internal(format!(
+        "cannot decode the batches received from a Motion: {e}"
+    )))));
+    while let Some((route, bytes)) = rx.recv().await {
+        let decoder = decoders.entry(route).or_insert_with(StreamDecoder::new);
+        let mut buffer = Buffer::from_vec(bytes);
+        while !buffer.is_empty() {
+            let batch = match decoder.decode(&mut buffer) {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    let _ = tx.send(fail(e.to_string())).await;
+                    return;
+                }
+            };
+            let n = batch.num_rows();
+            let mut arrays = Vec::with_capacity(positions.len());
+            for (i, &k) in positions.iter().enumerate() {
+                match batch.columns().get(k) {
+                    Some(a) if a.data_type() == schema.field(i).data_type() => arrays.push(a.clone()),
+                    _ => {
+                        let _ = tx.send(fail(format!("column {k} is missing or has another type"))).await;
+                        return;
+                    }
+                }
+            }
+            let item = make_batch(&schema, arrays, n).map_err(|e| DataFusionError::External(Box::new(e)));
+            if tx.send(item).await.is_err() {
+                return; // the plan stopped reading
+            }
+        }
+    }
+    // Every route ended: each stream must be complete.
+    for (_, mut d) in decoders {
+        if let Err(e) = d.finish() {
+            let _ = tx.send(fail(e.to_string())).await;
+            return;
         }
     }
 }
@@ -1014,6 +1181,7 @@ mod tests {
                     }
                 }
                 Poll::Pending => {}
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
                 Poll::Done => return Ok(rows),
                 Poll::Failed(e) => return Err(e),
                 Poll::Panicked(m) => panic!("{m}"),
@@ -1046,6 +1214,98 @@ mod tests {
         assert_eq!(rows, vec![vec![Some(12), Some(12)]]);
         let rows = run(&spec.replace("%MIN%", "100"), input(), 4).unwrap();
         assert_eq!(rows, vec![vec![Some(0), None]]);
+    }
+
+    /// Run `spec` over `input` with IPC output; returns the stream bytes.
+    fn run_ipc_out(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize) -> Vec<u8> {
+        runtime::init(2).unwrap();
+        let dir = std::env::temp_dir();
+        let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
+        let cols: Vec<RawColumn> = input
+            .iter()
+            .map(|(v, n)| RawColumn { values: v.as_ptr() as *const u8, nulls: n.as_ptr() })
+            .collect();
+        if nrows > 0 {
+            while !unsafe { q.push(&cols, nrows) }.unwrap() {}
+        }
+        q.finish_input();
+        let mut out = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Bytes(_) => out.extend_from_slice(q.output_bytes()),
+                Poll::Pending => {}
+                Poll::Done => return out,
+                Poll::Batch(_) => panic!("batch instead of IPC bytes"),
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ipc_streams_carry_rows_between_queries() {
+        // Two senders (routes) each send (a, a * 10) for their rows; one of
+        // them has none.  The receiver reads only the second column.
+        let send = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"int4"},
+                      {"expr":{"op":"*","type":"int8","args":[{"col":0},{"lit":{"type":"int8","value":10}}]},"type":"int8"}]}"#;
+        let a = run_ipc_out(send, vec![(vec![1, 2, 3, 0], vec![0, 0, 0, 1])], 4);
+        let b = run_ipc_out(send, vec![(vec![], vec![])], 0);
+        let recv = r#"{"scan":{"columns":[{"type":"int8"}],"motion_columns":[1]},"filter":null,
+            "aggregate":{"group":[],"aggs":[{"fn":"count_merge","arg":{"col":0}},{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
+            "having":null,
+            "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
+        let dir = std::env::temp_dir();
+        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false).unwrap();
+        // Deliver route 0 in small pieces, interleaved with route 1.
+        let (a1, a2) = a.split_at(a.len() / 3);
+        for (route, part) in [(0, a1), (1, &b[..]), (0, a2)] {
+            let pieces: Vec<&[u8]> = part.chunks(7).collect();
+            while !q.push_ipc(route, &pieces).unwrap() {}
+        }
+        q.finish_input();
+        let mut row = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(_) => {
+                    for c in 0..3 {
+                        let col = q.output_column(c).unwrap();
+                        row.push(unsafe { *(col.values as *const i64) });
+                    }
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
+            }
+        }
+        // 4 rows (one NULL): count_merge adds up the non-NULL values 10+20+30.
+        assert_eq!(row, vec![60, 60, 4]);
+    }
+
+    #[test]
+    fn truncated_ipc_stream_fails() {
+        let send = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"int4"}]}"#;
+        let a = run_ipc_out(send, vec![(vec![1, 2, 3], vec![0, 0, 0])], 3);
+        let recv = r#"{"scan":{"columns":[{"type":"int4"}],"motion_columns":[0]},"filter":null,
+            "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
+            "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
+        let dir = std::env::temp_dir();
+        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false).unwrap();
+        while !q.push_ipc(0, &[&a[..a.len() - 20]]).unwrap() {}
+        q.finish_input();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Failed(e) => {
+                    assert!(e.message.contains("cannot decode"), "{e:?}");
+                    return;
+                }
+                Poll::Done => panic!("a truncated stream was accepted"),
+                _ => {}
+            }
+        }
     }
 
     #[test]
@@ -1123,6 +1383,7 @@ mod tests {
                     groups += rows;
                 }
                 Poll::Pending => {}
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
                 Poll::Done => break,
                 Poll::Failed(e) => panic!("{e:?}"),
                 Poll::Panicked(m) => panic!("{m}"),
@@ -1181,7 +1442,7 @@ mod tests {
         let before = FAKE_ENDED.load(Ordering::SeqCst);
         let scan = PaxScan::new(std::ptr::null_mut(), 50, fake_read, fake_end);
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(spec, 4, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan)).unwrap();
+        let mut q = Query::start_with(spec, 4, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan), false).unwrap();
         let mut row = Vec::new();
         loop {
             match q.poll(Duration::from_millis(50)) {
@@ -1196,6 +1457,7 @@ mod tests {
                 Poll::Done => break,
                 Poll::Failed(e) => panic!("{e:?}"),
                 Poll::Panicked(m) => panic!("{m}"),
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
             }
         }
         // 500 rows 0..499, 50 of them NULL (those ending in 3).

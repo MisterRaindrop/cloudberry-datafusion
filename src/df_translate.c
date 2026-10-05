@@ -476,7 +476,17 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 				appendStringInfoChar(&json, ',');
 			appendStringInfo(&json, "{\"type\":\"%s\"}", df_type_tag(lfirst_oid(lc)));
 		}
-		appendStringInfo(&json, "]},\"filter\":%s,\"aggregate\":", filter.data);
+		appendStringInfoChar(&json, ']');
+		if (IsA(b.scan, Motion))
+		{
+			/* The Motion column behind each input column (M7b batches). */
+			appendStringInfoString(&json, ",\"motion_columns\":[");
+			i = 0;
+			foreach(lc, b.attnos)
+				appendStringInfo(&json, "%s%d", i++ > 0 ? "," : "", lfirst_int(lc) - 1);
+			appendStringInfoChar(&json, ']');
+		}
+		appendStringInfo(&json, "},\"filter\":%s,\"aggregate\":", filter.data);
 		if (b.agg)
 			appendStringInfo(&json, "{\"group\":%s,\"aggs\":[%s]},\"having\":%s",
 							 group.data, aggs.data, having.data);

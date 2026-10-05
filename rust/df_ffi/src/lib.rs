@@ -41,6 +41,13 @@ pub const DF_PENDING: i32 = 3;
 pub const DF_CANCELLED: i32 = 4;
 /// `df_ffi_query_poll` only: the query has produced all its rows.
 pub const DF_DONE: i32 = 5;
+/// df_ffi_query_poll: Arrow IPC bytes are available (df_ffi_query_bytes).
+pub const DF_BYTES: i32 = 6;
+
+/// Query flags: input arrives as Arrow IPC streams from a Motion
+/// (df_ffi_query_push_ipc); results leave as one Arrow IPC stream.
+pub const DF_QUERY_IPC_INPUT: u32 = 1;
+pub const DF_QUERY_IPC_OUTPUT: u32 = 2;
 
 /// Copy `msg` into a C buffer of `buflen` bytes as a NUL-terminated string,
 /// truncating on a UTF-8 character boundary.
@@ -279,14 +286,15 @@ fn report_panic(payload: Box<dyn Any + Send>, sqlstate: *mut c_char, buf: *mut c
 
 /// Build the plan described by the JSON `spec` and start it with
 /// `partitions` parallel partitions, an operator memory budget of
-/// `memory_limit` bytes and spill files under `spill_dir`.  The runtime must
-/// be running.
+/// `memory_limit` bytes and spill files under `spill_dir`; `flags` are
+/// DF_QUERY_* bits.  The runtime must be running.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start(
     spec: *const c_char,
     partitions: u32,
     memory_limit: u64,
     spill_dir: *const c_char,
+    flags: u32,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
@@ -296,7 +304,19 @@ pub extern "C" fn df_ffi_query_start(
         // SAFETY: the caller passes a NUL-terminated string.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
         let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
-        df_core::query::Query::start(&spec, partitions as usize, memory_limit as usize, &dir)
+        let source = if flags & DF_QUERY_IPC_INPUT != 0 {
+            df_core::query::Source::Ipc
+        } else {
+            df_core::query::Source::Pushed
+        };
+        df_core::query::Query::start_with(
+            &spec,
+            partitions as usize,
+            memory_limit as usize,
+            &dir,
+            source,
+            flags & DF_QUERY_IPC_OUTPUT != 0,
+        )
     }));
     match r {
         Ok(Ok(q)) => {
@@ -322,6 +342,7 @@ pub extern "C" fn df_ffi_query_start_pax(
     nblocks: u32,
     read: df_core::query::PaxReadFn,
     end: df_core::query::PaxEndFn,
+    flags: u32,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
@@ -332,7 +353,14 @@ pub extern "C" fn df_ffi_query_start_pax(
         // SAFETY: the caller passes NUL-terminated strings.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
         let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
-        df_core::query::Query::start_with(&spec, partitions as usize, memory_limit as usize, &dir, source)
+        df_core::query::Query::start_with(
+            &spec,
+            partitions as usize,
+            memory_limit as usize,
+            &dir,
+            source,
+            flags & DF_QUERY_IPC_OUTPUT != 0,
+        )
     }));
     match r {
         Ok(Ok(q)) => {
@@ -373,6 +401,60 @@ pub extern "C" fn df_ffi_query_push(
     }
 }
 
+/// A piece of a byte stream.
+#[repr(C)]
+pub struct DfSlice {
+    pub data: *const u8,
+    pub len: usize,
+}
+
+/// Offer Arrow IPC stream bytes received from Motion route `route`, as the
+/// `nparts` consecutive pieces `parts` (DF_QUERY_IPC_INPUT).  The bytes are
+/// copied.  DF_OK: taken.  DF_PENDING: the queue is full and nothing was
+/// taken; poll, then offer again.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_push_ipc(
+    query: *mut DfQuery,
+    route: i32,
+    parts: *const DfSlice,
+    nparts: u32,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    // SAFETY: `query` is live; `parts` points to `nparts` readable pieces.
+    let q = unsafe { &mut (*query).0 };
+    let pieces: Vec<&[u8]> = (0..nparts as usize)
+        .map(|i| unsafe {
+            let p = &*parts.add(i);
+            if p.len == 0 {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(p.data, p.len)
+            }
+        })
+        .collect();
+    match catch_unwind(AssertUnwindSafe(|| q.push_ipc(route, &pieces))) {
+        Ok(Ok(true)) => DF_OK,
+        Ok(Ok(false)) => DF_PENDING,
+        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
+        Err(p) => report_panic(p, sqlstate, buf, buflen),
+    }
+}
+
+/// The Arrow IPC bytes returned by the last poll (DF_BYTES), valid until
+/// the next poll.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_bytes(query: *mut DfQuery, data: *mut *const u8, len: *mut usize) {
+    // SAFETY: `query` is live; the out pointers are valid.
+    let q = unsafe { &(*query).0 };
+    let b = q.output_bytes();
+    unsafe {
+        *data = b.as_ptr();
+        *len = b.len();
+    }
+}
+
 /// Tell the query there is no more input.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_finish_input(query: *mut DfQuery) {
@@ -383,6 +465,8 @@ pub extern "C" fn df_ffi_query_finish_input(query: *mut DfQuery) {
 
 /// Wait up to `timeout_ms` for the next result batch.  DF_OK: `*nrows` rows
 /// are available through df_ffi_query_column until the next poll.
+/// DF_BYTES: `*nrows` bytes of the result stream are available through
+/// df_ffi_query_bytes (DF_QUERY_IPC_OUTPUT).
 /// DF_PENDING, DF_DONE, or DF_ERROR / DF_PANIC with SQLSTATE and message.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_poll(
@@ -404,6 +488,11 @@ pub extern "C" fn df_ffi_query_poll(
             // SAFETY: valid out pointer.
             unsafe { *nrows = n as u32 };
             DF_OK
+        }
+        Ok(Poll::Bytes(n)) => {
+            // SAFETY: valid out pointer.
+            unsafe { *nrows = n as u32 };
+            DF_BYTES
         }
         Ok(Poll::Pending) => DF_PENDING,
         Ok(Poll::Done) => DF_DONE,

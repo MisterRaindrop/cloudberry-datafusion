@@ -245,6 +245,46 @@ expression key it has no statistics for: each segment then redistributes
 from and to DataFusion's batches on both sides costs more than DataFusion
 saves.  Sending batches over the interconnect (M7b) is meant for that.
 
+### Experimental: batches through Gather Motions
+
+With `datafusion.motion_batches = on` (milestone M7b), a Gather Motion whose
+sending and receiving slices both run in DataFusion carries Arrow IPC
+batches instead of tuples; EXPLAIN marks the sending slice "sends Arrow
+batches".  Every process decides this from the plan and the synchronized
+settings alone, so both ends agree.
+
+- **Sending.**  The slice runs in place of the Motion node.  The workers
+  encode the results; the main thread cuts the bytes into tuple chunks and
+  sends them through the interconnect's own `SendTupleChunkToAMS`, then
+  `SendEndOfStream`.  A stop request from the receiver ends the slice as
+  it would end the Motion.
+- **Receiving.**  The main thread takes the chunks with
+  `RecvTupleChunkFromAny`, hands their bytes to the workers to decode and
+  returns the receive buffer; it keeps the motion layer's end-of-stream
+  count the way `cdbmotion.c` does for an unordered receiver.  A full
+  decode queue is waited on until it has room, not by waiting for output.
+- **Safety.**  The chunks carry a chunk type of their own, outside
+  PostgreSQL's range, so a PostgreSQL receiver rejects them with an error,
+  and our receiver rejects tuple chunks; each stream starts with a magic
+  and the Motion's signature (its id and column types), which the receiver
+  checks.  A mismatch can only fail the query, never be misread.
+
+Over 30 million distributed rows with `gp_enable_multiphase_agg = off`, so
+that every row is gathered to the coordinator's aggregate, 3 DataFusion
+threads per QE:
+
+| Query | PostgreSQL | DataFusion, tuple Motion | DataFusion, batch Motion |
+|---|---|---|---|
+| `count(*), sum(a), max(c)` | 1.45 s | 1.11 s | 0.53 s |
+| five aggregates, `WHERE e < 50` | 1.00 s | 0.78 s | 0.58 s |
+
+Then the coordinator waits for data and the senders wait in the UDP
+interconnect's flow control: the transport is the limit (about 700 MB/s
+here).  Limits: only plain Gather Motions into a DataFusion slice (a slice
+that only receives, such as a gather to the client, stays on tuples);
+EXPLAIN ANALYZE shows the Motion as never executed and the interconnect's
+per-Motion statistics are not updated; tested with the UDP interconnect.
+
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
 1.41 s on the PostgreSQL executor, with identical results (0.50 s once the
@@ -262,6 +302,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M5 | Segment slices below a sending Motion; partial aggregates |
 | M6 | AO, AOCS and PAX tables; parallel mode; experimental direct PAX reader |
 | M7a | Slices that receive through a Motion; combining aggregates |
+| M7b | Arrow IPC batches through Gather Motions between DataFusion slices |
 
 ## Build
 

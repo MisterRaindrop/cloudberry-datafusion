@@ -696,6 +696,77 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
 }
 
 /* ---------------------------------------------------------------------
+ * M7b: which Gather Motions carry Arrow batches
+ * ---------------------------------------------------------------------
+ */
+bool		df_motion_batches = false;
+
+/*
+ * Would the executor hook run slice 'index' in DataFusion?  The same check
+ * and translation it applies, from the plan alone.
+ */
+static bool
+df_slice_runs_in_datafusion(PlannedStmt *stmt, int index)
+{
+	char		reason[256];
+	DfSliceSpec spec;
+	Motion	   *sender;
+	Plan	   *root;
+	Plan	   *compute;
+
+	if (index < 0 || index >= stmt->numSlices)
+		return false;
+	sender = findSenderMotion(stmt, index);
+	root = sender ? (Plan *) sender : stmt->planTree;
+	compute = sender ? outerPlan(root) : root;
+	return compute != NULL &&
+		df_check_slice(stmt, root, sender != NULL, reason, sizeof(reason)) &&
+		df_translate_slice(compute, &spec, reason, sizeof(reason));
+}
+
+/*
+ * Does 'motion' carry Arrow IPC batches instead of tuples?  Only a plain
+ * Gather whose sending and receiving slices both run in DataFusion.  Every
+ * process of the query decides this from the plan and the synchronized
+ * settings alone, so the senders and the receiver agree.  Should they not
+ * (a slice falling back for a reason outside the plan), the chunks carry a
+ * type of their own: PostgreSQL's receiver rejects it with an error, and
+ * ours rejects tuple chunks, so nothing is ever misread.
+ */
+bool
+df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
+{
+	if (!df_motion_batches || df_mode == DF_MODE_OFF)
+		return false;
+	if (motion->motionType != MOTIONTYPE_GATHER || motion->sendSorted)
+		return false;
+	if (motion->motionID <= 0 || motion->motionID >= stmt->numSlices)
+		return false;
+	return df_slice_runs_in_datafusion(stmt, motion->motionID) &&
+		df_slice_runs_in_datafusion(stmt, stmt->slices[motion->motionID].parentIndex);
+}
+
+/*
+ * What both ends of a batch Motion must agree on, hashed (FNV-1a): the
+ * Motion and the types of the columns it carries.  The sender puts it at
+ * the start of each stream and the receiver checks it.
+ */
+uint64
+df_motion_signature(Motion *motion)
+{
+	uint64		h = UINT64CONST(14695981039346656037);
+	ListCell   *lc;
+
+#define DF_MIX(v) (h = (h ^ (uint64) (v)) * UINT64CONST(1099511628211))
+	DF_MIX(motion->motionID);
+	DF_MIX(list_length(motion->plan.targetlist));
+	foreach(lc, motion->plan.targetlist)
+		DF_MIX(exprType((Node *) lfirst_node(TargetEntry, lc)->expr));
+#undef DF_MIX
+	return h;
+}
+
+/* ---------------------------------------------------------------------
  * EXPLAIN: one line per slice
  * ---------------------------------------------------------------------
  */
@@ -773,7 +844,10 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 
 		if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender,
 						   reason, sizeof(reason)))
-			appendStringInfo(out, "DataFusion: slice %d eligible\n", cxt.roots[i].index);
+			appendStringInfo(out, "DataFusion: slice %d eligible%s\n", cxt.roots[i].index,
+							 cxt.roots[i].is_sender &&
+							 df_motion_sends_batches(stmt, (Motion *) cxt.roots[i].root) ?
+							 ", sends Arrow batches" : "");
 		else
 			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
 							 cxt.roots[i].index, reason);

@@ -1,0 +1,242 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Gather Motions between two DataFusion slices carrying Arrow IPC batches
+-- (M7b, datafusion.motion_batches).  The senders encode their results and
+-- send the bytes as tuple chunks of their own type; the receiver decodes
+-- them.  Each query runs with datafusion.mode off, then on; the two results
+-- must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+CREATE TABLE df_bat (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
+INSERT INTO df_bat SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
+FROM generate_series(1, 200000) i;
+INSERT INTO df_bat VALUES (NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE df_bat_empty (a int4, b int8, c float8, e int2) DISTRIBUTED BY (a);
+ANALYZE df_bat;
+-- Which Motions carry batches: only a Gather whose receiving slice runs in
+-- DataFusion too.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat WHERE e < 50;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_bat
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: e
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: e
+               ->  Streaming Partial HashAggregate
+                     Group Key: e
+                     ->  Seq Scan on df_bat
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(12 rows)
+
+SET gp_enable_multiphase_agg = off;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_bat
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(6 rows)
+
+SET datafusion.motion_batches = off;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
+                   QUERY PLAN                   
+------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_bat
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(6 rows)
+
+SET datafusion.motion_batches = on;
+-- Single-stage aggregates on the coordinator over every row, gathered as
+-- batches.
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
+ count  | count  |     sum     |   sum   | min  |  max  |   max   
+--------+--------+-------------+---------+------+-------+---------
+ 200001 | 200000 | 20000100000 | 9900000 | 0.25 | 50000 | 2000000
+(1 row)
+
+SELECT count(*), sum(a), max(c), min(e) FROM df_bat WHERE a IS NULL OR a < 1000;
+ count |  sum   |  max   | min 
+-------+--------+--------+-----
+  1000 | 499500 | 249.75 |   0
+(1 row)
+
+SELECT e, count(*), sum(a), min(c) FROM df_bat WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+    |     1 |           |      
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
+ 95 |  2000 | 200090000 | 23.75
+ 98 |  2000 | 200096000 |  24.5
+ 96 |  2000 | 200092000 |    24
+(6 rows)
+
+SELECT count(*), sum(a), max(c) FROM df_bat WHERE a = 5;
+ count | sum | max  
+-------+-----+------
+     1 |   5 | 1.25
+(1 row)
+
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
+ count | count | sum | min | max 
+-------+-------+-----+-----+-----
+     0 |     0 |     |     |    
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
+ count  | count  |     sum     |   sum   | min  |  max  |   max   
+--------+--------+-------------+---------+------+-------+---------
+ 200001 | 200000 | 20000100000 | 9900000 | 0.25 | 50000 | 2000000
+(1 row)
+
+SELECT count(*), sum(a), max(c), min(e) FROM df_bat WHERE a IS NULL OR a < 1000;
+ count |  sum   |  max   | min 
+-------+--------+--------+-----
+  1000 | 499500 | 249.75 |   0
+(1 row)
+
+SELECT e, count(*), sum(a), min(c) FROM df_bat WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+ 97 |  2000 | 200094000 | 24.25
+ 99 |  2000 | 200098000 | 24.75
+    |     1 |           |      
+ 96 |  2000 | 200092000 |    24
+ 98 |  2000 | 200096000 |  24.5
+ 95 |  2000 | 200090000 | 23.75
+(6 rows)
+
+-- One sender (direct dispatch), and senders without rows.
+SELECT count(*), sum(a), max(c) FROM df_bat WHERE a = 5;
+ count | sum | max  
+-------+-----+------
+     1 |   5 | 1.25
+(1 row)
+
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
+ count | count | sum | min | max 
+-------+-------+-----+-----+-----
+     0 |     0 |     |     |    
+(1 row)
+
+RESET gp_enable_multiphase_agg;
+-- Partial states gathered as batches and combined on the coordinator.
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
+ count  | count  |    sum     | min  |   max   
+--------+--------+------------+------+---------
+ 100000 | 100000 | 9997650000 | 0.25 | 2000000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
+ count  | count  |    sum     | min  |   max   
+--------+--------+------------+------+---------
+ 100000 | 100000 | 9997650000 | 0.25 | 2000000
+(1 row)
+
+-- Several senders per segment in Cloudberry's parallel mode.
+SET gp_enable_multiphase_agg = off;
+SET enable_parallel = on;
+SET max_parallel_workers_per_gather = 2;
+ALTER TABLE df_bat SET (parallel_workers = 2);
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Gather Motion 6:1  (slice1; segments: 6)
+         ->  Parallel Seq Scan on df_bat
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(6 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(a), max(c) FROM df_bat;
+ count  |     sum     |  max  
+--------+-------------+-------
+ 200001 | 20000100000 | 50000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(a), max(c) FROM df_bat;
+ count  |     sum     |  max  
+--------+-------------+-------
+ 200001 | 20000100000 | 50000
+(1 row)
+
+RESET enable_parallel;
+RESET max_parallel_workers_per_gather;
+-- Errors on a sender and on the receiver carry PostgreSQL's message.
+SELECT count(*), sum(a / (a - a)) FROM df_bat WHERE a = 5;
+ERROR:  division by zero
+SELECT count(*) FROM df_bat HAVING 1 / (count(*) - 200001) > 0;
+ERROR:  division by zero
+-- A cursor, and a query after the errors.
+BEGIN;
+DECLARE df_cur CURSOR FOR SELECT count(*), sum(a) FROM df_bat;
+FETCH 1 FROM df_cur;
+ count  |     sum     
+--------+-------------
+ 200001 | 20000100000
+(1 row)
+
+CLOSE df_cur;
+COMMIT;
+SELECT count(*), sum(a) FROM df_bat WHERE e < 10;
+ count |    sum     
+-------+------------
+ 20000 | 1999290000
+(1 row)
+
+RESET gp_enable_multiphase_agg;
+DROP TABLE df_bat, df_bat_empty;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

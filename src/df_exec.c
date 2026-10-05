@@ -34,6 +34,17 @@
  *     aggregates them on the runtime's threads;
  *   - result batches come back and are handed out one row at a time.
  *
+ * Between two DataFusion slices a Gather Motion carries Arrow IPC batches
+ * instead of tuples (M7b, datafusion.motion_batches; df_motion_sends_batches
+ * decides).  The sending slice then runs in place of the Motion node: the
+ * workers encode the results, and the main thread cuts the bytes into
+ * tuple chunks of a type of its own and sends them, then end-of-stream.
+ * The receiving slice takes the chunks straight from the interconnect,
+ * hands their bytes to the workers to decode, and keeps the motion layer's
+ * end-of-stream accounting the way cdbmotion.c does for an unordered
+ * receiver.  Each stream starts with DF_BATCH_MAGIC and the Motion's
+ * signature, which the receiver checks.
+ *
  * The scan descriptor is installed in the Seq Scan node, so ExecEndSeqScan
  * closes it.  The DataFusion query is released by a reset callback on the
  * query's memory context, so it goes away however the query ends; an error
@@ -59,6 +70,11 @@
 #include "postgres.h"
 
 #include "access/tableam.h"
+#include "cdb/cdbinterconnect.h"
+#include "cdb/cdbmotion.h"
+#include "cdb/ml_ipc.h"
+#include "cdb/tupchunk.h"
+#include "cdb/tupchunklist.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "executor/executor.h"
@@ -80,6 +96,16 @@
 /* Wait this long when the input queue was full. */
 #define DF_POLL_FULL_MS		1
 
+/*
+ * Tuple-chunk type of Arrow IPC bytes (M7b), outside PostgreSQL's
+ * TupleChunkType range so that its receiver rejects them.
+ */
+#define DF_CHUNK_TYPE		0x4446
+
+/* What each batch stream starts with, followed by the Motion's signature. */
+#define DF_BATCH_MAGIC		"DFARROW1"
+#define DF_BATCH_HEAD		16
+
 /* The vmem lease runs ahead of Rust's heap by budget/8, at least this much. */
 #define DF_MIN_HEADROOM		(1024 * 1024)
 
@@ -92,9 +118,28 @@ DfPaxScanInfo df_last_pax_scan;
 
 typedef struct DfExec
 {
-	PlanState  *root;			/* the slice's top node; its ExecProcNode is ours */
+	PlanState  *root;			/* the slice's top node below any sending Motion */
+	PlanState  *procnode;		/* the node whose ExecProcNode is ours: root,
+								 * or the Motion we send batches through */
 	SeqScanState *scan;			/* the scan whose table we read, or NULL */
 	MotionState *motion;		/* else the receiving Motion we read */
+
+	/* M7b batch Motions */
+	MotionState *send;			/* the Gather Motion we send batches through */
+	bool		ipc_input;		/* 'motion' delivers batches */
+	uint8		batch_head[DF_BATCH_HEAD];	/* magic + signature */
+	bool		head_sent;
+	bool		stopped;		/* the receiver asked us to stop */
+	MemoryContext chunkcxt;		/* chunks being sent */
+	TupleChunkListItem rx_items;	/* chunks received, not yet released */
+	int16		rx_route;
+	DfSlice    *rx_slices;		/* their payloads, past each stream's head */
+	int			rx_nslices;
+	int			rx_maxslices;
+	bool		rx_eos;			/* the chunks end the route's stream */
+	int			rx_nroutes;
+	int		   *rx_head_seen;	/* per route: head bytes checked */
+	bool	   *rx_ended;		/* per route: end-of-stream received */
 	EState	   *estate;
 	DfSliceSpec spec;
 	int			maxattno;		/* highest table column we read */
@@ -173,7 +218,7 @@ df_exec_lookup(PlanState *pstate)
 	DfExec	   *x;
 
 	for (x = df_execs; x != NULL; x = x->next)
-		if (x->root == pstate)
+		if (x->procnode == pstate)
 			return x;
 	elog(ERROR, "datafusion: no execution state for this plan node");
 	return NULL;				/* keep compiler quiet */
@@ -247,6 +292,255 @@ df_exec_finished(DfExec *x)
 	}
 }
 
+static uint32_t
+df_query_flags(DfExec *x)
+{
+	return (x->ipc_input ? DF_QUERY_IPC_INPUT : 0) |
+		(x->send ? DF_QUERY_IPC_OUTPUT : 0);
+}
+
+/* ---------------------------------------------------------------------
+ * M7b: sending batches through a Gather Motion
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Send 'len' bytes of the batch stream to the receiver (route 0 of a
+ * Gather), cut into tuple chunks of DF_CHUNK_TYPE.  Sets x->stopped if the
+ * receiver asked the senders to stop.
+ */
+static void
+df_send_bytes(DfExec *x, const uint8 *data, size_t len)
+{
+	Motion	   *motion = (Motion *) x->send->ps.plan;
+	size_t		maxdata = Gp_max_tuple_chunk_size - TUPLE_CHUNK_HEADER_SIZE;
+	TupleChunkListItem first = NULL;
+	TupleChunkListItem last = NULL;
+	MemoryContext oldcxt = MemoryContextSwitchTo(x->chunkcxt);
+
+	while (len > 0)
+	{
+		size_t		n = Min(len, maxdata);
+		TupleChunkListItem item;
+
+		item = palloc(offsetof(TupleChunkListItemData, chunk_data) +
+					  TUPLE_CHUNK_HEADER_SIZE + n);
+		item->p_next = NULL;
+		item->inplace = NULL;
+		item->chunk_length = TUPLE_CHUNK_HEADER_SIZE + n;
+		SetChunkDataSize(item->chunk_data, n);
+		SetChunkType(item->chunk_data, DF_CHUNK_TYPE);
+		memcpy(item->chunk_data + TUPLE_CHUNK_HEADER_SIZE, data, n);
+		if (last)
+			last->p_next = item;
+		else
+			first = item;
+		last = item;
+		data += n;
+		len -= n;
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	/* The interconnect copies the chunks into its own buffers. */
+	if (first != NULL &&
+		!CurrentMotionIPCLayer->SendTupleChunkToAMS(x->estate->interconnect_context,
+													motion->motionID, 0, first))
+		x->stopped = true;
+	MemoryContextReset(x->chunkcxt);
+}
+
+/* ---------------------------------------------------------------------
+ * M7b: receiving batches from a Gather Motion
+ * ---------------------------------------------------------------------
+ */
+
+/* Free the received chunks and give their receive buffer back. */
+static void
+df_rx_release(DfExec *x, int16 motion_id)
+{
+	TupleChunkListItem item = x->rx_items;
+
+	while (item != NULL)
+	{
+		TupleChunkListItem next = item->p_next;
+
+		pfree(item);
+		item = next;
+	}
+	x->rx_items = NULL;
+	x->rx_nslices = 0;
+	CurrentMotionIPCLayer->DirectPutRxBuffer(x->estate->interconnect_context,
+											 motion_id, x->rx_route);
+}
+
+/*
+ * Receive the next chunks, from whichever sender has some, and note their
+ * payloads in x->rx_slices, checking the head of each stream.
+ */
+static void
+df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
+{
+	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
+	TupleChunkListItem item;
+	int16		route = ANY_ROUTE;
+	MemoryContext oldcxt;
+
+	if (x->estate->interconnect_context == NULL)
+		ereport(ERROR, (errmsg("Interconnect is down unexpectedly.")));
+	if (x->rx_head_seen == NULL)
+	{
+		x->rx_nroutes = entry->num_senders;
+		x->rx_head_seen = MemoryContextAllocZero(x->estate->es_query_cxt,
+												 sizeof(int) * Max(x->rx_nroutes, 1));
+		x->rx_ended = MemoryContextAllocZero(x->estate->es_query_cxt,
+											 sizeof(bool) * Max(x->rx_nroutes, 1));
+	}
+
+	/* As execMotionUnsortedReceiver and processIncomingChunks do. */
+	x->estate->active_recv_id = motion_id;
+	oldcxt = MemoryContextSwitchTo(ml->motion_layer_mctx);
+	x->rx_items = CurrentMotionIPCLayer->RecvTupleChunkFromAny(x->estate->interconnect_context,
+															   motion_id, &route);
+	MemoryContextSwitchTo(oldcxt);
+	x->rx_route = route;
+	x->rx_nslices = 0;
+	x->rx_eos = false;
+	if (route < 0 || route >= x->rx_nroutes)
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+				 errmsg("datafusion: chunks from unexpected route %d of Motion %d",
+						route, motion_id)));
+
+	for (item = x->rx_items; item != NULL; item = item->p_next)
+	{
+		TupleChunkType type;
+		uint8	   *data;
+		size_t		len;
+		int		   *seen = &x->rx_head_seen[route];
+
+		if (item->chunk_length < TUPLE_CHUNK_HEADER_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("datafusion: tuple chunk of %u bytes from route %d of Motion %d",
+							item->chunk_length, route, motion_id)));
+		GetChunkType(item, &type);
+		if (x->rx_eos)
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("datafusion: data after end-of-stream from route %d of Motion %d",
+							route, motion_id)));
+		if (type == TC_END_OF_STREAM)
+		{
+			x->rx_eos = true;
+			continue;
+		}
+		if (type != DF_CHUNK_TYPE)
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("datafusion: Motion %d received tuples where DataFusion batches were expected",
+							motion_id),
+					 errdetail("The sending slice on route %d did not run in DataFusion.", route)));
+
+		data = (uint8 *) GetChunkDataPtr(item) + TUPLE_CHUNK_HEADER_SIZE;
+		len = item->chunk_length - TUPLE_CHUNK_HEADER_SIZE;
+		if (*seen < DF_BATCH_HEAD)
+		{
+			size_t		k = Min(len, (size_t) (DF_BATCH_HEAD - *seen));
+
+			if (memcmp(data, x->batch_head + *seen, k) != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+						 errmsg("datafusion: Motion %d received batches of another plan",
+								motion_id),
+						 errdetail("The stream from route %d does not start with this Motion's signature.",
+								   route)));
+			*seen += k;
+			data += k;
+			len -= k;
+		}
+		if (len == 0)
+			continue;
+		if (x->rx_nslices == x->rx_maxslices)
+		{
+			x->rx_maxslices = Max(16, x->rx_maxslices * 2);
+			x->rx_slices = x->rx_slices ?
+				repalloc(x->rx_slices, sizeof(DfSlice) * x->rx_maxslices) :
+				MemoryContextAlloc(x->estate->es_query_cxt, sizeof(DfSlice) * x->rx_maxslices);
+		}
+		x->rx_slices[x->rx_nslices].data = data;
+		x->rx_slices[x->rx_nslices].len = len;
+		x->rx_nslices++;
+	}
+}
+
+/*
+ * Batch-Motion input: hand the received bytes to DataFusion, receiving more
+ * when they are taken.  Sets *pushed when bytes were taken, *full when the
+ * queue was full.
+ */
+static void
+df_exec_receive(DfExec *x, bool *pushed, bool *full)
+{
+	char		buf[DF_MSG_BUFLEN];
+	char		sqlstate[6] = "XX000";
+	int16		motion_id = ((Motion *) x->motion->ps.plan)->motionID;
+	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
+	MotionNodeEntry *entry = &ml->mnEntries[motion_id - 1];
+
+	if (x->rx_items == NULL)
+	{
+		if (!entry->moreNetWork)
+		{
+			/* every sender has ended its stream */
+			x->estate->active_recv_id = -1;
+			df_ffi_query_finish_input(x->query);
+			x->input_done = true;
+			return;
+		}
+		df_rx_take(x, motion_id, entry);
+		if (x->rx_items == NULL)
+			return;
+	}
+
+	if (x->rx_nslices > 0)
+	{
+		int32		status = df_ffi_query_push_ipc(x->query, x->rx_route, x->rx_slices,
+												   (uint32_t) x->rx_nslices,
+												   sqlstate, buf, sizeof(buf));
+
+		if (status == DF_PENDING)
+		{
+			/*
+			 * Still full after a short wait inside: keep the chunks and offer
+			 * them again after polling (without waiting there).
+			 */
+			*pushed = true;
+			return;
+		}
+		if (status != DF_OK)
+			df_raise_query(status, sqlstate, buf);
+		*pushed = true;
+	}
+
+	/* The bytes are copied: account for end-of-stream, then release. */
+	if (x->rx_eos)
+	{
+		if (x->rx_ended[x->rx_route])
+			ereport(ERROR,
+					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
+					 errmsg("datafusion: second end-of-stream from route %d of Motion %d",
+							x->rx_route, motion_id)));
+		x->rx_ended[x->rx_route] = true;
+		entry->num_stream_ends_recvd++;
+		if (entry->num_stream_ends_recvd == entry->num_senders)
+			entry->moreNetWork = false;
+		CurrentMotionIPCLayer->DeregisterReadInterest(x->estate->interconnect_context,
+													  motion_id, x->rx_route,
+													  "end of stream");
+	}
+	df_rx_release(x, motion_id);
+}
+
 /*
  * Experimental: start the query on PAX micro-partitions that DataFusion's
  * partitions decode themselves.  Returns false when the direct reader does
@@ -301,7 +595,7 @@ df_exec_begin_pax(DfExec *x, int workers)
 	status = df_ffi_query_start_pax(x->spec.json, (uint32_t) workers,
 									(uint64_t) x->memory_limit, df_spill_dir(),
 									scan, (uint32_t) reader->nblocks(scan),
-									reader->read, reader->end,
+									reader->read, reader->end, df_query_flags(x),
 									&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
@@ -330,7 +624,7 @@ df_exec_begin(DfExec *x)
 	}
 	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
 								(uint64_t) x->memory_limit, df_spill_dir(),
-								&x->query, sqlstate, buf, sizeof(buf));
+								df_query_flags(x), &x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
 		x->query = NULL;
@@ -496,7 +790,9 @@ df_exec_next(DfExec *x)
 		if (x->done)
 			return ExecClearTuple(x->outslot);
 
-		if (!x->input_done)
+		if (!x->input_done && x->ipc_input)
+			df_exec_receive(x, &pushed, &full);
+		else if (!x->input_done)
 		{
 			if (!x->batch_ready)
 				df_exec_fill(x);
@@ -535,10 +831,44 @@ df_exec_next(DfExec *x)
 			x->out_nrows = nrows;
 			x->out_row = 0;
 		}
+		else if (status == DF_BYTES)
+		{
+			const uint8 *data;
+			size_t		len;
+
+			/* Our results, for the Motion's receiver. */
+			if (!x->head_sent)
+			{
+				df_send_bytes(x, x->batch_head, DF_BATCH_HEAD);
+				x->head_sent = true;
+			}
+			df_ffi_query_bytes(x->query, &data, &len);
+			if (!x->stopped)
+				df_send_bytes(x, data, len);
+			if (x->stopped)
+			{
+				/*
+				 * The receiver needs no more rows: stop as the Motion would,
+				 * without end-of-stream, and let the workers go.
+				 */
+				x->send->stopRequested = true;
+				x->done = true;
+				df_ffi_query_free(x->query);
+				x->query = NULL;
+				df_vmem_trim();
+			}
+		}
 		else if (status == DF_DONE)
 		{
 			x->done = true;
 			df_exec_finished(x);
+			if (x->send)
+			{
+				SendEndOfStream(x->estate->motionlayer_context,
+								x->estate->interconnect_context,
+								((Motion *) x->send->ps.plan)->motionID);
+				x->send->sentEndOfStream = true;
+			}
 		}
 		else if (status != DF_PENDING)
 			df_raise_query(status, sqlstate, buf);
@@ -554,13 +884,26 @@ df_exec_proc_node(PlanState *pstate)
 	return df_exec_next(df_exec_lookup(pstate));
 }
 
+/* The head of a batch stream through 'motion': magic, then signature. */
+static void
+df_batch_head(uint8 *head, Motion *motion)
+{
+	uint64		sig = df_motion_signature(motion);
+
+	memcpy(head, DF_BATCH_MAGIC, 8);
+	memcpy(head + 8, &sig, 8);
+}
+
 /*
  * Prepare to run the slice whose top PlanState is 'root' in DataFusion.
- * Returns false, with a reason, if the slice cannot be translated; it then
- * stays on the PostgreSQL executor.
+ * 'send', if not NULL, is the Gather Motion above it that is to carry
+ * Arrow batches; the slice then runs in its place.  Returns false, with a
+ * reason, if the slice cannot be translated; it then stays on the
+ * PostgreSQL executor.
  */
 bool
-df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reasonlen)
+df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
+			   char *reason, size_t reasonlen)
 {
 	EState	   *estate = queryDesc->estate;
 	MemoryContext oldcxt;
@@ -585,10 +928,24 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reaso
 		return false;
 	}
 	x->root = root;
+	x->procnode = send ? &send->ps : root;
 	if (IsA(scanps, MotionState))
+	{
 		x->motion = (MotionState *) scanps;
+		x->ipc_input = df_motion_sends_batches(queryDesc->plannedstmt,
+											   (Motion *) scanps->plan);
+		if (x->ipc_input)
+			df_batch_head(x->batch_head, (Motion *) scanps->plan);
+	}
 	else
 		x->scan = (SeqScanState *) scanps;
+	if (send)
+	{
+		x->send = send;
+		df_batch_head(x->batch_head, (Motion *) send->ps.plan);
+		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion chunks",
+											ALLOCSET_DEFAULT_SIZES);
+	}
 	x->estate = estate;
 	x->memory_limit = df_slice_memory(root);
 	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);
@@ -614,7 +971,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reaso
 	df_execs = x;
 	MemoryContextSwitchTo(oldcxt);
 
-	elog(DEBUG1, "datafusion plan: %s", x->spec.json);
-	ExecSetExecProcNode(root, df_exec_proc_node);
+	elog(DEBUG1, "datafusion plan: %s%s%s", x->spec.json,
+		 x->ipc_input ? " (batches in)" : "", x->send ? " (batches out)" : "");
+	ExecSetExecProcNode(x->procnode, df_exec_proc_node);
 	return true;
 }
