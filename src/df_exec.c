@@ -129,7 +129,8 @@ typedef struct DfExec
 	int			send_nroutes;	/* its receivers */
 	bool	   *head_sent_to;	/* per route: stream head sent */
 	bool		ipc_input;		/* 'motion' delivers batches */
-	uint8		batch_head[DF_BATCH_HEAD];	/* magic + signature */
+	uint8		rx_head[DF_BATCH_HEAD];	/* expected head of received streams */
+	uint8		tx_head[DF_BATCH_HEAD];	/* head of the streams we send */
 	bool		stopped;		/* the receiver asked us to stop */
 	MemoryContext chunkcxt;		/* chunks being sent */
 	TupleChunkListItem rx_items;	/* chunks received, not yet released */
@@ -448,7 +449,7 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
 		{
 			size_t		k = Min(len, (size_t) (DF_BATCH_HEAD - *seen));
 
-			if (memcmp(data, x->batch_head + *seen, k) != 0)
+			if (memcmp(data, x->rx_head + *seen, k) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 						 errmsg("datafusion: Motion %d received batches of another plan",
@@ -847,7 +848,7 @@ df_exec_next(DfExec *x)
 					 route, x->send_nroutes);
 			if (!x->head_sent_to[route])
 			{
-				df_send_bytes(x, route, x->batch_head, DF_BATCH_HEAD);
+				df_send_bytes(x, route, x->tx_head, DF_BATCH_HEAD);
 				x->head_sent_to[route] = true;
 			}
 			if (!x->stopped)
@@ -942,7 +943,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		x->ipc_input = df_motion_sends_batches(queryDesc->plannedstmt,
 											   (Motion *) scanps->plan);
 		if (x->ipc_input)
-			df_batch_head(x->batch_head, (Motion *) scanps->plan);
+			df_batch_head(x->rx_head, (Motion *) scanps->plan);
 	}
 	else
 		x->scan = (SeqScanState *) scanps;
@@ -951,7 +952,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		Motion	   *motion = (Motion *) send->ps.plan;
 
 		x->send = send;
-		df_batch_head(x->batch_head, motion);
+		df_batch_head(x->tx_head, motion);
 		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion chunks",
 											ALLOCSET_DEFAULT_SIZES);
 		x->send_nroutes = 1;

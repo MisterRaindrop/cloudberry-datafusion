@@ -318,8 +318,21 @@ DataFusion, values that are not exact in binary may differ from
 PostgreSQL's in the last digits, the rows being added in another order (as
 they are between PostgreSQL plans with different parallelism).
 
+A slice that only receives, such as the coordinator returning a Gather's
+rows to the client, stays on tuples, and its Gather with it.  Running it in
+DataFusion just to decode batches was tried and measured: results matched,
+but over 30 million rows `COPY (SELECT ...) TO '/dev/null'` took 3.31 s
+against 3.34 s with tuples and 3.38 s on PostgreSQL, and two filtered
+queries were 5-10% slower.  Sampling the coordinator showed why: formatting
+the rows for the client took 60-70% of its time either way, and while it
+handed out a whole decoded batch it did not read the interconnect, so the
+senders stalled in flow control (21% of its time waiting for chunks,
+against 8% with tuples, which interleaves receiving and output row by row).
+The coordinator is the bottleneck of such queries and the motion layer
+offers no non-blocking receive to interleave with.
+
 Limits: only Gather and Redistribute Motions between DataFusion slices (a
-slice that only receives, such as a gather to the client, stays on tuples;
+slice that only receives stays on tuples, see above;
 Broadcast Motions come with joins, which DataFusion does not run yet);
 EXPLAIN ANALYZE shows the Motion as never executed and the interconnect's
 per-Motion statistics are not updated; tested with the UDP interconnect.
