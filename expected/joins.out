@@ -15,9 +15,10 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Inner hash joins within a slice (J2): both sides scanned locally (tables
--- colocated on the join key), under an optional aggregate.  DataFusion
--- builds its hash table on PostgreSQL's Hash side, which is also fed first.
+-- Inner hash joins (J2, J3): both sides scanned locally (tables colocated
+-- on the join key) or received through a Redistribute or Broadcast Motion,
+-- under an optional aggregate.  DataFusion builds its hash table on
+-- PostgreSQL's Hash side, which is also fed first.
 -- Each query runs with datafusion.mode off, then on; the results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -141,6 +142,11 @@ SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
  k  |  c  |  b  
 ----+-----+-----
+  6 | 1.5 |  30
+ 10 | 2.5 |  50
+ 14 | 3.5 |  70
+ 28 |   7 | 140
+ 32 |   8 | 160
   2 | 0.5 |  10
   4 |   1 |  20
   8 |   2 |  40
@@ -155,11 +161,6 @@ SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb
  30 | 7.5 | 150
  36 |   9 | 180
  38 | 9.5 | 190
-  6 | 1.5 |  30
- 10 | 2.5 |  50
- 14 | 3.5 |  70
- 28 |   7 | 140
- 32 |   8 | 160
 (19 rows)
 
 SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -171,11 +172,11 @@ SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOI
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
  e | count |  sum   
 ---+-------+--------
+ 0 |   200 | 502500
+ 1 |   200 | 497600
  4 |   200 | 497900
  3 |   200 | 497800
  2 |   200 | 497700
- 0 |   200 | 502500
- 1 |   200 | 497600
 (5 rows)
 
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE ja.a + jb.e > 100;
@@ -218,20 +219,20 @@ SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
  k  |  c  |  b  
 ----+-----+-----
+  2 | 0.5 |  10
+  4 |   1 |  20
+ 18 | 4.5 |  90
+ 34 | 8.5 | 170
+  8 |   2 |  40
+ 16 |   4 |  80
+ 22 | 5.5 | 110
+ 24 |   6 | 120
  12 |   3 |  60
  20 |   5 | 100
  26 | 6.5 | 130
  36 |   9 | 180
  30 | 7.5 | 150
  38 | 9.5 | 190
-  8 |   2 |  40
- 16 |   4 |  80
- 22 | 5.5 | 110
- 24 |   6 | 120
-  2 | 0.5 |  10
-  4 |   1 |  20
- 18 | 4.5 |  90
- 34 | 8.5 | 170
  10 | 2.5 |  50
  28 |   7 | 140
   6 | 1.5 |  30
@@ -248,8 +249,8 @@ SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOI
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
  e | count |  sum   
 ---+-------+--------
- 0 |   200 | 502500
  1 |   200 | 497600
+ 0 |   200 | 502500
  4 |   200 | 497900
  2 |   200 | 497700
  3 |   200 | 497800
@@ -287,7 +288,7 @@ SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
 
 -- An error in the join filter carries PostgreSQL's message.
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a / (jb.e - jb.e) > 0;
-ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=11556)
+ERROR:  division by zero  (seg1 slice1 172.17.0.3:40001 pid=21176)
 -- With batch Motions, the joined rows' partial aggregates go out as batches.
 SET datafusion.motion_batches = on;
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
@@ -301,6 +302,161 @@ SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHER
 (5 rows)
 
 RESET datafusion.motion_batches;
-DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup;
+-- Inputs received through Motions (J3): a table distributed otherwise is
+-- redistributed on the join key, or broadcast.
+CREATE TABLE df_jr (r int4, k int4, w int8) DISTRIBUTED BY (r);
+INSERT INTO df_jr SELECT i, i * 2, i FROM generate_series(1, 5000) i;
+INSERT INTO df_jr VALUES (0, NULL, 0);
+ANALYZE df_jr;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (ja.k = jr.k)
+                     ->  Seq Scan on df_ja ja
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: jr.k
+                                 ->  Seq Scan on df_jr jr
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (ja.a = jr.r)
+                     ->  Seq Scan on df_ja ja
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on df_jr jr
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(13 rows)
+
+SET datafusion.motion_batches = on;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (ja.k = jr.k)
+                     ->  Seq Scan on df_ja ja
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: jr.k
+                                 ->  Seq Scan on df_jr jr
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (ja.a = jr.r)
+                     ->  Seq Scan on df_ja ja
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on df_jr jr
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+ count |  sum   | max  
+-------+--------+------
+  5000 | 245000 | 5000
+(1 row)
+
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+ ?column? | count |  max   
+----------+-------+--------
+        2 |  1000 | 2498.5
+        3 |  1000 |   2499
+        4 |  1000 | 2499.5
+        0 |  1000 |   2500
+        1 |  1000 |   2498
+(5 rows)
+
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+ count | max 
+-------+-----
+ 20001 |  99
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+ count |  sum   | max  
+-------+--------+------
+  5000 | 245000 | 5000
+(1 row)
+
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+ ?column? | count |  max   
+----------+-------+--------
+        0 |  1000 |   2500
+        1 |  1000 |   2498
+        3 |  1000 |   2499
+        4 |  1000 | 2499.5
+        2 |  1000 | 2498.5
+(5 rows)
+
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+ count | max 
+-------+-----
+ 20001 |  99
+(1 row)
+
+SET datafusion.motion_batches = on;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+ count |  sum   | max  
+-------+--------+------
+  5000 | 245000 | 5000
+(1 row)
+
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+ ?column? | count |  max   
+----------+-------+--------
+        0 |  1000 |   2500
+        1 |  1000 |   2498
+        2 |  1000 | 2498.5
+        4 |  1000 | 2499.5
+        3 |  1000 |   2499
+(5 rows)
+
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+ count | max 
+-------+-----
+ 20001 |  99
+(1 row)
+
+SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
+ERROR:  division by zero  (seg1 slice1 172.17.0.3:40001 pid=21176)
+RESET datafusion.motion_batches;
+DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

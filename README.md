@@ -333,15 +333,18 @@ offers no non-blocking receive to interleave with.
 
 ### Joins
 
-Milestone J2 runs inner hash joins within a slice whose inputs are scanned
-locally (tables colocated on the join key), several levels deep, under an
-optional aggregate.  DataFusion builds its hash table on PostgreSQL's Hash
+Milestones J2 and J3 run inner hash joins whose inputs are scanned locally
+(tables colocated on the join key) or received through a Redistribute or
+Broadcast Motion, several levels deep, under an optional aggregate.  DataFusion builds its hash table on PostgreSQL's Hash
 side; the main thread feeds the inputs one after the other, the Hash side
 first, as PostgreSQL's Hash Join reads them.  Join keys must be of one type
 (no int4 = int8 yet); a join filter and a filter above the join are
-evaluated as in PostgreSQL; NULL keys match nothing.  Outer, semi and anti
-joins, IS NOT DISTINCT FROM joins and joins over Motions stay on
-PostgreSQL for now.
+evaluated as in PostgreSQL; NULL keys match nothing.  Reading the Hash side to its
+end before the other, also from the interconnect, keeps the deadlock
+properties of PostgreSQL's plans.  With `datafusion.motion_batches` the
+Motions feeding a join carry batches too, Broadcast included (its one
+stream goes to every receiver).  Outer, semi and anti joins and IS NOT
+DISTINCT FROM joins stay on PostgreSQL for now.
 
 DataFusion's hash join does not spill.  A slice qualifies only if the Hash
 node's estimated size (planner rows times width plus a per-row allowance)
@@ -360,9 +363,21 @@ DataFusion threads per QE (results identical):
 | the same with filters on both sides | 0.89 s | 0.23 s |
 | `GROUP BY` a column of the build side | 4.17 s | 0.24 s |
 
-Limits: only Gather and Redistribute Motions between DataFusion slices (a
-slice that only receives stays on tuples, see above;
-Broadcast Motions come with joins, which DataFusion does not run yet);
+With the 2-million-row table distributed on another column, so that it is
+redistributed on the join key:
+
+| Query | PostgreSQL | tuple Motions | batch Motions |
+|---|---|---|---|
+| `count(*), sum, max` over the join | 3.17 s | 0.36 s | 0.31 s |
+| `GROUP BY` a column of the build side | 4.29 s | 0.39 s | 0.32 s |
+
+Broadcasting it instead (joining on another column) would put about 100 MB
+in each segment's hash table, beyond the 64 MB budget, so that slice stays
+on PostgreSQL.
+
+Limits: only Gather, Redistribute and (with joins, J3) Broadcast Motions
+between DataFusion slices (a slice that only receives stays on tuples, see
+above);
 EXPLAIN ANALYZE shows the Motion as never executed and the interconnect's
 per-Motion statistics are not updated; tested with the UDP interconnect.
 
@@ -388,6 +403,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M7d | Split avg through batch Motions with DataFusion's state |
 | J1 | Plan tree over several inputs (groundwork for joins) |
 | J2 | Inner hash joins over local scans, with a memory guard |
+| J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
 
 ## Build
 

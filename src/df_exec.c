@@ -347,8 +347,9 @@ df_ipc_inputs(DfExec *x)
 
 /*
  * Send 'len' bytes of the batch stream for receiver 'route' (0 for a
- * Gather), cut into tuple chunks of DF_CHUNK_TYPE.  Sets x->stopped if the
- * receiver asked the senders to stop.
+ * Gather; a Broadcast's one stream goes to every receiver), cut into tuple
+ * chunks of DF_CHUNK_TYPE.  Sets x->stopped if the receiver asked the
+ * senders to stop.
  */
 static void
 df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
@@ -383,6 +384,8 @@ df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
 	MemoryContextSwitchTo(oldcxt);
 
 	/* The interconnect copies the chunks into its own buffers. */
+	if (motion->motionType == MOTIONTYPE_BROADCAST)
+		route = BROADCAST_SEGIDX;
 	if (first != NULL &&
 		!CurrentMotionIPCLayer->SendTupleChunkToAMS(x->estate->interconnect_context,
 													motion->motionID, (int16) route, first))

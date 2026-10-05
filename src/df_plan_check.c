@@ -784,12 +784,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * Motion's targetlist is evaluated by the sending slice;
 					 * here only the types of the columns read matter.
 					 */
-					if (cxt->join_input)
-					{
-						df_reject(cxt, "join input from a %s", df_plan_name(plan));
-						return;
-					}
-					if (!cxt->agg_input)
+					if (!cxt->agg_input && !cxt->join_input)
 					{
 						df_reject(cxt, "receives rows from a %s with nothing to compute on them",
 								  df_plan_name(plan));
@@ -987,8 +982,8 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 }
 
 /*
- * Could 'motion' carry batches at all: a plain Gather, or a Redistribute
- * whose keys DataFusion hashes as cdbhash() does.
+ * Could 'motion' carry batches at all: a plain Gather or Broadcast, or a
+ * Redistribute whose keys DataFusion hashes as cdbhash() does.
  */
 static bool
 df_motion_batchable(Motion *motion)
@@ -1012,7 +1007,8 @@ df_motion_batchable(Motion *motion)
 		}
 		return true;
 	}
-	return motion->motionType == MOTIONTYPE_GATHER;
+	return motion->motionType == MOTIONTYPE_GATHER ||
+		motion->motionType == MOTIONTYPE_BROADCAST;
 }
 
 static void

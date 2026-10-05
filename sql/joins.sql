@@ -15,9 +15,10 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Inner hash joins within a slice (J2): both sides scanned locally (tables
--- colocated on the join key), under an optional aggregate.  DataFusion
--- builds its hash table on PostgreSQL's Hash side, which is also fed first.
+-- Inner hash joins (J2, J3): both sides scanned locally (tables colocated
+-- on the join key) or received through a Redistribute or Broadcast Motion,
+-- under an optional aggregate.  DataFusion builds its hash table on
+-- PostgreSQL's Hash side, which is also fed first.
 -- Each query runs with datafusion.mode off, then on; the results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -81,6 +82,34 @@ SET datafusion.motion_batches = on;
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup;
+-- Inputs received through Motions (J3): a table distributed otherwise is
+-- redistributed on the join key, or broadcast.
+CREATE TABLE df_jr (r int4, k int4, w int8) DISTRIBUTED BY (r);
+INSERT INTO df_jr SELECT i, i * 2, i FROM generate_series(1, 5000) i;
+INSERT INTO df_jr VALUES (0, NULL, 0);
+ANALYZE df_jr;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+SET datafusion.motion_batches = on;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+SET datafusion.mode = on;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+SET datafusion.motion_batches = on;
+SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
+SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
+SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
+SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
+RESET datafusion.motion_batches;
+
+DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
