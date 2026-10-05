@@ -17,7 +17,8 @@
 --
 -- Gather Motions between two DataFusion slices carrying Arrow IPC batches
 -- (M7b, datafusion.motion_batches), and Redistribute Motions routing them
--- by Cloudberry's distribution hash (M7c).  The senders encode their
+-- by Cloudberry's distribution hash (M7c), and split avg passing
+-- DataFusion's state through them (M7d).  The senders encode their
 -- results and send the bytes as tuple chunks of their own type; the
 -- receivers decode them.  Each query runs with datafusion.mode off, then on;
 -- the two results must match.
@@ -136,6 +137,35 @@ RESET enable_parallel;
 RESET max_parallel_workers_per_gather;
 RESET enable_groupagg;
 
-DROP TABLE df_bat, df_bat_empty;
+-- Split avg (M7d): through batch Motions the partial stage passes sum and
+-- count, and the combining stage divides their sums; without batches avg
+-- stays on PostgreSQL.  The values are exact in binary, so the order of the
+-- additions does not show.
+CREATE TABLE df_bat_avg (a int4, f real, c float8, e int2) DISTRIBUTED BY (a);
+INSERT INTO df_bat_avg SELECT i, (i % 977) / 8.0, i / 4.0, (i % 100)::int2
+FROM generate_series(1, 200000) i;
+INSERT INTO df_bat_avg VALUES (NULL, NULL, NULL, NULL), (200001, NULL, NULL, 7);
+ANALYZE df_bat_avg;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
+EXPLAIN (COSTS OFF) SELECT e, avg(c) FROM df_bat_avg GROUP BY e;
+SET datafusion.motion_batches = off;
+EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
+SET datafusion.motion_batches = on;
+EXPLAIN (COSTS OFF) SELECT avg(a) FROM df_bat_avg;
+SET datafusion.mode = off;
+SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
+SELECT avg(c), avg(f) FROM df_bat_avg WHERE a IS NULL;
+SELECT avg(c), avg(f) FROM df_bat_avg WHERE a < 0;
+SELECT e, avg(c), avg(f), count(*) FROM df_bat_avg WHERE e > 95 OR e IS NULL OR e = 7 GROUP BY e;
+SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
+SET datafusion.mode = on;
+SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
+SELECT avg(c), avg(f) FROM df_bat_avg WHERE a IS NULL;
+SELECT avg(c), avg(f) FROM df_bat_avg WHERE a < 0;
+SELECT e, avg(c), avg(f), count(*) FROM df_bat_avg WHERE e > 95 OR e IS NULL OR e = 7 GROUP BY e;
+SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
+
+DROP TABLE df_bat, df_bat_empty, df_bat_avg;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

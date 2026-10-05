@@ -31,8 +31,10 @@
 //!                  0-based Motion column behind each input column)
 //!   "filter":    <expr> | null,
 //!   "aggregate": { "group": [<expr>...], "aggs": [ {"fn": "sum", "arg": <expr>} ... ] } | null,
-//!                fn: count, sum, min, max, avg, or count_merge (adds up partial
-//!                counts, 0 without rows: PostgreSQL's combining count)
+//!                fn: count, sum, min, max, avg, count_merge (adds up partial
+//!                counts, 0 without rows: PostgreSQL's combining count), or
+//!                avg_merge with "arg2" (sum of arg / sum of arg2, NULL when
+//!                that is 0: combines avg states of sum and count)
 //!   "having":    <expr> | null,
 //!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ],
 //!   "route":     { "kind": "hash", "keys": [ {"col": k, "hash": "int4"}, ... ],
@@ -357,12 +359,23 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
         // 0 instead of NULL without rows: see the projection after the
         // aggregate in Query::start_with.
         "count_merge" => sum(need(arg)?),
+        // The sum of the sums; the counts are a second aggregate (`aggregate_extra`).
+        "avg_merge" => sum(need(arg)?),
         "sum" => sum(need(arg)?),
         "min" => min(need(arg)?),
         "max" => max(need(arg)?),
         "avg" => avg(need(arg)?),
         other => return Err(format!("unsupported aggregate {other}")),
     })
+}
+
+/// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
+/// counts.
+fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
+    if field(v, "fn")?.as_str() != Some("avg_merge") {
+        return Ok(None);
+    }
+    Ok(Some(sum(expr(field(v, "arg2")?)?)))
 }
 
 /// DataFusion's default session, minus expression simplification.
@@ -826,23 +839,36 @@ impl Query {
                 .map(|(i, g)| expr(g).map(|e| e.alias(format!("g{i}"))))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(internal)?;
-            let agg_exprs = aggs
-                .iter()
-                .enumerate()
-                .map(|(i, g)| aggregate(g).map(|e| e.alias(format!("a{i}"))))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(internal)?;
+            let mut agg_exprs = Vec::with_capacity(aggs.len());
+            for (i, g) in aggs.iter().enumerate() {
+                agg_exprs.push(aggregate(g).map_err(internal)?.alias(format!("a{i}")));
+                if let Some(e) = aggregate_extra(g).map_err(internal)? {
+                    agg_exprs.push(e.alias(format!("a{i}_n")));
+                }
+            }
             let ngroups = group_exprs.len();
             b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
-            // A combined count is 0, not NULL, when no partial count arrived.
-            if aggs.iter().any(|a| a.get("fn").and_then(Value::as_str) == Some("count_merge")) {
+            // A combined count is 0, not NULL, when no partial count arrived;
+            // a combined avg divides the sums, NULL without values (as
+            // PostgreSQL's float8_avg).
+            let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
+            if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge"))) {
                 let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
                 for (i, a) in aggs.iter().enumerate() {
                     let c = col(format!("a{i}"));
-                    cols.push(if a.get("fn").and_then(Value::as_str) == Some("count_merge") {
-                        when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
-                    } else {
-                        c
+                    cols.push(match kind(a).as_deref() {
+                        Some("count_merge") => {
+                            when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
+                        }
+                        Some("avg_merge") => {
+                            let n = col(format!("a{i}_n"));
+                            let nf = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(n.clone()), DataType::Float64));
+                            when(n.clone().is_null().or(n.eq(lit(0i64))), lit(ScalarValue::Float64(None)))
+                                .otherwise(binary_expr(c, Operator::Divide, nf))
+                                .map_err(df)?
+                                .alias(format!("a{i}"))
+                        }
+                        _ => c,
                     });
                 }
                 b = b.project(cols).map_err(df)?;

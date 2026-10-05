@@ -65,6 +65,10 @@ typedef struct DfCheckContext
 	PlannedStmt *stmt;
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
 	bool		agg_input;		/* checking the child of an Agg node */
+	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
+	bool		batch_sender;	/* checking the child of a batch-sending Motion */
+	bool		partial_states; /* this Agg may output DataFusion avg states */
+	bool		final_states;	/* this Agg may read DataFusion avg states */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -325,8 +329,34 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
+				else if (strcmp(name, "avg") == 0 && agg->aggsplit != AGGSPLIT_SIMPLE)
+				{
+					/*
+					 * M7d: through a batch Motion, a split avg of float4 or
+					 * float8 passes DataFusion's state (sum and count)
+					 * instead of PostgreSQL's array.
+					 */
+					Oid			argtype = list_length(agg->aggargtypes) == 1 ?
+						linitial_oid(agg->aggargtypes) : InvalidOid;
+					bool		allowed = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ?
+						cxt->partial_states : cxt->final_states;
+
+					if (argtype != FLOAT4OID && argtype != FLOAT8OID)
+						df_reject(cxt, "split aggregate avg of %s", format_type_be(argtype));
+					else if (!allowed)
+						df_reject(cxt, "%s aggregate avg without batch Motions",
+								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining");
+					else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+					{
+						/* its argument is the state column of the Motion below */
+						if (list_length(agg->args) != 1 ||
+							!IsA(linitial_node(TargetEntry, agg->args)->expr, Var))
+							df_reject(cxt, "combining aggregate avg over an expression");
+						return cxt->failed;
+					}
+				}
 				else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
-						 (strcmp(name, "avg") == 0 || agg->aggtranstype != agg->aggtype))
+						 agg->aggtranstype != agg->aggtype)
 					/*
 					 * Combining count, sum and min/max adds up or compares
 					 * plain values of the result type; other transition
@@ -335,13 +365,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 */
 					df_reject(cxt, "combining stage of aggregate %s", name);
 				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
-						 strcmp(name, "avg") == 0)
-					/* its transition state is an array */
-					df_reject(cxt, "partial aggregate avg");
-				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggtype == BYTEAOID)
 					df_reject(cxt, "partial aggregate %s with a serialized transition state", name);
-				else if (!df_type_supported(agg->aggtype))
+				else if (!df_type_supported(agg->aggtype) &&
+						 !(strcmp(name, "avg") == 0 && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 					df_reject(cxt, "aggregate %s returning %s", name,
 							  format_type_be(agg->aggtype));
 				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
@@ -554,10 +581,17 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						return;
 					}
 				}
+				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
+				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
+					IsA(child, Motion) &&
+					bms_is_member(((Motion *) child)->motionID, cxt->batches);
+				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
 				df_check_expr_list(plan->qual, cxt);
 				cxt->allow_aggref = false;
+				cxt->partial_states = false;
+				cxt->final_states = false;
 
 				/* The child must produce what the aggregate reads. */
 				df_collect_outer_refs((Node *) plan->targetlist, &child_needed);
@@ -608,7 +642,9 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						TargetEntry *tle = lfirst_node(TargetEntry, lc);
 						Oid			type = exprType((Node *) tle->expr);
 
-						if (bms_is_member(tle->resno, needed) && !df_type_supported(type))
+						if (bms_is_member(tle->resno, needed) && !df_type_supported(type) &&
+							!(bms_is_member(motion->motionID, cxt->batches) &&
+							  df_motion_state_column(motion, tle->resno)))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;
@@ -636,7 +672,9 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				cxt->agg_input = false;
+				cxt->batch_sender = bms_is_member(motion->motionID, cxt->batches);
 				df_check_plan(outerPlan(plan), cxt, NULL, false);
+				cxt->batch_sender = false;
 				return;
 			}
 
@@ -652,15 +690,15 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  * Motion this slice sends through (every slice but the top one); a Motion
  * anywhere else in the slice is a receiver.
  */
-bool
-df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-			   char *reason, size_t reasonlen)
+static bool
+df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+				 Bitmapset *batches, char *reason, size_t reasonlen)
 {
 	DfCheckContext cxt;
 
+	memset(&cxt, 0, sizeof(cxt));
 	cxt.stmt = stmt;
-	cxt.allow_aggref = false;
-	cxt.agg_input = false;
+	cxt.batches = batches;
 	cxt.failed = false;
 	cxt.reason = reason;
 	cxt.reasonlen = reasonlen;
@@ -678,6 +716,14 @@ df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 		df_check_plan(root, &cxt, NULL, root_is_sender);
 
 	return !cxt.failed;
+}
+
+bool
+df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+			   char *reason, size_t reasonlen)
+{
+	return df_check_slice_b(stmt, root, root_is_sender, df_batch_motions(stmt),
+							reason, reasonlen);
 }
 
 /*
@@ -702,11 +748,12 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
 bool		df_motion_batches = false;
 
 /*
- * Would the executor hook run slice 'index' in DataFusion?  The same check
- * and translation it applies, from the plan alone.
+ * Would the executor hook run slice 'index' in DataFusion, if the Motions
+ * in 'batches' carry batches?  The same check and translation it applies,
+ * from the plan alone.
  */
 static bool
-df_slice_runs_in_datafusion(PlannedStmt *stmt, int index)
+df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	char		reason[256];
 	DfSliceSpec spec;
@@ -719,9 +766,13 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index)
 	sender = findSenderMotion(stmt, index);
 	root = sender ? (Plan *) sender : stmt->planTree;
 	compute = sender ? outerPlan(root) : root;
-	return compute != NULL &&
-		df_check_slice(stmt, root, sender != NULL, reason, sizeof(reason)) &&
-		df_translate_slice(compute, &spec, reason, sizeof(reason));
+	if (compute != NULL &&
+		df_check_slice_b(stmt, root, sender != NULL, batches, reason, sizeof(reason)) &&
+		df_translate_slice(compute, &spec, reason, sizeof(reason)))
+		return true;
+	elog(DEBUG2, "datafusion: with these batch Motions slice %d cannot run: %s",
+		 index, compute ? reason : "no plan");
+	return false;
 }
 
 /*
@@ -768,20 +819,12 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 }
 
 /*
- * Does 'motion' carry Arrow IPC batches instead of tuples?  A plain Gather,
- * or a Redistribute whose keys DataFusion hashes as cdbhash() does, whose
- * sending and receiving slices both run in DataFusion.  Every
- * process of the query decides this from the plan and the synchronized
- * settings alone, so the senders and the receiver agree.  Should they not
- * (a slice falling back for a reason outside the plan), the chunks carry a
- * type of their own: PostgreSQL's receiver rejects it with an error, and
- * ours rejects tuple chunks, so nothing is ever misread.
+ * Could 'motion' carry batches at all: a plain Gather, or a Redistribute
+ * whose keys DataFusion hashes as cdbhash() does.
  */
-bool
-df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
+static bool
+df_motion_batchable(Motion *motion)
 {
-	if (!df_motion_batches || df_mode == DF_MODE_OFF)
-		return false;
 	if (motion->sendSorted)
 		return false;
 	if (motion->motionType == MOTIONTYPE_HASH)
@@ -799,13 +842,121 @@ df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
 			if (!df_motion_hash_key(motion, i, &column, &tag))
 				return false;
 		}
+		return true;
 	}
-	else if (motion->motionType != MOTIONTYPE_GATHER)
+	return motion->motionType == MOTIONTYPE_GATHER;
+}
+
+static void
+df_list_motions(Plan *plan, List **motions)
+{
+	if (plan == NULL)
+		return;
+	if (IsA(plan, Motion))
+		*motions = lappend(*motions, plan);
+	df_list_motions(outerPlan(plan), motions);
+	df_list_motions(innerPlan(plan), motions);
+}
+
+/*
+ * The Motions of 'stmt' that carry Arrow IPC batches instead of tuples:
+ * those whose sending and receiving slices both run in DataFusion.  A slice
+ * may itself need its Motions to carry batches (a split avg passes
+ * DataFusion's state, M7d), so this is the largest set for which that
+ * holds: start from every Motion that could, and drop those with a slice
+ * that cannot run given the rest, until none is dropped.  Every process of
+ * the query computes it from the plan and the synchronized settings alone,
+ * so the senders and the receivers agree.  Should they not (a slice falling
+ * back for a reason outside the plan), the chunks carry a type of their
+ * own: PostgreSQL's receiver rejects it with an error, and ours rejects
+ * tuple chunks, so nothing is ever misread.
+ */
+Bitmapset *
+df_batch_motions(PlannedStmt *stmt)
+{
+	List	   *motions = NIL;
+	Bitmapset  *batches = NULL;
+	ListCell   *lc;
+	bool		changed;
+
+	if (!df_motion_batches || df_mode == DF_MODE_OFF)
+		return NULL;
+	df_list_motions(stmt->planTree, &motions);
+	foreach(lc, motions)
+	{
+		Motion	   *m = (Motion *) lfirst(lc);
+
+		if (m->motionID > 0 && m->motionID < stmt->numSlices && df_motion_batchable(m))
+			batches = bms_add_member(batches, m->motionID);
+	}
+	do
+	{
+		changed = false;
+		foreach(lc, motions)
+		{
+			Motion	   *m = (Motion *) lfirst(lc);
+
+			if (bms_is_member(m->motionID, batches) &&
+				!(df_slice_runs_in_datafusion(stmt, m->motionID, batches) &&
+				  df_slice_runs_in_datafusion(stmt, stmt->slices[m->motionID].parentIndex,
+											  batches)))
+			{
+				batches = bms_del_member(batches, m->motionID);
+				changed = true;
+			}
+		}
+	} while (changed);
+	return batches;
+}
+
+/* Does 'motion' carry Arrow IPC batches instead of tuples? */
+bool
+df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
+{
+	return bms_is_member(motion->motionID, df_batch_motions(stmt));
+}
+
+/*
+ * Does column 'resno' of 'motion' carry a partial avg's state?  Through a
+ * batch Motion that state is DataFusion's, two columns in the stream (M7d).
+ */
+bool
+df_motion_state_column(Motion *motion, AttrNumber resno)
+{
+	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
+	Plan	   *child = outerPlan(motion);
+	Node	   *expr;
+	char	   *name;
+
+	if (tle == NULL || child == NULL)
 		return false;
-	if (motion->motionID <= 0 || motion->motionID >= stmt->numSlices)
+	expr = (Node *) tle->expr;
+	if (IsA(expr, Var) && ((Var *) expr)->varno == OUTER_VAR)
+	{
+		tle = get_tle_by_resno(child->targetlist, ((Var *) expr)->varattno);
+		if (tle == NULL)
+			return false;
+		expr = (Node *) tle->expr;
+	}
+	if (!IsA(expr, Aggref) || ((Aggref *) expr)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 		return false;
-	return df_slice_runs_in_datafusion(stmt, motion->motionID) &&
-		df_slice_runs_in_datafusion(stmt, stmt->slices[motion->motionID].parentIndex);
+	name = get_func_name(((Aggref *) expr)->aggfnoid);
+	return name != NULL && strcmp(name, "avg") == 0;
+}
+
+/*
+ * 0-based position in the batch stream of column 'resno' of 'motion': a
+ * partial avg's state takes two columns (sum, then count).
+ */
+int
+df_motion_stream_column(Motion *motion, AttrNumber resno)
+{
+	int			pos = 0;
+	AttrNumber	r;
+
+	for (r = 1; r < resno; r++)
+		pos += df_motion_state_column(motion, r) ? 2 : 1;
+	return pos;
 }
 
 /*

@@ -304,6 +304,20 @@ query results, is what shows the routes match.
 | `GROUP BY b % 1000`, three aggregates | 1.54 s | 1.93 s | 0.80 s |
 | `GROUP BY b` (30 million groups) | 5.98 s | 1.86 s | 1.07 s |
 
+A split avg of float4 or float8 (M7d) passes DataFusion's state through
+batch Motions instead of PostgreSQL's array: the partial stage sends
+sum(x) and count(x), two columns of the stream, and the combining stage
+divides their sums, NULL when the count is 0 (as `float8_avg`).  Since a
+slice may then need its Motions to carry batches, the set of batch Motions
+is the largest one for which every slice next to one of them runs in
+DataFusion, computed from the plan alone.  Without batches, and for avg of
+integers (numeric results), avg stays on PostgreSQL.  Over 30 million rows,
+`GROUP BY e` with `avg(c)` took 0.18 s instead of 1.04 s on PostgreSQL,
+`GROUP BY a % 1000` 0.56 s instead of 1.41 s.  As for float sums anywhere in
+DataFusion, values that are not exact in binary may differ from
+PostgreSQL's in the last digits, the rows being added in another order (as
+they are between PostgreSQL plans with different parallelism).
+
 Limits: only Gather and Redistribute Motions between DataFusion slices (a
 slice that only receives, such as a gather to the client, stays on tuples;
 Broadcast Motions come with joins, which DataFusion does not run yet);
@@ -329,6 +343,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M7a | Slices that receive through a Motion; combining aggregates |
 | M7b | Arrow IPC batches through Gather Motions between DataFusion slices |
 | M7c | Redistribute Motions with batches, routed by a checked transcription of cdbhash |
+| M7d | Split avg through batch Motions with DataFusion's state |
 
 ## Build
 

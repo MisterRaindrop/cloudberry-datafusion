@@ -974,7 +974,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 					elog(ERROR, "datafusion: unsupported distribution key in Motion %d",
 						 motion->motionID);
 				appendStringInfo(&json, "%s{\"col\":%d,\"hash\":\"%s\"}",
-								 i > 0 ? "," : "", column, tag);
+								 i > 0 ? "," : "",
+								 df_motion_stream_column(motion, column + 1), tag);
 			}
 			appendStringInfo(&json, "],\"segments\":%d,\"workers\":%d}}",
 							 send->numHashSegments, Max(send->parallel_workers, 1));

@@ -33,6 +33,12 @@
  * holding the partial aggregates' transition states; count's are added up
  * ("count_merge", 0 without rows), sum's added, min's and max's compared.
  *
+ * Through a batch Motion a split avg passes DataFusion's state instead of
+ * PostgreSQL's array (M7d): the partial stage outputs sum(x) and count(x),
+ * two columns of the stream, and the combining stage divides their sums
+ * ("avg_merge").  Input columns from a Motion are therefore numbered by
+ * their position in the stream (df_motion_stream_column).
+ *
  * df_check_slice has already rejected anything this file cannot express,
  * so the translator reports a failure only as a safety net, and the slice
  * then stays on the PostgreSQL executor.
@@ -68,7 +74,10 @@ typedef struct DfBuilder
 	List	   *attnos;			/* int: table column (or Motion output
 								 * column) of each input column */
 	List	   *types;			/* oid: type of each scan column */
-	List	   *aggrefs;		/* distinct Aggrefs, in first-use order */
+	List	   *aggrefs;		/* distinct aggregate calls, in first-use order */
+	List	   *aggfns;			/* the function of each: NULL for the
+								 * Aggref's own, or "sum" / "count" for the
+								 * parts of a partial avg's state */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -195,9 +204,44 @@ df_emit_child_column(DfBuilder *b, StringInfo out, AttrNumber resno)
 		df_fail(b, "a reference to the child's output");
 	else if (IsA(b->scan, Motion))
 		appendStringInfo(out, "{\"col\":%d}",
-						 df_input_column(b, resno, exprType((Node *) tle->expr)));
+						 df_input_column(b, df_motion_stream_column((Motion *) b->scan, resno) + 1,
+										 exprType((Node *) tle->expr)));
 	else
 		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+}
+
+/* Index of aggregate call ('agg', 'fn'), adding it if new. */
+static int
+df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
+{
+	ListCell   *la,
+			   *lf;
+	int			i = 0;
+
+	forboth(la, b->aggrefs, lf, b->aggfns)
+	{
+		const char *f = lfirst(lf);
+
+		if (equal(lfirst(la), agg) &&
+			((f == NULL && fn == NULL) || (f && fn && strcmp(f, fn) == 0)))
+			return i;
+		i++;
+	}
+	b->aggrefs = lappend(b->aggrefs, agg);
+	b->aggfns = lappend(b->aggfns, (void *) fn);
+	return i;
+}
+
+/* Is 'node' a partial avg, whose state goes out as sum and count? */
+static bool
+df_is_partial_avg(Node *node)
+{
+	char	   *name;
+
+	if (!IsA(node, Aggref) || ((Aggref *) node)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+		return false;
+	name = get_func_name(((Aggref *) node)->aggfnoid);
+	return name != NULL && strcmp(name, "avg") == 0;
 }
 
 static void
@@ -317,26 +361,13 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			}
 
 		case T_Aggref:
+			if (level != DF_LEVEL_AGG)
 			{
-				ListCell   *lc;
-				int			i = 0;
-
-				if (level != DF_LEVEL_AGG)
-				{
-					df_fail(b, "an aggregate outside the aggregate node");
-					return;
-				}
-				foreach(lc, b->aggrefs)
-				{
-					if (equal(lfirst(lc), node))
-						break;
-					i++;
-				}
-				if (lc == NULL)
-					b->aggrefs = lappend(b->aggrefs, node);
-				appendStringInfo(out, "{\"agg\":%d}", i);
+				df_fail(b, "an aggregate outside the aggregate node");
 				return;
 			}
+			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
+			return;
 
 		default:
 			df_fail(b, "an expression");
@@ -352,6 +383,9 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 	int			i = 0;
 
 	spec->nout = list_length(tlist);
+	foreach(lc, tlist)
+		if (df_is_partial_avg((Node *) lfirst_node(TargetEntry, lc)->expr))
+			spec->nout++;
 	spec->out_types = palloc(sizeof(Oid) * Max(spec->nout, 1));
 	appendStringInfoChar(out, '[');
 	foreach(lc, tlist)
@@ -360,6 +394,19 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		Oid			type = exprType((Node *) tle->expr);
 		const char *tag = df_type_tag(type);
 
+		if (level == DF_LEVEL_AGG && df_is_partial_avg((Node *) tle->expr))
+		{
+			/* DataFusion's avg state: sum, then count (M7d) */
+			Aggref	   *agg = (Aggref *) tle->expr;
+
+			spec->out_types[i++] = FLOAT8OID;
+			spec->out_types[i++] = INT8OID;
+			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"float8\"},"
+							 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
+							 i > 2 ? "," : "",
+							 df_agg_ref(b, agg, "sum"), df_agg_ref(b, agg, "count"));
+			continue;
+		}
 		if (tag == NULL)
 		{
 			df_fail(b, "an output column");
@@ -440,17 +487,38 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		StringInfoData aggs;
 
 		initStringInfo(&aggs);
+		ListCell   *lf;
+
 		i = 0;
-		foreach(lc, b.aggrefs)
+		forboth(lc, b.aggrefs, lf, b.aggfns)
 		{
 			Aggref	   *agg = lfirst_node(Aggref, lc);
+			const char *fn = lfirst(lf);
 			char	   *name = get_func_name(agg->aggfnoid);
 			bool		combine = (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL);
 
 			if (i++ > 0)
 				appendStringInfoChar(&aggs, ',');
-			appendStringInfo(&aggs, "{\"fn\":\"%s%s\",\"arg\":", name,
-							 combine && strcmp(name, "count") == 0 ? "_merge" : "");
+			if (combine && strcmp(name, "avg") == 0)
+			{
+				/* DataFusion's avg state: the stream's sum and count columns */
+				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+				int			pos;
+
+				if (!IsA(b.scan, Motion) || !IsA(arg, Var))
+				{
+					df_fail(&b, "a combining avg");
+					break;
+				}
+				pos = df_motion_stream_column((Motion *) b.scan, ((Var *) arg)->varattno);
+				appendStringInfo(&aggs, "{\"fn\":\"avg_merge\",\"arg\":{\"col\":%d},"
+								 "\"arg2\":{\"col\":%d}}",
+								 df_input_column(&b, pos + 1, FLOAT8OID),
+								 df_input_column(&b, pos + 2, INT8OID));
+				continue;
+			}
+			appendStringInfo(&aggs, "{\"fn\":\"%s%s\",\"arg\":", fn ? fn : name,
+							 !fn && combine && strcmp(name, "count") == 0 ? "_merge" : "");
 
 			/*
 			 * A combining aggregate keeps aggstar from the original call

@@ -77,15 +77,15 @@ EXPLAIN (COSTS OFF) SELECT a, b FROM df_m5 WHERE a % 50000 = 0;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_m5;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_m5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of aggregate avg
- DataFusion: slice 1 not eligible: partial aggregate avg
+ DataFusion: slice 0 not eligible: combining aggregate avg without batch Motions
+ DataFusion: slice 1 not eligible: partial aggregate avg without batch Motions
 (7 rows)
 
 -- Partial plain aggregate on the segments, finalized on the coordinator.
@@ -108,24 +108,24 @@ SET datafusion.mode = off;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
+ 95 |  2000 | 200090000 | 23.75
+ 98 |  2000 | 200096000 |  24.5
+ 96 |  2000 | 200092000 |    24
     |     1 |           |      
  99 |  2000 | 200098000 | 24.75
  97 |  2000 | 200094000 | 24.25
- 96 |  2000 | 200092000 |    24
- 95 |  2000 | 200090000 | 23.75
- 98 |  2000 | 200096000 |  24.5
 (6 rows)
 
 SET datafusion.mode = on;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
+ 98 |  2000 | 200096000 |  24.5
+ 95 |  2000 | 200090000 | 23.75
+ 96 |  2000 | 200092000 |    24
+    |     1 |           |      
  97 |  2000 | 200094000 | 24.25
  99 |  2000 | 200098000 | 24.75
-    |     1 |           |      
- 95 |  2000 | 200090000 | 23.75
- 98 |  2000 | 200096000 |  24.5
- 96 |  2000 | 200092000 |    24
 (6 rows)
 
 -- Grouping by the distribution key: one stage on the segments.
@@ -147,10 +147,10 @@ SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY 
 --------+-------+---------
   80000 |     1 |  800000
  120000 |     1 | 1200000
-  40000 |     1 |  400000
- 200000 |     1 | 2000000
  160000 |     1 | 1600000
         |     1 |        
+  40000 |     1 |  400000
+ 200000 |     1 | 2000000
 (6 rows)
 
 -- A filter and projection, gathered.
@@ -158,10 +158,10 @@ SET datafusion.mode = off;
 SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
    a    |    b    | ?column? | ?column? 
 --------+---------+----------+----------
- 150000 | 1500000 |    75000 |        1
   50000 |  500000 |    25000 |        1
  200000 | 2000000 |   100000 |        1
  100000 | 1000000 |    50000 |        1
+ 150000 | 1500000 |    75000 |        1
 (4 rows)
 
 SET datafusion.mode = on;
@@ -169,9 +169,9 @@ SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
    a    |    b    | ?column? | ?column? 
 --------+---------+----------+----------
  100000 | 1000000 |    50000 |        1
- 150000 | 1500000 |    75000 |        1
   50000 |  500000 |    25000 |        1
  200000 | 2000000 |   100000 |        1
+ 150000 | 1500000 |    75000 |        1
 (4 rows)
 
 -- The scan below the partial aggregate never runs on PostgreSQL.
@@ -192,7 +192,7 @@ SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
 
 -- An error on a segment carries PostgreSQL's SQLSTATE and message.
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=66261)
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=89058)
 \set VERBOSITY sqlstate
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
 ERROR:  22012

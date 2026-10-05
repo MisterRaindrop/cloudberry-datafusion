@@ -69,15 +69,15 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_rcv GROUP BY e;
 -- avg's transition state is an array; DISTINCT aggregates nest two
 -- aggregates; a slice that only receives has nothing to compute.
 EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_rcv;
-                             QUERY PLAN                             
---------------------------------------------------------------------
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_rcv
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of aggregate avg
- DataFusion: slice 1 not eligible: partial aggregate avg
+ DataFusion: slice 0 not eligible: combining aggregate avg without batch Motions
+ DataFusion: slice 1 not eligible: partial aggregate avg without batch Motions
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT e) FROM df_rcv;
@@ -137,12 +137,12 @@ SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count | count |    sum    |  min  |   max   
 ----+-------+-------+-----------+-------+---------
- 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
- 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
- 96 |  2000 |  2000 | 200092000 |    24 | 1999960
     |     1 |     0 |           |       |        
  99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
  97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
+ 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
+ 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
 (6 rows)
 
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
@@ -162,19 +162,19 @@ WHERE e >= 95 OR e IS NULL GROUP BY e;
 ----+-------+-------+-----------+-------+---------
  95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
  98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
-    |     1 |     0 |           |       |        
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
  97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
  99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
- 96 |  2000 |  2000 | 200092000 |    24 | 1999960
+    |     1 |     0 |           |       |        
 (6 rows)
 
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
  e  | count 
 ----+-------
- 97 |  2000
  99 |  2000
-  0 |  2000
+ 97 |  2000
  98 |  2000
+  0 |  2000
  96 |  2000
 (5 rows)
 
@@ -232,12 +232,12 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
 SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
-    |     1 |           |      
- 99 |  2000 | 200098000 | 24.75
- 97 |  2000 | 200094000 | 24.25
  98 |  2000 | 200096000 |  24.5
  95 |  2000 | 200090000 | 23.75
  96 |  2000 | 200092000 |    24
+    |     1 |           |      
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
 (6 rows)
 
 SET datafusion.mode = on;
@@ -254,8 +254,8 @@ SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP 
  99 |  2000 | 200098000 | 24.75
  97 |  2000 | 200094000 | 24.25
     |     1 |           |      
- 98 |  2000 | 200096000 |  24.5
  95 |  2000 | 200090000 | 23.75
+ 98 |  2000 | 200096000 |  24.5
 (6 rows)
 
 SET optimizer = off;

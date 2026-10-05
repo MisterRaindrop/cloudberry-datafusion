@@ -117,6 +117,9 @@ extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */
 /* M7b: Gather Motions between DataFusion slices carry Arrow IPC batches */
 extern bool df_motion_batches;	/* GUC datafusion.motion_batches */
 extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);
+extern Bitmapset *df_batch_motions(PlannedStmt *stmt);
+extern bool df_motion_state_column(Motion *motion, AttrNumber resno);
+extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern uint64 df_motion_signature(Motion *motion);
 extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **tag);
 
