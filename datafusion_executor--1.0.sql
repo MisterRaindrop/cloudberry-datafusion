@@ -77,3 +77,27 @@ AS 'MODULE_PATHNAME', 'datafusion_debug_takeovers'
 LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION datafusion_debug_takeovers() FROM PUBLIC;
+
+-- Memory test functions (M4): figures of the latest slice DataFusion ran to
+-- the end in this backend, and the backend's vmem lease for Rust's heap.
+CREATE FUNCTION datafusion_debug_last_run(OUT partitions int8, OUT memory_limit_kb int8,
+                                          OUT memory_peak_kb int8, OUT spilled_kb int8,
+                                          OUT spills int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'datafusion_debug_last_run'
+LANGUAGE C VOLATILE;
+
+CREATE FUNCTION datafusion_debug_vmem(OUT heap_bytes int8, OUT leased_bytes int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'datafusion_debug_vmem'
+LANGUAGE C VOLATILE;
+
+-- Run one vmem lease step with the given headroom; returns the bytes leased.
+CREATE FUNCTION datafusion_debug_vmem_lease(headroom int8)
+RETURNS int8
+AS 'MODULE_PATHNAME', 'datafusion_debug_vmem_lease'
+LANGUAGE C STRICT VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_last_run() FROM PUBLIC;
+REVOKE ALL ON FUNCTION datafusion_debug_vmem() FROM PUBLIC;
+REVOKE ALL ON FUNCTION datafusion_debug_vmem_lease(int8) FROM PUBLIC;

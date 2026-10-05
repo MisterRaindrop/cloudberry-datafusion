@@ -48,6 +48,54 @@ PG_FUNCTION_INFO_V1(datafusion_debug_spin);
 PG_FUNCTION_INFO_V1(datafusion_debug_worker_panic);
 PG_FUNCTION_INFO_V1(datafusion_debug_active_tasks);
 PG_FUNCTION_INFO_V1(datafusion_debug_runtime_threads);
+PG_FUNCTION_INFO_V1(datafusion_debug_last_run);
+PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
+PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
+
+static Datum
+df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
+{
+	TupleDesc	tupdesc;
+	Datum		values[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	int			i;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	for (i = 0; i < n; i++)
+		values[i] = Int64GetDatum(v[i]);
+	tupdesc = BlessTupleDesc(tupdesc);
+	return HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls));
+}
+
+/*
+ * datafusion_debug_last_run(OUT partitions int8, OUT memory_limit_kb int8,
+ *                           OUT memory_peak_kb int8, OUT spilled_kb int8,
+ *                           OUT spills int8)
+ */
+Datum
+datafusion_debug_last_run(PG_FUNCTION_ARGS)
+{
+	int64		v[5];
+
+	v[0] = (int64) df_last_run.partitions;
+	v[1] = (int64) (df_last_run.memory_limit / 1024);
+	v[2] = (int64) ((df_last_run.memory_peak + 1023) / 1024);
+	v[3] = (int64) ((df_last_run.spilled_bytes + 1023) / 1024);
+	v[4] = (int64) df_last_run.spill_count;
+	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
+}
+
+/* datafusion_debug_vmem(OUT heap_bytes int8, OUT leased_bytes int8) */
+Datum
+datafusion_debug_vmem(PG_FUNCTION_ARGS)
+{
+	int64		v[2];
+
+	v[0] = df_ffi_heap_bytes();
+	v[1] = df_vmem_leased_bytes();
+	PG_RETURN_DATUM(df_int8_record(fcinfo, 2, v));
+}
 
 static text *
 df_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
@@ -188,4 +236,27 @@ datafusion_debug_runtime_threads(PG_FUNCTION_ARGS)
 	values[1] = BoolGetDatum(all_blocked);
 	tupdesc = BlessTupleDesc(tupdesc);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * datafusion_debug_vmem_lease(headroom int8) returns int8
+ *
+ * Run the lease step a query runs between waits, with the given headroom,
+ * and return the bytes leased.  Lets tests reach the vmem tracker's limits,
+ * which Cloudberry enforces on QEs only.
+ */
+Datum
+datafusion_debug_vmem_lease(PG_FUNCTION_ARGS)
+{
+	int64		headroom = PG_GETARG_INT64(0);
+	int64		leased;
+
+	if (headroom < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("headroom must not be negative")));
+	df_vmem_sync(headroom);
+	leased = df_vmem_leased_bytes();
+	df_vmem_trim();
+	PG_RETURN_INT64(leased);
 }

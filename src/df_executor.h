@@ -63,6 +63,8 @@ typedef struct DfSliceSpec
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
 						   char *reason, size_t reasonlen);
+extern uint64 df_runs_completed;	/* slices DataFusion ran to the end */
+extern DfQueryStats df_last_run;	/* figures of the latest one */
 
 /* df_translate.c */
 extern const char *df_type_tag(Oid type);
@@ -81,6 +83,10 @@ extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);
 
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);
+extern const char *df_spill_dir(void);
+extern void df_vmem_sync(int64 headroom);
+extern void df_vmem_trim(void);
+extern int64 df_vmem_leased_bytes(void);
 extern int32 df_task_wait_interruptible(DfTask *task, char *buf, size_t buflen);
 
 #endif							/* DF_EXECUTOR_H */

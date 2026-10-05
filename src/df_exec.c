@@ -37,6 +37,18 @@
  * query's memory context, so it goes away however the query ends; an error
  * needs no PG_TRY here.
  *
+ * Memory follows Cloudberry's rules (M4):
+ *
+ *   - the slice's operator budget is what the Agg node would get from the
+ *     executor, min(operatorMemKB, work_mem) * hash_mem_multiplier, or
+ *     work_mem for a scan alone; it becomes the DataFusion pool's limit, and
+ *     hash aggregation spills to this backend's temporary directory instead
+ *     of growing past it;
+ *   - everything Rust allocates is leased from the vmem tracker between
+ *     waits (df_vmem_sync), so per-query and segment memory limits apply;
+ *   - the peak and the spill volume go into the top node's Instrumentation
+ *     and, for EXPLAIN ANALYZE, onto a DataFusion line.
+ *
  * src/df_exec.c
  *
  *-------------------------------------------------------------------------
@@ -46,6 +58,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "utils/memutils.h"
@@ -62,6 +75,12 @@
 /* Wait this long when the input queue was full. */
 #define DF_POLL_FULL_MS		1
 
+/* The vmem lease runs ahead of Rust's heap by budget/8, at least this much. */
+#define DF_MIN_HEADROOM		(1024 * 1024)
+
+uint64		df_runs_completed = 0;
+DfQueryStats df_last_run;
+
 typedef struct DfExec
 {
 	PlanState  *root;			/* the slice's top node; its ExecProcNode is ours */
@@ -69,6 +88,8 @@ typedef struct DfExec
 	EState	   *estate;
 	DfSliceSpec spec;
 	int			maxattno;		/* highest table column we read */
+	int64		memory_limit;	/* operator memory budget, bytes */
+	int64		headroom;		/* vmem lease ahead of the heap, bytes */
 
 	DfQuery    *query;			/* NULL until the first row is requested */
 	TableScanDesc scandesc;
@@ -122,6 +143,7 @@ df_exec_release(void *arg)
 	{
 		df_ffi_query_free(x->query);
 		x->query = NULL;
+		df_vmem_trim();
 	}
 	for (link = &df_execs; *link != NULL; link = &(*link)->next)
 	{
@@ -146,16 +168,60 @@ df_exec_lookup(PlanState *pstate)
 }
 
 static void
-df_raise_query(int32 status, const char *sqlstate, const char *msg)
+df_raise_query(int32 status, const char *sqlstate, char *msg)
 {
+	char	   *detail = strchr(msg, '\n');
+
 	if (status == DF_PANIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion panicked: %s", msg)));
+	if (detail)
+		*detail++ = '\0';
 	ereport(ERROR,
 			(errcode(MAKE_SQLSTATE(sqlstate[0], sqlstate[1], sqlstate[2],
 								   sqlstate[3], sqlstate[4])),
-			 errmsg("%s", msg)));
+			 errmsg("%s", msg),
+			 detail ? errdetail("%s", detail) : 0));
+}
+
+/*
+ * Operator memory budget of the slice, in bytes: what the executor would
+ * give its Agg node (see hash_agg_set_limits in nodeAgg.c), or work_mem for
+ * a scan alone.
+ */
+static int64
+df_slice_memory(PlanState *root)
+{
+	double		kb = work_mem;
+
+	if (IsA(root, AggState))
+	{
+		uint64		op = PlanStateOperatorMemKB(root);
+
+		if (op < kb)
+			kb = op;
+		kb *= hash_mem_multiplier;
+	}
+	return (int64) (kb * 1024.0);
+}
+
+/* The query produced all its rows: keep its figures. */
+static void
+df_exec_finished(DfExec *x)
+{
+	DfQueryStats s;
+
+	df_ffi_query_stats(x->query, &s);
+	df_last_run = s;
+	df_runs_completed++;
+
+	if (x->root->instrument)
+	{
+		x->root->instrument->workmemused = (double) s.memory_peak;
+		if (s.spilled_bytes > 0)
+			x->root->instrument->workmemwanted = (double) (s.memory_peak + s.spilled_bytes);
+	}
 }
 
 static void
@@ -168,13 +234,15 @@ df_exec_begin(DfExec *x)
 	Relation	rel = x->scan->ss.ss_currentRelation;
 
 	workers = df_runtime_ensure();
-	status = df_ffi_query_start(x->spec.json, (uint32_t) workers, &x->query,
-								sqlstate, buf, sizeof(buf));
+	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
+								(uint64_t) x->memory_limit, df_spill_dir(),
+								&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
 		x->query = NULL;
 		df_raise_query(status, sqlstate, buf);
 	}
+	df_vmem_sync(x->headroom);
 
 	x->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
 	x->scan->ss.ss_currentScanDesc = x->scandesc;	/* ExecEndSeqScan closes it */
@@ -343,10 +411,14 @@ df_exec_next(DfExec *x)
 			x->out_row = 0;
 		}
 		else if (status == DF_DONE)
+		{
 			x->done = true;
+			df_exec_finished(x);
+		}
 		else if (status != DF_PENDING)
 			df_raise_query(status, sqlstate, buf);
 
+		df_vmem_sync(x->headroom);
 		CHECK_FOR_INTERRUPTS();
 	}
 }
@@ -389,6 +461,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reaso
 	x->root = root;
 	x->scan = (SeqScanState *) scanps;
 	x->estate = estate;
+	x->memory_limit = df_slice_memory(root);
+	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);
 
 	x->invalues = palloc0(sizeof(char *) * Max(x->spec.nscan, 1));
 	x->innulls = palloc0(sizeof(uint8 *) * Max(x->spec.nscan, 1));

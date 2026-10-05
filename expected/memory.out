@@ -1,0 +1,122 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Memory (M4): the slice's operator budget bounds DataFusion's pool, hash
+-- aggregation spills instead of failing, and Rust's heap is leased from
+-- Cloudberry's vmem tracker.
+--
+CREATE EXTENSION datafusion_executor;
+\! PGOPTIONS='-c gp_role=utility' psql -X -a -q -d contrib_regression -f data/memory_utility.sql 2>&1
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Body of the memory test, run in utility mode on the coordinator by
+-- sql/memory.sql (a coordinator-local table gives a single-slice plan).
+--
+LOAD 'datafusion_executor';
+CREATE TABLE df_m4 AS SELECT i AS a, i % 7 AS b FROM generate_series(1, 300000) i;
+INSERT INTO df_m4 SELECT i, 0 FROM generate_series(1, 5) i;
+-- 300,000 groups do not fit in a 2 MB budget (work_mem * hash_mem_multiplier),
+-- so PostgreSQL and DataFusion both spill.  PostgreSQL first, then
+-- DataFusion: the rows must match.  The budget runs on one partition.
+SET work_mem = '1MB';
+SET datafusion.mode = off;
+SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
+ a | count | sum 
+---+-------+-----
+ 5 |     2 |   5
+ 4 |     2 |   4
+ 2 |     2 |   2
+ 1 |     2 |   1
+ 3 |     2 |   3
+(5 rows)
+
+SET datafusion.mode = on;
+SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
+ a | count | sum 
+---+-------+-----
+ 1 |     2 |   1
+ 2 |     2 |   2
+ 3 |     2 |   3
+ 4 |     2 |   4
+ 5 |     2 |   5
+(5 rows)
+
+SELECT partitions, memory_limit_kb, spilled_kb > 0 AS spilled, spills > 0 AS spills
+FROM datafusion_debug_last_run();
+ partitions | memory_limit_kb | spilled | spills 
+------------+-----------------+---------+--------
+          1 |            2048 | t       | t
+(1 row)
+
+-- A budget the groups fit in: no spill.
+SET work_mem = '64MB';
+SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
+ a | count | sum 
+---+-------+-----
+ 4 |     2 |   4
+ 2 |     2 |   2
+ 5 |     2 |   5
+ 1 |     2 |   1
+ 3 |     2 |   3
+(5 rows)
+
+SELECT memory_limit_kb, spilled_kb, spills FROM datafusion_debug_last_run();
+ memory_limit_kb | spilled_kb | spills 
+-----------------+------------+--------
+          131072 |          0 |      0
+(1 row)
+
+-- The backend's vmem lease covers Rust's heap.
+SELECT leased_bytes >= heap_bytes AS covered FROM datafusion_debug_vmem();
+ covered 
+---------
+ t
+(1 row)
+
+DROP TABLE df_m4;
+-- Cloudberry enforces vmem limits on QEs.  A 1 TB lease exceeds
+-- gp_vmem_protect_limit and fails like an allocation would; afterwards the
+-- lease bookkeeping is intact and ordinary leases succeed.
+\set VERBOSITY sqlstate
+SELECT datafusion_debug_vmem_lease(1::int8 << 40) FROM gp_dist_random('gp_id');
+ERROR:  53500
+\set VERBOSITY default
+SELECT gp_segment_id, datafusion_debug_vmem_lease(64::int8 << 20) >= 64::int8 << 20 AS leased
+FROM gp_dist_random('gp_id');
+ gp_segment_id | leased 
+---------------+--------
+             0 | t
+             1 | t
+             2 | t
+(3 rows)
+
+DROP EXTENSION datafusion_executor;

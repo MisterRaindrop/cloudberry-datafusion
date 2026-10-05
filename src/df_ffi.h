@@ -88,7 +88,9 @@ typedef struct DfColumn
 	const uint8_t *nulls;
 } DfColumn;
 
+/* The message may be followed by a newline and an error detail. */
 extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
+								  uint64_t memory_limit, const char *spill_dir,
 								  DfQuery **out_query, char *sqlstate,
 								  char *buf, size_t buflen);
 extern int32_t df_ffi_query_push(DfQuery *query, const DfColumn *cols,
@@ -100,5 +102,19 @@ extern int32_t df_ffi_query_poll(DfQuery *query, uint32_t timeout_ms,
 								 char *buf, size_t buflen);
 extern int32_t df_ffi_query_column(DfQuery *query, uint32_t col, DfColumn *out);
 extern void df_ffi_query_free(DfQuery *query);
+
+typedef struct DfQueryStats
+{
+	uint64_t	partitions;		/* partitions the plan ran with */
+	uint64_t	memory_limit;	/* operator memory budget, bytes */
+	uint64_t	memory_peak;	/* peak reserved from the pool, bytes */
+	uint64_t	spilled_bytes;
+	uint64_t	spill_count;
+} DfQueryStats;
+
+extern void df_ffi_query_stats(DfQuery *query, DfQueryStats *out);
+
+/* Live bytes allocated by Rust code in this process, on any thread. */
+extern int64_t df_ffi_heap_bytes(void);
 
 #endif							/* DF_FFI_H */

@@ -35,8 +35,12 @@
 #include <pthread.h>
 #include <signal.h>
 
+#include "catalog/pg_tablespace_d.h"
+#include "common/file_utils.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
+#include "utils/vmem_tracker.h"
 
 #include "df_executor.h"
 
@@ -55,6 +59,12 @@ int			df_worker_threads = 0;
 static pid_t df_runtime_pid = 0;
 static int	df_runtime_workers = 0;
 
+/* Bytes this backend has reserved from the vmem tracker for Rust's heap. */
+static int64 df_vmem_leased = 0;
+
+/* This backend's directory for DataFusion spill files, once created. */
+static char df_spill_path[MAXPGPATH];
+
 static void
 df_runtime_atexit(int code, Datum arg)
 {
@@ -63,6 +73,112 @@ df_runtime_atexit(int code, Datum arg)
 		df_ffi_runtime_shutdown(DF_SHUTDOWN_TIMEOUT_MS);
 		df_runtime_pid = 0;
 	}
+	if (df_spill_path[0] != '\0')
+	{
+		(void) rmtree(df_spill_path, true);
+		df_spill_path[0] = '\0';
+	}
+}
+
+/*
+ * Directory for this backend's DataFusion spill files, created on first use
+ * in the default temporary-file directory.  Its name starts with the
+ * temporary-file prefix, so the postmaster removes it with the other
+ * temporary files after a crash; a normal backend exit removes it.
+ */
+const char *
+df_spill_dir(void)
+{
+	char		parent[MAXPGPATH];
+
+	if (df_spill_path[0] != '\0')
+		return df_spill_path;
+
+	TempTablespacePath(parent, DEFAULTTABLESPACE_OID);
+	(void) MakePGDirectory(parent);	/* usually exists already */
+	snprintf(df_spill_path, sizeof(df_spill_path), "%s/%s/%s_datafusion_%d",
+			 DataDir, parent, PG_TEMP_FILE_PREFIX, (int) MyProcPid);
+	if (MakePGDirectory(df_spill_path) < 0 && errno != EEXIST)
+	{
+		int			save_errno = errno;
+		char		path[MAXPGPATH];
+
+		strlcpy(path, df_spill_path, sizeof(path));
+		df_spill_path[0] = '\0';
+		errno = save_errno;
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", path)));
+	}
+	return df_spill_path;
+}
+
+/* Report a failed vmem reservation the way Cloudberry's allocator does. */
+static void
+df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
+{
+	if (status == MemoryFailure_QueryMemoryExhausted)
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_MEMPROT_KILL),
+				 errmsg("Out of memory"),
+				 errdetail("Per-query memory limit reached: current limit is %d kB, "
+						   "requested " INT64_FORMAT " bytes, has %d MB available for this query",
+						   gp_vmem_limit_per_query, bytes,
+						   VmemTracker_GetAvailableQueryVmemMB())));
+	if (status == MemoryFailure_VmemExhausted)
+		ereport(ERROR,
+				(errcode(ERRCODE_GP_MEMPROT_KILL),
+				 errmsg("Out of memory"),
+				 errdetail("Vmem limit reached, failed to allocate " INT64_FORMAT
+						   " bytes from tracker, which has %d MB available",
+						   bytes, VmemTracker_GetAvailableVmemMB())));
+	ereport(ERROR,
+			(errcode(ERRCODE_GP_MEMPROT_KILL),
+			 errmsg("Out of memory"),
+			 errdetail("Could not reserve " INT64_FORMAT " bytes of vmem for DataFusion.",
+					   bytes)));
+}
+
+/*
+ * Keep the vmem lease at least 'headroom' bytes above what Rust has
+ * allocated in this process.  The runtime's threads allocate without asking
+ * anyone, so the main thread leases ahead of them: it calls this between
+ * waits, and the headroom covers what the threads allocate in between.
+ * Fails the query, like an allocation would, when the tracker says no.
+ */
+void
+df_vmem_sync(int64 headroom)
+{
+	int64		want = Max(df_ffi_heap_bytes(), 0) + headroom;
+
+	if (want > df_vmem_leased)
+	{
+		int64		more = want - df_vmem_leased;
+		MemoryAllocationStatus status = VmemTracker_ReserveVmem(more);
+
+		if (status != MemoryAllocation_Success)
+			df_vmem_failed(status, more);
+		df_vmem_leased = want;
+	}
+}
+
+/* Give back the part of the lease Rust no longer uses. */
+void
+df_vmem_trim(void)
+{
+	int64		want = Max(df_ffi_heap_bytes(), 0);
+
+	if (want < df_vmem_leased)
+	{
+		VmemTracker_ReleaseVmem(df_vmem_leased - want);
+		df_vmem_leased = want;
+	}
+}
+
+int64
+df_vmem_leased_bytes(void)
+{
+	return df_vmem_leased;
 }
 
 /*

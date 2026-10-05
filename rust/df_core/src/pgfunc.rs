@@ -52,11 +52,16 @@ use datafusion::logical_expr::{
 pub struct PgError {
     pub sqlstate: &'static str,
     pub message: String,
+    pub detail: Option<String>,
 }
 
 impl PgError {
     pub fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
-        PgError { sqlstate, message: message.into() }
+        PgError { sqlstate, message: message.into(), detail: None }
+    }
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
     pub fn internal(message: impl Into<String>) -> Self {
         PgError::new("XX000", message)
@@ -92,6 +97,11 @@ pub fn to_pg_error(e: &DataFusionError) -> PgError {
         }
         if let Some(ArrowError::DivideByZero) = err.downcast_ref::<ArrowError>() {
             return PgError::new(DIVISION_BY_ZERO, "division by zero");
+        }
+        if let Some(DataFusionError::ResourcesExhausted(msg)) = err.downcast_ref::<DataFusionError>() {
+            // The operator could not stay within the slice's memory budget
+            // and could not spill.
+            return PgError::new("53200", "out of memory").with_detail(format!("DataFusion: {msg}"));
         }
         cur = err.source();
     }

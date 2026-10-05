@@ -57,7 +57,10 @@ use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::ScalarValue;
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{binary_expr, when, Expr, LogicalPlanBuilder, Operator};
@@ -71,6 +74,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
 use crate::runtime;
 
@@ -79,6 +83,13 @@ pub const BATCH_ROWS: usize = 8192;
 
 /// Batches buffered in each direction.
 const CHANNEL_DEPTH: usize = 4;
+
+/// Operator memory each partition needs at least.  The pool is shared
+/// fairly among the operators that can spill, two per partition for a
+/// grouped aggregate (partial and final); a final aggregate's first
+/// allocation alone is a few hundred kB.  A small budget therefore runs on
+/// fewer partitions instead of starving all of them.
+const MIN_PARTITION_MEMORY: usize = 2 << 20;
 
 /// The PostgreSQL types a slice can carry so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -318,9 +329,17 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
 /// the guard that keeps PostgreSQL from dividing by zero (see `expr`).  The
 /// plan comes from PostgreSQL's planner, which has already folded constants
 /// and simplified expressions, so little is lost.
-fn session_state(config: SessionConfig) -> SessionState {
+fn session_state(config: SessionConfig, pool: Arc<TrackingPool>, spill_dir: &str) -> Result<SessionState, DataFusionError> {
+    let runtime_env = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .with_disk_manager_builder(
+            DiskManagerBuilder::default()
+                .with_mode(DiskManagerMode::Directories(vec![spill_dir.into()])),
+        )
+        .build_arc()?;
     let state = SessionStateBuilder::new()
         .with_config(config)
+        .with_runtime_env(runtime_env)
         .with_default_features()
         .build();
     let rules: Vec<_> = state
@@ -329,9 +348,9 @@ fn session_state(config: SessionConfig) -> SessionState {
         .filter(|r| r.name() != "simplify_expressions")
         .cloned()
         .collect();
-    SessionStateBuilder::new_from_existing(state)
+    Ok(SessionStateBuilder::new_from_existing(state)
         .with_optimizer_rules(rules)
-        .build()
+        .build())
 }
 
 /// Single-use stream fed by the main thread.
@@ -375,11 +394,36 @@ pub struct Query {
     out_types: Vec<PgType>,
     task: Option<JoinHandle<()>>,
     current: Vec<OutColumn>,
+    pool: Arc<TrackingPool>,
+    physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
+    partitions: usize,
+}
+
+/// Memory and spill figures of a query, for EXPLAIN ANALYZE.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct QueryStats {
+    pub partitions: u64,
+    pub memory_limit: u64,
+    pub memory_peak: u64,
+    pub spilled_bytes: u64,
+    pub spill_count: u64,
+}
+
+fn add_spills(plan: &Arc<dyn ExecutionPlan>, stats: &mut QueryStats) {
+    if let Some(m) = plan.metrics() {
+        stats.spilled_bytes += m.spilled_bytes().unwrap_or(0) as u64;
+        stats.spill_count += m.spill_count().unwrap_or(0) as u64;
+    }
+    for child in plan.children() {
+        add_spills(child, stats);
+    }
 }
 
 impl Query {
-    /// Build the plan described by `spec` and start running it.
-    pub fn start(spec: &str, partitions: usize) -> Result<Query, PgError> {
+    /// Build the plan described by `spec` and start running it with
+    /// `partitions` partitions, an operator memory budget of `memory_limit`
+    /// bytes, and spill files under `spill_dir`.
+    pub fn start(spec: &str, partitions: usize, memory_limit: usize, spill_dir: &str) -> Result<Query, PgError> {
         let handle = runtime::handle()
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
         let spec: Value = serde_json::from_str(spec)
@@ -446,16 +490,23 @@ impl Query {
         }
         let plan = b.project(out_exprs).map_err(df)?.build().map_err(df)?;
 
+        let partitions = partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1));
         let config = SessionConfig::new()
-            .with_target_partitions(partitions.max(1))
+            .with_target_partitions(partitions)
             .with_batch_size(BATCH_ROWS);
-        let ctx = SessionContext::new_with_state(session_state(config));
+        let pool = Arc::new(TrackingPool::new(memory_limit.max(1)));
+        let ctx = SessionContext::new_with_state(session_state(config, pool.clone(), spill_dir).map_err(df)?);
         let (out_tx, out_rx) = mpsc::channel(CHANNEL_DEPTH);
+        let physical_slot: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>> = Arc::new(Mutex::new(None));
+        let slot = physical_slot.clone();
 
         let task = handle.spawn(async move {
             let run = async {
                 let state = ctx.state();
                 let physical = state.create_physical_plan(&plan).await?;
+                if let Ok(mut s) = slot.lock() {
+                    *s = Some(physical.clone());
+                }
                 let mut stream = execute_stream(physical, ctx.task_ctx())?;
                 while let Some(batch) = stream.next().await {
                     let batch = batch?;
@@ -479,7 +530,26 @@ impl Query {
             out_types,
             task: Some(task),
             current: Vec::new(),
+            pool,
+            physical: physical_slot,
+            partitions,
         })
+    }
+
+    /// Memory and spill figures so far.
+    pub fn stats(&self) -> QueryStats {
+        let mut s = QueryStats {
+            partitions: self.partitions as u64,
+            memory_limit: self.pool.limit() as u64,
+            memory_peak: self.pool.peak() as u64,
+            ..Default::default()
+        };
+        if let Ok(slot) = self.physical.lock() {
+            if let Some(p) = slot.as_ref() {
+                add_spills(p, &mut s);
+            }
+        }
+        s
     }
 
     pub fn num_input_columns(&self) -> usize {
@@ -647,8 +717,13 @@ mod tests {
     use super::*;
 
     fn run(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize) -> Result<Vec<Vec<Option<i64>>>, PgError> {
+        run_with(spec, input, nrows, 64 << 20)
+    }
+
+    fn run_with(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize, limit: usize) -> Result<Vec<Vec<Option<i64>>>, PgError> {
         runtime::init(2).unwrap();
-        let mut q = Query::start(spec, 2)?;
+        let dir = std::env::temp_dir();
+        let mut q = Query::start(spec, 2, limit, dir.to_str().unwrap())?;
         let cols: Vec<RawColumn> = input
             .iter()
             .map(|(v, n)| RawColumn { values: v.as_ptr() as *const u8, nulls: n.as_ptr() })
@@ -729,6 +804,60 @@ mod tests {
         // the third, exactly as PostgreSQL would; so leave it out.
         let rows = run(&spec, vec![(vec![0, 2, 3, 4, 5, 6, 7, 8, 9, 10], vec![0; 10])], 10).unwrap();
         assert_eq!(rows, vec![vec![Some(9)]]);
+    }
+
+    #[test]
+    fn grouping_spills_within_a_small_budget() {
+        // 200,000 distinct keys, grouped under a 1 MB budget.
+        runtime::init(2).unwrap();
+        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+            "aggregate":{"group":[{"col":0}],"aggs":[{"fn":"count"}]},"having":null,
+            "output":[{"expr":{"group":0},"type":"int8"},{"expr":{"agg":0},"type":"int8"}]}"#;
+        let dir = std::env::temp_dir();
+        let mut q = Query::start(spec, 2, 1 << 20, dir.to_str().unwrap()).unwrap();
+        let n = 200_000usize;
+        let values: Vec<i32> = (0..n as i32).collect();
+        let nulls = vec![0u8; n];
+        let mut off = 0;
+        while off < n {
+            let len = BATCH_ROWS.min(n - off);
+            let col = RawColumn {
+                values: unsafe { (values.as_ptr() as *const u8).add(off * 4) },
+                nulls: unsafe { nulls.as_ptr().add(off) },
+            };
+            if unsafe { q.push(&[col], len) }.unwrap() {
+                off += len;
+            } else {
+                let _ = q.poll(Duration::from_millis(1));
+            }
+        }
+        q.finish_input();
+        let (mut groups, mut total) = (0usize, 0i64);
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(rows) => {
+                    let c = q.output_column(1).unwrap();
+                    for r in 0..rows {
+                        total += unsafe { *(c.values as *const i64).add(r) };
+                    }
+                    groups += rows;
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+            }
+        }
+        assert_eq!(groups, n);
+        assert_eq!(total, n as i64);
+        // The limit makes the aggregate spill.  It is not a hard cap on the
+        // pool: reservations DataFusion cannot refuse (merging the spilled
+        // runs) may go past it, so the peak is not asserted.  The hard limit
+        // is Cloudberry's vmem tracker, which the backend leases from for
+        // the whole Rust heap.
+        let s = q.stats();
+        assert_eq!(s.memory_limit, 1 << 20);
+        assert!(s.spill_count > 0 && s.spilled_bytes > 0, "expected spills: {s:?}");
     }
 
     #[test]

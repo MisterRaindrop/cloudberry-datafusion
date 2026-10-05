@@ -19,6 +19,7 @@
 //! PostgreSQL or C; `df_ffi` is the only bridge.
 
 pub mod debug;
+pub mod memory;
 pub mod pgfunc;
 pub mod query;
 pub mod runtime;

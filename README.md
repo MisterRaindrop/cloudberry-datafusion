@@ -79,12 +79,41 @@ Known differences:
   partial sums in a different order.
 - `EXPLAIN ANALYZE` counts rows for the slice's top node only; the nodes
   below it show as never executed.
-- DataFusion's memory use is not yet bounded by Cloudberry's memory limits
-  (milestone M4).
+- DataFusion's spill files live in the backend's temporary directory but
+  are not yet counted by Cloudberry's workfile limits.
+
+Milestone M4 puts DataFusion's memory under Cloudberry's control:
+
+- **Operator budget.** A slice gets what the executor would give its Agg
+  node, `min(operatorMemKB, work_mem) * hash_mem_multiplier`, or `work_mem`
+  for a scan alone.  That is the limit of the DataFusion memory pool.  Hash
+  aggregation spills to a directory in the backend's temporary-file area
+  instead of growing past it, as PostgreSQL's hash aggregation does; the
+  directory is removed when the backend exits, and after a crash with the
+  other temporary files.  The limit is soft for reservations DataFusion
+  cannot refuse, such as merging spilled runs.  A small budget runs on fewer
+  partitions (at least 2 MB each) instead of starving all of them.
+- **Vmem.** A counting allocator tracks every byte Rust allocates in the
+  backend.  Between waits the main thread leases that amount plus
+  budget/8 of headroom from Cloudberry's vmem tracker, and gives back the
+  unused part when a query ends.  On QEs, where Cloudberry enforces vmem
+  limits, a refused lease fails the query with the same error as a refused
+  allocation (`Out of memory`, SQLSTATE 53500).
+- **EXPLAIN ANALYZE.** The top node's Instrumentation carries the peak pool
+  use and, after spilling, the memory that would have avoided it, so
+  Cloudberry's slice statistics show `Work_mem: ... max, ... wanted`.  A
+  DataFusion line adds partitions, limit, peak and spill volume:
+
+```
+ DataFusion: 1 partitions, memory limit 2048 kB, peak 2625 kB, spilled 146510 kB in 72 files
+```
 
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
-1.41 s on the PostgreSQL executor, with identical results.
+1.41 s on the PostgreSQL executor, with identical results (0.50 s once the
+counting allocator was added in M4).  Grouping 2 million distinct keys with
+`work_mem = 1MB` spills in both engines and took 0.34 s in DataFusion and
+0.60 s in PostgreSQL.
 
 | Milestone | Scope |
 |---|---|

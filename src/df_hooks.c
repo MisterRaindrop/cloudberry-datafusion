@@ -182,6 +182,7 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 				planduration;
 	BufferUsage bufusage_start,
 				bufusage;
+	uint64		runs_before;
 
 	if (prev_ExplainOneQuery)
 	{
@@ -208,12 +209,25 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
 	}
 
+	runs_before = df_runs_completed;
 	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
 				   cursorOptions);
 
 	if (df_mode != DF_MODE_OFF && es->format == EXPLAIN_FORMAT_TEXT)
+	{
 		df_explain_slices(plan, es->str);
+		if (es->analyze && df_runs_completed != runs_before)
+			appendStringInfo(es->str,
+							 "DataFusion: " UINT64_FORMAT " partitions, memory limit "
+							 UINT64_FORMAT " kB, peak " UINT64_FORMAT " kB, spilled "
+							 UINT64_FORMAT " kB in " UINT64_FORMAT " files\n",
+							 df_last_run.partitions,
+							 df_last_run.memory_limit / 1024,
+							 (df_last_run.memory_peak + 1023) / 1024,
+							 (df_last_run.spilled_bytes + 1023) / 1024,
+							 df_last_run.spill_count);
+	}
 }
 
 void

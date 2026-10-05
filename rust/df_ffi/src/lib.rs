@@ -260,9 +260,14 @@ fn write_sqlstate(sqlstate: *mut c_char, code: &str) {
     write_message(sqlstate, 6, code);
 }
 
+/// Write the error's SQLSTATE, and its message followed, if it has one, by a
+/// newline and the detail (the C side splits at the first newline).
 fn report(e: &df_core::pgfunc::PgError, sqlstate: *mut c_char, buf: *mut c_char, buflen: usize) -> i32 {
     write_sqlstate(sqlstate, e.sqlstate);
-    write_message(buf, buflen, &e.message);
+    match &e.detail {
+        Some(d) => write_message(buf, buflen, &format!("{}\n{}", e.message, d)),
+        None => write_message(buf, buflen, &e.message),
+    }
     DF_ERROR
 }
 
@@ -273,11 +278,15 @@ fn report_panic(payload: Box<dyn Any + Send>, sqlstate: *mut c_char, buf: *mut c
 }
 
 /// Build the plan described by the JSON `spec` and start it with
-/// `partitions` parallel partitions.  The runtime must be running.
+/// `partitions` parallel partitions, an operator memory budget of
+/// `memory_limit` bytes and spill files under `spill_dir`.  The runtime must
+/// be running.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start(
     spec: *const c_char,
     partitions: u32,
+    memory_limit: u64,
+    spill_dir: *const c_char,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
@@ -286,7 +295,8 @@ pub extern "C" fn df_ffi_query_start(
     let r = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller passes a NUL-terminated string.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
-        df_core::query::Query::start(&spec, partitions as usize)
+        let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
+        df_core::query::Query::start(&spec, partitions as usize, memory_limit as usize, &dir)
     }));
     match r {
         Ok(Ok(q)) => {
@@ -386,6 +396,36 @@ pub extern "C" fn df_ffi_query_column(query: *mut DfQuery, col: u32, out: *mut D
         }
         None => DF_ERROR,
     }
+}
+
+/// Memory and spill figures of a query, for EXPLAIN ANALYZE.
+#[repr(C)]
+pub struct DfQueryStats {
+    pub partitions: u64,
+    pub memory_limit: u64,
+    pub memory_peak: u64,
+    pub spilled_bytes: u64,
+    pub spill_count: u64,
+}
+
+#[no_mangle]
+pub extern "C" fn df_ffi_query_stats(query: *mut DfQuery, out: *mut DfQueryStats) {
+    // SAFETY: `query` is live; `out` is valid.
+    let q = unsafe { &(*query).0 };
+    let s = catch_unwind(AssertUnwindSafe(|| q.stats())).unwrap_or_default();
+    unsafe {
+        (*out).partitions = s.partitions;
+        (*out).memory_limit = s.memory_limit;
+        (*out).memory_peak = s.memory_peak;
+        (*out).spilled_bytes = s.spilled_bytes;
+        (*out).spill_count = s.spill_count;
+    }
+}
+
+/// Live bytes allocated by Rust code in this process, on any thread.
+#[no_mangle]
+pub extern "C" fn df_ffi_heap_bytes() -> i64 {
+    df_core::memory::heap_bytes()
 }
 
 /// Stop the query and release it.  Never blocks; running work is aborted.
