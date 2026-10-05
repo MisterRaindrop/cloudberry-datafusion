@@ -25,4 +25,8 @@
 m/\(df_\w+\.c:\d+\)/
 s/\.c:\d+\)/.c:XXX)/
 
+# An error raised on a segment names the segment, slice, address and pid.
+m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+
 -- end_matchsubs

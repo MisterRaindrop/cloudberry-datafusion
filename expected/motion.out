@@ -1,0 +1,212 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Slices on the segments (M5).  A slice that sends through a Motion runs in
+-- DataFusion below that Motion, which keeps running on PostgreSQL and sends
+-- the rows.  Partial aggregates produce PostgreSQL transition states that a
+-- PostgreSQL Finalize Aggregate combines.  Each query runs with
+-- datafusion.mode off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+-- QEs load the library when they connect.
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+CREATE TABLE df_m5 (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
+INSERT INTO df_m5 SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
+FROM generate_series(1, 200000) i;
+INSERT INTO df_m5 VALUES (NULL, NULL, NULL, NULL, NULL);
+ANALYZE df_m5;
+-- Which slices qualify.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_m5 WHERE e < 50;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_m5
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_m5 GROUP BY e;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: e
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: e
+               ->  Streaming Partial HashAggregate
+                     Group Key: e
+                     ->  Seq Scan on df_m5
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion
+ DataFusion: slice 1 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, b FROM df_m5 WHERE a % 50000 = 0;
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_m5
+         Filter: ((a % 50000) = 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion
+ DataFusion: slice 1 eligible
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_m5;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_m5
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 1 not eligible: partial aggregate avg
+(7 rows)
+
+-- Partial plain aggregate on the segments, finalized on the coordinator.
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
+ count  | count  |    sum     |   sum   | min  |  max  |   max   
+--------+--------+------------+---------+------+-------+---------
+ 100000 | 100000 | 9997650000 | 2450000 | 0.25 | 50000 | 2000000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
+ count  | count  |    sum     |   sum   | min  |  max  |   max   
+--------+--------+------------+---------+------+-------+---------
+ 100000 | 100000 | 9997650000 | 2450000 | 0.25 | 50000 | 2000000
+(1 row)
+
+-- Partial grouped aggregate, redistributed, finalized on the segments.
+SET datafusion.mode = off;
+SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+    |     1 |           |      
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
+ 95 |  2000 | 200090000 | 23.75
+ 98 |  2000 | 200096000 |  24.5
+ 96 |  2000 | 200092000 |    24
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+ 96 |  2000 | 200092000 |    24
+    |     1 |           |      
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
+ 95 |  2000 | 200090000 | 23.75
+ 98 |  2000 | 200096000 |  24.5
+(6 rows)
+
+-- Grouping by the distribution key: one stage on the segments.
+SET datafusion.mode = off;
+SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
+   a    | count |   sum   
+--------+-------+---------
+  80000 |     1 |  800000
+ 120000 |     1 | 1200000
+ 160000 |     1 | 1600000
+        |     1 |        
+  40000 |     1 |  400000
+ 200000 |     1 | 2000000
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
+   a    | count |   sum   
+--------+-------+---------
+ 160000 |     1 | 1600000
+        |     1 |        
+  40000 |     1 |  400000
+ 200000 |     1 | 2000000
+  80000 |     1 |  800000
+ 120000 |     1 | 1200000
+(6 rows)
+
+-- A filter and projection, gathered.
+SET datafusion.mode = off;
+SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
+   a    |    b    | ?column? | ?column? 
+--------+---------+----------+----------
+ 100000 | 1000000 |    50000 |        1
+ 150000 | 1500000 |    75000 |        1
+  50000 |  500000 |    25000 |        1
+ 200000 | 2000000 |   100000 |        1
+(4 rows)
+
+SET datafusion.mode = on;
+SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
+   a    |    b    | ?column? | ?column? 
+--------+---------+----------+----------
+ 100000 | 1000000 |    50000 |        1
+ 150000 | 1500000 |    75000 |        1
+  50000 |  500000 |    25000 |        1
+ 200000 | 2000000 |   100000 |        1
+(4 rows)
+
+-- The scan below the partial aggregate never runs on PostgreSQL.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1 loops=1)
+   ->  Gather Motion 3:1  (slice1; segments: 3) (actual rows=3 loops=1)
+         ->  Partial Aggregate (actual rows=1 loops=1)
+               ->  Seq Scan on df_m5 (never executed)
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 1 eligible
+(8 rows)
+
+-- An error on a segment carries PostgreSQL's SQLSTATE and message.
+SELECT a / (a - a) FROM df_m5 WHERE a = 5;
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=16460)
+\set VERBOSITY sqlstate
+SELECT a / (a - a) FROM df_m5 WHERE a = 5;
+ERROR:  22012
+\set VERBOSITY default
+-- A cursor closed after one row stops the segments' work.
+BEGIN;
+DECLARE df_cur CURSOR FOR SELECT a FROM df_m5 WHERE a % 7 = 0;
+FETCH 1 FROM df_cur \gset
+CLOSE df_cur;
+COMMIT;
+SELECT count(*) FROM df_m5 WHERE a % 7 = 0;
+ count 
+-------
+ 28571
+(1 row)
+
+DROP TABLE df_m5;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

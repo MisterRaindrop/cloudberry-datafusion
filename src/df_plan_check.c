@@ -23,9 +23,13 @@
  * A slice qualifies when every plan node and expression in it is on a
  * deliberately small allow list.  Anything else keeps the slice on the
  * PostgreSQL executor, with a one-line reason that EXPLAIN shows.  The list
- * grows milestone by milestone; today it covers what M3 executes: a heap
- * Seq Scan with a filter, under an optional single-stage aggregate, over
- * boolean, integer and floating-point columns.
+ * grows milestone by milestone; today it covers a heap Seq Scan with a
+ * filter, under an optional aggregate, over boolean, integer and
+ * floating-point columns.  The aggregate may be single-stage, or the partial
+ * (first) stage whose transition states a PostgreSQL Finalize Aggregate
+ * combines in another slice.  The slice may end in the Motion it sends
+ * through; that Motion keeps running on PostgreSQL and sends DataFusion's
+ * rows one at a time.
  *
  * src/df_plan_check.c
  *
@@ -311,8 +315,16 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "DISTINCT or ORDER BY inside aggregate %s", name);
 				else if (agg->aggfilter != NULL)
 					df_reject(cxt, "FILTER clause on aggregate %s", name);
-				else if (agg->aggsplit != AGGSPLIT_SIMPLE)
-					df_reject(cxt, "partial aggregate %s", name);
+				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
+						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+					df_reject(cxt, "combining stage of aggregate %s", name);
+				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
+						 strcmp(name, "avg") == 0)
+					/* its transition state is an array */
+					df_reject(cxt, "partial aggregate avg");
+				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
+						 agg->aggtype == BYTEAOID)
+					df_reject(cxt, "partial aggregate %s with a serialized transition state", name);
 				else if (!df_type_supported(agg->aggtype))
 					df_reject(cxt, "aggregate %s returning %s", name,
 							  format_type_be(agg->aggtype));
@@ -469,9 +481,16 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Bitmapset  *child_needed = NULL;
 				int			i;
 
-				if (agg->aggsplit != AGGSPLIT_SIMPLE)
+				/*
+				 * Single-stage, or the first stage of a split aggregate: its
+				 * output is the transition state, which for the supported
+				 * aggregates is a plain value (count, sum and min/max of the
+				 * supported types).  Combining stages stay on PostgreSQL.
+				 */
+				if (agg->aggsplit != AGGSPLIT_SIMPLE &&
+					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 				{
-					df_reject(cxt, "multi-stage aggregation");
+					df_reject(cxt, "combining stage of a multi-stage aggregation");
 					return;
 				}
 				if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
@@ -508,10 +527,37 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			}
 
 		case T_Motion:
-			df_reject(cxt, root_is_sender ?
-					  "sends rows through a %s" : "receives rows from a %s",
-					  df_plan_name(plan));
-			return;
+			{
+				Motion	   *motion = (Motion *) plan;
+
+				/* Receiving needs Motion support inside DataFusion. */
+				if (!root_is_sender)
+				{
+					df_reject(cxt, "receives rows from a %s", df_plan_name(plan));
+					return;
+				}
+
+				/*
+				 * The sending Motion stays on PostgreSQL and pulls DataFusion's
+				 * rows.  A sorted send needs sorted input, and the remaining
+				 * types belong to parallel or DML plans.
+				 */
+				if (motion->sendSorted)
+				{
+					df_reject(cxt, "sorted %s", df_plan_name(plan));
+					return;
+				}
+				if (motion->motionType != MOTIONTYPE_GATHER &&
+					motion->motionType != MOTIONTYPE_GATHER_SINGLE &&
+					motion->motionType != MOTIONTYPE_HASH &&
+					motion->motionType != MOTIONTYPE_BROADCAST)
+				{
+					df_reject(cxt, "%s is not supported", df_plan_name(plan));
+					return;
+				}
+				df_check_plan(outerPlan(plan), cxt, NULL, false);
+				return;
+			}
 
 		default:
 			df_reject_plan(cxt, plan);

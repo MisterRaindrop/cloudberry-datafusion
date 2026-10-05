@@ -41,7 +41,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE abs(relpages) > 0;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relnatts IN (1, 2);
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid;
 
--- Distributed tables: every slice touches a Motion.
+-- Distributed tables: the coordinator's slice receives from a Motion and
+-- stays on PostgreSQL; a segment slice below its sending Motion can qualify.
 CREATE TABLE df_hooks_t (a int, b int8, c float8) DISTRIBUTED BY (a);
 EXPLAIN (COSTS OFF) SELECT a, b FROM df_hooks_t WHERE c > 0;
 EXPLAIN (COSTS OFF) SELECT sum(b) FROM df_hooks_t;

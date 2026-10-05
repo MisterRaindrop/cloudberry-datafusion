@@ -54,11 +54,15 @@ DataFusion filters and aggregates them on the runtime's threads; result
 batches come back and are returned one row at a time.
 
 What qualifies today: a heap Seq Scan with a filter, optionally under one
-single-stage plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`),
-over `bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison
-and arithmetic operators.  Any Motion keeps its slice on PostgreSQL, so in a
-normal cluster only coordinator-only plans qualify until Motion support
-lands; the regression test uses a coordinator-local table in utility mode.
+plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`), over
+`bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison and
+arithmetic operators.  Since M5 this includes the segments' slices: a slice
+that ends in the Motion it sends through runs in DataFusion below that
+Motion, which keeps running on PostgreSQL and sends the rows one at a time,
+and the aggregate may be the partial stage of a split aggregate (`count`,
+`sum`, `min`, `max`, whose transition states are plain values) that a
+PostgreSQL Finalize Aggregate combines.  Slices that receive from a Motion
+stay on PostgreSQL.
 
 PostgreSQL semantics are kept where DataFusion differs:
 
@@ -70,7 +74,13 @@ PostgreSQL semantics are kept where DataFusion differs:
   expression simplifier is disabled for this, since it would undo the guard;
   PostgreSQL's planner has already simplified the expressions.
 
-Known differences:
+Known differences and limits:
+
+- `datafusion.worker_threads` defaults to one thread per CPU in every
+  backend, so several QEs on one host oversubscribe it; set it to cores
+  divided by segments per host until the default does that.
+- With GPORCA, `HAVING` lands in a separate Result node, which does not
+  qualify yet; the PostgreSQL planner puts it in the aggregate.
 
 - When values that compare equal fall into one group, such as `-0` and `0`
   in a `float8` column, the value shown for the group may differ from the
@@ -107,6 +117,17 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
 ```
  DataFusion: 1 partitions, memory limit 2048 kB, peak 2625 kB, spilled 146510 kB in 72 files
 ```
+
+Milestone M5 runs the segments' slices.  QEs need the library loaded when
+they start: add it to `shared_preload_libraries`, or for one database
+`ALTER DATABASE ... SET session_preload_libraries = 'datafusion_executor'`.
+In a 3-segment container on 10 ARM cores with `datafusion.worker_threads =
+2`, both planners return identical results; for example a grouped aggregate
+over a 30-million-row distributed table (partial aggregate on the segments in
+DataFusion, final aggregate on PostgreSQL) took 0.27 s instead of 1.31 s,
+and grouping it by its distribution key with a HAVING filter took 0.61 s
+instead of 5.8 s.  A statement timeout or cancel stops the segments' work
+sooner than on PostgreSQL (about 0.25 s against 0.5 s for a 100 ms timeout).
 
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and

@@ -134,13 +134,19 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		Plan	   *root = df_local_slice_root(queryDesc, &slice_index, &is_sender);
 
 		/*
-		 * Only the top slice is attached for now: every other slice starts
-		 * with a sending Motion, which df_check_slice rejects.
+		 * The top slice is attached at its top node.  Any other slice starts
+		 * with the Motion it sends through: that Motion stays on PostgreSQL,
+		 * and DataFusion runs the subtree it pulls rows from.
 		 */
+		PlanState  *attach = queryDesc->planstate;
+
+		if (is_sender)
+			attach = IsA(attach, MotionState) ? outerPlanState(attach) : NULL;
+
 		if (df_check_slice(queryDesc->plannedstmt, root, is_sender,
 						   reason, sizeof(reason)) &&
-			!is_sender &&
-			df_exec_attach(queryDesc, queryDesc->planstate, reason, sizeof(reason)))
+			attach != NULL &&
+			df_exec_attach(queryDesc, attach, reason, sizeof(reason)))
 			df_takeover_record(queryDesc, slice_index);
 		else
 			elog(DEBUG1, "datafusion: slice %d stays on the PostgreSQL executor: %s",
