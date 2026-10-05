@@ -1,0 +1,157 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Cloudberry's parallel mode (M6): several QEs per segment share a parallel
+-- scan through the table AM, and each runs DataFusion on its part.  The
+-- costs below force parallel plans on small tables.  Each query runs with
+-- datafusion.mode off, then on; the results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 1;
+SET enable_parallel = on;
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+CREATE TABLE df_par_heap (a int4, b int8, c float8, e int2) USING heap
+  WITH (parallel_workers = 2) DISTRIBUTED BY (a);
+CREATE TABLE df_par_pax (a int4, b int8, c float8, e int2) USING pax
+  WITH (parallel_workers = 2) DISTRIBUTED BY (a);
+INSERT INTO df_par_heap SELECT i, i * 10, i / 4.0, (i % 100)::int2 FROM generate_series(1, 200000) i;
+INSERT INTO df_par_heap VALUES (NULL, NULL, NULL, NULL);
+INSERT INTO df_par_pax SELECT * FROM df_par_heap;
+DELETE FROM df_par_heap WHERE a % 1000 = 7;
+DELETE FROM df_par_pax WHERE a % 1000 = 7;
+ANALYZE df_par_heap;
+ANALYZE df_par_pax;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 50;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 6:1  (slice1; segments: 6)
+         ->  Partial Aggregate
+               ->  Parallel Seq Scan on df_par_heap
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Gather Motion 6:1  (slice1; segments: 6)
+   ->  Finalize GroupAggregate
+         Group Key: e
+         ->  Sort
+               Sort Key: e
+               ->  Redistribute Motion 6:6  (slice2; segments: 6)
+                     Hash Key: e
+                     Hash Module: 3
+                     ->  Partial HashAggregate
+                           Group Key: e
+                           ->  Parallel Seq Scan on df_par_pax
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion
+ DataFusion: slice 1 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 2 eligible
+(15 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
+ count | count |    sum     |  max  |   sum   
+-------+-------+------------+-------+---------
+ 99800 | 99800 | 9977748600 | 50000 | 2448600
+(1 row)
+
+SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_pax WHERE e < 50;
+ count | count |    sum     |  max  |   sum   
+-------+-------+------------+-------+---------
+ 99800 | 99800 | 9977748600 | 50000 | 2448600
+(1 row)
+
+SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |   max    
+----+-------+-----------+----------
+ 98 |  2000 | 200096000 |  49999.5
+ 99 |  2000 | 200098000 | 49999.75
+    |     1 |           |         
+ 97 |  2000 | 200094000 | 49999.25
+(4 rows)
+
+SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
+   a    |    b    |   c   
+--------+---------+-------
+ 100000 | 1000000 | 25000
+ 200000 | 2000000 | 50000
+  50000 |  500000 | 12500
+ 150000 | 1500000 | 37500
+(4 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
+ count | count |    sum     |  max  |   sum   
+-------+-------+------------+-------+---------
+ 99800 | 99800 | 9977748600 | 50000 | 2448600
+(1 row)
+
+SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_pax WHERE e < 50;
+ count | count |    sum     |  max  |   sum   
+-------+-------+------------+-------+---------
+ 99800 | 99800 | 9977748600 | 50000 | 2448600
+(1 row)
+
+SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |   max    
+----+-------+-----------+----------
+ 99 |  2000 | 200098000 | 49999.75
+    |     1 |           |         
+ 97 |  2000 | 200094000 | 49999.25
+ 98 |  2000 | 200096000 |  49999.5
+(4 rows)
+
+SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
+   a    |    b    |   c   
+--------+---------+-------
+ 100000 | 1000000 | 25000
+  50000 |  500000 | 12500
+ 200000 | 2000000 | 50000
+ 150000 | 1500000 | 37500
+(4 rows)
+
+-- In every parallel QE the scan runs in DataFusion's slice.
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
+SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate (actual rows=1 loops=1)
+   ->  Gather Motion 6:1  (slice1; segments: 6) (actual rows=6 loops=1)
+         ->  Partial Aggregate (actual rows=1 loops=1)
+               ->  Parallel Seq Scan on df_par_pax (never executed)
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 1 eligible
+(8 rows)
+
+DROP TABLE df_par_heap, df_par_pax;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

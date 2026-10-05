@@ -246,13 +246,20 @@ df_exec_begin(DfExec *x)
 	df_vmem_sync(x->headroom);
 
 	/*
-	 * Begin the scan the way the Seq Scan node would.  Column stores (AOCS,
-	 * PAX) take the node's PlanState to read only the columns its
-	 * targetlist and filter use; PAX also skips micro-partitions whose
+	 * In Cloudberry's parallel mode several QEs of one segment share the
+	 * scan: before the first row is requested, ExecutePlan has already begun
+	 * a parallel scan on the Seq Scan node (GpInsertParallelDSMHash), which
+	 * hands each QE its own part of the table.  Use it.
+	 *
+	 * Otherwise begin the scan the way the Seq Scan node would.  Column
+	 * stores (AOCS, PAX) take the node's PlanState to read only the columns
+	 * its targetlist and filter use; PAX also skips micro-partitions whose
 	 * min/max statistics rule the filter out.  DataFusion still applies the
 	 * whole filter to every row it receives.
 	 */
-	if (rel->rd_tableam->scan_begin_extractcolumns)
+	if (x->scan->ss.ss_currentScanDesc != NULL)
+		x->scandesc = x->scan->ss.ss_currentScanDesc;
+	else if (rel->rd_tableam->scan_begin_extractcolumns)
 		x->scandesc = table_beginscan_es(rel, x->estate->es_snapshot, 0, NULL,
 										 NULL, &x->scan->ss.ps);
 	else

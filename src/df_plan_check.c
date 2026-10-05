@@ -466,11 +466,6 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				RangeTblEntry *rte = rt_fetch(scan->scanrelid, cxt->stmt->rtable);
 				Oid			relam;
 
-				if (plan->parallel_aware)
-				{
-					df_reject(cxt, "parallel Seq Scan");
-					return;
-				}
 				if (rte->rtekind != RTE_RELATION || rte->tablesample != NULL)
 				{
 					df_reject(cxt, "Seq Scan over something other than a plain table");

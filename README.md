@@ -84,9 +84,14 @@ Known differences and limits:
   qualify yet; the PostgreSQL planner puts it in the aggregate.
 - A sorted Gather Motion (with a Sort below it, chosen for example for a
   `GROUP BY` with very few groups) keeps its slice on PostgreSQL.
-- The main thread still reads the table.  On the segments it uses about
-  three quarters of a query's CPU (scan, tuple deforming, batch packing),
-  the DataFusion threads the rest, so scan-heavy queries are bounded by it.
+- Within one QE the main thread still reads the table, and that is where
+  most of a query's CPU goes.  Sampled stacks of a QE's main thread put
+  60% of it into PAX filling a tuple slot per row (its columns turned into
+  rows that are then turned back into columns), 17% into reading files and
+  20% into this extension's copying and batch building; on heap, 54% into
+  reading buffers and scanning tuples, 27% into deforming them and 17% into
+  this extension.  Cloudberry's parallel mode spreads that work over
+  several QEs per segment (see below).
 
 - When values that compare equal fall into one group, such as `-0` and `0`
   in a `float8` column, the value shown for the group may differ from the
@@ -142,6 +147,14 @@ columns the scan uses and PAX skips micro-partitions its statistics rule
 out.  Over 30 million distributed rows, a grouped aggregate took 0.19 s on
 PAX and 0.26 s on heap in DataFusion, against 1.43 s and 1.27 s on
 PostgreSQL.
+
+Cloudberry's parallel mode works too (`enable_parallel`, a table's
+`parallel_workers`): several QEs per segment share a parallel scan through
+the table AM, and each runs DataFusion on its part, reusing the parallel
+scan descriptor Cloudberry sets up.  Over 30 million rows with 3 QEs per
+segment and one DataFusion thread each, a grouped aggregate on heap took
+0.14 s instead of 0.27 s without parallel mode (PostgreSQL: 0.58 s with
+parallel mode, 1.16 s without), and on PAX 0.14 s instead of 0.20 s.
 
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
