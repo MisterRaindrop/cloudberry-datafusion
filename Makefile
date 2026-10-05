@@ -39,7 +39,7 @@ EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor runtime hooks exec memory motion
+REGRESS = datafusion_executor runtime hooks exec memory motion storage
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
 PG_CPPFLAGS = -Isrc

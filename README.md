@@ -53,7 +53,8 @@ snapshot and pushes column batches of 8192 rows through a bounded queue;
 DataFusion filters and aggregates them on the runtime's threads; result
 batches come back and are returned one row at a time.
 
-What qualifies today: a heap Seq Scan with a filter, optionally under one
+What qualifies today: a Seq Scan with a filter over a heap, AO row, AO
+column or PAX table, optionally under one
 plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`), over
 `bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison and
 arithmetic operators.  Since M5 this includes the segments' slices: a slice
@@ -81,6 +82,11 @@ Known differences and limits:
   divided by segments per host until the default does that.
 - With GPORCA, `HAVING` lands in a separate Result node, which does not
   qualify yet; the PostgreSQL planner puts it in the aggregate.
+- A sorted Gather Motion (with a Sort below it, chosen for example for a
+  `GROUP BY` with very few groups) keeps its slice on PostgreSQL.
+- The main thread still reads the table.  On the segments it uses about
+  three quarters of a query's CPU (scan, tuple deforming, batch packing),
+  the DataFusion threads the rest, so scan-heavy queries are bounded by it.
 
 - When values that compare equal fall into one group, such as `-0` and `0`
   in a `float8` column, the value shown for the group may differ from the
@@ -128,6 +134,14 @@ DataFusion, final aggregate on PostgreSQL) took 0.27 s instead of 1.31 s,
 and grouping it by its distribution key with a HAVING filter took 0.61 s
 instead of 5.8 s.  A statement timeout or cancel stops the segments' work
 sooner than on PostgreSQL (about 0.25 s against 0.5 s for a 100 ms timeout).
+
+Milestone M6 (first part) reads AO row, AO column and PAX tables as well
+as heap tables, through the table AM interface on the main thread.  The scan
+starts the way the Seq Scan node would, so column stores read only the
+columns the scan uses and PAX skips micro-partitions its statistics rule
+out.  Over 30 million distributed rows, a grouped aggregate took 0.19 s on
+PAX and 0.26 s on heap in DataFusion, against 1.43 s and 1.27 s on
+PostgreSQL.
 
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and

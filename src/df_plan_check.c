@@ -23,8 +23,8 @@
  * A slice qualifies when every plan node and expression in it is on a
  * deliberately small allow list.  Anything else keeps the slice on the
  * PostgreSQL executor, with a one-line reason that EXPLAIN shows.  The list
- * grows milestone by milestone; today it covers a heap Seq Scan with a
- * filter, under an optional aggregate, over boolean, integer and
+ * grows milestone by milestone; today it covers a Seq Scan with a filter
+ * over a heap, AO, AOCS or PAX table, under an optional aggregate, over boolean, integer and
  * floating-point columns.  The aggregate may be single-stage, or the partial
  * (first) stage whose transition states a PostgreSQL Finalize Aggregate
  * combines in another slice.  The slice may end in the Motion it sends
@@ -413,6 +413,23 @@ df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 	}
 }
 
+/*
+ * Table access methods whose scans DataFusion can read.  The main thread
+ * reads them through the table AM interface (df_exec.c), so any AM whose
+ * slots carry the columns works; these are the ones tested.
+ */
+static bool
+df_am_supported(Oid relam)
+{
+	static const char *const ams[] = {"heap", "ao_row", "ao_column", "pax", NULL};
+	char	   *name;
+
+	if (relam == HEAP_TABLE_AM_OID)
+		return true;
+	name = get_am_name(relam);
+	return name != NULL && df_name_in(name, ams);
+}
+
 /* Access method of a relation, read from its pg_class row. */
 static Oid
 df_relation_am(Oid relid)
@@ -460,7 +477,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				relam = df_relation_am(rte->relid);
-				if (relam != HEAP_TABLE_AM_OID)
+				if (!df_am_supported(relam))
 				{
 					char	   *amname = get_am_name(relam);
 

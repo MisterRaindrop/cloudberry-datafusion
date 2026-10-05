@@ -26,8 +26,9 @@
  * es_processed and runs the MPP cleanup on error, and EXPLAIN ANALYZE
  * counts the rows of the top node.  Each call returns one row:
  *
- *   - the main thread scans the heap table with the query's snapshot and
- *     packs the needed columns into batches of DF_BATCH_ROWS rows;
+ *   - the main thread scans the table (heap, AO, AOCS or PAX) through the
+ *     table AM interface with the query's snapshot and packs the needed
+ *     columns into batches of DF_BATCH_ROWS rows;
  *   - batches go to DataFusion through a bounded queue, which filters and
  *     aggregates them on the runtime's threads;
  *   - result batches come back and are handed out one row at a time.
@@ -244,7 +245,18 @@ df_exec_begin(DfExec *x)
 	}
 	df_vmem_sync(x->headroom);
 
-	x->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
+	/*
+	 * Begin the scan the way the Seq Scan node would.  Column stores (AOCS,
+	 * PAX) take the node's PlanState to read only the columns its
+	 * targetlist and filter use; PAX also skips micro-partitions whose
+	 * min/max statistics rule the filter out.  DataFusion still applies the
+	 * whole filter to every row it receives.
+	 */
+	if (rel->rd_tableam->scan_begin_extractcolumns)
+		x->scandesc = table_beginscan_es(rel, x->estate->es_snapshot, 0, NULL,
+										 NULL, &x->scan->ss.ps);
+	else
+		x->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
 	x->scan->ss.ss_currentScanDesc = x->scandesc;	/* ExecEndSeqScan closes it */
 }
 
