@@ -154,6 +154,12 @@ pub enum PgType {
     Int8,
     Float4,
     Float8,
+    // Kept as PostgreSQL stores them, in its own epoch: days (date) or
+    // microseconds (time, timestamp, timestamptz).  Only compared.
+    Date,
+    Time,
+    Timestamp,
+    Timestamptz,
 }
 
 impl PgType {
@@ -165,30 +171,46 @@ impl PgType {
             "int8" => PgType::Int8,
             "float4" => PgType::Float4,
             "float8" => PgType::Float8,
+            "date" => PgType::Date,
+            "time" => PgType::Time,
+            "timestamp" => PgType::Timestamp,
+            "timestamptz" => PgType::Timestamptz,
             other => return Err(format!("unsupported type {other}")),
         })
     }
 
-    /// The distribution hash of a column of this type.
-    pub fn key_hash(self) -> KeyHash {
+    /// The type whose values this one's are laid out as.
+    pub fn storage(self) -> PgType {
         match self {
+            PgType::Date => PgType::Int4,
+            PgType::Time | PgType::Timestamp | PgType::Timestamptz => PgType::Int8,
+            t => t,
+        }
+    }
+
+    /// The distribution hash of a column of this type: hashint4 for date,
+    /// and time_hash and timestamp_hash are hashint8.
+    pub fn key_hash(self) -> KeyHash {
+        match self.storage() {
             PgType::Bool => KeyHash::Bool,
             PgType::Int2 => KeyHash::Int2,
             PgType::Int4 => KeyHash::Int4,
             PgType::Int8 => KeyHash::Int8,
             PgType::Float4 => KeyHash::Float4,
             PgType::Float8 => KeyHash::Float8,
+            _ => unreachable!(),
         }
     }
 
     pub fn arrow(self) -> DataType {
-        match self {
+        match self.storage() {
             PgType::Bool => DataType::Boolean,
             PgType::Int2 => DataType::Int16,
             PgType::Int4 => DataType::Int32,
             PgType::Int8 => DataType::Int64,
             PgType::Float4 => DataType::Float32,
             PgType::Float8 => DataType::Float64,
+            _ => unreachable!(),
         }
     }
 }
@@ -252,7 +274,7 @@ fn literal(v: &Value) -> Result<Expr, String> {
     let int = || -> Result<i64, String> {
         val.and_then(Value::as_i64).ok_or_else(|| "bad integer literal".to_string())
     };
-    let sv = match ty {
+    let sv = match ty.storage() {
         PgType::Bool => ScalarValue::Boolean(if null { None } else { val.and_then(Value::as_bool) }),
         PgType::Int2 => ScalarValue::Int16(if null { None } else { Some(int()? as i16) }),
         PgType::Int4 => ScalarValue::Int32(if null { None } else { Some(int()? as i32) }),
@@ -267,6 +289,7 @@ fn literal(v: &Value) -> Result<Expr, String> {
         } else {
             Some(float_value(val.ok_or("bad float literal")?)?)
         }),
+        _ => unreachable!(),
     };
     Ok(lit(sv))
 }
@@ -1362,7 +1385,7 @@ impl Query {
             }
             let n = array.len();
             let nulls: Vec<u8> = (0..n).map(|r| array.is_null(r) as u8).collect();
-            let (bools, values) = match ty {
+            let (bools, values) = match ty.storage() {
                 PgType::Bool => {
                     let b: Vec<u8> = array.as_boolean().values().iter().map(|v| v as u8).collect();
                     let p = b.as_ptr();
@@ -1373,6 +1396,7 @@ impl Query {
                 PgType::Int8 => (None, array.as_primitive::<Int64Type>().values().as_ptr() as *const u8),
                 PgType::Float4 => (None, array.as_primitive::<Float32Type>().values().as_ptr() as *const u8),
                 PgType::Float8 => (None, array.as_primitive::<Float64Type>().values().as_ptr() as *const u8),
+                _ => unreachable!(),
             };
             self.current.push(OutColumn { _array: array, bools, nulls, values });
         }
@@ -1467,7 +1491,7 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
     } else {
         None
     };
-    match ty {
+    match ty.storage() {
         PgType::Bool => {
             let v = std::slice::from_raw_parts(c.values, n);
             Arc::new(BooleanArray::new(BooleanBuffer::from_iter(v.iter().map(|b| *b != 0)), nulls))
@@ -1477,6 +1501,7 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
         PgType::Int8 => primitive::<Int64Type>(c, n, nulls),
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
+        _ => unreachable!(),
     }
 }
 
@@ -1535,6 +1560,22 @@ mod tests {
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"}]}"#;
         let rows = run(spec, vec![(vec![1, 2, 3, 0], vec![0, 0, 0, 1])], 4).unwrap();
         assert_eq!(rows, vec![vec![Some(5), Some(2)]]);
+    }
+
+    #[test]
+    fn dates_compare_as_stored() {
+        // Days from 2000-01-01; i32::MIN and i32::MAX are -infinity and
+        // infinity, which compare below and above every date.
+        let spec = r#"{"scan":{"columns":[{"type":"date"}]},
+            "filter":{"op":"<","type":"bool","args":[{"col":0},{"lit":{"type":"date","value":%D%}}]},
+            "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}}]},
+            "having":null,
+            "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
+        let input = || vec![(vec![i32::MIN, -730, 0, 9000, i32::MAX, 5], vec![0, 0, 0, 0, 0, 1])];
+        let count = |d: i32| run(&spec.replace("%D%", &d.to_string()), input(), 6).unwrap();
+        assert_eq!(count(0), vec![vec![Some(2)]]);
+        assert_eq!(count(i32::MAX), vec![vec![Some(4)]]);
+        assert_eq!(count(i32::MIN), vec![vec![Some(0)]]);
     }
 
     #[test]

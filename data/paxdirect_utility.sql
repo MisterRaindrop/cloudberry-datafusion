@@ -93,8 +93,22 @@ SET pax.enable_sparse_filter = off;
 SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
 SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
 RESET pax.enable_sparse_filter;
+-- Statistics on a date column skip as well.
+SET pax.max_tuples_per_group = 16384;
+CREATE TABLE df_pd_date (d date, ts timestamp) USING pax WITH (minmax_columns = 'd');
+INSERT INTO df_pd_date SELECT date '1990-01-01' + i / 100, timestamp '1990-01-01' + i * interval '1 minute'
+FROM generate_series(1, 100000) i;
+INSERT INTO df_pd_date VALUES ('infinity', '-infinity'), (NULL, NULL);
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+SET datafusion.mode = on;
+SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
 -- The memory PAX's reader held is given back once the scan is over.
 SELECT count(*) FROM df_pd_skip;
 SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
 
-DROP TABLE df_pd, df_pd_vec, df_pd_skip;
+DROP TABLE df_pd, df_pd_vec, df_pd_skip, df_pd_date;

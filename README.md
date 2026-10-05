@@ -57,7 +57,8 @@ What qualifies today: a Seq Scan with a filter over a heap, AO row, AO
 column or PAX table, optionally under one
 plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`), over
 `bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison and
-arithmetic operators.  Since M5 this includes the segments' slices: a slice
+arithmetic operators (and since T1 `date`, `time`, `timestamp` and
+`timestamptz`, see below).  Since M5 this includes the segments' slices: a slice
 that ends in the Motion it sends through runs in DataFusion below that
 Motion, which keeps running on PostgreSQL and sends the rows one at a time,
 and the aggregate may be the partial stage of a split aggregate (`count`,
@@ -420,6 +421,32 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | J2 | Inner hash joins over local scans, with a memory guard |
 | J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
 | J4 | Outer, semi and anti joins; keys of two integer or float types |
+| T1 | `date`, `time`, `timestamp` and `timestamptz` |
+
+### Date and time types
+
+`date`, `time`, `timestamp` and `timestamptz` travel as PostgreSQL stores
+them: days (`date`) or microseconds from 2000-01-01 (`time`: from
+midnight), in Int32 and Int64 Arrow columns, with no conversion when
+scanning, sending or returning rows.  The infinities are the integers'
+extremes, and `timestamptz` is UTC, so comparing two values of one type and
+`min`/`max` are integer comparisons that agree with PostgreSQL for every
+value, including the infinities and the ends of the range, in any
+`TimeZone`.  Constants arrive folded by the planner (`'today'`, `'2024-05-01
+00:00+08'`).  These columns can be filtered, grouped, joined on, counted
+and distribution keys (cdbhash with `hashint4` for date, `time_hash` and
+`timestamp_hash`, which are `hashint8`), and the direct PAX reader skips
+blocks by their min/max.
+
+Arithmetic (`d - 1`, `d1 - d2`, anything returning `interval`) checks for
+overflow and infinities and stays on PostgreSQL, as do comparisons between
+two of these types (`ts > date`, `tz > ts`), which convert one side first.
+
+Over 20 million heap rows on 3 segments, counting one year by a `date`
+range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s
+in PostgreSQL; grouping by `date` with a `timestamp` filter took 0.17 s and
+0.89 s (only the segments' slice in DataFusion; the coordinator sorts and
+limits).
 
 ## Build
 

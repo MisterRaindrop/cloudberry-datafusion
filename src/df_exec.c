@@ -198,6 +198,7 @@ df_type_width(Oid type)
 			return 2;
 		case INT4OID:
 		case FLOAT4OID:
+		case DATEOID:
 			return 4;
 		default:
 			return 8;
@@ -755,9 +756,13 @@ df_exec_fill(DfExec *x, DfInput *in)
 					((int16 *) dst)[n] = isnull ? 0 : DatumGetInt16(d);
 					break;
 				case INT4OID:
+				case DATEOID:
 					((int32 *) dst)[n] = isnull ? 0 : DatumGetInt32(d);
 					break;
 				case INT8OID:
+				case TIMEOID:
+				case TIMESTAMPOID:
+				case TIMESTAMPTZOID:
 					((int64 *) dst)[n] = isnull ? 0 : DatumGetInt64(d);
 					break;
 				case FLOAT4OID:
@@ -846,9 +851,13 @@ df_exec_emit(DfExec *x)
 				slot->tts_values[c] = Int16GetDatum(((const int16 *) v)[r]);
 				break;
 			case INT4OID:
+			case DATEOID:
 				slot->tts_values[c] = Int32GetDatum(((const int32 *) v)[r]);
 				break;
 			case INT8OID:
+			case TIMEOID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
 				slot->tts_values[c] = Int64GetDatum(((const int64 *) v)[r]);
 				break;
 			case FLOAT4OID:

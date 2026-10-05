@@ -106,10 +106,26 @@ df_type_supported(Oid type)
 		case INT8OID:
 		case FLOAT4OID:
 		case FLOAT8OID:
+		case DATEOID:
+		case TIMEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
 			return true;
 		default:
 			return false;
 	}
+}
+
+/*
+ * Date and time types travel as PostgreSQL stores them: days or
+ * microseconds from 2000-01-01 (time: from midnight), infinities included,
+ * so comparing two values of one type compares the integers.
+ */
+static bool
+df_type_is_datetime(Oid type)
+{
+	return type == DATEOID || type == TIMEOID ||
+		type == TIMESTAMPOID || type == TIMESTAMPTZOID;
 }
 
 static bool
@@ -298,6 +314,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					if (!df_type_supported(argtype))
 						df_reject(cxt, "operator %s on %s", name ? name : "?",
 								  format_type_be(argtype));
+				}
+				if (!cxt->failed)
+				{
+					Oid			ltype = exprType(linitial(op->args));
+					Oid			rtype = exprType(lsecond(op->args));
+
+					/*
+					 * Arithmetic on dates and times checks for overflow and
+					 * infinities, and comparing two types converts one.
+					 */
+					if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
+						(op->opresulttype != BOOLOID || ltype != rtype))
+						df_reject(cxt, "operator %s on %s and %s", name,
+								  format_type_be(ltype), format_type_be(rtype));
 				}
 				if (cxt->failed)
 					return true;
@@ -1061,6 +1091,8 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 	{
 		{BOOLOID, "hashchar"}, {INT2OID, "hashint2"}, {INT4OID, "hashint4"},
 		{INT8OID, "hashint8"}, {FLOAT4OID, "hashfloat4"}, {FLOAT8OID, "hashfloat8"},
+		{DATEOID, "hashint4"}, {TIMEOID, "time_hash"},
+		{TIMESTAMPOID, "timestamp_hash"}, {TIMESTAMPTZOID, "timestamp_hash"},
 	};
 	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);
 	Var		   *var;

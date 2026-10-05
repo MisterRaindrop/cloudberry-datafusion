@@ -1,0 +1,311 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Date and time types: date, time, timestamp and timestamptz travel as
+-- PostgreSQL stores them (days or microseconds from 2000-01-01, time from
+-- midnight), infinities included.  Comparing two values of one type and
+-- min/max are integer comparisons; arithmetic, which checks for overflow
+-- and infinities, and comparisons across types stay on PostgreSQL.  Each
+-- query runs with datafusion.mode off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET TimeZone = 'UTC';
+CREATE TABLE df_ty (id int4, d date, t time, ts timestamp, tz timestamptz) DISTRIBUTED BY (id);
+INSERT INTO df_ty SELECT i, date '2000-01-01' + (i % 4000) - 2000,
+  time '00:00' + (i % 86400) * interval '1 second',
+  timestamp '1999-12-31 12:00' + i * interval '37 minutes',
+  timestamptz '2024-03-10 01:00 America/New_York' + i * interval '13 minutes'
+FROM generate_series(1, 100000) i;
+INSERT INTO df_ty VALUES
+  (-1, 'infinity', '24:00', 'infinity', 'infinity'),
+  (-2, '-infinity', '00:00', '-infinity', '-infinity'),
+  (-3, NULL, NULL, NULL, NULL),
+  (-4, '4713-01-01 BC', '23:59:59.999999', '294276-12-31 23:59:59.999999', '4714-11-24 00:00:00+00 BC');
+CREATE TABLE df_ty2 AS SELECT id * 2 AS id, d, t, ts, tz FROM df_ty
+DISTRIBUTED BY (id);
+ANALYZE df_ty;
+ANALYZE df_ty2;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:00+08';
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (tz > 'Tue Apr 30 16:00:00 2024 UTC'::timestamp with time zone)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: ((d - 1) > '01-01-2001'::date)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator - on date and integer
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator - on date and date
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE ts > '2010-01-01'::date;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (ts > '01-01-2010'::date)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on timestamp without time zone and date
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE tz > ts;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (tz > ts)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on timestamp with time zone and timestamp without time zone
+(8 rows)
+
+SET datafusion.mode = off;
+SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
+    min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
+-----------+----------+----------+----------+-----------+----------+-----------+----------+--------
+ -infinity | infinity | 00:00:00 | 24:00:00 | -infinity | infinity | -infinity | infinity | 100003
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
+ count 
+-------
+  9125
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
+ count 
+-------
+     1
+(1 row)
+
+SELECT id, d, t, ts, tz FROM df_ty
+WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER BY id;
+ id |       d       |        t        |                ts                 |               tz                
+----+---------------+-----------------+-----------------------------------+---------------------------------
+ -4 | 01-01-4713 BC | 23:59:59.999999 | Sun Dec 31 23:59:59.999999 294276 | Mon Nov 24 00:00:00 4714 UTC BC
+ -3 |               |                 |                                   | 
+ -2 | -infinity     | 00:00:00        | -infinity                         | -infinity
+ -1 | infinity      | 24:00:00        | infinity                          | infinity
+(4 rows)
+
+SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
+     d      | count |           min            |             max              
+------------+-------+--------------------------+------------------------------
+ 07-11-1994 |    25 | Wed Apr 12 06:40:00 2000 | Sun Aug 30 00:40:00 2026 UTC
+ 04-06-1997 |    25 | Wed Jan 26 04:40:00 2000 | Sun Aug 02 22:40:00 2026 UTC
+ 01-01-2000 |    25 | Sun Feb 20 21:20:00 2000 | Tue Aug 11 23:20:00 2026 UTC
+ 09-27-2002 |    25 | Fri Mar 17 14:00:00 2000 | Fri Aug 21 00:00:00 2026 UTC
+(4 rows)
+
+SET datafusion.mode = on;
+SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
+    min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
+-----------+----------+----------+----------+-----------+----------+-----------+----------+--------
+ -infinity | infinity | 00:00:00 | 24:00:00 | -infinity | infinity | -infinity | infinity | 100003
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
+ count 
+-------
+  9125
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
+ count 
+-------
+     1
+(1 row)
+
+SELECT id, d, t, ts, tz FROM df_ty
+WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER BY id;
+ id |       d       |        t        |                ts                 |               tz                
+----+---------------+-----------------+-----------------------------------+---------------------------------
+ -4 | 01-01-4713 BC | 23:59:59.999999 | Sun Dec 31 23:59:59.999999 294276 | Mon Nov 24 00:00:00 4714 UTC BC
+ -3 |               |                 |                                   | 
+ -2 | -infinity     | 00:00:00        | -infinity                         | -infinity
+ -1 | infinity      | 24:00:00        | infinity                          | infinity
+(4 rows)
+
+SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
+     d      | count |           min            |             max              
+------------+-------+--------------------------+------------------------------
+ 07-11-1994 |    25 | Wed Apr 12 06:40:00 2000 | Sun Aug 30 00:40:00 2026 UTC
+ 04-06-1997 |    25 | Wed Jan 26 04:40:00 2000 | Sun Aug 02 22:40:00 2026 UTC
+ 01-01-2000 |    25 | Sun Feb 20 21:20:00 2000 | Tue Aug 11 23:20:00 2026 UTC
+ 09-27-2002 |    25 | Fri Mar 17 14:00:00 2000 | Fri Aug 21 00:00:00 2026 UTC
+(4 rows)
+
+-- Arithmetic stays on PostgreSQL, and fails there as it should.
+SELECT max(d - date '2000-01-01') FROM df_ty WHERE id >= -1;
+ERROR:  cannot subtract infinite dates  (seg2 slice1 172.17.0.3:40002 pid=38188)
+-- Redistributed by date and time keys (cdbhash: hashint4 for date,
+-- time_hash and timestamp_hash for the others), as batches.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (b.ts = a.ts)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: b.ts
+                           ->  Seq Scan on df_ty2 b
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: a.ts
+                                 ->  Seq Scan on df_ty a
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(17 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_ty GROUP BY d;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: d
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d
+               ->  Streaming Partial HashAggregate
+                     Group Key: d
+                     ->  Seq Scan on df_ty
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
+ count | count 
+-------+-------
+  4004 |     2
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
+ count  | count 
+--------+-------
+ 100004 |     1
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
+ count |  sum  
+-------+-------
+ 13601 | 27202
+(1 row)
+
+SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+ count  |    min    
+--------+-----------
+ 100003 | -infinity
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
+ count  | count  
+--------+--------
+ 246654 | 166650
+(1 row)
+
+SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
+ count 
+-------
+  2002
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
+ count | count 
+-------+-------
+  4004 |     2
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
+ count  | count 
+--------+-------
+ 100004 |     1
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
+ count |  sum  
+-------+-------
+ 13601 | 27202
+(1 row)
+
+SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+ count  |    min    
+--------+-----------
+ 100003 | -infinity
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
+ count  | count  
+--------+--------
+ 246654 | 166650
+(1 row)
+
+SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
+ count 
+-------
+  2002
+(1 row)
+
+DROP TABLE df_ty, df_ty2;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

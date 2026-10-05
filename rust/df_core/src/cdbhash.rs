@@ -52,6 +52,8 @@ impl KeyHash {
             "int8" => KeyHash::Int8,
             "float4" => KeyHash::Float4,
             "float8" => KeyHash::Float8,
+            "date" => KeyHash::Int4,
+            "time" | "timestamp" | "timestamptz" => KeyHash::Int8,
             _ => return None,
         })
     }

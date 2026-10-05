@@ -122,9 +122,9 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd W
 SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
  d | count  | min |   max    
 ---+--------+-----+----------
+   |      2 |   7 |      1.5
  f | 149700 |   1 | 74999.75
  t | 150000 |   0 |    75000
-   |      2 |   7 |      1.5
 (3 rows)
 
 SELECT count(*) FROM df_pd;
@@ -298,6 +298,47 @@ SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_p
 (1 row)
 
 RESET pax.enable_sparse_filter;
+-- Statistics on a date column skip as well.
+SET pax.max_tuples_per_group = 16384;
+CREATE TABLE df_pd_date (d date, ts timestamp) USING pax WITH (minmax_columns = 'd');
+INSERT INTO df_pd_date SELECT date '1990-01-01' + i / 100, timestamp '1990-01-01' + i * interval '1 minute'
+FROM generate_series(1, 100000) i;
+INSERT INTO df_pd_date VALUES ('infinity', '-infinity'), (NULL, NULL);
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
+ count |           min            |           max            
+-------+--------------------------+--------------------------
+  3100 | Tue Jan 30 10:40:00 1990 | Thu Feb 01 14:19:00 1990
+(1 row)
+
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+    d     |    ts     
+----------+-----------
+ infinity | -infinity
+          | 
+(2 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
+ count |           min            |           max            
+-------+--------------------------+--------------------------
+  3100 | Tue Jan 30 10:40:00 1990 | Thu Feb 01 14:19:00 1990
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped 
+-------+---------------+--------+----------------
+     2 |             1 |      7 |              6
+(1 row)
+
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+    d     |    ts     
+----------+-----------
+ infinity | -infinity
+          | 
+(2 rows)
+
 -- The memory PAX's reader held is given back once the scan is over.
 SELECT count(*) FROM df_pd_skip;
  count  
@@ -311,7 +352,7 @@ SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem(
  t
 (1 row)
 
-DROP TABLE df_pd, df_pd_vec, df_pd_skip;
+DROP TABLE df_pd, df_pd_vec, df_pd_skip, df_pd_date;
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
 \c
 SET optimizer = off;

@@ -115,6 +115,14 @@ df_type_tag(Oid type)
 			return "float4";
 		case FLOAT8OID:
 			return "float8";
+		case DATEOID:
+			return "date";
+		case TIMEOID:
+			return "time";
+		case TIMESTAMPOID:
+			return "timestamp";
+		case TIMESTAMPTZOID:
+			return "timestamptz";
 		default:
 			return NULL;
 	}
@@ -156,9 +164,13 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 				appendStringInfo(out, "%d", (int) DatumGetInt16(c->constvalue));
 				break;
 			case INT4OID:
+			case DATEOID:
 				appendStringInfo(out, "%d", DatumGetInt32(c->constvalue));
 				break;
 			case INT8OID:
+			case TIMEOID:
+			case TIMESTAMPOID:
+			case TIMESTAMPTZOID:
 				appendStringInfo(out, INT64_FORMAT, DatumGetInt64(c->constvalue));
 				break;
 			case FLOAT4OID:
