@@ -105,9 +105,12 @@ Known differences and limits:
 
 Milestone M4 puts DataFusion's memory under Cloudberry's control:
 
-- **Operator budget.** A slice gets what the executor would give its Agg
-  node, `min(operatorMemKB, work_mem) * hash_mem_multiplier`, or `work_mem`
-  for a scan alone.  That is the limit of the DataFusion memory pool.  Hash
+- **Operator budget.** A slice gets what the executor would give its hashed
+  Agg node, `min(operatorMemKB, work_mem) * hash_mem_multiplier`, or
+  `work_mem` for a plain aggregate or a scan alone, which hold only the
+  batches in flight (the resource queue grants a plain Agg 100 kB, on which
+  DataFusion's repartitioning spilled those batches).  That is the limit of
+  the DataFusion memory pool.  Hash
   aggregation spills to a directory in the backend's temporary-file area
   instead of growing past it, as PostgreSQL's hash aggregation does; the
   directory is removed when the backend exits, and after a crash with the
@@ -215,6 +218,33 @@ Over 30 million rows on 3 segments, 3 DataFusion threads per QE:
 | filtered aggregate | 0.99 s | 0.19 s | 0.13 s | 0.06 s |
 | `count(*)` | 0.75 s | 0.10 s | 0.08 s | 0.009 s |
 
+### Receiving slices
+
+Milestone M7a runs slices that receive rows through a Motion, below an
+aggregate.  The receiving Motion stays on PostgreSQL; the main thread pulls
+the rows it receives and hands them to DataFusion in batches.  That brings
+the combining stage of a two-stage aggregate (Finalize Aggregate) into
+DataFusion, on the coordinator and on the segments, for count, sum, min and
+max, whose transition states are plain values (a combined count is 0 when
+no partial count arrives).  A slice that only receives, with nothing to
+compute, stays on PostgreSQL, as do avg (an array transition state),
+DISTINCT aggregates (an aggregate over another) and sorted receives.
+
+Over 30 million distributed rows, 3 DataFusion threads per QE:
+
+| Query | PostgreSQL | DataFusion |
+|---|---|---|
+| `GROUP BY b HAVING count(*) > 1` (30 million groups) | 5.99 s | 1.93 s |
+| `GROUP BY e HAVING sum(a) > 0` | 1.44 s | 0.19 s |
+| `GROUP BY a % 1000` | 1.34 s | 1.34 s |
+| `GROUP BY b % 1000`, three aggregates | 1.71 s | 1.94 s |
+
+The last two are the planner's choice to skip the partial stage for an
+expression key it has no statistics for: each segment then redistributes
+10 million raw rows through a row-at-a-time Motion, and converting them
+from and to DataFusion's batches on both sides costs more than DataFusion
+saves.  Sending batches over the interconnect (M7b) is meant for that.
+
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
 1.41 s on the PostgreSQL executor, with identical results (0.50 s once the
@@ -229,6 +259,9 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M2 | Executor hooks, `datafusion.mode` GUC, eligibility check |
 | M3 | Heap scan on the main thread, Filter and Aggregate in DataFusion, results back to PostgreSQL |
 | M4 | Memory pool bound to `operatorMemKB`, vmem lease, SQLSTATE mapping |
+| M5 | Segment slices below a sending Motion; partial aggregates |
+| M6 | AO, AOCS and PAX tables; parallel mode; experimental direct PAX reader |
+| M7a | Slices that receive through a Motion; combining aggregates |
 
 ## Build
 

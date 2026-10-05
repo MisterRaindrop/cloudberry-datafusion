@@ -43,21 +43,21 @@ ANALYZE df_par_heap;
 ANALYZE df_par_pax;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 50;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                     QUERY PLAN                     
+----------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 6:1  (slice1; segments: 6)
          ->  Partial Aggregate
                ->  Parallel Seq Scan on df_par_heap
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
  Gather Motion 6:1  (slice1; segments: 6)
    ->  Finalize GroupAggregate
          Group Key: e
@@ -70,8 +70,8 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
                            Group Key: e
                            ->  Parallel Seq Scan on df_par_pax
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion
- DataFusion: slice 1 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: sorted or mixed aggregation
  DataFusion: slice 2 eligible
 (15 rows)
 
@@ -91,18 +91,18 @@ SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_pax WHERE e < 50;
 SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
  e  | count |    sum    |   max    
 ----+-------+-----------+----------
- 98 |  2000 | 200096000 |  49999.5
  99 |  2000 | 200098000 | 49999.75
     |     1 |           |         
  97 |  2000 | 200094000 | 49999.25
+ 98 |  2000 | 200096000 |  49999.5
 (4 rows)
 
 SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
    a    |    b    |   c   
 --------+---------+-------
- 100000 | 1000000 | 25000
- 200000 | 2000000 | 50000
   50000 |  500000 | 12500
+ 200000 | 2000000 | 50000
+ 100000 | 1000000 | 25000
  150000 | 1500000 | 37500
 (4 rows)
 
@@ -131,26 +131,27 @@ SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GR
 SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
    a    |    b    |   c   
 --------+---------+-------
- 100000 | 1000000 | 25000
   50000 |  500000 | 12500
  200000 | 2000000 | 50000
  150000 | 1500000 | 37500
+ 100000 | 1000000 | 25000
 (4 rows)
 
 -- In every parallel QE the scan runs in DataFusion's slice.
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
  Finalize Aggregate (actual rows=1 loops=1)
    ->  Gather Motion 6:1  (slice1; segments: 6) (actual rows=6 loops=1)
          ->  Partial Aggregate (actual rows=1 loops=1)
                ->  Parallel Seq Scan on df_par_pax (never executed)
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
-(8 rows)
+ DataFusion: 1 partitions, memory limit 32768 kB, peak 0 kB, spilled 0 kB in 0 files
+(9 rows)
 
 DROP TABLE df_par_heap, df_par_pax;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

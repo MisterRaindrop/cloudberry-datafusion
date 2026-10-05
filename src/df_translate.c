@@ -20,11 +20,18 @@
  * df_translate.c
  *	  Describe an eligible slice to the Rust side as a JSON plan.
  *
- * The slice is a heap Seq Scan, optionally under one aggregate.  The scan
- * contributes the columns DataFusion needs and the filter; the aggregate
- * its grouping keys, aggregate calls and HAVING; the slice's top node the
- * output columns, in targetlist order, each with its PostgreSQL type.  The
- * JSON format is documented in rust/df_core/src/query.rs.
+ * The slice is a Seq Scan, optionally under one aggregate, or an aggregate
+ * over a receiving Motion.  The scan contributes the columns DataFusion
+ * needs and the filter; the aggregate its grouping keys, aggregate calls
+ * and HAVING; the slice's top node the output columns, in targetlist order,
+ * each with its PostgreSQL type.  The JSON format is documented in
+ * rust/df_core/src/query.rs.
+ *
+ * Over a Motion, the input columns are the Motion's output columns, by
+ * position: what the sending slice computed is already in them.  A
+ * combining (Finalize) aggregate's single argument refers to such a column,
+ * holding the partial aggregates' transition states; count's are added up
+ * ("count_merge", 0 without rows), sum's added, min's and max's compared.
  *
  * df_check_slice has already rejected anything this file cannot express,
  * so the translator reports a failure only as a safety net, and the slice
@@ -55,10 +62,11 @@ typedef enum DfLevel
 
 typedef struct DfBuilder
 {
-	Index		scanrelid;
-	Plan	   *scan;
+	Index		scanrelid;		/* 0 when the input is a Motion */
+	Plan	   *scan;			/* the Seq Scan or the receiving Motion */
 	Agg		   *agg;
-	List	   *attnos;			/* int: table column of each scan column */
+	List	   *attnos;			/* int: table column (or Motion output
+								 * column) of each input column */
 	List	   *types;			/* oid: type of each scan column */
 	List	   *aggrefs;		/* distinct Aggrefs, in first-use order */
 	bool		failed;
@@ -150,33 +158,46 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 	}
 }
 
-/* Index of the scan column for table column 'attno', adding it if new. */
+/* Index of the input column for column 'attno', adding it if new. */
 static int
-df_scan_column(DfBuilder *b, Var *var)
+df_input_column(DfBuilder *b, AttrNumber attno, Oid type)
 {
 	ListCell   *lc;
 	int			i = 0;
 
 	foreach(lc, b->attnos)
 	{
-		if (lfirst_int(lc) == var->varattno)
+		if (lfirst_int(lc) == attno)
 			return i;
 		i++;
 	}
-	b->attnos = lappend_int(b->attnos, var->varattno);
-	b->types = lappend_oid(b->types, var->vartype);
+	b->attnos = lappend_int(b->attnos, attno);
+	b->types = lappend_oid(b->types, type);
 	return i;
 }
 
-/* Child targetlist entry an OUTER_VAR of the aggregate refers to. */
-static TargetEntry *
-df_child_tle(DfBuilder *b, Var *var)
+static int
+df_scan_column(DfBuilder *b, Var *var)
 {
-	TargetEntry *tle = get_tle_by_resno(b->scan->targetlist, var->varattno);
+	return df_input_column(b, var->varattno, var->vartype);
+}
+
+/*
+ * Output column 'resno' of the aggregate's child, as an input expression:
+ * the scan's targetlist entry, or the Motion's column itself.
+ */
+static void
+df_emit_child_column(DfBuilder *b, StringInfo out, AttrNumber resno)
+{
+	TargetEntry *tle = get_tle_by_resno(b->scan->targetlist, resno);
 
 	if (tle == NULL)
-		df_fail(b, "a reference to the scan's output");
-	return tle;
+		df_fail(b, "a reference to the child's output");
+	else if (IsA(b->scan, Motion))
+		appendStringInfo(out, "{\"col\":%d}",
+						 df_input_column(b, resno, exprType((Node *) tle->expr)));
+	else
+		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
 }
 
 static void
@@ -227,12 +248,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (level == DF_LEVEL_SCAN && var->varno == b->scanrelid)
 					appendStringInfo(out, "{\"col\":%d}", df_scan_column(b, var));
 				else if (level == DF_LEVEL_AGGARG && var->varno == OUTER_VAR)
-				{
-					TargetEntry *tle = df_child_tle(b, var);
-
-					if (tle)
-						df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
-				}
+					df_emit_child_column(b, out, var->varattno);
 				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
 				{
 					int			k;
@@ -391,12 +407,13 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 	}
 	else
 		b.scan = root;
-	if (b.scan == NULL || !IsA(b.scan, SeqScan))
+	if (b.scan != NULL && IsA(b.scan, SeqScan))
+		b.scanrelid = ((Scan *) b.scan)->scanrelid;
+	else if (!(b.agg && b.scan != NULL && IsA(b.scan, Motion)))
 	{
 		snprintf(reason, reasonlen, "cannot translate this slice shape");
 		return false;
 	}
-	b.scanrelid = ((Scan *) b.scan)->scanrelid;
 
 	df_emit_qual(&b, &filter, b.scan->qual, DF_LEVEL_SCAN);
 	if (b.agg)
@@ -404,16 +421,9 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		appendStringInfoChar(&group, '[');
 		for (i = 0; i < b.agg->numCols; i++)
 		{
-			TargetEntry *tle = get_tle_by_resno(b.scan->targetlist, b.agg->grpColIdx[i]);
-
-			if (tle == NULL)
-			{
-				df_fail(&b, "a grouping key");
-				break;
-			}
 			if (i > 0)
 				appendStringInfoChar(&group, ',');
-			df_emit(&b, &group, (Node *) tle->expr, DF_LEVEL_SCAN);
+			df_emit_child_column(&b, &group, b.agg->grpColIdx[i]);
 		}
 		appendStringInfoChar(&group, ']');
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
@@ -434,12 +444,19 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		foreach(lc, b.aggrefs)
 		{
 			Aggref	   *agg = lfirst_node(Aggref, lc);
+			char	   *name = get_func_name(agg->aggfnoid);
+			bool		combine = (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL);
 
 			if (i++ > 0)
 				appendStringInfoChar(&aggs, ',');
-			appendStringInfo(&aggs, "{\"fn\":\"%s\",\"arg\":",
-							 get_func_name(agg->aggfnoid));
-			if (agg->aggstar || agg->args == NIL)
+			appendStringInfo(&aggs, "{\"fn\":\"%s%s\",\"arg\":", name,
+							 combine && strcmp(name, "count") == 0 ? "_merge" : "");
+
+			/*
+			 * A combining aggregate keeps aggstar from the original call
+			 * (count(*)), but its one argument is the partial state.
+			 */
+			if ((agg->aggstar && !combine) || agg->args == NIL)
 				appendStringInfoString(&aggs, "null");
 			else
 				df_emit(&b, &aggs,

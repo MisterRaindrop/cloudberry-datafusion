@@ -29,6 +29,8 @@
 //! { "scan":      { "columns": [ {"type": "int4"}, ... ] },
 //!   "filter":    <expr> | null,
 //!   "aggregate": { "group": [<expr>...], "aggs": [ {"fn": "sum", "arg": <expr>} ... ] } | null,
+//!                fn: count, sum, min, max, avg, or count_merge (adds up partial
+//!                counts, 0 without rows: PostgreSQL's combining count)
 //!   "having":    <expr> | null,
 //!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ] }
 //!
@@ -321,6 +323,9 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
     let need = |a: Option<Expr>| a.ok_or_else(|| format!("aggregate {name} needs an argument"));
     Ok(match name {
         "count" => count(arg.unwrap_or_else(|| lit(1i64))),
+        // 0 instead of NULL without rows: see the projection after the
+        // aggregate in Query::start_with.
+        "count_merge" => sum(need(arg)?),
         "sum" => sum(need(arg)?),
         "min" => min(need(arg)?),
         "max" => max(need(arg)?),
@@ -724,7 +729,21 @@ impl Query {
                 .map(|(i, g)| aggregate(g).map(|e| e.alias(format!("a{i}"))))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(internal)?;
+            let ngroups = group_exprs.len();
             b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
+            // A combined count is 0, not NULL, when no partial count arrived.
+            if aggs.iter().any(|a| a.get("fn").and_then(Value::as_str) == Some("count_merge")) {
+                let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
+                for (i, a) in aggs.iter().enumerate() {
+                    let c = col(format!("a{i}"));
+                    cols.push(if a.get("fn").and_then(Value::as_str) == Some("count_merge") {
+                        when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
+                    } else {
+                        c
+                    });
+                }
+                b = b.project(cols).map_err(df)?;
+            }
             if let Some(h) = spec.get("having").filter(|v| !v.is_null()) {
                 b = b.filter(expr(h).map_err(internal)?).map_err(df)?;
             }
@@ -1011,6 +1030,22 @@ mod tests {
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"}]}"#;
         let rows = run(spec, vec![(vec![1, 2, 3, 0], vec![0, 0, 0, 1])], 4).unwrap();
         assert_eq!(rows, vec![vec![Some(5), Some(2)]]);
+    }
+
+    #[test]
+    fn count_merge_adds_partial_counts() {
+        // Partial counts arrive as an int4 column here; HAVING sees the
+        // combined count, and no rows give 0 where sum gives NULL.
+        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},
+            "filter":{"op":">","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":%MIN%}}]},
+            "aggregate":{"group":[],"aggs":[{"fn":"count_merge","arg":{"col":0}},{"fn":"sum","arg":{"col":0}}]},
+            "having":{"op":">=","type":"bool","args":[{"agg":0},{"lit":{"type":"int8","value":0}}]},
+            "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"}]}"#;
+        let input = || vec![(vec![3, 4, 0, 5], vec![0, 0, 1, 0])];
+        let rows = run(&spec.replace("%MIN%", "0"), input(), 4).unwrap();
+        assert_eq!(rows, vec![vec![Some(12), Some(12)]]);
+        let rows = run(&spec.replace("%MIN%", "100"), input(), 4).unwrap();
+        assert_eq!(rows, vec![vec![Some(0), None]]);
     }
 
     #[test]

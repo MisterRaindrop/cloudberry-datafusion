@@ -136,13 +136,13 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.att
 -- stays on PostgreSQL; a segment slice below its sending Motion can qualify.
 CREATE TABLE df_hooks_t (a int, b int8, c float8) DISTRIBUTED BY (a);
 EXPLAIN (COSTS OFF) SELECT a, b FROM df_hooks_t WHERE c > 0;
-                              QUERY PLAN                              
-----------------------------------------------------------------------
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Seq Scan on df_hooks_t
          Filter: (c > '0'::double precision)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 eligible
 (6 rows)
 
@@ -154,7 +154,7 @@ EXPLAIN (COSTS OFF) SELECT sum(b) FROM df_hooks_t;
          ->  Partial Aggregate
                ->  Seq Scan on df_hooks_t
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 not eligible: combining stage of aggregate sum
  DataFusion: slice 1 not eligible: partial aggregate sum with a serialized transition state
 (7 rows)
 

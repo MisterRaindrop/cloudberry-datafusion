@@ -26,10 +26,15 @@
  * grows milestone by milestone; today it covers a Seq Scan with a filter
  * over a heap, AO, AOCS or PAX table, under an optional aggregate, over boolean, integer and
  * floating-point columns.  The aggregate may be single-stage, or the partial
- * (first) stage whose transition states a PostgreSQL Finalize Aggregate
- * combines in another slice.  The slice may end in the Motion it sends
- * through; that Motion keeps running on PostgreSQL and sends DataFusion's
- * rows one at a time.
+ * (first) stage whose transition states a Finalize Aggregate combines in
+ * another slice.  The slice may end in the Motion it sends through; that
+ * Motion keeps running on PostgreSQL and sends DataFusion's rows one at a
+ * time.
+ *
+ * Instead of a scan, the aggregate may read the rows a Motion receives from
+ * another slice (M7a): the Motion keeps running on PostgreSQL, and the
+ * aggregate may then be the combining stage (Finalize Aggregate) of count,
+ * sum, min and max, whose transition states are plain values.
  *
  * src/df_plan_check.c
  *
@@ -59,6 +64,7 @@ typedef struct DfCheckContext
 {
 	PlannedStmt *stmt;
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
+	bool		agg_input;		/* checking the child of an Agg node */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -316,7 +322,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if (agg->aggfilter != NULL)
 					df_reject(cxt, "FILTER clause on aggregate %s", name);
 				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
-						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
+						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
+					df_reject(cxt, "combining stage of aggregate %s", name);
+				else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
+						 (strcmp(name, "avg") == 0 || agg->aggtranstype != agg->aggtype))
+					/*
+					 * Combining count, sum and min/max adds up or compares
+					 * plain values of the result type; other transition
+					 * states (avg's array, serialized states) stay on
+					 * PostgreSQL.
+					 */
 					df_reject(cxt, "combining stage of aggregate %s", name);
 				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
 						 strcmp(name, "avg") == 0)
@@ -493,21 +509,37 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Bitmapset  *child_needed = NULL;
 				int			i;
 
+				if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
+				{
+					df_reject(cxt, "sorted or mixed aggregation");
+					return;
+				}
 				/*
 				 * Single-stage, or the first stage of a split aggregate: its
 				 * output is the transition state, which for the supported
 				 * aggregates is a plain value (count, sum and min/max of the
-				 * supported types).  Combining stages stay on PostgreSQL.
+				 * supported types).  Or the combining stage, reading those
+				 * states straight from the Motion that gathers them; other
+				 * combining stages stay on PostgreSQL.
 				 */
-				if (agg->aggsplit != AGGSPLIT_SIMPLE &&
-					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+				{
+					if (child == NULL || !IsA(child, Motion))
+					{
+						df_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
+						return;
+					}
+				}
+				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
+						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "combining stage of a multi-stage aggregation");
 					return;
 				}
-				if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
+				if (child != NULL && IsA(child, Agg))
 				{
-					df_reject(cxt, "sorted or mixed aggregation");
+					/* e.g. DISTINCT aggregates: an aggregate over a grouping */
+					df_reject(cxt, "aggregate over another aggregate");
 					return;
 				}
 				for (i = 0; i < agg->numCols && child != NULL; i++)
@@ -534,7 +566,9 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					child_needed = bms_add_member(child_needed, agg->grpColIdx[i]);
 				/* count(*) alone reads no column; keep the set non-NULL. */
 				child_needed = bms_add_member(child_needed, 0);
+				cxt->agg_input = true;
 				df_check_plan(child, cxt, child_needed, false);
+				cxt->agg_input = false;
 				return;
 			}
 
@@ -542,10 +576,44 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			{
 				Motion	   *motion = (Motion *) plan;
 
-				/* Receiving needs Motion support inside DataFusion. */
 				if (!root_is_sender)
 				{
-					df_reject(cxt, "receives rows from a %s", df_plan_name(plan));
+					ListCell   *lc;
+
+					/*
+					 * A receiving Motion stays on PostgreSQL; the main thread
+					 * pulls the rows it receives and hands them to DataFusion
+					 * in batches.  Worth it only below an aggregate.  The
+					 * Motion's targetlist is evaluated by the sending slice;
+					 * here only the types of the columns read matter.
+					 */
+					if (!cxt->agg_input)
+					{
+						df_reject(cxt, "receives rows from a %s with nothing to compute on them",
+								  df_plan_name(plan));
+						return;
+					}
+					if (motion->sendSorted)
+					{
+						df_reject(cxt, "receives rows from a sorted %s", df_plan_name(plan));
+						return;
+					}
+					if (plan->qual != NIL)
+					{
+						df_reject(cxt, "filter on a %s", df_plan_name(plan));
+						return;
+					}
+					foreach(lc, plan->targetlist)
+					{
+						TargetEntry *tle = lfirst_node(TargetEntry, lc);
+						Oid			type = exprType((Node *) tle->expr);
+
+						if (bms_is_member(tle->resno, needed) && !df_type_supported(type))
+						{
+							df_reject(cxt, "receives a column of type %s", format_type_be(type));
+							return;
+						}
+					}
 					return;
 				}
 
@@ -567,6 +635,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "%s is not supported", df_plan_name(plan));
 					return;
 				}
+				cxt->agg_input = false;
 				df_check_plan(outerPlan(plan), cxt, NULL, false);
 				return;
 			}
@@ -591,6 +660,7 @@ df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 
 	cxt.stmt = stmt;
 	cxt.allow_aggref = false;
+	cxt.agg_input = false;
 	cxt.failed = false;
 	cxt.reason = reason;
 	cxt.reasonlen = reasonlen;

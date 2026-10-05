@@ -27,7 +27,8 @@
  * counts the rows of the top node.  Each call returns one row:
  *
  *   - the main thread scans the table (heap, AO, AOCS or PAX) through the
- *     table AM interface with the query's snapshot and packs the needed
+ *     table AM interface with the query's snapshot, or pulls the rows a
+ *     receiving Motion gets from another slice (M7a), and packs the needed
  *     columns into batches of DF_BATCH_ROWS rows;
  *   - batches go to DataFusion through a bounded queue, which filters and
  *     aggregates them on the runtime's threads;
@@ -40,9 +41,10 @@
  *
  * Memory follows Cloudberry's rules (M4):
  *
- *   - the slice's operator budget is what the Agg node would get from the
- *     executor, min(operatorMemKB, work_mem) * hash_mem_multiplier, or
- *     work_mem for a scan alone; it becomes the DataFusion pool's limit, and
+ *   - the slice's operator budget is what a hashed Agg node would get from
+ *     the executor, min(operatorMemKB, work_mem) * hash_mem_multiplier, or
+ *     work_mem for a plain aggregate or a scan; it becomes the DataFusion
+ *     pool's limit, and
  *     hash aggregation spills to this backend's temporary directory instead
  *     of growing past it;
  *   - everything Rust allocates is leased from the vmem tracker between
@@ -91,7 +93,8 @@ DfPaxScanInfo df_last_pax_scan;
 typedef struct DfExec
 {
 	PlanState  *root;			/* the slice's top node; its ExecProcNode is ours */
-	SeqScanState *scan;			/* the scan whose table we read */
+	SeqScanState *scan;			/* the scan whose table we read, or NULL */
+	MotionState *motion;		/* else the receiving Motion we read */
 	EState	   *estate;
 	DfSliceSpec spec;
 	int			maxattno;		/* highest table column we read */
@@ -196,15 +199,23 @@ df_raise_query(int32 status, const char *sqlstate, char *msg)
 
 /*
  * Operator memory budget of the slice, in bytes: what the executor would
- * give its Agg node (see hash_agg_set_limits in nodeAgg.c), or work_mem for
- * a scan alone.
+ * give its hashed Agg node (see hash_agg_set_limits in nodeAgg.c), or
+ * work_mem for a plain aggregate or a scan alone.
  */
 static int64
 df_slice_memory(PlanState *root)
 {
 	double		kb = work_mem;
 
-	if (IsA(root, AggState))
+	/*
+	 * Only a hashed aggregate holds a hash table that the executor would
+	 * limit.  A plain aggregate, like a scan, holds just the batches in
+	 * flight; the resource queue rates it a light operator (100 kB), far
+	 * too little for those, and DataFusion's repartitioning would spill
+	 * them to disk.
+	 */
+	if (IsA(root, AggState) &&
+		((Agg *) root->plan)->aggstrategy == AGG_HASHED)
 	{
 		uint64		op = PlanStateOperatorMemKB(root);
 
@@ -309,10 +320,10 @@ df_exec_begin(DfExec *x)
 	char		sqlstate[6] = "XX000";
 	int			workers;
 	int32		status;
-	Relation	rel = x->scan->ss.ss_currentRelation;
+	Relation	rel;
 
 	workers = df_runtime_ensure();
-	if (df_exec_begin_pax(x, workers))
+	if (x->scan && df_exec_begin_pax(x, workers))
 	{
 		df_vmem_sync(x->headroom);
 		return;
@@ -326,6 +337,8 @@ df_exec_begin(DfExec *x)
 		df_raise_query(status, sqlstate, buf);
 	}
 	df_vmem_sync(x->headroom);
+	if (x->motion)
+		return;					/* the Motion is ready to receive */
 
 	/*
 	 * In Cloudberry's parallel mode several QEs of one segment share the
@@ -339,6 +352,7 @@ df_exec_begin(DfExec *x)
 	 * min/max statistics rule the filter out.  DataFusion still applies the
 	 * whole filter to every row it receives.
 	 */
+	rel = x->scan->ss.ss_currentRelation;
 	if (x->scan->ss.ss_currentScanDesc != NULL)
 		x->scandesc = x->scan->ss.ss_currentScanDesc;
 	else if (rel->rd_tableam->scan_begin_extractcolumns)
@@ -353,13 +367,23 @@ df_exec_begin(DfExec *x)
 static void
 df_exec_fill(DfExec *x)
 {
-	TupleTableSlot *slot = x->scan->ss.ss_ScanTupleSlot;
+	TupleTableSlot *slot = x->scan ? x->scan->ss.ss_ScanTupleSlot : NULL;
 	int			n = 0;
 	int			c;
 
 	while (n < DF_BATCH_ROWS)
 	{
-		if (!table_scan_getnextslot(x->scandesc, ForwardScanDirection, slot))
+		if (x->motion)
+		{
+			/* The Motion's own receive path, with its instrumentation. */
+			slot = ExecProcNode(&x->motion->ps);
+			if (TupIsNull(slot))
+			{
+				x->scan_ended = true;
+				break;
+			}
+		}
+		else if (!table_scan_getnextslot(x->scandesc, ForwardScanDirection, slot))
 		{
 			x->scan_ended = true;
 			break;
@@ -545,7 +569,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reaso
 	int			c;
 
 	scanps = IsA(root, AggState) ? outerPlanState(root) : root;
-	if (scanps == NULL || !IsA(scanps, SeqScanState))
+	if (scanps == NULL ||
+		!(IsA(scanps, SeqScanState) || (IsA(scanps, MotionState) && scanps != root)))
 	{
 		snprintf(reason, reasonlen, "unexpected executor state for this slice");
 		return false;
@@ -560,7 +585,10 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, char *reason, size_t reaso
 		return false;
 	}
 	x->root = root;
-	x->scan = (SeqScanState *) scanps;
+	if (IsA(scanps, MotionState))
+		x->motion = (MotionState *) scanps;
+	else
+		x->scan = (SeqScanState *) scanps;
 	x->estate = estate;
 	x->memory_limit = df_slice_memory(root);
 	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);

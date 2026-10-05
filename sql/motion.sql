@@ -18,7 +18,8 @@
 -- Slices on the segments (M5).  A slice that sends through a Motion runs in
 -- DataFusion below that Motion, which keeps running on PostgreSQL and sends
 -- the rows.  Partial aggregates produce PostgreSQL transition states that a
--- PostgreSQL Finalize Aggregate combines.  Each query runs with
+-- Finalize Aggregate combines (since M7a in DataFusion as well, see
+-- receive.sql).  Each query runs with
 -- datafusion.mode off, then on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;

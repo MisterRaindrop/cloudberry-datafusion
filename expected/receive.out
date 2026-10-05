@@ -1,0 +1,296 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Slices that receive rows through a Motion (M7a).  The Motion keeps
+-- running on PostgreSQL; DataFusion aggregates the rows it receives, which
+-- lets it run the combining stage (Finalize Aggregate) of count, sum, min
+-- and max on the coordinator and on the segments.  Each query runs with
+-- datafusion.mode off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+CREATE TABLE df_rcv (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
+INSERT INTO df_rcv SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
+FROM generate_series(1, 200000) i;
+INSERT INTO df_rcv VALUES (NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE df_rcv_empty (a int4, b int8, c float8, e int2) DISTRIBUTED BY (a);
+ANALYZE df_rcv;
+-- Which slices qualify.
+SET datafusion.mode = explain;
+-- Both stages: partial on the segments, combining on the coordinator.
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_rcv WHERE e < 50;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_rcv
+                     Filter: (e < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(8 rows)
+
+-- The combining stage on the segments, between two Motions.
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_rcv GROUP BY e;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: e
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: e
+               ->  Streaming Partial HashAggregate
+                     Group Key: e
+                     ->  Seq Scan on df_rcv
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(12 rows)
+
+-- avg's transition state is an array; DISTINCT aggregates nest two
+-- aggregates; a slice that only receives has nothing to compute.
+EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_rcv;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_rcv
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining stage of aggregate avg
+ DataFusion: slice 1 not eligible: partial aggregate avg
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT e) FROM df_rcv;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  HashAggregate
+                     Group Key: e
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: e
+                           ->  Streaming HashAggregate
+                                 Group Key: e
+                                 ->  Seq Scan on df_rcv
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: aggregate over another aggregate
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, b FROM df_rcv WHERE a % 50000 = 0;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_rcv
+         Filter: ((a % 50000) = 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(6 rows)
+
+-- Combining on the coordinator.
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_rcv WHERE e < 50;
+ count  | count  |    sum     |   sum   | min  |  max  |   max   
+--------+--------+------------+---------+------+-------+---------
+ 100000 | 100000 | 9997650000 | 2450000 | 0.25 | 50000 | 2000000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_rcv WHERE e < 50;
+ count  | count  |    sum     |   sum   | min  |  max  |   max   
+--------+--------+------------+---------+------+-------+---------
+ 100000 | 100000 | 9997650000 | 2450000 | 0.25 | 50000 | 2000000
+(1 row)
+
+SELECT datafusion_debug_takeovers() AS coordinator_takeovers;
+ coordinator_takeovers 
+-----------------------
+                     1
+(1 row)
+
+-- Combining on the segments, with HAVING.
+SET datafusion.mode = off;
+SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
+WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count | count |    sum    |  min  |   max   
+----+-------+-------+-----------+-------+---------
+ 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
+ 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
+    |     1 |     0 |           |       |        
+ 99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
+ 97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
+(6 rows)
+
+SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
+ e  | count 
+----+-------
+ 99 |  2000
+ 97 |  2000
+  0 |  2000
+ 98 |  2000
+ 96 |  2000
+(5 rows)
+
+SET datafusion.mode = on;
+SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
+WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count | count |    sum    |  min  |   max   
+----+-------+-------+-----------+-------+---------
+ 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
+ 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
+    |     1 |     0 |           |       |        
+ 97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
+ 99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
+(6 rows)
+
+SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
+ e  | count 
+----+-------
+ 97 |  2000
+ 99 |  2000
+  0 |  2000
+ 98 |  2000
+ 96 |  2000
+(5 rows)
+
+-- No rows: count is 0, the other aggregates NULL.
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv_empty;
+ count | count | sum | min | max 
+-------+-------+-----+-----+-----
+     0 |     0 |     |     |    
+(1 row)
+
+SELECT count(*), sum(e), max(c) FROM df_rcv WHERE a IS NULL;
+ count | sum | max 
+-------+-----+-----
+     1 |     |    
+(1 row)
+
+SELECT count(*) FROM df_rcv HAVING count(*) > 1000000;
+ count 
+-------
+(0 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv_empty;
+ count | count | sum | min | max 
+-------+-------+-----+-----+-----
+     0 |     0 |     |     |    
+(1 row)
+
+SELECT count(*), sum(e), max(c) FROM df_rcv WHERE a IS NULL;
+ count | sum | max 
+-------+-----+-----
+     1 |     |    
+(1 row)
+
+SELECT count(*) FROM df_rcv HAVING count(*) > 1000000;
+ count 
+-------
+(0 rows)
+
+SELECT e, count(*), sum(a) FROM df_rcv_empty GROUP BY e;
+ e | count | sum 
+---+-------+-----
+(0 rows)
+
+-- GPORCA's plans.
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
+ count  | count  |    sum     | min  |   max   
+--------+--------+------------+------+---------
+ 100000 | 100000 | 9997650000 | 0.25 | 2000000
+(1 row)
+
+SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+    |     1 |           |      
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
+ 98 |  2000 | 200096000 |  24.5
+ 95 |  2000 | 200090000 | 23.75
+ 96 |  2000 | 200092000 |    24
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
+ count  | count  |    sum     | min  |   max   
+--------+--------+------------+------+---------
+ 100000 | 100000 | 9997650000 | 0.25 | 2000000
+(1 row)
+
+SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
+ e  | count |    sum    |  min  
+----+-------+-----------+-------
+ 96 |  2000 | 200092000 |    24
+ 99 |  2000 | 200098000 | 24.75
+ 97 |  2000 | 200094000 | 24.25
+    |     1 |           |      
+ 98 |  2000 | 200096000 |  24.5
+ 95 |  2000 | 200090000 | 23.75
+(6 rows)
+
+SET optimizer = off;
+-- A cursor over the coordinator's slice.
+BEGIN;
+DECLARE df_cur CURSOR FOR SELECT count(*), sum(a) FROM df_rcv WHERE e < 50;
+FETCH 1 FROM df_cur;
+ count  |    sum     
+--------+------------
+ 100000 | 9997650000
+(1 row)
+
+FETCH 1 FROM df_cur;
+ count | sum 
+-------+-----
+(0 rows)
+
+CLOSE df_cur;
+COMMIT;
+-- A plain aggregate gets work_mem, not the resource queue's 100 kB for a
+-- light operator, and does not spill its batches.
+SELECT count(*), sum(a) FROM df_rcv WHERE e < 50;
+ count  |    sum     
+--------+------------
+ 100000 | 9997650000
+(1 row)
+
+SELECT memory_limit_kb = pg_size_bytes(current_setting('work_mem')) / 1024 AS work_mem_budget,
+       spills
+FROM datafusion_debug_last_run();
+ work_mem_budget | spills 
+-----------------+--------
+ t               |      0
+(1 row)
+
+DROP TABLE df_rcv, df_rcv_empty;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

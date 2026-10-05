@@ -29,4 +29,8 @@ s/\.c:\d+\)/.c:XXX)/
 m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
 s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
 
+# EXPLAIN ANALYZE figures of a DataFusion run vary from run to run.
+m/^ DataFusion: \d+ partitions, memory limit \d+ kB, peak \d+ kB, spilled \d+ kB in \d+ files$/
+s/^ DataFusion: \d+ partitions, memory limit \d+ kB, peak \d+ kB, spilled \d+ kB in \d+ files$/ DataFusion: # partitions, memory limit # kB, peak # kB, spilled # kB in # files/
+
 -- end_matchsubs

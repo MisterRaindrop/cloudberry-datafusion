@@ -41,41 +41,41 @@ DELETE FROM df_m6_aocs WHERE a % 1000 = 7;
 DELETE FROM df_m6_pax WHERE a % 1000 = 7;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_ao WHERE a > 10;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_m6_ao
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_aocs WHERE a > 10;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_m6_aocs
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_pax WHERE a > 10;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_m6_pax
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
 (8 rows)
 
@@ -130,9 +130,9 @@ SELECT e, count(*), sum(a) FROM df_m6_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
 SELECT a, b, c FROM df_m6_aocs WHERE a % 25000 = 0 OR a % 1000 = 7;
    a    |    b    |   c   
 --------+---------+-------
+ 100000 | 1000000 | 25000
   25000 |  250000 |  6250
   50000 |  500000 | 12500
- 100000 | 1000000 | 25000
   75000 |  750000 | 18750
 (4 rows)
 
@@ -140,10 +140,10 @@ SET datafusion.mode = on;
 SELECT e, count(*), sum(a) FROM df_m6_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
  e  | count |   sum    
 ----+-------+----------
+ 98 |  1000 | 50048000
     |     1 |         
  97 |  1000 | 50047000
  99 |  1000 | 50049000
- 98 |  1000 | 50048000
 (4 rows)
 
 SELECT a, b, c FROM df_m6_aocs WHERE a % 25000 = 0 OR a % 1000 = 7;
@@ -151,24 +151,25 @@ SELECT a, b, c FROM df_m6_aocs WHERE a % 25000 = 0 OR a % 1000 = 7;
 --------+---------+-------
   25000 |  250000 |  6250
   50000 |  500000 | 12500
- 100000 | 1000000 | 25000
   75000 |  750000 | 18750
+ 100000 | 1000000 | 25000
 (4 rows)
 
 -- The PAX scan below the partial aggregate runs in DataFusion's slice.
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*), sum(a) FROM df_m6_pax WHERE e < 50;
-                                   QUERY PLAN                                   
---------------------------------------------------------------------------------
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
  Finalize Aggregate (actual rows=1 loops=1)
    ->  Gather Motion 3:1  (slice1; segments: 3) (actual rows=3 loops=1)
          ->  Partial Aggregate (actual rows=1 loops=1)
                ->  Seq Scan on df_m6_pax (never executed)
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of a multi-stage aggregation
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
-(8 rows)
+ DataFusion: 2 partitions, memory limit 32768 kB, peak 129 kB, spilled 0 kB in 0 files
+(9 rows)
 
 DROP TABLE df_m6_heap, df_m6_ao, df_m6_aocs, df_m6_pax;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
