@@ -1,0 +1,344 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- The DataFusion execution path (M3): a heap scan with a filter, under an
+-- optional aggregate, executed by DataFusion and compared with PostgreSQL.
+-- The body runs in a utility-mode session on the coordinator; see
+-- data/exec_utility.sql.
+--
+CREATE EXTENSION datafusion_executor;
+\! PGOPTIONS='-c gp_role=utility' psql -X -a -q -v dfmode=on -d contrib_regression -f data/exec_utility.sql 2>&1
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Body of the exec test, run in utility mode on the coordinator by
+-- sql/exec.sql.  A table created in utility mode lives on the coordinator
+-- only, so its plans have one slice and no Motion, which is what DataFusion
+-- runs today.  The same file runs with datafusion.mode off and on, and the
+-- outputs must match apart from the mode and the final takeover count.
+--
+LOAD 'datafusion_executor';
+SET datafusion.mode = :dfmode;
+CREATE TABLE df_m3 (a int4, b int8, c float8, d bool, e int2, f float4);
+INSERT INTO df_m3
+SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2, (i / 8.0)::float4
+FROM generate_series(1, 100000) i;
+INSERT INTO df_m3 VALUES (NULL, NULL, NULL, NULL, NULL, NULL),
+                         (100001, NULL, 1.5, NULL, 7, NULL);
+-- Aggregates over every type, across many input batches.
+SELECT count(*), count(a), count(b), count(c), count(d), count(e), count(f) FROM df_m3;
+ count  | count  | count  | count  | count  | count  | count  
+--------+--------+--------+--------+--------+--------+--------
+ 100002 | 100001 | 100000 | 100001 | 100000 | 100001 | 100000
+(1 row)
+
+SELECT sum(a), sum(e), sum(c), min(a), max(a), min(b), max(b),
+       min(c), max(c), min(e), max(e), min(f), max(f), avg(c), avg(f)
+FROM df_m3;
+    sum     |   sum   |     sum      | min |  max   | min |   max   | min  |  max  | min | max |  min  |  max  |        avg        |    avg    
+------------+---------+--------------+-----+--------+-----+---------+------+-------+-----+-----+-------+-------+-------------------+-----------
+ 5000150001 | 4950007 | 1250012501.5 |   1 | 100001 |  10 | 1000000 | 0.25 | 25000 |   0 |  99 | 0.125 | 12500 | 12500.00001499985 | 6250.0625
+(1 row)
+
+-- Grouping, including the NULL group, and HAVING.
+SELECT d, count(*), sum(a), max(c) FROM df_m3 GROUP BY d;
+ d | count |    sum     |   max    
+---+-------+------------+----------
+   |     2 |     100001 |      1.5
+ f | 50000 | 2500000000 | 24999.75
+ t | 50000 | 2500050000 |    25000
+(3 rows)
+
+SELECT e, count(*), sum(a) FROM df_m3 WHERE a <= 1000 GROUP BY e HAVING sum(a) > 5000;
+ e  | count | sum  
+----+-------+------
+ 60 |    10 | 5100
+ 63 |    10 | 5130
+ 78 |    10 | 5280
+ 51 |    10 | 5010
+ 62 |    10 | 5120
+ 65 |    10 | 5150
+ 73 |    10 | 5230
+ 80 |    10 | 5300
+ 89 |    10 | 5390
+ 90 |    10 | 5400
+ 98 |    10 | 5480
+ 58 |    10 | 5080
+ 61 |    10 | 5110
+ 76 |    10 | 5260
+ 94 |    10 | 5440
+ 59 |    10 | 5090
+ 97 |    10 | 5470
+ 54 |    10 | 5040
+ 66 |    10 | 5160
+ 74 |    10 | 5240
+ 82 |    10 | 5320
+ 83 |    10 | 5330
+ 91 |    10 | 5410
+ 96 |    10 | 5460
+ 52 |    10 | 5020
+ 53 |    10 | 5030
+ 55 |    10 | 5050
+ 69 |    10 | 5190
+ 84 |    10 | 5340
+ 85 |    10 | 5350
+ 86 |    10 | 5360
+ 68 |    10 | 5180
+ 77 |    10 | 5270
+ 79 |    10 | 5290
+ 87 |    10 | 5370
+ 92 |    10 | 5420
+ 93 |    10 | 5430
+ 57 |    10 | 5070
+ 64 |    10 | 5140
+ 67 |    10 | 5170
+ 75 |    10 | 5250
+ 81 |    10 | 5310
+ 99 |    10 | 5490
+ 56 |    10 | 5060
+ 72 |    10 | 5220
+ 88 |    10 | 5380
+  0 |    10 | 5500
+ 70 |    10 | 5200
+ 71 |    10 | 5210
+ 95 |    10 | 5450
+(50 rows)
+
+SELECT e, d, count(*) FROM df_m3 WHERE e < 3 GROUP BY e, d;
+ e | d | count 
+---+---+-------
+ 1 | f |  1000
+ 0 | t |  1000
+ 2 | t |  1000
+(3 rows)
+
+-- Filters: AND, OR, NOT, NULL tests and cross-type comparisons.
+SELECT count(*) FROM df_m3 WHERE a > 50000 AND (d OR e = 7) AND NOT (c < 20000);
+ count 
+-------
+ 10201
+(1 row)
+
+SELECT count(*) FROM df_m3 WHERE b > 999990;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_m3 WHERE e > 98::int8;
+ count 
+-------
+  1000
+(1 row)
+
+SELECT count(*) FROM df_m3 WHERE f > 12499.5::float8;
+ count 
+-------
+     4
+(1 row)
+
+SELECT count(*), count(a) FROM df_m3 WHERE a IS NULL OR d IS NULL;
+ count | count 
+-------+-------
+     2 |     1
+(1 row)
+
+SELECT count(*) FROM df_m3 WHERE d IS NOT NULL AND a IS NOT NULL;
+ count  
+--------
+ 100000
+(1 row)
+
+-- Arithmetic in the output.
+SELECT a, a + 1, a - 1, a * 2, a / 7, a % 7, e + e, e * 300, b / 3, b % 7,
+       c * 2, c / 4, f + f
+FROM df_m3 WHERE a % 20000 = 0;
+   a    | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? | ?column? 
+--------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------+----------
+  40000 |    40001 |    39999 |    80000 |     5714 |        2 |        0 |        0 |   133333 |        6 |    20000 |     2500 |    10000
+  60000 |    60001 |    59999 |   120000 |     8571 |        3 |        0 |        0 |   200000 |        2 |    30000 |     3750 |    15000
+  20000 |    20001 |    19999 |    40000 |     2857 |        1 |        0 |        0 |    66666 |        3 |    10000 |     1250 |     5000
+ 100000 |   100001 |    99999 |   200000 |    14285 |        5 |        0 |        0 |   333333 |        1 |    50000 |     6250 |    25000
+  80000 |    80001 |    79999 |   160000 |    11428 |        4 |        0 |        0 |   266666 |        5 |    40000 |     5000 |    20000
+(5 rows)
+
+-- Integer division truncates toward zero; INT_MIN % -1 is 0.
+CREATE TABLE df_m3_neg (x int4, y int4);
+INSERT INTO df_m3_neg VALUES (-7, 2), (7, -2), (-8, 3), (-2147483648, -1);
+SELECT x, y, x % y FROM df_m3_neg;
+      x      | y  | ?column? 
+-------------+----+----------
+          -7 |  2 |       -1
+           7 | -2 |        1
+          -8 |  3 |       -2
+ -2147483648 | -1 |        0
+(4 rows)
+
+SELECT x, y, x / y FROM df_m3_neg WHERE y <> -1;
+ x  | y  | ?column? 
+----+----+----------
+ -7 |  2 |       -3
+  7 | -2 |       -3
+ -8 |  3 |       -2
+(3 rows)
+
+-- Errors carry PostgreSQL's SQLSTATE and message.
+SELECT a + 2147483647 FROM df_m3 WHERE a = 1;
+psql:data/exec_utility.sql:65: ERROR:  integer out of range
+SELECT e * 1000::int2 FROM df_m3 WHERE a = 99;
+psql:data/exec_utility.sql:66: ERROR:  smallint out of range
+SELECT b * 922337203685477580 FROM df_m3 WHERE a = 2;
+psql:data/exec_utility.sql:67: ERROR:  bigint out of range
+SELECT a / (a - a) FROM df_m3 WHERE a = 5;
+psql:data/exec_utility.sql:68: ERROR:  division by zero
+SELECT e % (e - e) FROM df_m3 WHERE a = 5;
+psql:data/exec_utility.sql:69: ERROR:  division by zero
+SELECT c / 0 FROM df_m3 WHERE a = 5;
+psql:data/exec_utility.sql:70: ERROR:  division by zero
+SELECT c * 1e308 FROM df_m3 WHERE a = 40;
+psql:data/exec_utility.sql:71: ERROR:  value out of range: overflow
+SELECT c / 1e308 / 1e308 FROM df_m3 WHERE a = 1;
+psql:data/exec_utility.sql:72: ERROR:  value out of range: underflow
+SELECT x / y FROM df_m3_neg WHERE y = -1;
+psql:data/exec_utility.sql:73: ERROR:  integer out of range
+-- The same failures, showing the SQLSTATE instead of the message.
+\set VERBOSITY sqlstate
+SELECT a + 2147483647 FROM df_m3 WHERE a = 1;
+psql:data/exec_utility.sql:77: ERROR:  22003
+SELECT a / (a - a) FROM df_m3 WHERE a = 5;
+psql:data/exec_utility.sql:78: ERROR:  22012
+SELECT c * 1e308 FROM df_m3 WHERE a = 40;
+psql:data/exec_utility.sql:79: ERROR:  22003
+\set VERBOSITY default
+-- A guard keeps the division from running where it would fail.
+SELECT count(*) FROM df_m3 WHERE a <> 5 AND 10 / (a - 5) >= 0;
+ count 
+-------
+ 99996
+(1 row)
+
+SELECT count(*) FROM df_m3 WHERE a = 5 OR 10 / (a - 5) >= 0;
+ count 
+-------
+ 99997
+(1 row)
+
+-- No input rows.
+SELECT count(*), sum(a), max(c) FROM df_m3 WHERE a < 0;
+ count | sum | max 
+-------+-----+-----
+     0 |     |    
+(1 row)
+
+SELECT d, count(*) FROM df_m3 WHERE a < 0 GROUP BY d;
+ d | count 
+---+-------
+(0 rows)
+
+-- Special floating-point values.
+CREATE TABLE df_m3_float (k int4, c float8, f float4);
+INSERT INTO df_m3_float VALUES (1, 'NaN', 'NaN'), (2, 'Infinity', 'Infinity'),
+  (3, '-Infinity', '-Infinity'), (4, '-0', '-0'), (5, '0', '0'), (6, 1.5, 1.5),
+  (7, NULL, NULL);
+SELECT count(*) FROM df_m3_float WHERE c = 'NaN';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_m3_float WHERE c > 1;
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM df_m3_float WHERE c = 0;
+ count 
+-------
+     2
+(1 row)
+
+SELECT count(*) FROM df_m3_float WHERE f = 0 OR f = 'NaN';
+ count 
+-------
+     3
+(1 row)
+
+SELECT max(c), min(c), max(f), min(f) FROM df_m3_float;
+ max |    min    | max |    min    
+-----+-----------+-----+-----------
+ NaN | -Infinity | NaN | -Infinity
+(1 row)
+
+SELECT sum(c) FROM df_m3_float WHERE k > 1;
+ sum 
+-----
+ NaN
+(1 row)
+
+SELECT k, c, c * 2, f, f * 2 FROM df_m3_float;
+ k |     c     | ?column?  |     f     | ?column?  
+---+-----------+-----------+-----------+-----------
+ 1 |       NaN |       NaN |       NaN |       NaN
+ 2 |  Infinity |  Infinity |  Infinity |  Infinity
+ 3 | -Infinity | -Infinity | -Infinity | -Infinity
+ 4 |        -0 |        -0 |        -0 |        -0
+ 5 |         0 |         0 |         0 |         0
+ 6 |       1.5 |         3 |       1.5 |         3
+ 7 |           |           |           |          
+(7 rows)
+
+-- A cursor fetches the result in parts.
+BEGIN;
+DECLARE df_cur CURSOR FOR SELECT count(*), sum(a) FROM df_m3;
+FETCH 1 FROM df_cur;
+ count  |    sum     
+--------+------------
+ 100002 | 5000150001
+(1 row)
+
+FETCH 1 FROM df_cur;
+ count | sum 
+-------+-----
+(0 rows)
+
+CLOSE df_cur;
+COMMIT;
+DROP TABLE df_m3;
+DROP TABLE df_m3_neg;
+DROP TABLE df_m3_float;
+SELECT datafusion_debug_takeovers() AS takeovers;
+ takeovers 
+-----------
+        39
+(1 row)
+
+DROP EXTENSION datafusion_executor;

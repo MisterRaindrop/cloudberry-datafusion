@@ -32,6 +32,8 @@ publish = false
 datafusion = { version = "55", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 libc = "0.2"
+serde_json = "1"
+futures = "0.3"
 df_core = { path = "df_core" }
 
 # panic must stay "unwind": every FFI entry point relies on catch_unwind to

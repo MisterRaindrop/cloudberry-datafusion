@@ -48,6 +48,27 @@ extern int	df_worker_threads;
 /* df_init.c */
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
 
+/* What df_translate_slice produces for one slice. */
+typedef struct DfSliceSpec
+{
+	char	   *json;			/* plan for the Rust side */
+	Index		scanrelid;
+	int			nscan;			/* columns read from the table */
+	AttrNumber *scan_attnos;
+	Oid		   *scan_types;
+	int			nout;			/* output columns, in targetlist order */
+	Oid		   *out_types;
+} DfSliceSpec;
+
+/* df_exec.c */
+extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
+						   char *reason, size_t reasonlen);
+
+/* df_translate.c */
+extern const char *df_type_tag(Oid type);
+extern bool df_translate_slice(Plan *root, DfSliceSpec *spec,
+							   char *reason, size_t reasonlen);
+
 /* df_hooks.c */
 extern void df_install_hooks(void);
 

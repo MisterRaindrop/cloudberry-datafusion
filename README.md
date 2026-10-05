@@ -41,11 +41,50 @@ and if not, why:
  DataFusion: slice 0 eligible
 ```
 
-With `on`, eligible slices are routed to DataFusion at `ExecutorRun`; until
-M3 they are still executed by PostgreSQL.  Load the library in every
-backend, including the segments' QEs, by adding `datafusion_executor` to
-`shared_preload_libraries`; otherwise the hooks only exist in sessions that
-have called one of its functions.
+Load the library in every backend, including the segments' QEs, by adding
+`datafusion_executor` to `shared_preload_libraries`; otherwise the hooks only
+exist in sessions that have called one of its functions.
+
+Milestone M3 executes eligible slices in DataFusion.  The slice's top
+PlanState keeps its place in the executor and only its `ExecProcNode` is
+replaced, so `ExecutorRun`, cursors, `es_processed` and error cleanup work
+as before.  The backend's main thread scans the heap table with the query's
+snapshot and pushes column batches of 8192 rows through a bounded queue;
+DataFusion filters and aggregates them on the runtime's threads; result
+batches come back and are returned one row at a time.
+
+What qualifies today: a heap Seq Scan with a filter, optionally under one
+single-stage plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`),
+over `bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison
+and arithmetic operators.  Any Motion keeps its slice on PostgreSQL, so in a
+normal cluster only coordinator-only plans qualify until Motion support
+lands; the regression test uses a coordinator-local table in utility mode.
+
+PostgreSQL semantics are kept where DataFusion differs:
+
+- Integer and floating-point arithmetic raises PostgreSQL's errors with the
+  same SQLSTATE and message (overflow, underflow, division by zero), instead
+  of wrapping around or returning infinity.
+- `AND` and `OR` skip later arguments once the result is decided, so a guard
+  such as `b <> 0 AND a / b > 1` never divides by zero.  DataFusion's
+  expression simplifier is disabled for this, since it would undo the guard;
+  PostgreSQL's planner has already simplified the expressions.
+
+Known differences:
+
+- When values that compare equal fall into one group, such as `-0` and `0`
+  in a `float8` column, the value shown for the group may differ from the
+  one PostgreSQL shows.
+- Floating-point sums can differ in the last bits, because DataFusion adds
+  partial sums in a different order.
+- `EXPLAIN ANALYZE` counts rows for the slice's top node only; the nodes
+  below it show as never executed.
+- DataFusion's memory use is not yet bounded by Cloudberry's memory limits
+  (milestone M4).
+
+Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
+a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
+1.41 s on the PostgreSQL executor, with identical results.
 
 | Milestone | Scope |
 |---|---|
@@ -57,7 +96,8 @@ have called one of its functions.
 
 ## Build
 
-Requires a Cloudberry installation (for `pg_config` and server headers) and a
+Requires a Cloudberry installation (for `pg_config` and server headers; the
+headers include OpenSSL's, so install the OpenSSL development package) and a
 Rust toolchain; the version is pinned in `rust/rust-toolchain.toml`.
 
 ```sh

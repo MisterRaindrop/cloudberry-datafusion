@@ -45,6 +45,7 @@
 #define DF_PANIC	2
 #define DF_PENDING	3			/* df_ffi_task_wait: still running */
 #define DF_CANCELLED 4			/* df_ffi_task_wait: stopped by cancel */
+#define DF_DONE		5			/* df_ffi_query_poll: all rows produced */
 
 #define DF_MSG_BUFLEN 1024
 
@@ -73,5 +74,31 @@ extern int32_t df_ffi_task_wait(DfTask *task, uint32_t timeout_ms,
 extern void df_ffi_task_cancel(DfTask *task);
 extern void df_ffi_task_free(DfTask *task);
 extern uint64_t df_ffi_debug_active_tasks(void);
+
+/*
+ * Queries (M3).  Column buffers hold native values (one byte per bool) and
+ * one byte per row that is 1 for NULL.  Failures carry a SQLSTATE: the
+ * 'sqlstate' arguments take a 6-byte buffer.
+ */
+typedef struct DfQuery DfQuery;
+
+typedef struct DfColumn
+{
+	const void *values;
+	const uint8_t *nulls;
+} DfColumn;
+
+extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
+								  DfQuery **out_query, char *sqlstate,
+								  char *buf, size_t buflen);
+extern int32_t df_ffi_query_push(DfQuery *query, const DfColumn *cols,
+								 uint32_t ncols, uint32_t nrows,
+								 char *sqlstate, char *buf, size_t buflen);
+extern void df_ffi_query_finish_input(DfQuery *query);
+extern int32_t df_ffi_query_poll(DfQuery *query, uint32_t timeout_ms,
+								 uint32_t *nrows, char *sqlstate,
+								 char *buf, size_t buflen);
+extern int32_t df_ffi_query_column(DfQuery *query, uint32_t col, DfColumn *out);
+extern void df_ffi_query_free(DfQuery *query);
 
 #endif							/* DF_FFI_H */

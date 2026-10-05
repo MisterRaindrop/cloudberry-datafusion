@@ -26,9 +26,10 @@
  * the record disappears with the query however it ends.  ExecutorRun then
  * routes recorded slices to DataFusion.
  *
- * Until M3 provides the DataFusion execution path, a taken-over slice still
- * runs on the PostgreSQL executor; datafusion_debug_takeovers() counts the
- * takeovers so tests can see the routing work.
+ * A taken-over slice runs in DataFusion (df_exec.c): its top PlanState's
+ * ExecProcNode is replaced, so the rest of the executor is unchanged.
+ * datafusion_debug_takeovers() counts the ExecutorRun calls that reached a
+ * taken-over slice.
  *
  * With datafusion.mode = explain or on, text-format EXPLAIN ends with one
  * line per slice saying whether DataFusion can run it, and why not.
@@ -119,17 +120,27 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	else
 		standard_ExecutorStart(queryDesc, eflags);
 
+	/*
+	 * Backward and mark/restore scans need a rewindable result, which the
+	 * DataFusion stream is not.
+	 */
 	if (df_mode == DF_MODE_ON &&
-		(eflags & EXEC_FLAG_EXPLAIN_ONLY) == 0 &&
-		queryDesc->estate != NULL)
+		(eflags & (EXEC_FLAG_EXPLAIN_ONLY | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) == 0 &&
+		queryDesc->estate != NULL && queryDesc->planstate != NULL)
 	{
 		char		reason[256];
 		int			slice_index;
 		bool		is_sender;
 		Plan	   *root = df_local_slice_root(queryDesc, &slice_index, &is_sender);
 
+		/*
+		 * Only the top slice is attached for now: every other slice starts
+		 * with a sending Motion, which df_check_slice rejects.
+		 */
 		if (df_check_slice(queryDesc->plannedstmt, root, is_sender,
-						   reason, sizeof(reason)))
+						   reason, sizeof(reason)) &&
+			!is_sender &&
+			df_exec_attach(queryDesc, queryDesc->planstate, reason, sizeof(reason)))
 			df_takeover_record(queryDesc, slice_index);
 		else
 			elog(DEBUG1, "datafusion: slice %d stays on the PostgreSQL executor: %s",
@@ -147,7 +158,6 @@ df_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 	{
 		df_takeover_runs++;
 		elog(DEBUG1, "datafusion: running slice %d", t->slice_index);
-		/* M3 replaces this with the DataFusion execution path. */
 	}
 
 	if (prev_ExecutorRun)

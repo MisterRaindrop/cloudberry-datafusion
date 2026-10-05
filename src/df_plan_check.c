@@ -266,7 +266,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				char	   *name = get_opname(op->opno);
 				ListCell   *lc;
 
-				if (op->opno >= FirstGenbkiObjectId)
+				if (list_length(op->args) != 2)
+					df_reject(cxt, "unary operator %s", name ? name : "?");
+				else if (op->opno >= FirstGenbkiObjectId)
 					df_reject(cxt, "user-defined operator %s", name ? name : "?");
 				else if (name == NULL || !df_name_in(name, operators))
 					df_reject(cxt, "operator %s", name ? name : "?");
@@ -314,6 +316,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if (!df_type_supported(agg->aggtype))
 					df_reject(cxt, "aggregate %s returning %s", name,
 							  format_type_be(agg->aggtype));
+				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
+					/* PostgreSQL adds real values in single precision. */
+					df_reject(cxt, "sum of real values");
 				if (cxt->failed)
 					return true;
 				break;

@@ -39,6 +39,8 @@ pub const DF_PANIC: i32 = 2;
 pub const DF_PENDING: i32 = 3;
 /// `df_ffi_task_wait` only: the task stopped because it was cancelled.
 pub const DF_CANCELLED: i32 = 4;
+/// `df_ffi_query_poll` only: the query has produced all its rows.
+pub const DF_DONE: i32 = 5;
 
 /// Copy `msg` into a C buffer of `buflen` bytes as a NUL-terminated string,
 /// truncating on a UTF-8 character boundary.
@@ -236,6 +238,164 @@ pub extern "C" fn df_ffi_task_free(task: *mut DfTask) {
 #[no_mangle]
 pub extern "C" fn df_ffi_debug_active_tasks() -> u64 {
     df_core::debug::active_tasks() as u64
+}
+
+// ---------------------------------------------------------------------------
+// Queries (M3): one slice executed by DataFusion
+// ---------------------------------------------------------------------------
+
+/// Opaque handle owned by the C caller; release it with `df_ffi_query_free`.
+pub struct DfQuery(df_core::query::Query);
+
+/// Column buffers as exchanged with C: native values and one byte per row
+/// that is 1 for NULL.
+#[repr(C)]
+pub struct DfColumn {
+    pub values: *const u8,
+    pub nulls: *const u8,
+}
+
+/// Write a five-character SQLSTATE plus NUL into `sqlstate` (6 bytes).
+fn write_sqlstate(sqlstate: *mut c_char, code: &str) {
+    write_message(sqlstate, 6, code);
+}
+
+fn report(e: &df_core::pgfunc::PgError, sqlstate: *mut c_char, buf: *mut c_char, buflen: usize) -> i32 {
+    write_sqlstate(sqlstate, e.sqlstate);
+    write_message(buf, buflen, &e.message);
+    DF_ERROR
+}
+
+fn report_panic(payload: Box<dyn Any + Send>, sqlstate: *mut c_char, buf: *mut c_char, buflen: usize) -> i32 {
+    write_sqlstate(sqlstate, "XX000");
+    write_message(buf, buflen, panic_message(payload.as_ref()));
+    DF_PANIC
+}
+
+/// Build the plan described by the JSON `spec` and start it with
+/// `partitions` parallel partitions.  The runtime must be running.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_start(
+    spec: *const c_char,
+    partitions: u32,
+    out_query: *mut *mut DfQuery,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller passes a NUL-terminated string.
+        let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
+        df_core::query::Query::start(&spec, partitions as usize)
+    }));
+    match r {
+        Ok(Ok(q)) => {
+            // SAFETY: the caller passes a valid out pointer.
+            unsafe { *out_query = Box::into_raw(Box::new(DfQuery(q))) };
+            DF_OK
+        }
+        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
+        Err(p) => report_panic(p, sqlstate, buf, buflen),
+    }
+}
+
+/// Offer `nrows` rows in `ncols` columns.  DF_OK: taken.  DF_PENDING: the
+/// input queue is full and nothing was taken; poll, then offer again.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_push(
+    query: *mut DfQuery,
+    cols: *const DfColumn,
+    ncols: u32,
+    nrows: u32,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    // SAFETY: `query` is live; `cols` points to `ncols` columns of `nrows` rows.
+    let q = unsafe { &mut (*query).0 };
+    let raw: Vec<df_core::query::RawColumn> = (0..ncols as usize)
+        .map(|i| unsafe {
+            let c = &*cols.add(i);
+            df_core::query::RawColumn { values: c.values, nulls: c.nulls }
+        })
+        .collect();
+    match catch_unwind(AssertUnwindSafe(|| unsafe { q.push(&raw, nrows as usize) })) {
+        Ok(Ok(true)) => DF_OK,
+        Ok(Ok(false)) => DF_PENDING,
+        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
+        Err(p) => report_panic(p, sqlstate, buf, buflen),
+    }
+}
+
+/// Tell the query there is no more input.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_finish_input(query: *mut DfQuery) {
+    // SAFETY: `query` is live.
+    let q = unsafe { &mut (*query).0 };
+    let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input()));
+}
+
+/// Wait up to `timeout_ms` for the next result batch.  DF_OK: `*nrows` rows
+/// are available through df_ffi_query_column until the next poll.
+/// DF_PENDING, DF_DONE, or DF_ERROR / DF_PANIC with SQLSTATE and message.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_poll(
+    query: *mut DfQuery,
+    timeout_ms: u32,
+    nrows: *mut u32,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    use df_core::query::Poll;
+    // SAFETY: `query` is live.
+    let q = unsafe { &mut (*query).0 };
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        q.poll(std::time::Duration::from_millis(timeout_ms as u64))
+    }));
+    match r {
+        Ok(Poll::Batch(n)) => {
+            // SAFETY: valid out pointer.
+            unsafe { *nrows = n as u32 };
+            DF_OK
+        }
+        Ok(Poll::Pending) => DF_PENDING,
+        Ok(Poll::Done) => DF_DONE,
+        Ok(Poll::Failed(e)) => report(&e, sqlstate, buf, buflen),
+        Ok(Poll::Panicked(msg)) => {
+            write_sqlstate(sqlstate, "XX000");
+            write_message(buf, buflen, &msg);
+            DF_PANIC
+        }
+        Err(p) => report_panic(p, sqlstate, buf, buflen),
+    }
+}
+
+/// Buffers of output column `col` of the batch returned by the last poll.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_column(query: *mut DfQuery, col: u32, out: *mut DfColumn) -> i32 {
+    // SAFETY: `query` is live; `out` is valid.
+    let q = unsafe { &(*query).0 };
+    match q.output_column(col as usize) {
+        Some(c) => {
+            unsafe {
+                (*out).values = c.values;
+                (*out).nulls = c.nulls;
+            }
+            DF_OK
+        }
+        None => DF_ERROR,
+    }
+}
+
+/// Stop the query and release it.  Never blocks; running work is aborted.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_free(query: *mut DfQuery) {
+    if !query.is_null() {
+        // SAFETY: `query` came from Box::into_raw and is freed exactly once.
+        let q = unsafe { Box::from_raw(query) };
+        let _ = catch_unwind(AssertUnwindSafe(move || drop(q)));
+    }
 }
 
 #[cfg(test)]

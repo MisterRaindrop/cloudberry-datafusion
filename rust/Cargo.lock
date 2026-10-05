@@ -1006,7 +1006,10 @@ dependencies = [
 name = "df_core"
 version = "0.1.0"
 dependencies = [
+ "datafusion",
+ "futures",
  "libc",
+ "serde_json",
  "tokio",
 ]
 
