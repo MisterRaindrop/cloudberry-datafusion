@@ -93,7 +93,7 @@ extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  uint64_t memory_limit, const char *spill_dir,
 								  DfQuery **out_query, char *sqlstate,
 								  char *buf, size_t buflen);
-/* PAX blocks read on the workers (experimental); see src/df_pax.cc. */
+/* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfColumn *cols);
 typedef int (*DfPaxRead) (void *scan, int index, DfPaxEmit emit, void *ctx,
 						  char *err, size_t errlen);

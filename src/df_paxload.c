@@ -18,12 +18,14 @@
  * under the License.
  *
  * df_paxload.c
- *	  Load datafusion_pax.so, the experimental PAX reader (src/df_pax.cc).
+ *	  Load datafusion_pax.so, the experimental PAX reader, built from the
+ *	  PAX patch in patches/pax (access/datafusion_scan_api.cc).
  *
- * The reader calls PAX's internal C++ classes, so it is only used with the
- * pax.so it was built against: both carry pax.so's ELF build ID, the
- * library as a string recorded at build time, the running pax.so in its
- * note segment.  Any problem (library missing, symbols that do not bind,
+ * The library exports one symbol, datafusion_pax_scan_api(), a table of
+ * functions.  They call PAX's internal C++ classes, so the table is only
+ * used with the pax.so it was built against: both carry pax.so's ELF build
+ * ID, the table as a string recorded at build time, the running pax.so in
+ * its note segment.  Any problem (library missing, symbols that do not bind,
  * another build ID) is reported once per backend as a WARNING and the scan
  * goes through the table AM instead.
  *
@@ -41,10 +43,10 @@
 
 #include "df_executor.h"
 
-typedef const char *(*BuildIdFn) (void);
+typedef const DfPaxReader *(*ScanApiFn) (void);
 
 static bool df_pax_tried = false;
-static DfPaxReader df_pax_reader;
+static const DfPaxReader *df_pax_reader;
 static bool df_pax_ok = false;
 
 typedef struct BuildIdSearch
@@ -103,7 +105,8 @@ df_pax_load(char *why, size_t whylen)
 {
 	char		path[MAXPGPATH];
 	void	   *handle;
-	BuildIdFn	built_against;
+	ScanApiFn	scan_api;
+	const DfPaxReader *api;
 	BuildIdSearch running;
 
 	memset(&running, 0, sizeof(running));
@@ -122,23 +125,26 @@ df_pax_load(char *why, size_t whylen)
 		return false;
 	}
 
-	built_against = (BuildIdFn) dlsym(handle, "df_pax_shim_build_id");
-	df_pax_reader.begin = (DfPaxBegin) dlsym(handle, "df_pax_scan_begin");
-	df_pax_reader.nblocks = (DfPaxNBlocks) dlsym(handle, "df_pax_scan_nblocks");
-	df_pax_reader.read = (DfPaxRead) dlsym(handle, "df_pax_read_block");
-	df_pax_reader.end = (DfPaxEnd) dlsym(handle, "df_pax_scan_end");
-	if (!built_against || !df_pax_reader.begin || !df_pax_reader.nblocks ||
-		!df_pax_reader.read || !df_pax_reader.end)
+	scan_api = (ScanApiFn) dlsym(handle, "datafusion_pax_scan_api");
+	if (scan_api == NULL)
 	{
-		snprintf(why, whylen, "%s lacks an entry point", path);
+		snprintf(why, whylen, "%s lacks datafusion_pax_scan_api", path);
 		return false;
 	}
-	if (strcmp(built_against(), running.hex) != 0)
+	api = scan_api();
+	if (api == NULL || api->version != DF_PAX_SCAN_API_VERSION)
+	{
+		snprintf(why, whylen, "%s has scan interface version %u, expected %u",
+				 path, api ? api->version : 0, DF_PAX_SCAN_API_VERSION);
+		return false;
+	}
+	if (strcmp(api->pax_build_id, running.hex) != 0)
 	{
 		snprintf(why, whylen, "built against pax.so %s, running pax.so is %s",
-				 built_against(), running.hex);
+				 api->pax_build_id, running.hex);
 		return false;
 	}
+	df_pax_reader = api;
 	return true;
 }
 
@@ -160,5 +166,5 @@ df_pax_reader_get(void)
 					(errmsg("datafusion: reading PAX tables through the table access method"),
 					 errdetail("The direct PAX reader is unavailable: %s", why)));
 	}
-	return df_pax_ok ? &df_pax_reader : NULL;
+	return df_pax_ok ? df_pax_reader : NULL;
 }

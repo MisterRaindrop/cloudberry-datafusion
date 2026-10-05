@@ -92,24 +92,46 @@ df-rust-clean:
 	-cd rust && $(CARGO) clean
 
 # ---------------------------------------------------------------------------
-# Experimental direct PAX reader, datafusion_pax.so (src/df_pax.cc).  Built
-# only when DF_PAX_SRC names the pax_storage C++ sources (contrib/pax_storage/
-# src/cpp) of the Cloudberry tree the installed pax.so was built from; the
+# Experimental direct PAX reader, datafusion_pax.so.  Its source is a patch to
+# PAX, patches/pax/*.patch, which adds a columnar scan interface
+# (access/datafusion_scan_api.cc).  Built only when DF_PAX_SRC names the
+# pax_storage C++ sources (contrib/pax_storage/src/cpp) of the Cloudberry tree
+# the installed pax.so was built from: they are copied to pax_build/, patched,
+# and the files the patches add are compiled into datafusion_pax.so.  The
+# Cloudberry tree itself and the installed pax.so are left untouched.  The
 # installed PAX headers come first, they include the generated protobuf ones.
 # The library records the installed pax.so's build ID and is only used with it.
 # ---------------------------------------------------------------------------
 ifdef DF_PAX_SRC
 DF_PAX_SO := $(pkglibdir)/pax.so
 DF_PAX_BUILD_ID := $(shell readelf -n $(DF_PAX_SO) 2>/dev/null | awk '/Build ID/ {print $$3}')
+DF_PAX_PATCHES := $(sort $(wildcard patches/pax/*.patch))
+DF_PAX_TREE := pax_build/src/cpp
+DF_PAX_API_SRC := $(DF_PAX_TREE)/access/datafusion_scan_api.cc
 CXX ?= g++
 
 all: datafusion_pax.so
 
-datafusion_pax.so: src/df_pax.cc
+# The patches are against the Cloudberry tree; -p5 strips
+# a/contrib/pax_storage/src/cpp.
+pax_build/.patched: $(DF_PAX_PATCHES)
+	rm -rf pax_build
+	mkdir -p $(dir $(DF_PAX_TREE))
+	cp -R $(DF_PAX_SRC) $(DF_PAX_TREE)
+	for p in $(DF_PAX_PATCHES); do \
+		patch -s -p5 --forward -d $(DF_PAX_TREE) < $$p || exit 1; \
+	done
+	touch $@
+
+$(DF_PAX_API_SRC): pax_build/.patched
+
+# -Bsymbolic keeps the library's own references inside it, even if a loaded
+# pax.so ever exports the same names.
+datafusion_pax.so: $(DF_PAX_API_SRC)
 	@test -n "$(DF_PAX_BUILD_ID)" || { echo "cannot read the build ID of $(DF_PAX_SO)"; exit 1; }
 	$(CXX) -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -DUSE_PAX_CATALOG \
-		-DDF_PAX_BUILD_ID='"$(DF_PAX_BUILD_ID)"' \
-		-I$(includedir)/pax -I$(DF_PAX_SRC) -I$(includedir_server) -I$(includedir_internal) \
+		-DDF_PAX_BUILD_ID='"$(DF_PAX_BUILD_ID)"' -Wl,-Bsymbolic \
+		-I$(includedir)/pax -I$(DF_PAX_TREE) -I$(includedir_server) -I$(includedir_internal) \
 		$< -o $@
 
 install: install-pax
@@ -117,5 +139,5 @@ install: install-pax
 install-pax: datafusion_pax.so
 	$(INSTALL_SHLIB) datafusion_pax.so '$(DESTDIR)$(pkglibdir)/'
 
-EXTRA_CLEAN += datafusion_pax.so
+EXTRA_CLEAN += datafusion_pax.so pax_build
 endif

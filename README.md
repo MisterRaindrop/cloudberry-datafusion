@@ -162,12 +162,22 @@ parallel mode, 1.16 s without), and on PAX 0.14 s instead of 0.20 s.
 row-at-a-time interface.  The main thread lists the micro-partitions
 visible to the snapshot; DataFusion's partitions then take blocks one at a
 time and decode the needed columns themselves, through PAX's own reader
-classes, in a small separate library, `datafusion_pax.so` (`src/df_pax.cc`).
+classes, in a small separate library, `datafusion_pax.so`.
+
+Its source is a patch to PAX, `patches/pax/0001-pax-columnar-scan-api.patch`,
+which adds a columnar scan interface (`access/datafusion_scan_api.{h,cc}`):
+one exported C function, `datafusion_pax_scan_api()`, returning a versioned
+table of functions; every other symbol stays local, and the library links
+with `-Bsymbolic`, so nothing clashes with PAX or PostgreSQL.  The build
+copies the PAX sources to `pax_build/`, applies the patches there and
+compiles what they add; neither the Cloudberry tree nor the installed
+pax.so is modified.  The same patch could later go upstream into PAX.
+
 That code calls PAX's internal C++ classes, not a published API:
 
 - It is built only with `make DF_PAX_SRC=<cloudberry>/contrib/pax_storage/src/cpp`,
   against the installed PAX headers plus the sources of the same tree, and
-  needs the protobuf headers of the version pax.so links.
+  needs the protobuf headers of the version pax.so links and GNU `patch`.
 - It records the installed pax.so's ELF build ID.  At run time the extension
   compares it with the running pax.so and, if they differ or the library
   does not load, warns once and reads through the table AM.

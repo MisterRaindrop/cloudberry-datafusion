@@ -73,13 +73,22 @@ extern const char *df_type_tag(Oid type);
 extern bool df_translate_slice(Plan *root, DfSliceSpec *spec,
 							   char *reason, size_t reasonlen);
 
-/* df_paxload.c: the experimental direct PAX reader (src/df_pax.cc) */
+/*
+ * df_paxload.c: the experimental direct PAX reader, datafusion_pax.so, built
+ * from patches/pax.  DfPaxReader mirrors DatafusionPaxScanApi in the patch's
+ * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
+ * two identical.
+ */
+#define DF_PAX_SCAN_API_VERSION 1
+
 typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, const int *cols,
 							 const int *widths, int ncols, char *err, size_t errlen);
 typedef int (*DfPaxNBlocks) (void *scan);
 
 typedef struct DfPaxReader
 {
+	uint32		version;
+	const char *pax_build_id;	/* the pax.so it was built against */
 	DfPaxBegin	begin;
 	DfPaxNBlocks nblocks;
 	DfPaxRead	read;
