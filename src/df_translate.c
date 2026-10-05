@@ -55,6 +55,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 
 #include "df_executor.h"
@@ -123,6 +124,9 @@ df_type_tag(Oid type)
 			return "timestamp";
 		case TIMESTAMPTZOID:
 			return "timestamptz";
+		case TEXTOID:
+		case VARCHAROID:
+			return "text";
 		default:
 			return NULL;
 	}
@@ -137,6 +141,30 @@ df_emit_float(StringInfo out, double v, bool single)
 		appendStringInfoString(out, v > 0 ? "\"Infinity\"" : "\"-Infinity\"");
 	else
 		appendStringInfo(out, single ? "%.9g" : "%.17g", v);
+}
+
+/* 'len' bytes of UTF-8 as a JSON string. */
+static void
+df_emit_json_string(StringInfo out, const char *s, int len)
+{
+	int			i;
+
+	appendStringInfoChar(out, '"');
+	for (i = 0; i < len; i++)
+	{
+		unsigned char ch = (unsigned char) s[i];
+
+		if (ch == '"' || ch == '\\')
+		{
+			appendStringInfoChar(out, '\\');
+			appendStringInfoChar(out, ch);
+		}
+		else if (ch < 0x20)
+			appendStringInfo(out, "\\u%04x", ch);
+		else
+			appendStringInfoChar(out, ch);
+	}
+	appendStringInfoChar(out, '"');
 }
 
 static void
@@ -178,6 +206,14 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 				break;
 			case FLOAT8OID:
 				df_emit_float(out, DatumGetFloat8(c->constvalue), false);
+				break;
+			case TEXTOID:
+			case VARCHAROID:
+				{
+					text	   *t = DatumGetTextPP(c->constvalue);
+
+					df_emit_json_string(out, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+				}
 				break;
 		}
 		appendStringInfoString(out, "}}");
@@ -422,6 +458,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				return;
 			}
 
+		case T_RelabelType:
+			/* varchar read as text, or COLLATE (checked by the planner hook) */
+			df_emit(b, out, (Node *) ((RelabelType *) node)->arg, level);
+			return;
+
 		case T_Aggref:
 			if (level != DF_LEVEL_AGG)
 			{
@@ -622,6 +663,29 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 }
 
 /*
+ * Rows per batch: about DF_BATCH_BYTES of the widest row the planner
+ * expects anywhere in the slice, at most DF_BATCH_MAX_ROWS.  DataFusion's
+ * operators allocate in proportion to a batch's bytes, and a partition's
+ * share of the memory budget is sized for batches of about this size.
+ */
+#define DF_BATCH_BYTES		(256 * 1024)
+#define DF_BATCH_MIN_ROWS	16
+#define DF_BATCH_MAX_ROWS	8192
+
+static int
+df_slice_width(Plan *plan)
+{
+	int			width;
+
+	if (plan == NULL)
+		return 0;
+	width = plan->plan_width;
+	if (IsA(plan, Motion))
+		return width;			/* another slice below */
+	return Max(width, Max(df_slice_width(outerPlan(plan)), df_slice_width(innerPlan(plan))));
+}
+
+/*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
  */
@@ -771,7 +835,10 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 							 node.data, group.data, aggs.data, having.data);
 			node = a;
 		}
-		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s}", node.data, outputs.data);
+		spec->batch_rows = Min(DF_BATCH_MAX_ROWS,
+							   Max(DF_BATCH_MIN_ROWS, DF_BATCH_BYTES / Max(df_slice_width(root), 1)));
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s,\"batch_rows\":%d}",
+						 node.data, outputs.data, spec->batch_rows);
 	}
 
 	spec->json = json.data;

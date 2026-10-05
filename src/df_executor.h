@@ -69,6 +69,7 @@ typedef struct DfSliceSpec
 	DfSliceInput *inputs;
 	int			nout;			/* output columns, in targetlist order */
 	Oid		   *out_types;
+	int			batch_rows;		/* rows per batch, from the widest row */
 } DfSliceSpec;
 
 /* df_exec.c */

@@ -84,9 +84,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray,
+    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, StringArray,
 };
-use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
@@ -160,6 +160,8 @@ pub enum PgType {
     Time,
     Timestamp,
     Timestamptz,
+    // text and varchar: UTF-8 bytes, compared byte by byte.
+    Text,
 }
 
 impl PgType {
@@ -175,6 +177,7 @@ impl PgType {
             "time" => PgType::Time,
             "timestamp" => PgType::Timestamp,
             "timestamptz" => PgType::Timestamptz,
+            "text" => PgType::Text,
             other => return Err(format!("unsupported type {other}")),
         })
     }
@@ -192,6 +195,7 @@ impl PgType {
     /// and time_hash and timestamp_hash are hashint8.
     pub fn key_hash(self) -> KeyHash {
         match self.storage() {
+            PgType::Text => KeyHash::Text,
             PgType::Bool => KeyHash::Bool,
             PgType::Int2 => KeyHash::Int2,
             PgType::Int4 => KeyHash::Int4,
@@ -210,16 +214,34 @@ impl PgType {
             PgType::Int8 => DataType::Int64,
             PgType::Float4 => DataType::Float32,
             PgType::Float8 => DataType::Float64,
+            PgType::Text => DataType::Utf8,
             _ => unreachable!(),
         }
     }
 }
 
 /// Column data as the C side lays it out: native values (one byte per bool)
-/// and one byte per row that is 1 for NULL.
+/// and one byte per row that is 1 for NULL.  A string column's `values` are
+/// its bytes, row r being `offsets[r]..offsets[r + 1]`; `offsets` is null
+/// for the other types.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawColumn {
+    pub values: *const u8,
+    pub nulls: *const u8,
+    pub offsets: *const i32,
+}
+
+impl RawColumn {
+    pub fn fixed(values: *const u8, nulls: *const u8) -> RawColumn {
+        RawColumn { values, nulls, offsets: std::ptr::null() }
+    }
+}
+
+/// A column as the PAX reader hands it out (fixed-width types only).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PaxColumn {
     pub values: *const u8,
     pub nulls: *const u8,
 }
@@ -227,6 +249,7 @@ pub struct RawColumn {
 /// Converted output column whose buffers stay valid until the next poll.
 struct OutColumn {
     _array: ArrayRef,
+    offsets: *const i32,
     bools: Option<Vec<u8>>,
     nulls: Vec<u8>,
     values: *const u8,
@@ -288,6 +311,11 @@ fn literal(v: &Value) -> Result<Expr, String> {
             None
         } else {
             Some(float_value(val.ok_or("bad float literal")?)?)
+        }),
+        PgType::Text => ScalarValue::Utf8(if null {
+            None
+        } else {
+            Some(val.and_then(Value::as_str).ok_or("bad text literal")?.to_string())
         }),
         _ => unreachable!(),
     };
@@ -509,7 +537,7 @@ impl PartitionStream for ChannelPartition {
 // ---------------------------------------------------------------------------
 
 /// Called by the PAX reader once per group of visible rows.
-pub type PaxEmitFn = unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const RawColumn) -> i32;
+pub type PaxEmitFn = unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32;
 /// Called by the PAX reader with the change in bytes it holds.
 pub type PaxAccountFn = unsafe extern "C" fn(ctx: *mut c_void, delta: i64);
 /// read_block of the PAX scan interface (patches/pax): decode one block,
@@ -584,16 +612,19 @@ struct EmitContext {
     error: Option<String>,
 }
 
-unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const RawColumn) -> i32 {
+unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32 {
     let ctx = &mut *(ctx as *mut EmitContext);
     let result = catch_unwind(AssertUnwindSafe(|| {
         let n = nrows as usize;
-        let arrays: Vec<ArrayRef> = ctx
+        let arrays = ctx
             .types
             .iter()
             .enumerate()
-            .map(|(i, ty)| build_array(*ty, *cols.add(i), n))
-            .collect();
+            .map(|(i, ty)| {
+                let c = *cols.add(i);
+                build_array(*ty, RawColumn::fixed(c.values, c.nulls), n)
+            })
+            .collect::<Result<Vec<ArrayRef>, PgError>>()?;
         make_batch(&ctx.schema, arrays, n)
     }));
     match result {
@@ -1080,9 +1111,16 @@ impl Query {
             }
         }
 
+        // Rows per batch, from the widest row the planner expects (the C
+        // side pushes batches of the same size).
+        let batch_rows = spec
+            .get("batch_rows")
+            .and_then(Value::as_u64)
+            .map(|n| (n as usize).clamp(1, BATCH_ROWS))
+            .unwrap_or(BATCH_ROWS);
         let config = SessionConfig::new()
             .with_target_partitions(partitions)
-            .with_batch_size(BATCH_ROWS);
+            .with_batch_size(batch_rows);
         let pool = Arc::new(TrackingPool::new(memory_limit.max(1)));
         let ctx = SessionContext::new_with_state(session_state(config, pool.clone(), spill_dir).map_err(df)?);
         let (out_tx, out_rx) = mpsc::channel(CHANNEL_DEPTH);
@@ -1249,7 +1287,7 @@ impl Query {
         }
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
         for (c, ty) in cols.iter().zip(types) {
-            arrays.push(build_array(*ty, *c, nrows));
+            arrays.push(build_array(*ty, *c, nrows)?);
         }
         let batch = make_batch(&self.in_schemas[input], arrays, nrows)?;
         match tx.try_send(Ok(batch)) {
@@ -1385,6 +1423,7 @@ impl Query {
             }
             let n = array.len();
             let nulls: Vec<u8> = (0..n).map(|r| array.is_null(r) as u8).collect();
+            let mut offsets: *const i32 = std::ptr::null();
             let (bools, values) = match ty.storage() {
                 PgType::Bool => {
                     let b: Vec<u8> = array.as_boolean().values().iter().map(|v| v as u8).collect();
@@ -1396,9 +1435,14 @@ impl Query {
                 PgType::Int8 => (None, array.as_primitive::<Int64Type>().values().as_ptr() as *const u8),
                 PgType::Float4 => (None, array.as_primitive::<Float32Type>().values().as_ptr() as *const u8),
                 PgType::Float8 => (None, array.as_primitive::<Float64Type>().values().as_ptr() as *const u8),
+                PgType::Text => {
+                    let a = array.as_string::<i32>();
+                    offsets = a.value_offsets().as_ptr();
+                    (None, a.values().as_ptr())
+                }
                 _ => unreachable!(),
             };
-            self.current.push(OutColumn { _array: array, bools, nulls, values });
+            self.current.push(OutColumn { _array: array, offsets, bools, nulls, values });
         }
         Ok(())
     }
@@ -1408,6 +1452,7 @@ impl Query {
         self.current.get(i).map(|c| RawColumn {
             values: c.bools.as_ref().map(|b| b.as_ptr()).unwrap_or(c.values),
             nulls: c.nulls.as_ptr(),
+            offsets: c.offsets,
         })
     }
 }
@@ -1480,21 +1525,33 @@ unsafe fn primitive<T: ArrowPrimitiveType>(c: RawColumn, n: usize, nulls: Option
     Arc::new(PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls))
 }
 
-/// An Arrow array of `n` values of `ty` from C buffers.
+/// An Arrow array of `n` values of `ty` from C buffers.  Strings are
+/// checked to be UTF-8 (PostgreSQL has checked them on input; Arrow's
+/// string kernels rely on it).
 ///
 /// # Safety
-/// `c` must point to `n` values of `ty` and `n` null bytes.
-pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
+/// `c` must point to `n` values of `ty` (for a string, `n + 1` offsets and
+/// the bytes they cover) and `n` null bytes.
+pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef, PgError> {
     let null_bytes = std::slice::from_raw_parts(c.nulls, n);
     let nulls = if null_bytes.iter().any(|b| *b != 0) {
         Some(NullBuffer::from(null_bytes.iter().map(|b| *b == 0).collect::<Vec<bool>>()))
     } else {
         None
     };
-    match ty.storage() {
+    Ok(match ty.storage() {
         PgType::Bool => {
             let v = std::slice::from_raw_parts(c.values, n);
             Arc::new(BooleanArray::new(BooleanBuffer::from_iter(v.iter().map(|b| *b != 0)), nulls))
+        }
+        PgType::Text => {
+            let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
+            let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets.to_vec()));
+            Arc::new(
+                StringArray::try_new(offsets, Buffer::from_slice_ref(bytes), nulls)
+                    .map_err(|e| PgError::new("22021", format!("invalid byte sequence for encoding \"UTF8\": {e}")))?,
+            )
         }
         PgType::Int2 => primitive::<Int16Type>(c, n, nulls),
         PgType::Int4 => primitive::<Int32Type>(c, n, nulls),
@@ -1502,7 +1559,7 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
         _ => unreachable!(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1519,7 +1576,7 @@ mod tests {
         let mut q = Query::start(spec, 2, limit, dir.to_str().unwrap())?;
         let cols: Vec<RawColumn> = input
             .iter()
-            .map(|(v, n)| RawColumn { values: v.as_ptr() as *const u8, nulls: n.as_ptr() })
+            .map(|(v, n)| RawColumn::fixed(v.as_ptr() as *const u8, n.as_ptr()))
             .collect();
         loop {
             if unsafe { q.push(&cols, nrows) }? {
@@ -1578,6 +1635,79 @@ mod tests {
         assert_eq!(count(i32::MIN), vec![vec![Some(0)]]);
     }
 
+    /// Push one text column (`None` = NULL) and return the output text column.
+    fn run_text(spec: &str, values: &[Option<&str>]) -> Result<Vec<Option<String>>, PgError> {
+        runtime::init(2).unwrap();
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0i32];
+        let mut nulls = Vec::new();
+        for v in values {
+            bytes.extend_from_slice(v.unwrap_or("").as_bytes());
+            offsets.push(bytes.len() as i32);
+            nulls.push(v.is_none() as u8);
+        }
+        let dir = std::env::temp_dir();
+        let mut q = Query::start(spec, 2, 64 << 20, dir.to_str().unwrap())?;
+        let col = RawColumn { values: bytes.as_ptr(), nulls: nulls.as_ptr(), offsets: offsets.as_ptr() };
+        while !unsafe { q.push(&[col], values.len()) }? {}
+        q.finish_input();
+        let mut out = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(n) => {
+                    let c = q.output_column(0).unwrap();
+                    for r in 0..n {
+                        if unsafe { *c.nulls.add(r) } != 0 {
+                            out.push(None);
+                            continue;
+                        }
+                        let (a, b) = unsafe { (*c.offsets.add(r) as usize, *c.offsets.add(r + 1) as usize) };
+                        let s = unsafe { std::slice::from_raw_parts(c.values.add(a), b - a) };
+                        out.push(Some(String::from_utf8(s.to_vec()).unwrap()));
+                    }
+                }
+                Poll::Pending => {}
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
+                Poll::Done => return Ok(out),
+                Poll::Failed(e) => return Err(e),
+                Poll::Panicked(m) => panic!("{m}"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_compares_bytes() {
+        let spec = r#"{"scan":{"columns":[{"type":"text"}]},
+            "filter":{"op":"<>","type":"bool","args":[{"col":0},{"lit":{"type":"text","value":"b\"\\"}}]},
+            "aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"text"}]}"#;
+        let input = [Some("a"), Some("b\"\\"), Some(""), None, Some("中文"), Some("b")];
+        let mut got = run_text(spec, &input).unwrap();
+        got.sort();
+        let want: Vec<Option<String>> = vec![Some(""), Some("a"), Some("b"), Some("中文")]
+            .into_iter().map(|s| s.map(String::from)).collect();
+        assert_eq!(got, want);
+
+        // min/max order bytes, as the C collation does.
+        let spec = r#"{"scan":{"columns":[{"type":"text"}]},"filter":null,
+            "aggregate":{"group":[],"aggs":[{"fn":"max","arg":{"col":0}}]},"having":null,
+            "output":[{"expr":{"agg":0},"type":"text"}]}"#;
+        assert_eq!(run_text(spec, &input).unwrap(), vec![Some("中文".to_string())]);
+    }
+
+    #[test]
+    fn invalid_utf8_is_an_error() {
+        let spec = r#"{"scan":{"columns":[{"type":"text"}]},"filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"text"}]}"#;
+        runtime::init(2).unwrap();
+        let dir = std::env::temp_dir();
+        let mut q = Query::start(spec, 2, 64 << 20, dir.to_str().unwrap()).unwrap();
+        let (bytes, offsets, nulls) = ([0xffu8, 0xfe], [0i32, 2], [0u8]);
+        let col = RawColumn { values: bytes.as_ptr(), nulls: nulls.as_ptr(), offsets: offsets.as_ptr() };
+        let e = unsafe { q.push(&[col], 1) }.err().expect("invalid UTF-8 accepted");
+        assert_eq!(e.sqlstate, "22021");
+    }
+
     #[test]
     fn count_merge_adds_partial_counts() {
         // Partial counts arrive as an int4 column here; HAVING sees the
@@ -1601,7 +1731,7 @@ mod tests {
         let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
         let cols: Vec<RawColumn> = input
             .iter()
-            .map(|(v, n)| RawColumn { values: v.as_ptr() as *const u8, nulls: n.as_ptr() })
+            .map(|(v, n)| RawColumn::fixed(v.as_ptr() as *const u8, n.as_ptr()))
             .collect();
         if nrows > 0 {
             while !unsafe { q.push(&cols, nrows) }.unwrap() {}
@@ -1675,7 +1805,7 @@ mod tests {
         let nulls: Vec<u8> = vals.iter().map(|v| (*v == 500) as u8).collect();
         let dir = std::env::temp_dir();
         let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
-        let col = RawColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
+        let col = RawColumn::fixed(vals.as_ptr() as *const u8, nulls.as_ptr());
         while !unsafe { q.push(&[col], 1000) }.unwrap() {}
         q.finish_input();
         let mut streams: HashMap<i32, Vec<u8>> = HashMap::new();
@@ -1784,10 +1914,10 @@ mod tests {
         let mut off = 0;
         while off < n {
             let len = BATCH_ROWS.min(n - off);
-            let col = RawColumn {
-                values: unsafe { (values.as_ptr() as *const u8).add(off * 4) },
-                nulls: unsafe { nulls.as_ptr().add(off) },
-            };
+            let col = RawColumn::fixed(
+                unsafe { (values.as_ptr() as *const u8).add(off * 4) },
+                unsafe { nulls.as_ptr().add(off) },
+            );
             if unsafe { q.push(&[col], len) }.unwrap() {
                 off += len;
             } else {
@@ -1840,7 +1970,7 @@ mod tests {
         for g in 0..2 {
             let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
             let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
-            let col = RawColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
+            let col = PaxColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
             if emit(ctx, 5, &col) != 0 {
                 account(ctx, -1000);
                 return -1;

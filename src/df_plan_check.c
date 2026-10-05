@@ -45,8 +45,10 @@
 #include "access/htup_details.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation_d.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "mb/pg_wchar.h"
 #include "executor/execUtils.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -61,6 +63,12 @@
 
 #include "df_executor.h"
 
+/*
+ * From utils/pg_locale.h, which needs ICU's headers when the server was
+ * built with ICU.
+ */
+extern bool lc_collate_is_c(Oid collation);
+
 typedef struct DfCheckContext
 {
 	PlannedStmt *stmt;
@@ -71,6 +79,7 @@ typedef struct DfCheckContext
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
 	bool		final_states;	/* this Agg may read DataFusion avg states */
+	bool		locale_dependent;	/* the verdict depends on this node's locale */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -111,6 +120,10 @@ df_type_supported(Oid type)
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
 			return true;
+		case TEXTOID:
+		case VARCHAROID:
+			/* Arrow's strings are UTF-8. */
+			return GetDatabaseEncoding() == PG_UTF8;
 		default:
 			return false;
 	}
@@ -126,6 +139,37 @@ df_type_is_datetime(Oid type)
 {
 	return type == DATEOID || type == TIMEOID ||
 		type == TIMESTAMPOID || type == TIMESTAMPTZOID;
+}
+
+/*
+ * text and varchar travel as their bytes, which DataFusion compares byte by
+ * byte: equality agrees with PostgreSQL under a deterministic collation,
+ * ordering (and min/max) only under the C collation.
+ */
+static bool
+df_type_is_string(Oid type)
+{
+	return type == TEXTOID || type == VARCHAROID;
+}
+
+/*
+ * Why comparing strings under 'collation' as 'name' does stays on
+ * PostgreSQL, or NULL.  Whether the database's default collation is C is
+ * each node's own: the coordinator and the segments can differ (e.g. C and
+ * C.UTF-8), so such a verdict is marked as depending on the node.
+ */
+static const char *
+df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
+{
+	bool		equality = strcmp(name, "=") == 0 || strcmp(name, "<>") == 0;
+
+	if (!equality && collation == DEFAULT_COLLATION_OID)
+		cxt->locale_dependent = true;
+	if (!OidIsValid(collation))
+		return "without a collation";
+	if (equality ? !get_collation_isdeterministic(collation) : !lc_collate_is_c(collation))
+		return equality ? "under a nondeterministic collation" : "under a collation other than C";
+	return NULL;
 }
 
 static bool
@@ -328,6 +372,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						(op->opresulttype != BOOLOID || ltype != rtype))
 						df_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
+					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
+					{
+						const char *problem;
+
+						if (op->opresulttype != BOOLOID || ltype != rtype)
+							df_reject(cxt, "operator %s on %s and %s", name,
+									  format_type_be(ltype), format_type_be(rtype));
+						else if ((problem = df_string_compare_problem(cxt, name, op->inputcollid)) != NULL)
+							df_reject(cxt, "operator %s on %s %s", name,
+									  format_type_be(ltype), problem);
+					}
 				}
 				if (cxt->failed)
 					return true;
@@ -406,6 +461,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
 					/* PostgreSQL adds real values in single precision. */
 					df_reject(cxt, "sum of real values");
+				else if (df_type_is_string(agg->aggtype) &&
+						 df_string_compare_problem(cxt, name, agg->inputcollid) != NULL)
+					df_reject(cxt, "aggregate %s of %s %s", name, format_type_be(agg->aggtype),
+							  df_string_compare_problem(cxt, name, agg->inputcollid));
 				if (cxt->failed)
 					return true;
 				break;
@@ -437,6 +496,21 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			return true;
 
 		case T_RelabelType:
+			{
+				RelabelType *r = (RelabelType *) node;
+
+				/*
+				 * varchar is read as text, the same bytes; COLLATE keeps the
+				 * type and the comparison above checks the collation.
+				 */
+				if (df_type_is_string(r->resulttype) &&
+					(r->resulttype == exprType((Node *) r->arg) ||
+					 (r->resulttype == TEXTOID && exprType((Node *) r->arg) == VARCHAROID)))
+					break;
+				df_reject(cxt, "type cast");
+				return true;
+			}
+
 		case T_CoerceViaIO:
 		case T_ArrayCoerceExpr:
 			df_reject(cxt, "type cast");
@@ -732,6 +806,14 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 								  format_type_be(exprType((Node *) tle->expr)));
 						return;
 					}
+					if (tle && df_type_is_string(exprType((Node *) tle->expr)) &&
+						df_string_compare_problem(cxt, "=", agg->grpCollations[i]) != NULL)
+					{
+						df_reject(cxt, "GROUP BY key of type %s %s",
+								  format_type_be(exprType((Node *) tle->expr)),
+								  df_string_compare_problem(cxt, "=", agg->grpCollations[i]));
+						return;
+					}
 				}
 				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
@@ -991,7 +1073,8 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  */
 static bool
 df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-				 Bitmapset *batches, char *reason, size_t reasonlen)
+				 Bitmapset *batches, char *reason, size_t reasonlen,
+				 bool *locale_dependent)
 {
 	DfCheckContext cxt;
 
@@ -1014,6 +1097,8 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	else
 		df_check_plan(root, &cxt, NULL, root_is_sender);
 
+	if (locale_dependent)
+		*locale_dependent = cxt.locale_dependent;
 	return !cxt.failed;
 }
 
@@ -1022,7 +1107,7 @@ df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 			   char *reason, size_t reasonlen)
 {
 	return df_check_slice_b(stmt, root, root_is_sender, df_batch_motions(stmt),
-							reason, reasonlen);
+							reason, reasonlen, NULL);
 }
 
 /*
@@ -1049,7 +1134,9 @@ bool		df_motion_batches = false;
 /*
  * Would the executor hook run slice 'index' in DataFusion, if the Motions
  * in 'batches' carry batches?  The same check and translation it applies,
- * from the plan alone.
+ * from the plan alone.  A slice whose verdict depends on the node's locale
+ * counts as not running there: every node must find the same batch
+ * Motions, and its Motions carry tuples whichever way each node decides.
  */
 static bool
 df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
@@ -1059,6 +1146,7 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 	Motion	   *sender;
 	Plan	   *root;
 	Plan	   *compute;
+	bool		locale_dependent = false;
 
 	if (index < 0 || index >= stmt->numSlices)
 		return false;
@@ -1066,9 +1154,13 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 	root = sender ? (Plan *) sender : stmt->planTree;
 	compute = sender ? outerPlan(root) : root;
 	if (compute != NULL &&
-		df_check_slice_b(stmt, root, sender != NULL, batches, reason, sizeof(reason)) &&
+		df_check_slice_b(stmt, root, sender != NULL, batches, reason, sizeof(reason),
+						 &locale_dependent) &&
+		!locale_dependent &&
 		df_translate_slice(compute, &spec, reason, sizeof(reason)))
 		return true;
+	if (locale_dependent)
+		snprintf(reason, sizeof(reason), "its verdict depends on the node's default collation");
 	elog(DEBUG2, "datafusion: with these batch Motions slice %d cannot run: %s",
 		 index, compute ? reason : "no plan");
 	return false;

@@ -41,6 +41,7 @@ pub enum KeyHash {
     Int8,   // hashint8
     Float4, // hashfloat4
     Float8, // hashfloat8
+    Text,   // hashtext under a deterministic collation (not yet routed)
 }
 
 impl KeyHash {
@@ -137,6 +138,7 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
         KeyHash::Int8 => hash_int8(a.as_primitive::<Int64Type>().value(r)),
         KeyHash::Float4 => hash_float8(a.as_primitive::<Float32Type>().value(r) as f64),
         KeyHash::Float8 => hash_float8(a.as_primitive::<Float64Type>().value(r)),
+        KeyHash::Text => unimplemented!("hashtext"),
     })
 }
 

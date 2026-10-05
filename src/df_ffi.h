@@ -86,11 +86,24 @@ extern uint64_t df_ffi_debug_active_tasks(void);
  */
 typedef struct DfQuery DfQuery;
 
+/*
+ * Native values, or for a string column its bytes with 'offsets' giving
+ * row r as bytes offsets[r] to offsets[r + 1]; one byte per row that is 1
+ * for NULL.  'offsets' is NULL for other columns.
+ */
 typedef struct DfColumn
 {
 	const void *values;
 	const uint8_t *nulls;
+	const int32_t *offsets;
 } DfColumn;
+
+/* A column as the PAX reader hands it out: fixed-width values only. */
+typedef struct DfPaxColumn
+{
+	const void *values;
+	const uint8_t *nulls;
+} DfPaxColumn;
 
 /* The message may be followed by a newline and an error detail. */
 /* Bit j of 'ipc_inputs': input j arrives as Arrow IPC streams from a Motion. */
@@ -100,7 +113,7 @@ extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  DfQuery **out_query,
 								  char *sqlstate, char *buf, size_t buflen);
 /* PAX blocks read on the workers (experimental); see patches/pax. */
-typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfColumn *cols);
+typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfPaxColumn *cols);
 typedef void (*DfPaxAccount) (void *ctx, int64_t delta);
 typedef int (*DfPaxRead) (void *scan, int index, DfPaxEmit emit,
 						  DfPaxAccount account, void *ctx,

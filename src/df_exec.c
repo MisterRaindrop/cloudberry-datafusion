@@ -81,6 +81,7 @@
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -89,6 +90,11 @@
 
 /* Rows per input batch; matches df_core::query::BATCH_ROWS. */
 #define DF_BATCH_ROWS		8192
+/*
+ * A batch also ends once one of its string columns holds this many bytes,
+ * for rows much wider than the planner expected.
+ */
+#define DF_BATCH_STRING_BYTES	(4 * 1024 * 1024)
 
 /* Wait for results this long when there is nothing else to do. */
 #define DF_POLL_IDLE_MS		10
@@ -127,8 +133,10 @@ typedef struct DfInput
 	int			maxattno;		/* highest column read */
 
 	/* batch being assembled or offered */
-	char	  **invalues;
+	char	  **invalues;		/* string columns: their bytes */
 	uint8	  **innulls;
+	int32	  **inoffsets;		/* string columns: DF_BATCH_ROWS + 1 offsets */
+	Size	   *incap;			/* string columns: bytes allocated */
 	DfColumn   *incols;
 	int			batch_rows;
 	bool		batch_ready;	/* a filled batch waits to be pushed */
@@ -176,6 +184,7 @@ typedef struct DfExec
 
 	/* output batch being handed out */
 	TupleTableSlot *outslot;
+	MemoryContext rowcxt;		/* the strings of the row handed out */
 	DfColumn   *outcols;
 	uint32		out_nrows;
 	uint32		out_row;
@@ -187,6 +196,13 @@ typedef struct DfExec
 
 static DfExec *df_execs = NULL;
 
+static bool
+df_type_is_string(Oid type)
+{
+	return type == TEXTOID || type == VARCHAROID;
+}
+
+/* Bytes per value of a fixed-width type. */
 static int
 df_type_width(Oid type)
 {
@@ -614,6 +630,10 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 		if (amname == NULL || strcmp(amname, "pax") != 0)
 			return false;
 	}
+	/* The reader hands out fixed-width values only. */
+	for (c = 0; c < in->spec->ncols; c++)
+		if (df_type_is_string(in->spec->types[c]))
+			return false;
 	reader = df_pax_reader_get();
 	if (reader == NULL)
 		return false;
@@ -712,15 +732,19 @@ df_exec_begin(DfExec *x)
 	}
 }
 
-/* Read up to DF_BATCH_ROWS rows of the needed columns of input 'in'. */
+/*
+ * Read up to the slice's rows per batch (at most DF_BATCH_ROWS) of the
+ * needed columns of input 'in'.
+ */
 static void
 df_exec_fill(DfExec *x, DfInput *in)
 {
 	TupleTableSlot *slot = in->scan ? in->scan->ss.ss_ScanTupleSlot : NULL;
 	int			n = 0;
 	int			c;
+	bool		strings_full = false;
 
-	while (n < DF_BATCH_ROWS)
+	while (n < x->spec.batch_rows && !strings_full)
 	{
 		if (in->motion)
 		{
@@ -771,10 +795,39 @@ df_exec_fill(DfExec *x, DfInput *in)
 				case FLOAT8OID:
 					((float8 *) dst)[n] = isnull ? 0 : DatumGetFloat8(d);
 					break;
+				case TEXTOID:
+				case VARCHAROID:
+					{
+						int32	   *off = in->inoffsets[c];
+						Size		end = off[n];
+
+						if (!isnull)
+						{
+							struct varlena *v = (struct varlena *) DatumGetPointer(d);
+							struct varlena *p = pg_detoast_datum_packed(v);
+							Size		len = VARSIZE_ANY_EXHDR(p);
+
+							if (end + len > in->incap[c])
+							{
+								in->incap[c] = Max(in->incap[c] * 2, end + len);
+								in->invalues[c] = repalloc_huge(in->invalues[c], in->incap[c]);
+							}
+							memcpy(in->invalues[c] + end, VARDATA_ANY(p), len);
+							if (p != v)
+								pfree(p);
+							end += len;
+						}
+						off[n + 1] = (int32) end;
+						if (end >= DF_BATCH_STRING_BYTES)
+							strings_full = true;
+					}
+					break;
 			}
 		}
 		n++;
 	}
+	for (c = 0; c < in->spec->ncols; c++)
+		in->incols[c].values = in->invalues[c];	/* moved if it grew */
 	in->batch_rows = n;
 	in->batch_ready = (n > 0);
 	if (in->ended && !in->batch_ready)
@@ -831,6 +884,7 @@ df_exec_emit(DfExec *x)
 	int			c;
 
 	ExecClearTuple(slot);
+	MemoryContextReset(x->rowcxt);
 	for (c = 0; c < x->spec.nout; c++)
 	{
 		const void *v = x->outcols[c].values;
@@ -865,6 +919,18 @@ df_exec_emit(DfExec *x)
 				break;
 			case FLOAT8OID:
 				slot->tts_values[c] = Float8GetDatum(((const float8 *) v)[r]);
+				break;
+			case TEXTOID:
+			case VARCHAROID:
+				{
+					const int32 *off = x->outcols[c].offsets;
+					MemoryContext oldcxt = MemoryContextSwitchTo(x->rowcxt);
+
+					slot->tts_values[c] =
+						PointerGetDatum(cstring_to_text_with_len((const char *) v + off[r],
+																 off[r + 1] - off[r]));
+					MemoryContextSwitchTo(oldcxt);
+				}
 				break;
 		}
 	}
@@ -1064,13 +1130,24 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		}
 		in->invalues = palloc0(sizeof(char *) * Max(in->spec->ncols, 1));
 		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
+		in->inoffsets = palloc0(sizeof(int32 *) * Max(in->spec->ncols, 1));
+		in->incap = palloc0(sizeof(Size) * Max(in->spec->ncols, 1));
 		in->incols = palloc0(sizeof(DfColumn) * Max(in->spec->ncols, 1));
 		for (c = 0; c < in->spec->ncols; c++)
 		{
-			in->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(in->spec->types[c]));
+			if (df_type_is_string(in->spec->types[c]))
+			{
+				in->incap[c] = DF_BATCH_ROWS * 16;
+				in->invalues[c] = palloc(in->incap[c]);
+				in->inoffsets[c] = palloc(sizeof(int32) * (DF_BATCH_ROWS + 1));
+				in->inoffsets[c][0] = 0;
+			}
+			else
+				in->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(in->spec->types[c]));
 			in->innulls[c] = palloc(DF_BATCH_ROWS);
 			in->incols[c].values = in->invalues[c];
 			in->incols[c].nulls = in->innulls[c];
+			in->incols[c].offsets = in->inoffsets[c];
 			in->maxattno = Max(in->maxattno, in->spec->attnos[c]);
 		}
 	}
@@ -1119,6 +1196,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 
 	x->outcols = palloc0(sizeof(DfColumn) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
+	x->rowcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion row",
+									  ALLOCSET_SMALL_SIZES);
 
 	x->release.func = df_exec_release;
 	x->release.arg = x;

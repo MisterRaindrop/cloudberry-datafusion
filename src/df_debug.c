@@ -417,6 +417,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 		}
 		cols[k].values = (const void *) values[k];
 		cols[k].nulls = nulls[k];
+		cols[k].offsets = NULL;
 	}
 	h = makeCdbHash(segments, nkeys, funcs);
 	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);

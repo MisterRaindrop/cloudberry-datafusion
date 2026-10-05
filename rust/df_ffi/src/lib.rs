@@ -258,6 +258,7 @@ pub struct DfQuery(df_core::query::Query);
 pub struct DfColumn {
     pub values: *const u8,
     pub nulls: *const u8,
+    pub offsets: *const i32,
 }
 
 /// Write a five-character SQLSTATE plus NUL into `sqlstate` (6 bytes).
@@ -398,7 +399,7 @@ pub extern "C" fn df_ffi_query_push(
     let raw: Vec<df_core::query::RawColumn> = (0..ncols as usize)
         .map(|i| unsafe {
             let c = &*cols.add(i);
-            df_core::query::RawColumn { values: c.values, nulls: c.nulls }
+            df_core::query::RawColumn { values: c.values, nulls: c.nulls, offsets: c.offsets }
         })
         .collect();
     match catch_unwind(AssertUnwindSafe(|| unsafe { q.push_input(input as usize, &raw, nrows as usize) })) {
@@ -496,8 +497,8 @@ pub extern "C" fn df_ffi_cdbhash_routes(
                 5 => PgType::Float8,
                 _ => return None,
             };
-            let raw = df_core::query::RawColumn { values: c.values, nulls: c.nulls };
-            keys.push((ty.key_hash(), unsafe { df_core::query::build_array(ty, raw, nrows as usize) }));
+            let raw = df_core::query::RawColumn { values: c.values, nulls: c.nulls, offsets: c.offsets };
+            keys.push((ty.key_hash(), unsafe { df_core::query::build_array(ty, raw, nrows as usize) }.ok()?));
         }
         Some(df_core::cdbhash::routes(&keys, nrows as usize, segments, workers))
     }));
@@ -580,6 +581,7 @@ pub extern "C" fn df_ffi_query_column(query: *mut DfQuery, col: u32, out: *mut D
             unsafe {
                 (*out).values = c.values;
                 (*out).nulls = c.nulls;
+                (*out).offsets = c.offsets;
             }
             DF_OK
         }

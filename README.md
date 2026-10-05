@@ -58,7 +58,7 @@ column or PAX table, optionally under one
 plain or hashed aggregate (`count`, `sum`, `min`, `max`, `avg`), over
 `bool`, `int2`, `int4`, `int8`, `float4` and `float8`, with comparison and
 arithmetic operators (and since T1 `date`, `time`, `timestamp` and
-`timestamptz`, see below).  Since M5 this includes the segments' slices: a slice
+`timestamptz`, since X1 `text` and `varchar`, see below).  Since M5 this includes the segments' slices: a slice
 that ends in the Motion it sends through runs in DataFusion below that
 Motion, which keeps running on PostgreSQL and sends the rows one at a time,
 and the aggregate may be the partial stage of a split aggregate (`count`,
@@ -422,6 +422,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
 | J4 | Outer, semi and anti joins; keys of two integer or float types |
 | T1 | `date`, `time`, `timestamp` and `timestamptz` |
+| X1 | `text` and `varchar`; batch size from the row width |
 
 ### Date and time types
 
@@ -447,6 +448,48 @@ range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s
 in PostgreSQL; grouping by `date` with a `timestamp` filter took 0.17 s and
 0.89 s (only the segments' slice in DataFusion; the coordinator sorts and
 limits).
+
+### Text and varchar
+
+In a UTF-8 database, `text` and `varchar` columns travel as Arrow string
+columns: the main thread detoasts each value and copies its bytes, and
+results come back as new `text` values.  DataFusion compares the bytes,
+which agrees with PostgreSQL as follows:
+
+| Operation | Runs in DataFusion when the collation is |
+|---|---|
+| `=`, `<>`, GROUP BY keys, hash join keys | deterministic (any libc or ICU collation that is not `deterministic = false`) |
+| `<`, `<=`, `>`, `>=`, `min`, `max` | C or POSIX |
+
+Anything else stays on PostgreSQL with the reason in EXPLAIN (`operator <
+on text under a collation other than C`).  Whether the database's default
+collation is C is decided by each node itself: the coordinator and the
+segments can disagree (a cluster initialized with `C` on the coordinator
+and `C.UTF-8` on the segments does), so EXPLAIN shows the coordinator's
+verdict, a segment may run the same slice on PostgreSQL, and the Motions
+of a slice whose verdict depends on the default collation carry tuples
+rather than batches, so that every node agrees on which Motions carry
+batches.  An explicit `COLLATE "C"` is the same everywhere and keeps the
+batches.  Functions and operators on strings (`LIKE`, `||`, `length`)
+stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
+other encodings.  The direct PAX reader hands out fixed-width values only;
+a PAX table with a string column is read through the table AM.
+
+Batches hold about 256 kB of the widest row the planner expects in the
+slice (at most 8192 rows), the same on the C side and in DataFusion,
+since DataFusion's operators allocate in proportion to a batch's bytes and
+a partition's share of the memory budget is sized for that; the C side
+also ends a batch at 4 MB of one string column.  A table without
+statistics on wide strings (the planner assumes 32 bytes) can therefore
+fail with `out of memory` (53200) and DataFusion's reservation in the
+detail, as stale statistics do for joins; ANALYZE fixes it.
+
+Over 20 million heap rows on 3 segments: an equality filter on a `text`
+and a `varchar` column took 0.24 s in DataFusion and 0.98 s in
+PostgreSQL; grouping by a `varchar` of 500 values with `max(cust COLLATE
+"C")` 0.26 s and 1.00 s; grouping by a `text` of 200,000 values 0.67 s
+and 1.57 s.  Grouping 300,000 keys of 1 kB with `work_mem = 4MB` spills
+in both and took 2.16 s in DataFusion against 1.42 s.
 
 ## Build
 

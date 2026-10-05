@@ -1,0 +1,414 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- text and varchar: UTF-8 bytes in Arrow string columns, compared byte by
+-- byte.  Equality (filters, GROUP BY, join keys) agrees with PostgreSQL
+-- under any deterministic collation; ordering comparisons and min/max only
+-- under the C collation.  Whether the database's default collation is C is
+-- each node's own, so a slice that depends on it decides per node and its
+-- Motions carry tuples.  Each query runs with datafusion.mode off, then
+-- on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+CREATE COLLATION df_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+CREATE TABLE df_st (id int4, t text, v varchar(20), u text COLLATE "unicode", ci text COLLATE df_ci)
+DISTRIBUTED BY (id);
+INSERT INTO df_st SELECT i, 'k' || (i % 5000), 'v' || (i % 300), chr(65 + i % 58) || i % 7,
+  CASE WHEN i % 2 = 0 THEN 'ABC' ELSE 'abc' END
+FROM generate_series(1, 100000) i;
+INSERT INTO df_st VALUES (-1, '', '', '', ''), (-2, NULL, NULL, NULL, NULL),
+  (-3, '中文字符', 'ünïcödé', '😀', 'Ä'), (-4, E'quo"te\\back\nline', E'tab\there', 'b', 'B'),
+  (-5, 'k1 ', 'v1 ', 'a', 'A');
+CREATE TABLE df_st2 AS SELECT id, t::varchar(30) AS vt, v::text AS tv FROM df_st
+WHERE id % 3 = 0 OR id < 0 DISTRIBUTED BY (id);
+-- Values stored out of line in the TOAST table.
+CREATE TABLE df_st_big (id int4, t text) DISTRIBUTED BY (id);
+ALTER TABLE df_st_big ALTER COLUMN t SET STORAGE EXTERNAL;
+INSERT INTO df_st_big SELECT i, repeat(md5(i::text), 300 + i % 7) FROM generate_series(1, 2000) i;
+ANALYZE df_st;
+ANALYZE df_st2;
+ANALYZE df_st_big;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t = 'k42' AND v <> 'v1';
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: (((v)::text <> 'v1'::text) AND (t = 'k42'::text))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT min(t COLLATE "C"), max(v COLLATE "C") FROM df_st WHERE t COLLATE "C" > 'k4';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: ((t)::text > 'k4'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE u < 'b';
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: (u < 'b'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator < on text under a collation other than C
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT min(u) FROM df_st;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: aggregate min of text under a collation other than C
+ DataFusion: slice 1 not eligible: aggregate min of text under a collation other than C
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: (ci = 'abc'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator = on text under a nondeterministic collation
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%';
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: (t ~~ 'k1%'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator ~~
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: ((t || 'x'::text) = 'k1x'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator ||
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (a.t = (b.vt)::text)
+                     ->  Seq Scan on df_st a
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on df_st2 b
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 1:1  (slice1; segments: 1)
+   ->  Seq Scan on df_st_big
+         Filter: (id = 1500)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(6 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
+ count | count | count 
+-------+-------+-------
+   354 |   354 |   354
+(1 row)
+
+SELECT id, t, v FROM df_st WHERE id < 0 ORDER BY id;
+ id |      t      |      v       
+----+-------------+--------------
+ -5 | k1          | v1 
+ -4 | quo"te\back+| tab     here
+    | line        | 
+ -3 | 中文字符    | ünïcödé
+ -2 |             | 
+ -1 |             | 
+(5 rows)
+
+SELECT id FROM df_st WHERE t = E'quo"te\\back\nline' OR t = '中文字符' OR t = '' OR v = E'tab\there'
+ORDER BY id;
+ id 
+----
+ -4
+ -3
+ -1
+(3 rows)
+
+SELECT min(t COLLATE "C"), max(t COLLATE "C"), min(v COLLATE "C"), max(v COLLATE "C") FROM df_st;
+ min |   max    | min |   max   
+-----+----------+-----+---------
+     | 中文字符 |     | ünïcödé
+(1 row)
+
+SELECT count(*) FROM df_st WHERE t COLLATE "C" > 'k4' AND t COLLATE "C" <= 'k5';
+ count 
+-------
+ 22220
+(1 row)
+
+SELECT count(*), min(t), max(v) FROM df_st WHERE t >= 'k2' AND v < 'v5';
+ count | min | max 
+-------+-----+-----
+ 63461 | k2  | v49
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st GROUP BY t) s;
+ count | count 
+-------+-------
+  5005 |     2
+(1 row)
+
+SELECT v, count(*), max(id) FROM df_st
+WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
+    v    | count |  max  
+---------+-------+-------
+         |     1 |    -1
+ v1      |   334 | 99901
+ v1      |     1 |    -5
+ ünïcödé |     1 |    -3
+         |     1 |    -2
+(5 rows)
+
+SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
+ u  | count 
+----+-------
+    |     1
+ A0 |   246
+ A1 |   246
+ A2 |   247
+ A3 |   246
+(5 rows)
+
+SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+ count  |  max   
+--------+--------
+ 666664 | 100000
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
+ count  | count  
+--------+--------
+ 399669 | 333001
+(1 row)
+
+SELECT count(*) FROM df_st_big WHERE t = repeat(md5('7'), 300);
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_st_big a JOIN df_st_big b ON a.t = b.t;
+ count 
+-------
+  2000
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st_big GROUP BY t) s;
+ count | count 
+-------+-------
+  2000 |     1
+(1 row)
+
+-- A value the segments' slice hands out, checked on the client.
+SELECT t AS big FROM df_st_big WHERE id = 1500 \gset
+SELECT length(:'big'), md5(:'big');
+ length |               md5                
+--------+----------------------------------
+   9664 | 42590384552ce5ebf03a0a287b9cbb57
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
+ count | count | count 
+-------+-------+-------
+   354 |   354 |   354
+(1 row)
+
+SELECT id, t, v FROM df_st WHERE id < 0 ORDER BY id;
+ id |      t      |      v       
+----+-------------+--------------
+ -5 | k1          | v1 
+ -4 | quo"te\back+| tab     here
+    | line        | 
+ -3 | 中文字符    | ünïcödé
+ -2 |             | 
+ -1 |             | 
+(5 rows)
+
+SELECT id FROM df_st WHERE t = E'quo"te\\back\nline' OR t = '中文字符' OR t = '' OR v = E'tab\there'
+ORDER BY id;
+ id 
+----
+ -4
+ -3
+ -1
+(3 rows)
+
+SELECT min(t COLLATE "C"), max(t COLLATE "C"), min(v COLLATE "C"), max(v COLLATE "C") FROM df_st;
+ min |   max    | min |   max   
+-----+----------+-----+---------
+     | 中文字符 |     | ünïcödé
+(1 row)
+
+SELECT count(*) FROM df_st WHERE t COLLATE "C" > 'k4' AND t COLLATE "C" <= 'k5';
+ count 
+-------
+ 22220
+(1 row)
+
+SELECT count(*), min(t), max(v) FROM df_st WHERE t >= 'k2' AND v < 'v5';
+ count | min | max 
+-------+-----+-----
+ 63461 | k2  | v49
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st GROUP BY t) s;
+ count | count 
+-------+-------
+  5005 |     2
+(1 row)
+
+SELECT v, count(*), max(id) FROM df_st
+WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
+    v    | count |  max  
+---------+-------+-------
+         |     1 |    -1
+ v1      |   334 | 99901
+ v1      |     1 |    -5
+ ünïcödé |     1 |    -3
+         |     1 |    -2
+(5 rows)
+
+SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
+ u  | count 
+----+-------
+    |     1
+ A0 |   246
+ A1 |   246
+ A2 |   247
+ A3 |   246
+(5 rows)
+
+SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+ count  |  max   
+--------+--------
+ 666664 | 100000
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
+ count  | count  
+--------+--------
+ 399669 | 333001
+(1 row)
+
+SELECT count(*) FROM df_st_big WHERE t = repeat(md5('7'), 300);
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_st_big a JOIN df_st_big b ON a.t = b.t;
+ count 
+-------
+  2000
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st_big GROUP BY t) s;
+ count | count 
+-------+-------
+  2000 |     1
+(1 row)
+
+-- A value the segments' slice hands out, checked on the client.
+SELECT t AS big FROM df_st_big WHERE id = 1500 \gset
+SELECT length(:'big'), md5(:'big');
+ length |               md5                
+--------+----------------------------------
+   9664 | 42590384552ce5ebf03a0a287b9cbb57
+(1 row)
+
+-- Strings handed out row by row through a cursor.
+BEGIN;
+DECLARE df_st_cur CURSOR FOR SELECT t, v FROM df_st WHERE id BETWEEN 1 AND 3 OR id = -3;
+FETCH 2 FROM df_st_cur;
+ t  | v  
+----+----
+ k2 | v2
+ k3 | v3
+(2 rows)
+
+FETCH 2 FROM df_st_cur;
+    t     |    v    
+----------+---------
+ k1       | v1
+ 中文字符 | ünïcödé
+(2 rows)
+
+CLOSE df_st_cur;
+COMMIT;
+DROP TABLE df_st, df_st2, df_st_big;
+DROP COLLATION df_ci;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;
