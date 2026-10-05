@@ -1185,6 +1185,10 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 		{INT8OID, "hashint8"}, {FLOAT4OID, "hashfloat4"}, {FLOAT8OID, "hashfloat8"},
 		{DATEOID, "hashint4"}, {TIMEOID, "time_hash"},
 		{TIMESTAMPOID, "timestamp_hash"}, {TIMESTAMPTZOID, "timestamp_hash"},
+#ifndef WORDS_BIGENDIAN
+		/* cdbhash passes the default collation: hash_any of the bytes */
+		{TEXTOID, "hashtext"}, {VARCHAROID, "hashtext"},
+#endif
 	};
 	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);
 	Var		   *var;

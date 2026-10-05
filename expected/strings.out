@@ -169,6 +169,47 @@ EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
  DataFusion: slice 1 eligible
 (6 rows)
 
+-- Redistributed by text and varchar keys as batches (hashtext through
+-- cdbhash is hash_any of the bytes).
+EXPLAIN (COSTS OFF) SELECT t, count(*) FROM df_st GROUP BY t;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: t
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: t
+               ->  Streaming Partial HashAggregate
+                     Group Key: t
+                     ->  Seq Scan on df_st
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st b ON a.t = b.t;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (a.t = b.t)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a.t
+                           ->  Seq Scan on df_st a
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: b.t
+                                 ->  Seq Scan on df_st b
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(17 rows)
+
 SET datafusion.mode = off;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
  count | count | count 
@@ -245,6 +286,18 @@ SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
  count  |  max   
 --------+--------
  666664 | 100000
+(1 row)
+
+SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
+  count  |     sum      |     sum      
+---------+--------------+--------------
+ 2000004 | 100000999987 | 100000999987
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
+ count |  sum   
+-------+--------
+   305 | 100005
 (1 row)
 
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
@@ -357,6 +410,18 @@ SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
  666664 | 100000
 (1 row)
 
+SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
+  count  |     sum      |     sum      
+---------+--------------+--------------
+ 2000004 | 100000999987 | 100000999987
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
+ count |  sum   
+-------+--------
+   305 | 100005
+(1 row)
+
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
  count  | count  
 --------+--------
@@ -389,21 +454,22 @@ SELECT length(:'big'), md5(:'big');
    9664 | 42590384552ce5ebf03a0a287b9cbb57
 (1 row)
 
--- Strings handed out row by row through a cursor.
+-- Strings handed out row by row through a cursor (rows arrive from the
+-- segments in any order, so they are all alike).
 BEGIN;
-DECLARE df_st_cur CURSOR FOR SELECT t, v FROM df_st WHERE id BETWEEN 1 AND 3 OR id = -3;
+DECLARE df_st_cur CURSOR FOR SELECT v, t FROM df_st WHERE v = 'v1' AND t = 'k301';
 FETCH 2 FROM df_st_cur;
- t  | v  
-----+----
- k2 | v2
- k3 | v3
+ v  |  t   
+----+------
+ v1 | k301
+ v1 | k301
 (2 rows)
 
 FETCH 2 FROM df_st_cur;
-    t     |    v    
-----------+---------
- k1       | v1
- 中文字符 | ünïcödé
+ v  |  t   
+----+------
+ v1 | k301
+ v1 | k301
 (2 rows)
 
 CLOSE df_st_cur;

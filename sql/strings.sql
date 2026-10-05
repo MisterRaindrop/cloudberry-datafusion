@@ -61,6 +61,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
 EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
+-- Redistributed by text and varchar keys as batches (hashtext through
+-- cdbhash is hash_any of the bytes).
+EXPLAIN (COSTS OFF) SELECT t, count(*) FROM df_st GROUP BY t;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st b ON a.t = b.t;
 
 SET datafusion.mode = off;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
@@ -75,6 +79,8 @@ SELECT v, count(*), max(id) FROM df_st
 WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
 SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
 SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
+SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
 SELECT count(*) FROM df_st_big WHERE t = repeat(md5('7'), 300);
 SELECT count(*) FROM df_st_big a JOIN df_st_big b ON a.t = b.t;
@@ -95,6 +101,8 @@ SELECT v, count(*), max(id) FROM df_st
 WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
 SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
 SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
+SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
 SELECT count(*) FROM df_st_big WHERE t = repeat(md5('7'), 300);
 SELECT count(*) FROM df_st_big a JOIN df_st_big b ON a.t = b.t;
@@ -103,9 +111,10 @@ SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st_big 
 SELECT t AS big FROM df_st_big WHERE id = 1500 \gset
 SELECT length(:'big'), md5(:'big');
 
--- Strings handed out row by row through a cursor.
+-- Strings handed out row by row through a cursor (rows arrive from the
+-- segments in any order, so they are all alike).
 BEGIN;
-DECLARE df_st_cur CURSOR FOR SELECT t, v FROM df_st WHERE id BETWEEN 1 AND 3 OR id = -3;
+DECLARE df_st_cur CURSOR FOR SELECT v, t FROM df_st WHERE v = 'v1' AND t = 'k301';
 FETCH 2 FROM df_st_cur;
 FETCH 2 FROM df_st_cur;
 CLOSE df_st_cur;

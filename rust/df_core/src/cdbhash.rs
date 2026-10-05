@@ -41,7 +41,7 @@ pub enum KeyHash {
     Int8,   // hashint8
     Float4, // hashfloat4
     Float8, // hashfloat8
-    Text,   // hashtext under a deterministic collation (not yet routed)
+    Text,   // hashtext (cdbhash passes the default collation: deterministic)
 }
 
 impl KeyHash {
@@ -55,6 +55,7 @@ impl KeyHash {
             "float8" => KeyHash::Float8,
             "date" => KeyHash::Int4,
             "time" | "timestamp" | "timestamptz" => KeyHash::Int8,
+            "text" => KeyHash::Text,
             _ => return None,
         })
     }
@@ -78,6 +79,61 @@ fn final_mix(mut a: u32, mut b: u32, mut c: u32) -> u32 {
     c = c.wrapping_sub(b.rotate_left(24));
     let _ = a;
     c
+}
+
+#[inline]
+fn mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= c.rotate_left(16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= a.rotate_left(19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= b.rotate_left(4);
+    *b = b.wrapping_add(*a);
+}
+
+/// hash_bytes (hash_any) on a little-endian machine: the byte-wise path,
+/// which gives what the word-wise path for aligned keys gives.  hashtext
+/// under a deterministic collation hashes a value's bytes with it.
+pub fn hash_bytes(k: &[u8]) -> u32 {
+    let word = |i: usize| u32::from_le_bytes([k[i], k[i + 1], k[i + 2], k[i + 3]]);
+    let init = 0x9e37_79b9u32.wrapping_add(k.len() as u32).wrapping_add(3_923_095);
+    let (mut a, mut b, mut c) = (init, init, init);
+    let mut off = 0;
+    while k.len() - off >= 12 {
+        a = a.wrapping_add(word(off));
+        b = b.wrapping_add(word(off + 4));
+        c = c.wrapping_add(word(off + 8));
+        mix(&mut a, &mut b, &mut c);
+        off += 12;
+    }
+    // The last 0 to 11 bytes; the lowest byte of c is reserved for the length.
+    let t = &k[off..];
+    let byte = |i: usize, shift: u32| (t[i] as u32) << shift;
+    let n = t.len();
+    if n >= 11 { c = c.wrapping_add(byte(10, 24)); }
+    if n >= 10 { c = c.wrapping_add(byte(9, 16)); }
+    if n >= 9 { c = c.wrapping_add(byte(8, 8)); }
+    if n >= 8 { b = b.wrapping_add(byte(7, 24)); }
+    if n >= 7 { b = b.wrapping_add(byte(6, 16)); }
+    if n >= 6 { b = b.wrapping_add(byte(5, 8)); }
+    if n >= 5 { b = b.wrapping_add(byte(4, 0)); }
+    if n >= 4 { a = a.wrapping_add(byte(3, 24)); }
+    if n >= 3 { a = a.wrapping_add(byte(2, 16)); }
+    if n >= 2 { a = a.wrapping_add(byte(1, 8)); }
+    if n >= 1 { a = a.wrapping_add(byte(0, 0)); }
+    final_mix(a, b, c)
 }
 
 /// hash_bytes_uint32 (hash_uint32).
@@ -138,7 +194,7 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
         KeyHash::Int8 => hash_int8(a.as_primitive::<Int64Type>().value(r)),
         KeyHash::Float4 => hash_float8(a.as_primitive::<Float32Type>().value(r) as f64),
         KeyHash::Float8 => hash_float8(a.as_primitive::<Float64Type>().value(r)),
-        KeyHash::Text => unimplemented!("hashtext"),
+        KeyHash::Text => hash_bytes(a.as_string::<i32>().value(r).as_bytes()),
     })
 }
 
@@ -188,6 +244,13 @@ mod tests {
         assert_eq!(hash_float8(f64::NAN) as i32, -1275764840);
         assert_eq!(hash_float8(-f64::NAN) as i32, -1275764840);
         assert_eq!(hash_int8(5_000_000_000) as i32, -694934712);
+        // hashtext: hash_bytes of every tail length class.
+        assert_eq!(hash_bytes(b""), 2817148525);
+        assert_eq!(hash_bytes(b"a"), 1075015857);
+        assert_eq!(hash_bytes(b"abcdefghijk"), 2811163603);
+        assert_eq!(hash_bytes(b"hello world!"), 1400155871);
+        assert_eq!(hash_bytes(b"hello world!!"), 2176858744);
+        assert_eq!(hash_bytes("中文😀".as_bytes()), 3467869828);
         // Jump hash stays in range and is stable.
         for k in 0..1000u64 {
             let s = jump_consistent_hash(k, 3);

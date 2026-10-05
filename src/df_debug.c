@@ -322,13 +322,37 @@ typedef struct DfKeyType
 {
 	int32		kind;			/* as df_ffi_cdbhash_routes numbers it */
 	Oid			hashfunc;
-	int			width;
+	int			width;			/* 0: a string */
 } DfKeyType;
 
 static const DfKeyType df_key_types[] = {
 	{0, F_HASHCHAR, 1}, {1, F_HASHINT2, 2}, {2, F_HASHINT4, 4},
 	{3, F_HASHINT8, 8}, {4, F_HASHFLOAT4, 4}, {5, F_HASHFLOAT8, 8},
+	{6, F_HASHTEXT, 0},
 };
+
+/*
+ * A random UTF-8 string of 0 to 40 bytes (every tail length of hash_bytes),
+ * now and then a long one, mixing ASCII with 2-, 3- and 4-byte characters.
+ */
+static void
+df_random_string(pg_prng_state *rng, StringInfo buf)
+{
+	static const char *const pieces[] = {"\xc3\xa9", "\xe4\xb8\xad", "\xf0\x9f\x98\x80"};
+	int			len = pg_prng_uint64(rng) % 16 == 0 ? 100 + pg_prng_uint64(rng) % 300 :
+		pg_prng_uint64(rng) % 41;
+	int			start = buf->len;
+
+	while (buf->len - start < len)
+	{
+		uint64		r = pg_prng_uint64(rng);
+
+		if (r % 8 == 0)
+			appendStringInfoString(buf, pieces[(r >> 8) % 3]);
+		else
+			appendStringInfoChar(buf, (char) (32 + (r >> 8) % 95));
+	}
+}
 
 /* A random value of key type 'kind', a special value one time in four. */
 static void
@@ -391,6 +415,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 					  int nrows, int segments, int workers)
 {
 	char	   *values[3];
+	int32	   *offsets[3];
 	uint8	   *nulls[3];
 	DfColumn	cols[3];
 	int32		kinds[3];
@@ -408,16 +433,35 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 
 		kinds[k] = t->kind;
 		funcs[k] = t->hashfunc;
-		values[k] = palloc(t->width * nrows);
 		nulls[k] = palloc(nrows);
-		for (r = 0; r < nrows; r++)
+		offsets[k] = NULL;
+		if (t->width == 0)
 		{
-			nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
-			df_random_key(rng, t->kind, values[k] + r * t->width);
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+			offsets[k] = palloc(sizeof(int32) * (nrows + 1));
+			offsets[k][0] = 0;
+			for (r = 0; r < nrows; r++)
+			{
+				nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
+				df_random_string(rng, &buf);
+				offsets[k][r + 1] = buf.len;
+			}
+			values[k] = buf.data;
+		}
+		else
+		{
+			values[k] = palloc(t->width * nrows);
+			for (r = 0; r < nrows; r++)
+			{
+				nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
+				df_random_key(rng, t->kind, values[k] + r * t->width);
+			}
 		}
 		cols[k].values = (const void *) values[k];
 		cols[k].nulls = nulls[k];
-		cols[k].offsets = NULL;
+		cols[k].offsets = offsets[k];
 	}
 	h = makeCdbHash(segments, nkeys, funcs);
 	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);
@@ -434,8 +478,13 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 		cdbhashinit(hw);
 		for (k = 0; k < nkeys; k++)
 		{
-			Datum		d = df_key_datum(kinds[k],
-										 values[k] + r * df_key_types[types[k]].width);
+			Datum		d;
+
+			if (offsets[k])
+				d = PointerGetDatum(cstring_to_text_with_len(values[k] + offsets[k][r],
+															 offsets[k][r + 1] - offsets[k][r]));
+			else
+				d = df_key_datum(kinds[k], values[k] + r * df_key_types[types[k]].width);
 
 			cdbhash(h, k + 1, d, nulls[k][r] != 0);
 			cdbhash(hw, k + 1, d, nulls[k][r] != 0);
@@ -453,8 +502,8 @@ datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
 {
 	static const int combos[][4] = {
 		/* nkeys, key types (indexes into df_key_types) */
-		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5},
-		{2, 2, 5}, {3, 3, 1, 0},
+		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6},
+		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3},
 	};
 	int32		nrows = PG_GETARG_INT32(0);
 	int32		segments = PG_GETARG_INT32(1);

@@ -288,7 +288,8 @@ would: `df_core::cdbhash` transcribes Cloudberry's distribution hash (key
 hashes rotated and combined, Jump Consistent Hash over the segments, and in
 parallel mode the receiving worker from a second jump) and the hash
 functions of the supported types (`hashchar` for bool, `hashint2/4/8`,
-`hashfloat4/8` with their handling of -0 and NaN).  Each receiver gets its
+`hashfloat4/8` with their handling of -0 and NaN, and since X2
+`hashtext`).  Each receiver gets its
 own stream.  Keys must be plain columns hashed by their type's own
 non-legacy function; random distribution, legacy and cross-type hashing
 stay on tuples.  `datafusion_debug_cdbhash_check(nrows, segments, workers)`
@@ -423,6 +424,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | J4 | Outer, semi and anti joins; keys of two integer or float types |
 | T1 | `date`, `time`, `timestamp` and `timestamptz` |
 | X1 | `text` and `varchar`; batch size from the row width |
+| X2 | Redistribute batches by `text` and `varchar` keys (`hashtext`) |
 
 ### Date and time types
 
@@ -474,6 +476,17 @@ batches.  Functions and operators on strings (`LIKE`, `||`, `length`)
 stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out fixed-width values only;
 a PAX table with a string column is read through the table AM.
+
+Redistribute Motions by a `text` or `varchar` key carry batches too (X2):
+cdbhash calls `hashtext` with the default collation, which is always
+deterministic, so it is `hash_any` of the value's bytes, which
+`df_core::cdbhash::hash_bytes` transcribes (the little-endian byte path,
+equal to the word path; big-endian builds keep such Motions on tuples).
+`datafusion_debug_cdbhash_check` routes random strings of every tail
+length, multibyte characters included, alone and with other keys.  Joining
+two 2-million-row tables on a text key, both sides redistributed as
+batches, took 0.32 s against 0.93 s in PostgreSQL (LEFT JOIN 0.25 s
+against 1.06 s, NOT EXISTS 0.21 s against 0.95 s).
 
 Batches hold about 256 kB of the widest row the planner expects in the
 slice (at most 8192 rows), the same on the C side and in DataFusion,

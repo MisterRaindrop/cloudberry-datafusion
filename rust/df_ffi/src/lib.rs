@@ -495,6 +495,7 @@ pub extern "C" fn df_ffi_cdbhash_routes(
                 3 => PgType::Int8,
                 4 => PgType::Float4,
                 5 => PgType::Float8,
+                6 => PgType::Text,
                 _ => return None,
             };
             let raw = df_core::query::RawColumn { values: c.values, nulls: c.nulls, offsets: c.offsets };
