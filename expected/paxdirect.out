@@ -122,9 +122,9 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd W
 SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
  d | count  | min |   max    
 ---+--------+-----+----------
-   |      2 |   7 |      1.5
  f | 149700 |   1 | 74999.75
  t | 150000 |   0 |    75000
+   |      2 |   7 |      1.5
 (3 rows)
 
 SELECT count(*) FROM df_pd;
@@ -199,7 +199,119 @@ SELECT count(*), sum(a) FROM df_pd;
  299702 | 44955597901
 (1 row)
 
-DROP TABLE df_pd, df_pd_vec;
+-- Min/max skipping: micro-partitions and groups whose statistics rule out
+-- the scan's qual are not read (4 micro-partitions of 8 groups or fewer).
+-- Only column a has statistics.
+SET pax.max_tuples_per_file = 131072;
+SET pax.max_tuples_per_group = 16384;
+CREATE TABLE df_pd_skip (a int4, b int8, e int2) USING pax WITH (minmax_columns = 'a');
+INSERT INTO df_pd_skip SELECT i, i * 10, (i % 100)::int2 FROM generate_series(1, 500000) i;
+RESET pax.max_tuples_per_file;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+ count |    sum     |   max   
+-------+------------+---------
+ 10001 | 2050205000 | 2100000
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a < 5000 OR a > 490000;
+ count |    sum     |   max   
+-------+------------+---------
+ 14999 | 4962502500 | 5000000
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a > 600000;
+ count | sum | max 
+-------+-----+-----
+     0 |     |    
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
+ count |    sum     |   max   
+-------+------------+---------
+  5000 | 1249785000 | 4999070
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+ count |    sum     |   max   
+-------+------------+---------
+ 10001 | 2050205000 | 2100000
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb > 0 AS decoded
+FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped | decoded 
+-------+---------------+--------+----------------+---------
+     4 |             3 |      8 |              7 | t
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a < 5000 OR a > 490000;
+ count |    sum     |   max   
+-------+------------+---------
+ 14999 | 4962502500 | 5000000
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped 
+-------+---------------+--------+----------------
+     4 |             2 |     15 |             12
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a > 600000;
+ count | sum | max 
+-------+-----+-----
+     0 |     |    
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped | decode_peak_kb 
+-------+---------------+--------+----------------+----------------
+     4 |             4 |      0 |              0 |              0
+(1 row)
+
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
+ count |    sum     |   max   
+-------+------------+---------
+  5000 | 1249785000 | 4999070
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped 
+-------+---------------+--------+----------------
+     4 |             0 |     31 |              0
+(1 row)
+
+-- PAX's switch for its own skipping applies too.
+SET pax.enable_sparse_filter = off;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+ count |    sum     |   max   
+-------+------------+---------
+ 10001 | 2050205000 | 2100000
+(1 row)
+
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+ files | files_skipped | groups | groups_skipped 
+-------+---------------+--------+----------------
+     4 |             0 |      0 |              0
+(1 row)
+
+RESET pax.enable_sparse_filter;
+-- The memory PAX's reader held is given back once the scan is over.
+SELECT count(*) FROM df_pd_skip;
+ count  
+--------
+ 500000
+(1 row)
+
+SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
+ heap_returned 
+---------------
+ t
+(1 row)
+
+DROP TABLE df_pd, df_pd_vec, df_pd_skip;
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
 \c
 SET optimizer = off;

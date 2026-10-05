@@ -181,10 +181,31 @@ That code calls PAX's internal C++ classes, not a published API:
 - It records the installed pax.so's ELF build ID.  At run time the extension
   compares it with the running pax.so and, if they differ or the library
   does not load, warns once and reads through the table AM.
-- PAX's decoding allocates with malloc outside the counting allocator, so
-  that memory is not yet leased from the vmem tracker; PAX's min/max
-  micro-partition skipping is not applied; Cloudberry's parallel mode
-  keeps the table AM path.
+- Cloudberry's parallel mode keeps the table AM path.
+
+Like PAX's own scan, it skips micro-partitions and then groups whose
+min/max statistics (`minmax_columns`) rule out the scan's qual, honouring
+`pax.enable_sparse_filter`.  That evaluates operators through fmgr, so it
+happens on the main thread while the blocks are listed; the workers only
+read the groups that remain, and DataFusion still filters every row.
+
+PAX's decoding allocates with malloc, outside the counting allocator.  The
+reader passes PAX a read buffer of its own (`pax.scan_reuse_buffer_size`)
+and reports what it holds (that buffer, the decoded columns and null
+bitmaps, the visibility map, the rows handed out); the figure is added to
+the Rust heap and leased from the vmem tracker with it.  Measured with
+`mallinfo2` it is within a few kB of what PAX actually allocates per group
+(the file footer is not counted).  `datafusion_debug_last_pax()` and
+EXPLAIN ANALYZE show what was skipped and the peak decoding memory.
+
+Selective queries over 30 million rows with `minmax_columns = 'a'`
+(3 segments, 3 DataFusion threads per QE):
+
+| Query | PostgreSQL | table AM | direct, skipping off | direct |
+|---|---|---|---|---|
+| `a BETWEEN 1000000 AND 1100000` | 4.4 ms | 7.7 ms | 43.7 ms | 4.7 ms |
+| `a < 3000000` | 145 ms | 20.5 ms | 44.0 ms | 13.6 ms |
+| `e = 7` (no statistics) | 857 ms | 190 ms | 55.9 ms | 57.1 ms |
 
 Over 30 million rows on 3 segments, 3 DataFusion threads per QE:
 

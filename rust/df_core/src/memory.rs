@@ -42,6 +42,9 @@ use datafusion::execution::memory_pool::{
 };
 
 static HEAP_BYTES: AtomicI64 = AtomicI64::new(0);
+/// Bytes held by C/C++ code on DataFusion's threads (PAX's reader), as it
+/// reports them; leased from the vmem tracker together with the Rust heap.
+static EXTERNAL_BYTES: AtomicI64 = AtomicI64::new(0);
 
 /// System allocator that keeps a running total of live bytes.
 pub struct CountingAllocator;
@@ -80,9 +83,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
-/// Live bytes allocated by Rust code in this process.
+/// Live bytes allocated by Rust code in this process, plus those reported
+/// through `external_add`.
 pub fn heap_bytes() -> i64 {
-    HEAP_BYTES.load(Ordering::Relaxed)
+    HEAP_BYTES.load(Ordering::Relaxed) + EXTERNAL_BYTES.load(Ordering::Relaxed)
+}
+
+/// Record memory allocated (positive) or freed (negative) outside the Rust
+/// allocator.
+pub fn external_add(delta: i64) {
+    EXTERNAL_BYTES.fetch_add(delta, Ordering::Relaxed);
 }
 
 /// FairSpillPool with a recorded peak.

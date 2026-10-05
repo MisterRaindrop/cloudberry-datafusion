@@ -233,6 +233,14 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 							 (df_last_run.memory_peak + 1023) / 1024,
 							 (df_last_run.spilled_bytes + 1023) / 1024,
 							 df_last_run.spill_count);
+		if (es->analyze && df_runs_completed != runs_before && df_last_run_pax)
+			appendStringInfo(es->str,
+							 "DataFusion PAX direct read: skipped " INT64_FORMAT
+							 " of " INT64_FORMAT " micro-partitions and " INT64_FORMAT
+							 " of " INT64_FORMAT " groups, decode peak " UINT64_FORMAT " kB\n",
+							 df_last_pax_scan.files_skipped, df_last_pax_scan.files,
+							 df_last_pax_scan.groups_skipped, df_last_pax_scan.groups,
+							 (df_last_run.pax_decode_peak + 1023) / 1024);
 	}
 }
 

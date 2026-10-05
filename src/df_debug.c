@@ -52,6 +52,7 @@ PG_FUNCTION_INFO_V1(datafusion_debug_last_run);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
 PG_FUNCTION_INFO_V1(datafusion_debug_pax_direct_scans);
+PG_FUNCTION_INFO_V1(datafusion_debug_last_pax);
 
 static Datum
 df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
@@ -267,4 +268,35 @@ Datum
 datafusion_debug_pax_direct_scans(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_INT64((int64) df_pax_direct_scans);
+}
+
+/*
+ * datafusion_debug_last_pax(OUT files int8, OUT files_skipped int8,
+ *                           OUT groups int8, OUT groups_skipped int8,
+ *                           OUT decode_peak_kb int8)
+ * The min/max skipping and the decoding memory of the latest completed run,
+ * if it read PAX directly; NULLs otherwise.
+ */
+Datum
+datafusion_debug_last_pax(PG_FUNCTION_ARGS)
+{
+	int64		v[5];
+
+	if (!df_last_run_pax)
+	{
+		TupleDesc	tupdesc;
+		Datum		values[5] = {0};
+		bool		nulls[5] = {true, true, true, true, true};
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		tupdesc = BlessTupleDesc(tupdesc);
+		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	}
+	v[0] = df_last_pax_scan.files;
+	v[1] = df_last_pax_scan.files_skipped;
+	v[2] = df_last_pax_scan.groups;
+	v[3] = df_last_pax_scan.groups_skipped;
+	v[4] = (int64) ((df_last_run.pax_decode_peak + 1023) / 1024);
+	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
 }

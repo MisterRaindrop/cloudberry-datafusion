@@ -79,11 +79,22 @@ extern bool df_translate_slice(Plan *root, DfSliceSpec *spec,
  * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
  * two identical.
  */
-#define DF_PAX_SCAN_API_VERSION 1
+#define DF_PAX_SCAN_API_VERSION 2
 
-typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, const int *cols,
-							 const int *widths, int ncols, char *err, size_t errlen);
+/* What the scan's min/max skipping did (DatafusionPaxScanInfo). */
+typedef struct DfPaxScanInfo
+{
+	int64		files;			/* micro-partitions visible to the snapshot */
+	int64		files_skipped;	/* skipped by their statistics */
+	int64		groups;			/* groups examined in the remaining files */
+	int64		groups_skipped; /* skipped by their statistics */
+} DfPaxScanInfo;
+
+typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, List *qual,
+							 const int *cols, const int *widths, int ncols,
+							 char *err, size_t errlen);
 typedef int (*DfPaxNBlocks) (void *scan);
+typedef void (*DfPaxInfo) (void *scan, DfPaxScanInfo *out);
 
 typedef struct DfPaxReader
 {
@@ -91,6 +102,7 @@ typedef struct DfPaxReader
 	const char *pax_build_id;	/* the pax.so it was built against */
 	DfPaxBegin	begin;
 	DfPaxNBlocks nblocks;
+	DfPaxInfo	info;
 	DfPaxRead	read;
 	DfPaxEnd	end;
 } DfPaxReader;
@@ -98,6 +110,8 @@ typedef struct DfPaxReader
 extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */
 extern const DfPaxReader *df_pax_reader_get(void);
 extern uint64 df_pax_direct_scans;	/* scans read through it */
+extern bool df_last_run_pax;	/* df_last_run read PAX directly */
+extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */
 
 /* df_hooks.c */
 extern void df_install_hooks(void);

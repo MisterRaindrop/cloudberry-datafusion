@@ -95,7 +95,9 @@ extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  char *buf, size_t buflen);
 /* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfColumn *cols);
-typedef int (*DfPaxRead) (void *scan, int index, DfPaxEmit emit, void *ctx,
+typedef void (*DfPaxAccount) (void *ctx, int64_t delta);
+typedef int (*DfPaxRead) (void *scan, int index, DfPaxEmit emit,
+						  DfPaxAccount account, void *ctx,
 						  char *err, size_t errlen);
 typedef void (*DfPaxEnd) (void *scan);
 
@@ -123,6 +125,7 @@ typedef struct DfQueryStats
 	uint64_t	memory_peak;	/* peak reserved from the pool, bytes */
 	uint64_t	spilled_bytes;
 	uint64_t	spill_count;
+	uint64_t	pax_decode_peak;	/* peak bytes PAX's reader held */
 } DfQueryStats;
 
 extern void df_ffi_query_stats(DfQuery *query, DfQueryStats *out);

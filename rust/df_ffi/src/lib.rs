@@ -442,6 +442,7 @@ pub struct DfQueryStats {
     pub memory_peak: u64,
     pub spilled_bytes: u64,
     pub spill_count: u64,
+    pub pax_decode_peak: u64,
 }
 
 #[no_mangle]
@@ -455,6 +456,7 @@ pub extern "C" fn df_ffi_query_stats(query: *mut DfQuery, out: *mut DfQueryStats
         (*out).memory_peak = s.memory_peak;
         (*out).spilled_bytes = s.spilled_bytes;
         (*out).spill_count = s.spill_count;
+        (*out).pax_decode_peak = s.pax_decode_peak;
     }
 }
 

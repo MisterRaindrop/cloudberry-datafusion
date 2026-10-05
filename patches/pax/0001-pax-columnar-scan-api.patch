@@ -1,4 +1,4 @@
-From 682d70392c3e3ca8c970eaefc5d34d4e1483e384 Mon Sep 17 00:00:00 2001
+From 7e380420b600c9a5afe5efe26878e7b5e93161f8 Mon Sep 17 00:00:00 2001
 From: MisterRaindrop <p_xiaoyu.liu@synxdata.com>
 Date: Mon, 5 Oct 2026 17:05:43 +0800
 Subject: [PATCH] pax: add a columnar scan interface for datafusion_executor
@@ -8,19 +8,24 @@ exported C function table, datafusion_pax_scan_api(), so that the
 datafusion_executor extension can read PAX blocks column by column on its
 worker threads instead of row by row through the table AM.  Every other
 symbol is local, so nothing can clash with PAX or PostgreSQL.
+
+begin skips micro-partitions and groups by their min/max statistics, as
+PAX's own scan does, on the main thread since that calls fmgr.  read_block
+reports the memory it holds (read buffer, decoded columns, visibility map,
+handed-out rows) so that the caller can account for it.
 ---
- .../src/cpp/access/datafusion_scan_api.cc     | 235 ++++++++++++++++++
- .../src/cpp/access/datafusion_scan_api.h      |  92 +++++++
- 2 files changed, 327 insertions(+)
+ .../src/cpp/access/datafusion_scan_api.cc     | 358 ++++++++++++++++++
+ .../src/cpp/access/datafusion_scan_api.h      | 114 ++++++
+ 2 files changed, 472 insertions(+)
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 new file mode 100644
-index 0000000..e8f69c0
+index 0000000..73774a5
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,358 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -52,6 +57,14 @@ index 0000000..e8f69c0
 + * built with: DF_PAX_BUILD_ID records that pax.so's GNU build ID, and the
 + * caller compares it with the running one.
 + *
++ * Memory: PAX's reader allocates with malloc.  read_block passes PAX a read
++ * buffer of its own (ReaderOptions::reused_buffer, as PAX's scan does) and
++ * reports through 'account' what it can see: that buffer's capacity, the
++ * projected columns' decoded data and null bitmaps, the visibility map and
++ * the rows it hands out.  The file footer and PAX's small bookkeeping
++ * objects are not counted; uncompressed columns that point into the read
++ * buffer are counted twice, so the figure errs on the high side.
++ *
 + * contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 + *
 + *-------------------------------------------------------------------------
@@ -67,14 +80,18 @@ index 0000000..e8f69c0
 +#include <vector>
 +
 +#include "comm/bitmap.h"
++#include "comm/guc.h"
 +#include "comm/singleton.h"
 +#include "exceptions/CException.h"
 +#include "storage/columns/pax_columns.h"
 +#include "storage/filter/pax_filter.h"
++#include "storage/filter/pax_sparse_filter.h"
 +#include "storage/local_file_system.h"
 +#include "storage/micro_partition_file_factory.h"
 +#include "storage/micro_partition_iterator.h"
 +#include "storage/micro_partition_metadata.h"
++#include "storage/micro_partition_stats.h"
++#include "storage/pax_buffer.h"
 +#include "storage/paxc_define.h"
 +
 +#ifndef DF_PAX_BUILD_ID
@@ -87,6 +104,8 @@ index 0000000..e8f69c0
 +  std::string file;
 +  std::string visimap;
 +  bool toast;
++  bool all_groups;              // no group was examined: read them all
++  std::vector<uint32_t> groups; // otherwise the groups to read
 +};
 +
 +struct DfScan {
@@ -95,28 +114,105 @@ index 0000000..e8f69c0
 +  std::vector<int> cols;     // 0-based table columns to hand out
 +  std::vector<int> widths;   // their value widths in bytes
 +  int read_col;              // column decoded when none is handed out
++  size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
++  DatafusionPaxScanInfo info;
 +};
 +
 +void SetError(char *err, size_t errlen, const char *what, const char *msg) {
 +  if (err && errlen > 0) snprintf(err, errlen, "%s: %s", what, msg);
 +}
 +
++std::unique_ptr<pax::MicroPartitionReader> OpenReader(
++    const DfBlock &block, std::vector<bool> &&proj,
++    std::shared_ptr<pax::DataBuffer<char>> read_buffer) {
++  auto fs = pax::Singleton<pax::LocalFileSystem>::GetInstance();
++  pax::MicroPartitionReader::ReaderOptions options;
++  options.filter = std::make_shared<pax::PaxFilter>();
++  options.filter->SetColumnProjection(std::move(proj));
++  options.reused_buffer = std::move(read_buffer);
++
++  std::unique_ptr<pax::File> toast;
++  if (block.toast)
++    toast = fs->Open(block.file + TOAST_FILE_SUFFIX, pax::fs::kReadMode);
++  return pax::MicroPartitionFileFactory::CreateMicroPartitionReader(
++      options, pax::FLAGS_EMPTY, fs->Open(block.file, pax::fs::kReadMode),
++      std::move(toast));
++}
++
++// Keeps the caller informed of the bytes held, and gives them all back when
++// it goes out of scope, exceptions included.
++class Ledger {
++ public:
++  Ledger(DatafusionPaxAccount account, void *ctx)
++      : account_(account), ctx_(ctx) {}
++  ~Ledger() { Set(0); }
++  void Set(int64_t held) {
++    if (account_ && held != held_) account_(ctx_, held - held_);
++    held_ = held;
++  }
++
++ private:
++  DatafusionPaxAccount account_;
++  void *ctx_;
++  int64_t held_ = 0;
++};
++
 +void *ScanBegin(struct RelationData *rel, struct SnapshotData *snapshot,
-+                const int *cols, const int *widths, int ncols, char *err,
-+                size_t errlen) {
++                struct List *qual, const int *cols, const int *widths,
++                int ncols, char *err, size_t errlen) {
 +  try {
 +    auto scan = std::make_unique<DfScan>();
 +    scan->natts = RelationGetNumberOfAttributes(rel);
 +    scan->cols.assign(cols, cols + ncols);
 +    scan->widths.assign(widths, widths + ncols);
 +    scan->read_col = ncols > 0 ? cols[0] : 0;
++    scan->read_buffer_size = pax::pax_scan_reuse_buffer_size;
++    scan->info = DatafusionPaxScanInfo{0, 0, 0, 0};
++
++    // The same min/max skipping as PAX's scan: whole micro-partitions by
++    // the statistics in the auxiliary table, then groups by those in the
++    // file footer.  Both evaluate operators through fmgr, which is why it
++    // happens here, on the main thread, and not in read_block.
++    std::shared_ptr<pax::PaxFilter> filter;
++    if (qual != nullptr && pax::pax_enable_sparse_filter) {
++      filter = std::make_shared<pax::PaxFilter>();
++      filter->InitSparseFilter(rel, qual, nullptr, 0);
++      if (!filter->SparseFilterEnabled()) filter.reset();
++    }
++    TupleDesc desc = RelationGetDescr(rel);
 +
 +    auto it = pax::MicroPartitionIterator::New(rel, snapshot);
 +    while (it->HasNext()) {
 +      auto meta = it->Next();
-+      scan->blocks.push_back(DfBlock{meta.GetFileName(),
-+                                   meta.GetVisibilityBitmapFile(),
-+                                   meta.GetExistToast()});
++      scan->info.files++;
++      if (filter) {
++        pax::MicroPartitionStatsProvider provider(meta.GetStats());
++        if (!filter->ExecSparseFilter(
++                provider, desc, pax::PaxSparseFilter::StatisticsKind::kFile)) {
++          scan->info.files_skipped++;
++          continue;
++        }
++      }
++      DfBlock block{meta.GetFileName(), meta.GetVisibilityBitmapFile(),
++                    meta.GetExistToast(), true, {}};
++      if (filter) {
++        std::vector<bool> proj(scan->natts, false);
++        proj[scan->read_col] = true;
++        auto reader = OpenReader(block, std::move(proj), nullptr);
++        block.all_groups = false;
++        for (size_t g = 0; g < reader->GetGroupNums(); g++) {
++          scan->info.groups++;
++          auto stats = reader->GetGroupStatsInfo(g);
++          if (filter->ExecSparseFilter(
++                  *stats, desc, pax::PaxSparseFilter::StatisticsKind::kGroup))
++            block.groups.push_back(static_cast<uint32_t>(g));
++          else
++            scan->info.groups_skipped++;
++        }
++        reader->Close();
++        if (block.groups.empty()) continue;
++      }
++      scan->blocks.push_back(std::move(block));
 +    }
 +    it->Release();
 +    return scan.release();
@@ -134,22 +230,31 @@ index 0000000..e8f69c0
 +  return static_cast<int>(static_cast<DfScan *>(scan)->blocks.size());
 +}
 +
++void ScanInfo(void *scan, DatafusionPaxScanInfo *out) {
++  *out = static_cast<DfScan *>(scan)->info;
++}
++
 +void ScanEnd(void *scan) { delete static_cast<DfScan *>(scan); }
 +
-+int ReadBlock(void *scan_arg, int index, DatafusionPaxEmit emit, void *ctx,
-+              char *err, size_t errlen) {
++int ReadBlock(void *scan_arg, int index, DatafusionPaxEmit emit,
++              DatafusionPaxAccount account, void *ctx, char *err,
++              size_t errlen) {
 +  auto scan = static_cast<DfScan *>(scan_arg);
 +  try {
++    // Declared first, so that it is destroyed last: everything it counts is
++    // freed by then.
++    Ledger ledger(account, ctx);
 +    const DfBlock &block = scan->blocks.at(index);
 +    auto fs = pax::Singleton<pax::LocalFileSystem>::GetInstance();
 +
-+    pax::MicroPartitionReader::ReaderOptions options;
 +    std::vector<bool> proj(scan->natts, false);
 +    for (int c : scan->cols) proj[c] = true;
 +    proj[scan->read_col] = true;
-+    options.filter = std::make_shared<pax::PaxFilter>();
-+    options.filter->SetColumnProjection(std::move(proj));
++    std::vector<int> projected;
++    for (int c = 0; c < scan->natts; c++)
++      if (proj[c]) projected.push_back(c);
 +
++    int64_t visimap_bytes = 0;
 +    std::shared_ptr<pax::Bitmap8> visimap;
 +    if (!block.visimap.empty()) {
 +      auto file = fs->Open(block.visimap, pax::fs::kReadMode);
@@ -157,25 +262,39 @@ index 0000000..e8f69c0
 +      visimap = std::make_shared<pax::Bitmap8>(len * 8);
 +      file->ReadN(visimap->Raw().bitmap, len);
 +      file->Close();
++      visimap_bytes = static_cast<int64_t>(len);
 +    }
 +
-+    std::unique_ptr<pax::File> toast;
-+    if (block.toast)
-+      toast = fs->Open(block.file + TOAST_FILE_SUFFIX, pax::fs::kReadMode);
-+    auto reader = pax::MicroPartitionFileFactory::CreateMicroPartitionReader(
-+        options, pax::FLAGS_EMPTY, fs->Open(block.file, pax::fs::kReadMode),
-+        std::move(toast));
++    auto read_buffer =
++        std::make_shared<pax::DataBuffer<char>>(scan->read_buffer_size);
++    auto reader = OpenReader(block, std::move(proj), read_buffer);
 +
 +    const size_t ncols = scan->cols.size();
 +    std::vector<std::vector<char>> values(ncols);
 +    std::vector<std::vector<uint8_t>> nulls(ncols);
 +    std::vector<DatafusionPaxColumn> out(ncols);
 +
-+    for (size_t g = 0; g < reader->GetGroupNums(); g++) {
++    const size_t ngroups =
++        block.all_groups ? reader->GetGroupNums() : block.groups.size();
++    for (size_t n = 0; n < ngroups; n++) {
++      const size_t g = block.all_groups ? n : block.groups[n];
 +      auto group = reader->ReadGroup(g);
 +      auto &columns = *group->GetAllColumns();
 +      const size_t rows = group->GetRows();
 +      const size_t offset = group->GetRowOffset();
++
++      int64_t decoded = 0;
++      for (int c : projected) {
++        pax::PaxColumn *col = columns[c].get();
++        if (col == nullptr) continue;
++        decoded += static_cast<int64_t>(col->GetBuffer().second);
++        if (col->GetBitmap())
++          decoded += static_cast<int64_t>(col->GetBitmap()->Raw().size);
++      }
++      const int64_t base = visimap_bytes +
++                           static_cast<int64_t>(read_buffer->Capacity()) +
++                           decoded;
++      ledger.Set(base);
 +
 +      // Rows deleted in the visibility map are left out.
 +      std::vector<uint32_t> keep;
@@ -184,6 +303,7 @@ index 0000000..e8f69c0
 +        if (!visimap || !visimap->Test(static_cast<uint32>(offset + r)))
 +          keep.push_back(static_cast<uint32_t>(r));
 +
++      int64_t handed_out = static_cast<int64_t>(keep.capacity() * 4);
 +      for (size_t k = 0; k < ncols; k++) {
 +        pax::PaxColumn *col = columns[scan->cols[k]].get();
 +        if (col == nullptr) {
@@ -202,6 +322,8 @@ index 0000000..e8f69c0
 +                          pax::PaxColumnTypeInMem::kTypeVecBitPacked;
 +        values[k].assign(keep.size() * w, 0);
 +        nulls[k].assign(keep.size(), 0);
++        handed_out += static_cast<int64_t>(values[k].capacity() +
++                                           nulls[k].capacity());
 +
 +        // In the plain format only non-null values are stored, in row
 +        // order; in the vectorized format every row has a slot.
@@ -226,6 +348,7 @@ index 0000000..e8f69c0
 +        out[k].values = values[k].data();
 +        out[k].nulls = nulls[k].data();
 +      }
++      ledger.Set(base + handed_out);
 +
 +      if (!keep.empty() &&
 +          emit(ctx, static_cast<uint32_t>(keep.size()), out.data()) != 0) {
@@ -246,8 +369,13 @@ index 0000000..e8f69c0
 +}
 +
 +const DatafusionPaxScanApi kScanApi = {
-+    DATAFUSION_PAX_SCAN_API_VERSION, DF_PAX_BUILD_ID, ScanBegin, ScanNBlocks,
-+    ReadBlock, ScanEnd,
++    DATAFUSION_PAX_SCAN_API_VERSION,
++    DF_PAX_BUILD_ID,
++    ScanBegin,
++    ScanNBlocks,
++    ScanInfo,
++    ReadBlock,
++    ScanEnd,
 +};
 +
 +}  // namespace
@@ -258,10 +386,10 @@ index 0000000..e8f69c0
 +}
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 new file mode 100644
-index 0000000..a56d7c6
+index 0000000..dbdc9b3
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,114 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -292,12 +420,14 @@ index 0000000..a56d7c6
 + *
 + * Threading contract:
 + *   - begin runs on the backend's main thread: listing the micro-partitions
-+ *     visible to the snapshot reads PAX's auxiliary table.  It copies what
-+ *     the readers need and keeps no PostgreSQL object.
++ *     visible to the snapshot reads PAX's auxiliary table, and skipping
++ *     them by min/max statistics calls PostgreSQL's comparison functions.
++ *     It copies what the readers need and keeps no PostgreSQL object.
 + *   - read_block may run on any thread, concurrently for different blocks.
 + *     It opens the block's files through PAX's LocalFileSystem (POSIX I/O),
 + *     decodes the projected columns with PAX's reader (malloc, C++
 + *     exceptions, no PostgreSQL calls) and hands out rows group by group.
++ *     The memory it holds meanwhile is reported through 'account'.
 + *   - end frees the scan from any thread, once no reader runs.
 + * No exception crosses these functions: failures come back as NULL or -1
 + * with a message.
@@ -315,8 +445,9 @@ index 0000000..a56d7c6
 +extern "C" {
 +#endif
 +
-+#define DATAFUSION_PAX_SCAN_API_VERSION 1
++#define DATAFUSION_PAX_SCAN_API_VERSION 2
 +
++struct List;
 +struct RelationData;
 +struct SnapshotData;
 +
@@ -331,21 +462,40 @@ index 0000000..a56d7c6
 +typedef int (*DatafusionPaxEmit)(void *ctx, uint32_t nrows,
 +                                 const DatafusionPaxColumn *cols);
 +
++/* Called with the change in bytes the reader holds (decoded columns, read
++ * buffer, visibility map, handed-out rows); the deltas of one read_block
++ * call add up to zero by the time it returns. */
++typedef void (*DatafusionPaxAccount)(void *ctx, int64_t delta);
++
++/* What begin's min/max skipping did. */
++typedef struct DatafusionPaxScanInfo {
++  int64_t files;          /* micro-partitions visible to the snapshot */
++  int64_t files_skipped;  /* skipped by their statistics */
++  int64_t groups;         /* groups examined in the remaining files */
++  int64_t groups_skipped; /* skipped by their statistics */
++} DatafusionPaxScanInfo;
++
 +typedef struct DatafusionPaxScanApi {
 +  uint32_t version; /* DATAFUSION_PAX_SCAN_API_VERSION */
 +  /* GNU build ID of the pax.so this table was built against, in hex. */
 +  const char *pax_build_id;
 +
-+  /* List the micro-partitions of 'rel' visible to 'snapshot'.  'cols' are
-+   * the 0-based table columns to read, with their value widths in bytes. */
++  /* List the micro-partitions of 'rel' visible to 'snapshot'.  'qual', the
++   * scan's implicitly ANDed conditions (may be NULL), only serves to skip
++   * micro-partitions and groups whose min/max statistics rule it out, as
++   * PAX's own scan does; the caller still applies it to every row.  'cols'
++   * are the 0-based table columns to read, with their value widths. */
 +  void *(*begin)(struct RelationData *rel, struct SnapshotData *snapshot,
-+                 const int *cols, const int *widths, int ncols, char *err,
-+                 size_t errlen);
++                 struct List *qual, const int *cols, const int *widths,
++                 int ncols, char *err, size_t errlen);
 +  int (*nblocks)(void *scan);
-+  /* Decode block 'index' and call 'emit' once per group.  Returns 0, or -1
-+   * with a message (also when 'emit' returns non-zero). */
-+  int (*read_block)(void *scan, int index, DatafusionPaxEmit emit, void *ctx,
-+                    char *err, size_t errlen);
++  void (*info)(void *scan, DatafusionPaxScanInfo *out);
++  /* Decode block 'index' and call 'emit' once per group, 'account' as the
++   * memory held changes; both get 'ctx'.  Returns 0, or -1 with a message
++   * (also when 'emit' returns non-zero). */
++  int (*read_block)(void *scan, int index, DatafusionPaxEmit emit,
++                    DatafusionPaxAccount account, void *ctx, char *err,
++                    size_t errlen);
 +  void (*end)(void *scan);
 +} DatafusionPaxScanApi;
 +

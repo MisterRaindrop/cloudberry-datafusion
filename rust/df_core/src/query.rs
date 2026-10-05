@@ -42,7 +42,7 @@
 use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -394,16 +394,20 @@ impl PartitionStream for ChannelPartition {
 
 /// Called by the PAX reader once per group of visible rows.
 pub type PaxEmitFn = unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const RawColumn) -> i32;
-/// df_pax_read_block (src/df_pax.cc): decode one block, emitting its groups.
+/// Called by the PAX reader with the change in bytes it holds.
+pub type PaxAccountFn = unsafe extern "C" fn(ctx: *mut c_void, delta: i64);
+/// read_block of the PAX scan interface (patches/pax): decode one block,
+/// emitting its groups and accounting for the memory it holds.
 pub type PaxReadFn = unsafe extern "C" fn(
     scan: *mut c_void,
     index: i32,
     emit: PaxEmitFn,
+    account: PaxAccountFn,
     ctx: *mut c_void,
     err: *mut c_char,
     errlen: usize,
 ) -> i32;
-/// df_pax_scan_end: free the scan.
+/// end of the PAX scan interface: free the scan.
 pub type PaxEndFn = unsafe extern "C" fn(scan: *mut c_void);
 
 /// A PAX scan listed on the main thread.  Partitions take blocks from it
@@ -414,6 +418,27 @@ pub struct PaxScan {
     read: PaxReadFn,
     end: PaxEndFn,
     next: AtomicUsize,
+    memory: Arc<PaxMemory>,
+}
+
+/// Memory the PAX reader reports holding for one scan, all partitions
+/// together.
+#[derive(Debug, Default)]
+pub struct PaxMemory {
+    held: AtomicI64,
+    peak: AtomicI64,
+}
+
+impl PaxMemory {
+    fn add(&self, delta: i64) {
+        crate::memory::external_add(delta);
+        let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
+        self.peak.fetch_max(now, Ordering::Relaxed);
+    }
+
+    pub fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed).max(0) as u64
+    }
 }
 
 // SAFETY: the C++ scan object holds no PostgreSQL state and its read
@@ -424,7 +449,7 @@ unsafe impl Sync for PaxScan {}
 impl PaxScan {
     /// Take ownership of a scan; `end` runs when this is dropped.
     pub fn new(scan: *mut c_void, nblocks: usize, read: PaxReadFn, end: PaxEndFn) -> Self {
-        PaxScan { scan, nblocks, read, end, next: AtomicUsize::new(0) }
+        PaxScan { scan, nblocks, read, end, next: AtomicUsize::new(0), memory: Arc::default() }
     }
 }
 
@@ -436,6 +461,7 @@ impl Drop for PaxScan {
 }
 
 struct EmitContext {
+    memory: Arc<PaxMemory>,
     schema: SchemaRef,
     types: Vec<PgType>,
     batches: Vec<RecordBatch>,
@@ -468,6 +494,11 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const RawColu
             1
         }
     }
+}
+
+unsafe extern "C" fn pax_account(ctx: *mut c_void, delta: i64) {
+    let ctx = &*(ctx as *const EmitContext);
+    ctx.memory.add(delta);
 }
 
 fn make_batch(schema: &SchemaRef, arrays: Vec<ArrayRef>, nrows: usize) -> Result<RecordBatch, PgError> {
@@ -521,7 +552,7 @@ impl PartitionStream for PaxPartition {
                     if index >= scan.nblocks {
                         return None;
                     }
-                    let mut ctx = EmitContext { schema: schema.clone(), types: types.clone(), batches: Vec::new(), error: None };
+                    let mut ctx = EmitContext { memory: scan.memory.clone(), schema: schema.clone(), types: types.clone(), batches: Vec::new(), error: None };
                     let mut err = vec![0 as c_char; 1024];
                     // SAFETY: see PaxScan; ctx outlives the call.
                     let rc = unsafe {
@@ -529,6 +560,7 @@ impl PartitionStream for PaxPartition {
                             scan.scan,
                             index as i32,
                             pax_emit,
+                            pax_account,
                             &mut ctx as *mut EmitContext as *mut c_void,
                             err.as_mut_ptr(),
                             err.len(),
@@ -575,6 +607,7 @@ pub struct Query {
     pool: Arc<TrackingPool>,
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
+    pax_memory: Option<Arc<PaxMemory>>,
 }
 
 /// Memory and spill figures of a query, for EXPLAIN ANALYZE.
@@ -585,6 +618,8 @@ pub struct QueryStats {
     pub memory_peak: u64,
     pub spilled_bytes: u64,
     pub spill_count: u64,
+    /// Peak bytes the PAX reader reported holding (direct PAX scans).
+    pub pax_decode_peak: u64,
 }
 
 fn add_spills(plan: &Arc<dyn ExecutionPlan>, stats: &mut QueryStats) {
@@ -646,6 +681,10 @@ impl Query {
             partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1))
         } else {
             partitions.max(1)
+        };
+        let pax_memory = match &source {
+            Source::Pax(scan) => Some(scan.memory.clone()),
+            Source::Pushed => None,
         };
         let (in_tx, table) = match source {
             Source::Pushed => {
@@ -746,6 +785,7 @@ impl Query {
             pool,
             physical: physical_slot,
             partitions,
+            pax_memory,
         })
     }
 
@@ -755,6 +795,7 @@ impl Query {
             partitions: self.partitions as u64,
             memory_limit: self.pool.limit() as u64,
             memory_peak: self.pool.peak() as u64,
+            pax_decode_peak: self.pax_memory.as_ref().map_or(0, |m| m.peak()),
             ..Default::default()
         };
         if let Ok(slot) = self.physical.lock() {
@@ -1065,23 +1106,28 @@ mod tests {
     }
 
     /// A fake PAX reader: block i holds rows i*10 .. i*10+9 of one int4
-    /// column, in two groups, with the row i*10+3 NULL.
+    /// column, in two groups, with the row i*10+3 NULL.  It reports holding
+    /// 1000 bytes while it reads a block.
     unsafe extern "C" fn fake_read(
         _scan: *mut c_void,
         index: i32,
         emit: PaxEmitFn,
+        account: PaxAccountFn,
         ctx: *mut c_void,
         _err: *mut c_char,
         _errlen: usize,
     ) -> i32 {
+        account(ctx, 1000);
         for g in 0..2 {
             let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
             let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
             let col = RawColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
             if emit(ctx, 5, &col) != 0 {
+                account(ctx, -1000);
                 return -1;
             }
         }
+        account(ctx, -1000);
         0
     }
 
@@ -1120,6 +1166,9 @@ mod tests {
         // 500 rows 0..499, 50 of them NULL (those ending in 3).
         let sum: i64 = (0..500).filter(|v| v % 10 != 3).sum();
         assert_eq!(row, vec![450, sum, 500]);
+        // At least one block was held, at most one per partition at a time.
+        let peak = q.stats().pax_decode_peak;
+        assert!((1000..=4000).contains(&peak), "pax_decode_peak {peak}");
         drop(q);
         // The scan is released once the plan is gone.
         for _ in 0..100 {

@@ -85,6 +85,8 @@ uint64		df_runs_completed = 0;
 DfQueryStats df_last_run;
 bool		df_pax_direct_read = false;
 uint64		df_pax_direct_scans = 0;
+bool		df_last_run_pax = false;
+DfPaxScanInfo df_last_pax_scan;
 
 typedef struct DfExec
 {
@@ -97,6 +99,8 @@ typedef struct DfExec
 	int64		headroom;		/* vmem lease ahead of the heap, bytes */
 
 	DfQuery    *query;			/* NULL until the first row is requested */
+	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
+	DfPaxScanInfo pax_info;
 	TableScanDesc scandesc;
 
 	/* input batch being assembled or offered */
@@ -219,6 +223,9 @@ df_exec_finished(DfExec *x)
 
 	df_ffi_query_stats(x->query, &s);
 	df_last_run = s;
+	df_last_run_pax = x->pax_direct;
+	if (x->pax_direct)
+		df_last_pax_scan = x->pax_info;
 	df_runs_completed++;
 
 	if (x->root->instrument)
@@ -266,12 +273,18 @@ df_exec_begin_pax(DfExec *x, int workers)
 		cols[c] = x->spec.scan_attnos[c] - 1;
 		widths[c] = df_type_width(x->spec.scan_types[c]);
 	}
-	scan = reader->begin(rel, x->estate->es_snapshot, cols, widths,
-						 x->spec.nscan, buf, sizeof(buf));
+	/*
+	 * The scan's qual only lets PAX skip micro-partitions and groups by
+	 * their min/max statistics; DataFusion still filters every row.
+	 */
+	scan = reader->begin(rel, x->estate->es_snapshot, x->scan->ss.ps.plan->qual,
+						 cols, widths, x->spec.nscan, buf, sizeof(buf));
 	if (scan == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion: %s", buf)));
+	reader->info(scan, &x->pax_info);
+	x->pax_direct = true;
 
 	/* From here on the query owns the scan. */
 	status = df_ffi_query_start_pax(x->spec.json, (uint32_t) workers,

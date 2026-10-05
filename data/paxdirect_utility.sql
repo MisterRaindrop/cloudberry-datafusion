@@ -64,4 +64,37 @@ ROLLBACK;
 SET datafusion.mode = on;
 SELECT count(*), sum(a) FROM df_pd;
 
-DROP TABLE df_pd, df_pd_vec;
+-- Min/max skipping: micro-partitions and groups whose statistics rule out
+-- the scan's qual are not read (4 micro-partitions of 8 groups or fewer).
+-- Only column a has statistics.
+SET pax.max_tuples_per_file = 131072;
+SET pax.max_tuples_per_group = 16384;
+CREATE TABLE df_pd_skip (a int4, b int8, e int2) USING pax WITH (minmax_columns = 'a');
+INSERT INTO df_pd_skip SELECT i, i * 10, (i % 100)::int2 FROM generate_series(1, 500000) i;
+RESET pax.max_tuples_per_file;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a < 5000 OR a > 490000;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a > 600000;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
+SET datafusion.mode = on;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb > 0 AS decoded
+FROM datafusion_debug_last_pax();
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a < 5000 OR a > 490000;
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a > 600000;
+SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb FROM datafusion_debug_last_pax();
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+-- PAX's switch for its own skipping applies too.
+SET pax.enable_sparse_filter = off;
+SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
+SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+RESET pax.enable_sparse_filter;
+-- The memory PAX's reader held is given back once the scan is over.
+SELECT count(*) FROM df_pd_skip;
+SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
+
+DROP TABLE df_pd, df_pd_vec, df_pd_skip;

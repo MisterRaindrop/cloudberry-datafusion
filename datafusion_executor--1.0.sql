@@ -110,3 +110,15 @@ AS 'MODULE_PATHNAME', 'datafusion_debug_pax_direct_scans'
 LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION datafusion_debug_pax_direct_scans() FROM PUBLIC;
+
+-- The latest completed direct PAX scan in this backend: micro-partitions
+-- and groups skipped by their min/max statistics, and the peak memory PAX's
+-- reader held while decoding.  NULLs if the latest run was not one.
+CREATE FUNCTION datafusion_debug_last_pax(OUT files int8, OUT files_skipped int8,
+                                          OUT groups int8, OUT groups_skipped int8,
+                                          OUT decode_peak_kb int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'datafusion_debug_last_pax'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_last_pax() FROM PUBLIC;
