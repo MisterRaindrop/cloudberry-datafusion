@@ -39,7 +39,10 @@
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
 //! ```
 
+use std::ffi::{c_char, c_void};
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,11 +87,14 @@ pub const BATCH_ROWS: usize = 8192;
 /// Batches buffered in each direction.
 const CHANNEL_DEPTH: usize = 4;
 
-/// Operator memory each partition needs at least.  The pool is shared
-/// fairly among the operators that can spill, two per partition for a
-/// grouped aggregate (partial and final); a final aggregate's first
-/// allocation alone is a few hundred kB.  A small budget therefore runs on
-/// fewer partitions instead of starving all of them.
+/// Operator memory each partition of a grouped aggregate needs at least.
+/// The pool is shared fairly among the operators that can spill, two per
+/// partition (partial and final); a final aggregate's first allocation
+/// alone is a few hundred kB.  A small budget therefore runs on fewer
+/// partitions instead of starving all of them.  Plans without a grouped
+/// aggregate hold only a few accumulators per partition and are not capped;
+/// Cloudberry gives such operators little memory (a plain Agg gets 100 kB
+/// from the resource queue), which would otherwise force one partition.
 const MIN_PARTITION_MEMORY: usize = 2 << 20;
 
 /// The PostgreSQL types a slice can carry so far.
@@ -129,6 +135,7 @@ impl PgType {
 
 /// Column data as the C side lays it out: native values (one byte per bool)
 /// and one byte per row that is 1 for NULL.
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawColumn {
     pub values: *const u8,
@@ -382,6 +389,177 @@ impl PartitionStream for ChannelPartition {
 }
 
 // ---------------------------------------------------------------------------
+// PAX micro-partitions read on the workers (experimental)
+// ---------------------------------------------------------------------------
+
+/// Called by the PAX reader once per group of visible rows.
+pub type PaxEmitFn = unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const RawColumn) -> i32;
+/// df_pax_read_block (src/df_pax.cc): decode one block, emitting its groups.
+pub type PaxReadFn = unsafe extern "C" fn(
+    scan: *mut c_void,
+    index: i32,
+    emit: PaxEmitFn,
+    ctx: *mut c_void,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32;
+/// df_pax_scan_end: free the scan.
+pub type PaxEndFn = unsafe extern "C" fn(scan: *mut c_void);
+
+/// A PAX scan listed on the main thread.  Partitions take blocks from it
+/// one at a time; it is freed when the last partition is done with it.
+pub struct PaxScan {
+    scan: *mut c_void,
+    nblocks: usize,
+    read: PaxReadFn,
+    end: PaxEndFn,
+    next: AtomicUsize,
+}
+
+// SAFETY: the C++ scan object holds no PostgreSQL state and its read
+// function is safe to call from several threads for different blocks.
+unsafe impl Send for PaxScan {}
+unsafe impl Sync for PaxScan {}
+
+impl PaxScan {
+    /// Take ownership of a scan; `end` runs when this is dropped.
+    pub fn new(scan: *mut c_void, nblocks: usize, read: PaxReadFn, end: PaxEndFn) -> Self {
+        PaxScan { scan, nblocks, read, end, next: AtomicUsize::new(0) }
+    }
+}
+
+impl Drop for PaxScan {
+    fn drop(&mut self) {
+        // SAFETY: no partition is reading any more (they hold an Arc).
+        unsafe { (self.end)(self.scan) }
+    }
+}
+
+struct EmitContext {
+    schema: SchemaRef,
+    types: Vec<PgType>,
+    batches: Vec<RecordBatch>,
+    error: Option<String>,
+}
+
+unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const RawColumn) -> i32 {
+    let ctx = &mut *(ctx as *mut EmitContext);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let n = nrows as usize;
+        let arrays: Vec<ArrayRef> = ctx
+            .types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| build_array(*ty, *cols.add(i), n))
+            .collect();
+        make_batch(&ctx.schema, arrays, n)
+    }));
+    match result {
+        Ok(Ok(batch)) => {
+            ctx.batches.push(batch);
+            0
+        }
+        Ok(Err(e)) => {
+            ctx.error = Some(e.message);
+            1
+        }
+        Err(_) => {
+            ctx.error = Some("panic while building a batch".into());
+            1
+        }
+    }
+}
+
+fn make_batch(schema: &SchemaRef, arrays: Vec<ArrayRef>, nrows: usize) -> Result<RecordBatch, PgError> {
+    if arrays.is_empty() {
+        RecordBatch::try_new_with_options(
+            schema.clone(),
+            arrays,
+            &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(nrows)),
+        )
+    } else {
+        RecordBatch::try_new(schema.clone(), arrays)
+    }
+    .map_err(|e| PgError::internal(e.to_string()))
+}
+
+/// One of the partitions reading a PAX scan.
+struct PaxPartition {
+    schema: SchemaRef,
+    types: Vec<PgType>,
+    scan: Arc<PaxScan>,
+}
+
+impl fmt::Debug for PaxPartition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PaxPartition")
+    }
+}
+
+impl PartitionStream for PaxPartition {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let schema = self.schema.clone();
+        let types = self.types.clone();
+        let scan = self.scan.clone();
+        let state = (scan, std::collections::VecDeque::<RecordBatch>::new(), false);
+        let stream = futures::stream::unfold(state, move |(scan, mut queue, failed)| {
+            let schema = schema.clone();
+            let types = types.clone();
+            async move {
+                loop {
+                    if let Some(batch) = queue.pop_front() {
+                        return Some((Ok(batch), (scan, queue, failed)));
+                    }
+                    if failed {
+                        return None;
+                    }
+                    let index = scan.next.fetch_add(1, Ordering::Relaxed);
+                    if index >= scan.nblocks {
+                        return None;
+                    }
+                    let mut ctx = EmitContext { schema: schema.clone(), types: types.clone(), batches: Vec::new(), error: None };
+                    let mut err = vec![0 as c_char; 1024];
+                    // SAFETY: see PaxScan; ctx outlives the call.
+                    let rc = unsafe {
+                        (scan.read)(
+                            scan.scan,
+                            index as i32,
+                            pax_emit,
+                            &mut ctx as *mut EmitContext as *mut c_void,
+                            err.as_mut_ptr(),
+                            err.len(),
+                        )
+                    };
+                    if rc != 0 {
+                        let msg = ctx.error.take().unwrap_or_else(|| {
+                            unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned()
+                        });
+                        let e = DataFusionError::External(Box::new(PgError::internal(msg)));
+                        return Some((Err(e), (scan, queue, true)));
+                    }
+                    queue.extend(ctx.batches);
+                    // Let other tasks run between blocks.
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), stream))
+    }
+}
+
+/// Where a query's rows come from.
+pub enum Source {
+    /// Batches the main thread pushes (any table AM).
+    Pushed,
+    /// PAX micro-partitions read by the partitions themselves.
+    Pax(PaxScan),
+}
+
+// ---------------------------------------------------------------------------
 // Query
 // ---------------------------------------------------------------------------
 
@@ -424,6 +602,17 @@ impl Query {
     /// `partitions` partitions, an operator memory budget of `memory_limit`
     /// bytes, and spill files under `spill_dir`.
     pub fn start(spec: &str, partitions: usize, memory_limit: usize, spill_dir: &str) -> Result<Query, PgError> {
+        Self::start_with(spec, partitions, memory_limit, spill_dir, Source::Pushed)
+    }
+
+    /// Like `start`, reading from `source`.
+    pub fn start_with(
+        spec: &str,
+        partitions: usize,
+        memory_limit: usize,
+        spill_dir: &str,
+        source: Source,
+    ) -> Result<Query, PgError> {
         let handle = runtime::handle()
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
         let spec: Value = serde_json::from_str(spec)
@@ -448,9 +637,34 @@ impl Query {
                 .collect::<Vec<_>>(),
         ));
 
-        let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
-        let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
-        let table = StreamingTable::try_new(in_schema.clone(), vec![Arc::new(partition)]).map_err(df)?;
+        let grouped = spec
+            .get("aggregate")
+            .and_then(|a| a.get("group"))
+            .and_then(Value::as_array)
+            .map_or(false, |g| !g.is_empty());
+        let partitions = if grouped {
+            partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1))
+        } else {
+            partitions.max(1)
+        };
+        let (in_tx, table) = match source {
+            Source::Pushed => {
+                let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
+                let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
+                let table = StreamingTable::try_new(in_schema.clone(), vec![Arc::new(partition)]).map_err(df)?;
+                (Some(in_tx), table)
+            }
+            Source::Pax(scan) => {
+                let scan = Arc::new(scan);
+                let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
+                    .map(|_| {
+                        Arc::new(PaxPartition { schema: in_schema.clone(), types: in_types.clone(), scan: scan.clone() })
+                            as Arc<dyn PartitionStream>
+                    })
+                    .collect();
+                (None, StreamingTable::try_new(in_schema.clone(), parts).map_err(df)?)
+            }
+        };
 
         let mut b = LogicalPlanBuilder::scan("t", provider_as_source(Arc::new(table)), None).map_err(df)?;
         if let Some(f) = spec.get("filter").filter(|v| !v.is_null()) {
@@ -490,7 +704,6 @@ impl Query {
         }
         let plan = b.project(out_exprs).map_err(df)?.build().map_err(df)?;
 
-        let partitions = partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1));
         let config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(BATCH_ROWS);
@@ -523,7 +736,7 @@ impl Query {
 
         Ok(Query {
             handle,
-            in_tx: Some(in_tx),
+            in_tx,
             in_schema,
             in_types,
             out_rx,
@@ -577,16 +790,7 @@ impl Query {
         for (c, ty) in cols.iter().zip(&self.in_types) {
             arrays.push(build_array(*ty, *c, nrows));
         }
-        let batch = if arrays.is_empty() {
-            RecordBatch::try_new_with_options(
-                self.in_schema.clone(),
-                arrays,
-                &datafusion::arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(nrows)),
-            )
-        } else {
-            RecordBatch::try_new(self.in_schema.clone(), arrays)
-        }
-        .map_err(|e| PgError::internal(e.to_string()))?;
+        let batch = make_batch(&self.in_schema, arrays, nrows)?;
         match tx.try_send(batch) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
@@ -858,6 +1062,73 @@ mod tests {
         let s = q.stats();
         assert_eq!(s.memory_limit, 1 << 20);
         assert!(s.spill_count > 0 && s.spilled_bytes > 0, "expected spills: {s:?}");
+    }
+
+    /// A fake PAX reader: block i holds rows i*10 .. i*10+9 of one int4
+    /// column, in two groups, with the row i*10+3 NULL.
+    unsafe extern "C" fn fake_read(
+        _scan: *mut c_void,
+        index: i32,
+        emit: PaxEmitFn,
+        ctx: *mut c_void,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        for g in 0..2 {
+            let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
+            let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
+            let col = RawColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
+            if emit(ctx, 5, &col) != 0 {
+                return -1;
+            }
+        }
+        0
+    }
+
+    static FAKE_ENDED: AtomicUsize = AtomicUsize::new(0);
+    unsafe extern "C" fn fake_end(_scan: *mut c_void) {
+        FAKE_ENDED.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn pax_source_reads_all_blocks_once() {
+        runtime::init(2).unwrap();
+        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+            "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}},{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
+            "having":null,
+            "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
+        let before = FAKE_ENDED.load(Ordering::SeqCst);
+        let scan = PaxScan::new(std::ptr::null_mut(), 50, fake_read, fake_end);
+        let dir = std::env::temp_dir();
+        let mut q = Query::start_with(spec, 4, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan)).unwrap();
+        let mut row = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(n) => {
+                    assert_eq!(n, 1);
+                    for c in 0..3 {
+                        let col = q.output_column(c).unwrap();
+                        row.push(unsafe { *(col.values as *const i64) });
+                    }
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+            }
+        }
+        // 500 rows 0..499, 50 of them NULL (those ending in 3).
+        let sum: i64 = (0..500).filter(|v| v % 10 != 3).sum();
+        assert_eq!(row, vec![450, sum, 500]);
+        drop(q);
+        // The scan is released once the plan is gone.
+        for _ in 0..100 {
+            if FAKE_ENDED.load(Ordering::SeqCst) > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(FAKE_ENDED.load(Ordering::SeqCst), before + 1);
     }
 
     #[test]

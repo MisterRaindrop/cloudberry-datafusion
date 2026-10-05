@@ -309,6 +309,42 @@ pub extern "C" fn df_ffi_query_start(
     }
 }
 
+/// Like df_ffi_query_start, reading PAX micro-partitions on the workers:
+/// `scan` (with `nblocks` blocks) is read with `read` and released with
+/// `end`, which the query owns from now on, even if this call fails.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_start_pax(
+    spec: *const c_char,
+    partitions: u32,
+    memory_limit: u64,
+    spill_dir: *const c_char,
+    scan: *mut std::ffi::c_void,
+    nblocks: u32,
+    read: df_core::query::PaxReadFn,
+    end: df_core::query::PaxEndFn,
+    out_query: *mut *mut DfQuery,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
+    let source = df_core::query::Source::Pax(df_core::query::PaxScan::new(scan, nblocks as usize, read, end));
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the caller passes NUL-terminated strings.
+        let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
+        let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
+        df_core::query::Query::start_with(&spec, partitions as usize, memory_limit as usize, &dir, source)
+    }));
+    match r {
+        Ok(Ok(q)) => {
+            // SAFETY: the caller passes a valid out pointer.
+            unsafe { *out_query = Box::into_raw(Box::new(DfQuery(q))) };
+            DF_OK
+        }
+        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
+        Err(p) => report_panic(p, sqlstate, buf, buflen),
+    }
+}
+
 /// Offer `nrows` rows in `ncols` columns.  DF_OK: taken.  DF_PENDING: the
 /// input queue is full and nothing was taken; poll, then offer again.
 #[no_mangle]

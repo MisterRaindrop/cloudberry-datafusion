@@ -33,13 +33,18 @@
 
 MODULE_big = datafusion_executor
 OBJS = src/df_init.o src/df_runtime.o src/df_debug.o \
-	src/df_hooks.o src/df_plan_check.o src/df_translate.o src/df_exec.o
+	src/df_hooks.o src/df_plan_check.o src/df_translate.o src/df_exec.o \
+	src/df_paxload.o
 
 EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
 REGRESS = datafusion_executor runtime hooks exec memory motion storage parallel
+# The direct PAX reader is only tested when it is built.
+ifdef DF_PAX_SRC
+REGRESS += paxdirect
+endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
 PG_CPPFLAGS = -Isrc
@@ -85,3 +90,32 @@ df-rust-test:
 
 df-rust-clean:
 	-cd rust && $(CARGO) clean
+
+# ---------------------------------------------------------------------------
+# Experimental direct PAX reader, datafusion_pax.so (src/df_pax.cc).  Built
+# only when DF_PAX_SRC names the pax_storage C++ sources (contrib/pax_storage/
+# src/cpp) of the Cloudberry tree the installed pax.so was built from; the
+# installed PAX headers come first, they include the generated protobuf ones.
+# The library records the installed pax.so's build ID and is only used with it.
+# ---------------------------------------------------------------------------
+ifdef DF_PAX_SRC
+DF_PAX_SO := $(pkglibdir)/pax.so
+DF_PAX_BUILD_ID := $(shell readelf -n $(DF_PAX_SO) 2>/dev/null | awk '/Build ID/ {print $$3}')
+CXX ?= g++
+
+all: datafusion_pax.so
+
+datafusion_pax.so: src/df_pax.cc
+	@test -n "$(DF_PAX_BUILD_ID)" || { echo "cannot read the build ID of $(DF_PAX_SO)"; exit 1; }
+	$(CXX) -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -DUSE_PAX_CATALOG \
+		-DDF_PAX_BUILD_ID='"$(DF_PAX_BUILD_ID)"' \
+		-I$(includedir)/pax -I$(DF_PAX_SRC) -I$(includedir_server) -I$(includedir_internal) \
+		$< -o $@
+
+install: install-pax
+.PHONY: install-pax
+install-pax: datafusion_pax.so
+	$(INSTALL_SHLIB) datafusion_pax.so '$(DESTDIR)$(pkglibdir)/'
+
+EXTRA_CLEAN += datafusion_pax.so
+endif

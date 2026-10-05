@@ -72,6 +72,17 @@ _PG_init(void)
 							GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("datafusion.pax_direct_read",
+							 "Experimental: read PAX tables column by column on DataFusion's threads.",
+							 "Bypasses the table access method's row-at-a-time interface "
+							 "by calling PAX's reader classes directly (datafusion_pax.so).  "
+							 "Not used in Cloudberry's parallel mode.",
+							 &df_pax_direct_read,
+							 false,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();

@@ -51,6 +51,7 @@ PG_FUNCTION_INFO_V1(datafusion_debug_runtime_threads);
 PG_FUNCTION_INFO_V1(datafusion_debug_last_run);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
+PG_FUNCTION_INFO_V1(datafusion_debug_pax_direct_scans);
 
 static Datum
 df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
@@ -259,4 +260,11 @@ datafusion_debug_vmem_lease(PG_FUNCTION_ARGS)
 	leased = df_vmem_leased_bytes();
 	df_vmem_trim();
 	PG_RETURN_INT64(leased);
+}
+
+/* datafusion_debug_pax_direct_scans() returns bigint */
+Datum
+datafusion_debug_pax_direct_scans(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) df_pax_direct_scans);
 }

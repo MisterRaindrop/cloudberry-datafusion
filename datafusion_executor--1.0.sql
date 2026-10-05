@@ -101,3 +101,12 @@ LANGUAGE C STRICT VOLATILE;
 REVOKE ALL ON FUNCTION datafusion_debug_last_run() FROM PUBLIC;
 REVOKE ALL ON FUNCTION datafusion_debug_vmem() FROM PUBLIC;
 REVOKE ALL ON FUNCTION datafusion_debug_vmem_lease(int8) FROM PUBLIC;
+
+-- Number of scans in this backend that read PAX micro-partitions directly
+-- (datafusion.pax_direct_read).
+CREATE FUNCTION datafusion_debug_pax_direct_scans()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'datafusion_debug_pax_direct_scans'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_pax_direct_scans() FROM PUBLIC;

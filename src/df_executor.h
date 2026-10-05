@@ -31,6 +31,8 @@
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
 #include "nodes/plannodes.h"
+#include "utils/rel.h"
+#include "utils/snapshot.h"
 
 /* GUC datafusion.mode */
 typedef enum DfMode
@@ -70,6 +72,23 @@ extern DfQueryStats df_last_run;	/* figures of the latest one */
 extern const char *df_type_tag(Oid type);
 extern bool df_translate_slice(Plan *root, DfSliceSpec *spec,
 							   char *reason, size_t reasonlen);
+
+/* df_paxload.c: the experimental direct PAX reader (src/df_pax.cc) */
+typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, const int *cols,
+							 const int *widths, int ncols, char *err, size_t errlen);
+typedef int (*DfPaxNBlocks) (void *scan);
+
+typedef struct DfPaxReader
+{
+	DfPaxBegin	begin;
+	DfPaxNBlocks nblocks;
+	DfPaxRead	read;
+	DfPaxEnd	end;
+} DfPaxReader;
+
+extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */
+extern const DfPaxReader *df_pax_reader_get(void);
+extern uint64 df_pax_direct_scans;	/* scans read through it */
 
 /* df_hooks.c */
 extern void df_install_hooks(void);

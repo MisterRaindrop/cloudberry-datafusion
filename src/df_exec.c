@@ -58,10 +58,12 @@
 
 #include "access/tableam.h"
 #include "catalog/pg_type_d.h"
+#include "commands/defrem.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
@@ -81,6 +83,8 @@
 
 uint64		df_runs_completed = 0;
 DfQueryStats df_last_run;
+bool		df_pax_direct_read = false;
+uint64		df_pax_direct_scans = 0;
 
 typedef struct DfExec
 {
@@ -225,6 +229,66 @@ df_exec_finished(DfExec *x)
 	}
 }
 
+/*
+ * Experimental: start the query on PAX micro-partitions that DataFusion's
+ * partitions decode themselves.  Returns false when the direct reader does
+ * not apply; the caller then reads through the table AM.
+ */
+static bool
+df_exec_begin_pax(DfExec *x, int workers)
+{
+	Relation	rel = x->scan->ss.ss_currentRelation;
+	const DfPaxReader *reader;
+	char		buf[DF_MSG_BUFLEN];
+	char		sqlstate[6] = "XX000";
+	int		   *cols;
+	int		   *widths;
+	void	   *scan;
+	int32		status;
+	int			c;
+
+	if (!df_pax_direct_read || x->scan->ss.ss_currentScanDesc != NULL)
+		return false;
+	{
+		char	   *amname = get_am_name(rel->rd_rel->relam);
+
+		if (amname == NULL || strcmp(amname, "pax") != 0)
+			return false;
+	}
+	reader = df_pax_reader_get();
+	if (reader == NULL)
+		return false;
+
+	cols = palloc(sizeof(int) * Max(x->spec.nscan, 1));
+	widths = palloc(sizeof(int) * Max(x->spec.nscan, 1));
+	for (c = 0; c < x->spec.nscan; c++)
+	{
+		cols[c] = x->spec.scan_attnos[c] - 1;
+		widths[c] = df_type_width(x->spec.scan_types[c]);
+	}
+	scan = reader->begin(rel, x->estate->es_snapshot, cols, widths,
+						 x->spec.nscan, buf, sizeof(buf));
+	if (scan == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("datafusion: %s", buf)));
+
+	/* From here on the query owns the scan. */
+	status = df_ffi_query_start_pax(x->spec.json, (uint32_t) workers,
+									(uint64_t) x->memory_limit, df_spill_dir(),
+									scan, (uint32_t) reader->nblocks(scan),
+									reader->read, reader->end,
+									&x->query, sqlstate, buf, sizeof(buf));
+	if (status != DF_OK)
+	{
+		x->query = NULL;
+		df_raise_query(status, sqlstate, buf);
+	}
+	x->input_done = true;		/* nothing to push from the main thread */
+	df_pax_direct_scans++;
+	return true;
+}
+
 static void
 df_exec_begin(DfExec *x)
 {
@@ -235,6 +299,11 @@ df_exec_begin(DfExec *x)
 	Relation	rel = x->scan->ss.ss_currentRelation;
 
 	workers = df_runtime_ensure();
+	if (df_exec_begin_pax(x, workers))
+	{
+		df_vmem_sync(x->headroom);
+		return;
+	}
 	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
 								(uint64_t) x->memory_limit, df_spill_dir(),
 								&x->query, sqlstate, buf, sizeof(buf));

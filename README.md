@@ -156,6 +156,34 @@ segment and one DataFusion thread each, a grouped aggregate on heap took
 0.14 s instead of 0.27 s without parallel mode (PostgreSQL: 0.58 s with
 parallel mode, 1.16 s without), and on PAX 0.14 s instead of 0.20 s.
 
+### Experimental: direct PAX reader
+
+`datafusion.pax_direct_read = on` reads PAX tables without the table AM's
+row-at-a-time interface.  The main thread lists the micro-partitions
+visible to the snapshot; DataFusion's partitions then take blocks one at a
+time and decode the needed columns themselves, through PAX's own reader
+classes, in a small separate library, `datafusion_pax.so` (`src/df_pax.cc`).
+That code calls PAX's internal C++ classes, not a published API:
+
+- It is built only with `make DF_PAX_SRC=<cloudberry>/contrib/pax_storage/src/cpp`,
+  against the installed PAX headers plus the sources of the same tree, and
+  needs the protobuf headers of the version pax.so links.
+- It records the installed pax.so's ELF build ID.  At run time the extension
+  compares it with the running pax.so and, if they differ or the library
+  does not load, warns once and reads through the table AM.
+- PAX's decoding allocates with malloc outside the counting allocator, so
+  that memory is not yet leased from the vmem tracker; PAX's min/max
+  micro-partition skipping is not applied; Cloudberry's parallel mode
+  keeps the table AM path.
+
+Over 30 million rows on 3 segments, 3 DataFusion threads per QE:
+
+| Query | PostgreSQL | table AM | table AM, parallel 3 | direct PAX |
+|---|---|---|---|---|
+| grouped aggregate | 1.08 s | 0.18 s | 0.13 s | 0.07 s |
+| filtered aggregate | 0.99 s | 0.19 s | 0.13 s | 0.06 s |
+| `count(*)` | 0.75 s | 0.10 s | 0.08 s | 0.009 s |
+
 Measured in a 3-segment container on 10 ARM cores, a grouped aggregate over
 a 20-million-row coordinator-local heap table took 0.47 s in DataFusion and
 1.41 s on the PostgreSQL executor, with identical results (0.50 s once the
