@@ -51,14 +51,22 @@ extern int	df_worker_threads;
 /* df_init.c */
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
 
+/* One input of a slice: the rows of a Seq Scan or of a receiving Motion. */
+typedef struct DfSliceInput
+{
+	Plan	   *leaf;			/* the Seq Scan or Motion node */
+	int			ncols;			/* columns read */
+	AttrNumber *attnos;			/* table columns, or Motion stream
+								 * positions + 1 */
+	Oid		   *types;
+} DfSliceInput;
+
 /* What df_translate_slice produces for one slice. */
 typedef struct DfSliceSpec
 {
 	char	   *json;			/* plan for the Rust side */
-	Index		scanrelid;
-	int			nscan;			/* columns read from the table */
-	AttrNumber *scan_attnos;
-	Oid		   *scan_types;
+	int			ninputs;		/* in the order they are fed */
+	DfSliceInput *inputs;
 	int			nout;			/* output columns, in targetlist order */
 	Oid		   *out_types;
 } DfSliceSpec;

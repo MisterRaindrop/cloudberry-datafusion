@@ -49,8 +49,7 @@
 #define DF_BYTES	6			/* df_ffi_query_poll: IPC bytes available */
 
 /* Query flags (M7b) */
-#define DF_QUERY_IPC_INPUT	1	/* input: Arrow IPC streams from a Motion */
-#define DF_QUERY_IPC_OUTPUT 2	/* results: one Arrow IPC stream */
+#define DF_QUERY_IPC_OUTPUT 2	/* results: Arrow IPC streams */
 
 #define DF_MSG_BUFLEN 1024
 
@@ -94,9 +93,11 @@ typedef struct DfColumn
 } DfColumn;
 
 /* The message may be followed by a newline and an error detail. */
+/* Bit j of 'ipc_inputs': input j arrives as Arrow IPC streams from a Motion. */
 extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  uint64_t memory_limit, const char *spill_dir,
-								  uint32_t flags, DfQuery **out_query,
+								  uint32_t flags, uint32_t ninputs, uint64_t ipc_inputs,
+								  DfQuery **out_query,
 								  char *sqlstate, char *buf, size_t buflen);
 /* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfColumn *cols);
@@ -113,7 +114,7 @@ extern int32_t df_ffi_query_start_pax(const char *spec, uint32_t partitions,
 									  DfPaxRead read, DfPaxEnd end, uint32_t flags,
 									  DfQuery **out_query, char *sqlstate,
 									  char *buf, size_t buflen);
-extern int32_t df_ffi_query_push(DfQuery *query, const DfColumn *cols,
+extern int32_t df_ffi_query_push(DfQuery *query, uint32_t input, const DfColumn *cols,
 								 uint32_t ncols, uint32_t nrows,
 								 char *sqlstate, char *buf, size_t buflen);
 typedef struct DfSlice
@@ -123,7 +124,7 @@ typedef struct DfSlice
 } DfSlice;
 
 /* Copies the bytes; DF_PENDING when the queue is full (nothing taken). */
-extern int32_t df_ffi_query_push_ipc(DfQuery *query, int32_t route,
+extern int32_t df_ffi_query_push_ipc(DfQuery *query, uint32_t input, int32_t route,
 									 const DfSlice *parts, uint32_t nparts,
 									 char *sqlstate, char *buf, size_t buflen);
 /*
@@ -139,6 +140,7 @@ extern int32_t df_ffi_cdbhash_routes(const int32_t *kinds, const DfColumn *cols,
 									 int32_t segments, int32_t workers,
 									 uint32_t *out);
 extern void df_ffi_query_finish_input(DfQuery *query);
+extern void df_ffi_query_finish_input_at(DfQuery *query, uint32_t input);
 extern int32_t df_ffi_query_poll(DfQuery *query, uint32_t timeout_ms,
 								 uint32_t *nrows, char *sqlstate,
 								 char *buf, size_t buflen);

@@ -44,9 +44,7 @@ pub const DF_DONE: i32 = 5;
 /// df_ffi_query_poll: Arrow IPC bytes are available (df_ffi_query_bytes).
 pub const DF_BYTES: i32 = 6;
 
-/// Query flags: input arrives as Arrow IPC streams from a Motion
-/// (df_ffi_query_push_ipc); results leave as one Arrow IPC stream.
-pub const DF_QUERY_IPC_INPUT: u32 = 1;
+/// Query flag: results leave as Arrow IPC streams (DF_BYTES).
 pub const DF_QUERY_IPC_OUTPUT: u32 = 2;
 
 /// Copy `msg` into a C buffer of `buflen` bytes as a NUL-terminated string,
@@ -287,7 +285,10 @@ fn report_panic(payload: Box<dyn Any + Send>, sqlstate: *mut c_char, buf: *mut c
 /// Build the plan described by the JSON `spec` and start it with
 /// `partitions` parallel partitions, an operator memory budget of
 /// `memory_limit` bytes and spill files under `spill_dir`; `flags` are
-/// DF_QUERY_* bits.  The runtime must be running.
+/// DF_QUERY_* bits.  The plan has `ninputs` inputs; bit j of `ipc_inputs`
+/// says input j arrives as Arrow IPC streams from a Motion
+/// (df_ffi_query_push_ipc), otherwise as pushed batches.  The runtime must
+/// be running.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start(
     spec: *const c_char,
@@ -295,6 +296,8 @@ pub extern "C" fn df_ffi_query_start(
     memory_limit: u64,
     spill_dir: *const c_char,
     flags: u32,
+    ninputs: u32,
+    ipc_inputs: u64,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
@@ -304,17 +307,21 @@ pub extern "C" fn df_ffi_query_start(
         // SAFETY: the caller passes a NUL-terminated string.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
         let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
-        let source = if flags & DF_QUERY_IPC_INPUT != 0 {
-            df_core::query::Source::Ipc
-        } else {
-            df_core::query::Source::Pushed
-        };
-        df_core::query::Query::start_with(
+        let sources = (0..ninputs)
+            .map(|j| {
+                if j < 64 && ipc_inputs & (1u64 << j) != 0 {
+                    df_core::query::Source::Ipc
+                } else {
+                    df_core::query::Source::Pushed
+                }
+            })
+            .collect();
+        df_core::query::Query::start_multi(
             &spec,
             partitions as usize,
             memory_limit as usize,
             &dir,
-            source,
+            sources,
             flags & DF_QUERY_IPC_OUTPUT != 0,
         )
     }));
@@ -378,6 +385,7 @@ pub extern "C" fn df_ffi_query_start_pax(
 #[no_mangle]
 pub extern "C" fn df_ffi_query_push(
     query: *mut DfQuery,
+    input: u32,
     cols: *const DfColumn,
     ncols: u32,
     nrows: u32,
@@ -393,7 +401,7 @@ pub extern "C" fn df_ffi_query_push(
             df_core::query::RawColumn { values: c.values, nulls: c.nulls }
         })
         .collect();
-    match catch_unwind(AssertUnwindSafe(|| unsafe { q.push(&raw, nrows as usize) })) {
+    match catch_unwind(AssertUnwindSafe(|| unsafe { q.push_input(input as usize, &raw, nrows as usize) })) {
         Ok(Ok(true)) => DF_OK,
         Ok(Ok(false)) => DF_PENDING,
         Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
@@ -415,6 +423,7 @@ pub struct DfSlice {
 #[no_mangle]
 pub extern "C" fn df_ffi_query_push_ipc(
     query: *mut DfQuery,
+    input: u32,
     route: i32,
     parts: *const DfSlice,
     nparts: u32,
@@ -434,7 +443,7 @@ pub extern "C" fn df_ffi_query_push_ipc(
             }
         })
         .collect();
-    match catch_unwind(AssertUnwindSafe(|| q.push_ipc(route, &pieces))) {
+    match catch_unwind(AssertUnwindSafe(|| q.push_ipc_input(input as usize, route, &pieces))) {
         Ok(Ok(true)) => DF_OK,
         Ok(Ok(false)) => DF_PENDING,
         Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
@@ -508,6 +517,14 @@ pub extern "C" fn df_ffi_query_finish_input(query: *mut DfQuery) {
     // SAFETY: `query` is live.
     let q = unsafe { &mut (*query).0 };
     let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input()));
+}
+
+/// Tell the query input `input` has no more rows.
+#[no_mangle]
+pub extern "C" fn df_ffi_query_finish_input_at(query: *mut DfQuery, input: u32) {
+    // SAFETY: `query` is live.
+    let q = unsafe { &mut (*query).0 };
+    let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input_at(input as usize)));
 }
 
 /// Wait up to `timeout_ms` for the next result batch.  DF_OK: `*nrows` rows

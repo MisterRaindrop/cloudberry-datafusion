@@ -23,7 +23,26 @@
 //! directions go through bounded channels, so a slow consumer slows the
 //! producer instead of piling up memory.
 //!
-//! The plan arrives as JSON built by the C side (src/df_translate.c):
+//! The plan arrives as JSON built by the C side (src/df_translate.c), as a
+//! tree over one or more inputs:
+//!
+//! ```text
+//! { "inputs":  [ { "columns": [ {"type": "int4"}, ... ],
+//!                  "motion_columns": [k, ...] }, ... ],   (motion_columns:
+//!                input from a Motion, the stream column behind each column)
+//!   "plan":    <node>,
+//!   "output":  [ {"expr": <expr>, "type": "int8"}, ... ],
+//!   "route":   ... }                                   (as below)
+//!
+//! <node> := {"input": j}
+//!         | {"filter": {"input": <node>, "pred": <expr>}}
+//!         | {"aggregate": {"input": <node>, "group": [<expr>...],
+//!                          "aggs": [...], "having": <expr> | null}}
+//! ```
+//!
+//! {"col": k, "input": j} is column k of input j ("input" defaults to 0);
+//! every input column has a name of its own (`input_column`), which it
+//! keeps through any node.  The single-input form below is still accepted:
 //!
 //! ```text
 //! { "scan":      { "columns": [ {"type": "int4"}, ... ],
@@ -256,9 +275,22 @@ fn comparison(name: &str) -> Option<Operator> {
     })
 }
 
+/// The name of column `k` of input `j`.
+fn input_column(j: usize, k: usize) -> String {
+    if j == 0 {
+        format!("c{k}")
+    } else {
+        format!("c{j}_{k}")
+    }
+}
+
 fn expr(v: &Value) -> Result<Expr, String> {
     if let Some(i) = v.get("col") {
-        return Ok(col(format!("c{}", index(i)?)));
+        let j = match v.get("input") {
+            Some(j) => index(j)?,
+            None => 0,
+        };
+        return Ok(col(input_column(j, index(i)?)));
     }
     if let Some(i) = v.get("group") {
         return Ok(col(format!("g{}", index(i)?)));
@@ -647,6 +679,111 @@ pub enum Source {
 // Query
 // ---------------------------------------------------------------------------
 
+/// The single-input spec form (one "scan", then "filter", "aggregate",
+/// "having") as the tree form.
+fn normalize_spec(mut spec: Value) -> Result<Value, String> {
+    if spec.get("plan").is_some() {
+        return Ok(spec);
+    }
+    let obj = spec.as_object_mut().ok_or("plan spec: not an object")?;
+    let scan = obj.remove("scan").ok_or("plan spec: no scan")?;
+    let mut node = serde_json::json!({"input": 0});
+    if let Some(f) = obj.remove("filter").filter(|v| !v.is_null()) {
+        node = serde_json::json!({"filter": {"input": node, "pred": f}});
+    }
+    if let Some(mut a) = obj.remove("aggregate").filter(|v| !v.is_null()) {
+        let having = obj.remove("having").unwrap_or(Value::Null);
+        let am = a.as_object_mut().ok_or("plan spec: bad aggregate")?;
+        am.insert("input".into(), node);
+        am.insert("having".into(), having);
+        node = serde_json::json!({ "aggregate": a });
+    } else {
+        obj.remove("having");
+    }
+    obj.insert("inputs".into(), Value::Array(vec![scan]));
+    obj.insert("plan".into(), node);
+    Ok(spec)
+}
+
+/// Does the plan group rows in an aggregate (which caps the partitions)?
+fn has_grouped_aggregate(node: &Value) -> bool {
+    if let Some(a) = node.get("aggregate") {
+        let grouped = a.get("group").and_then(Value::as_array).map_or(false, |g| !g.is_empty());
+        return grouped || a.get("input").map_or(false, has_grouped_aggregate);
+    }
+    if let Some(f) = node.get("filter") {
+        return f.get("input").map_or(false, has_grouped_aggregate);
+    }
+    false
+}
+
+/// The logical plan of a node of the spec.  `tables` holds each input's
+/// table, taken by the node that reads it.
+fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<LogicalPlanBuilder, String> {
+    let df = |e: DataFusionError| e.to_string();
+    if let Some(j) = node.get("input") {
+        let j = index(j)?;
+        let table = tables
+            .get_mut(j)
+            .and_then(Option::take)
+            .ok_or_else(|| format!("plan spec: input {j} missing or read twice"))?;
+        return LogicalPlanBuilder::scan(format!("t{j}"), provider_as_source(Arc::new(table)), None).map_err(df);
+    }
+    if let Some(f) = node.get("filter") {
+        let b = build_node(field(f, "input")?, tables)?;
+        return b.filter(expr(field(f, "pred")?)?).map_err(df);
+    }
+    if let Some(a) = node.get("aggregate") {
+        let mut b = build_node(field(a, "input")?, tables)?;
+        let groups = field(a, "group")?.as_array().cloned().unwrap_or_default();
+        let aggs = field(a, "aggs")?.as_array().cloned().unwrap_or_default();
+        let group_exprs = groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| expr(g).map(|e| e.alias(format!("g{i}"))))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut agg_exprs = Vec::with_capacity(aggs.len());
+        for (i, g) in aggs.iter().enumerate() {
+            agg_exprs.push(aggregate(g)?.alias(format!("a{i}")));
+            if let Some(e) = aggregate_extra(g)? {
+                agg_exprs.push(e.alias(format!("a{i}_n")));
+            }
+        }
+        let ngroups = group_exprs.len();
+        b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
+        // A combined count is 0, not NULL, when no partial count arrived;
+        // a combined avg divides the sums, NULL without values (as
+        // PostgreSQL's float8_avg).
+        let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
+        if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge"))) {
+            let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
+            for (i, a) in aggs.iter().enumerate() {
+                let c = col(format!("a{i}"));
+                cols.push(match kind(a).as_deref() {
+                    Some("count_merge") => {
+                        when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
+                    }
+                    Some("avg_merge") => {
+                        let n = col(format!("a{i}_n"));
+                        let nf = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(n.clone()), DataType::Float64));
+                        when(n.clone().is_null().or(n.eq(lit(0i64))), lit(ScalarValue::Float64(None)))
+                            .otherwise(binary_expr(c, Operator::Divide, nf))
+                            .map_err(df)?
+                            .alias(format!("a{i}"))
+                    }
+                    _ => c,
+                });
+            }
+            b = b.project(cols).map_err(df)?;
+        }
+        if let Some(h) = a.get("having").filter(|v| !v.is_null()) {
+            b = b.filter(expr(h)?).map_err(df)?;
+        }
+        return Ok(b);
+    }
+    Err(format!("plan spec: unknown node {node}"))
+}
+
 /// What the plan's task hands the main thread.
 enum Out {
     Batch(RecordBatch),
@@ -692,12 +829,13 @@ impl HashRoute {
 
 pub struct Query {
     handle: Handle,
-    in_tx: Option<mpsc::Sender<Result<RecordBatch, DataFusionError>>>,
-    /// Source::Ipc: received stream bytes, by route, for the decoding task.
-    ipc_tx: Option<mpsc::Sender<(i32, Vec<u8>)>>,
-    decoder: Option<JoinHandle<()>>,
-    in_schema: SchemaRef,
-    in_types: Vec<PgType>,
+    /// Per input: Source::Pushed batches.
+    in_tx: Vec<Option<mpsc::Sender<Result<RecordBatch, DataFusionError>>>>,
+    /// Per input: Source::Ipc stream bytes, by route, for its decoding task.
+    ipc_tx: Vec<Option<mpsc::Sender<(i32, Vec<u8>)>>>,
+    decoders: Vec<JoinHandle<()>>,
+    in_schemas: Vec<SchemaRef>,
+    in_types: Vec<Vec<PgType>>,
     out_rx: mpsc::Receiver<Result<Out, PgError>>,
     out_types: Vec<PgType>,
     task: Option<JoinHandle<()>>,
@@ -751,6 +889,18 @@ impl Query {
         source: Source,
         ipc_output: bool,
     ) -> Result<Query, PgError> {
+        Self::start_multi(spec, partitions, memory_limit, spill_dir, vec![source], ipc_output)
+    }
+
+    /// Like `start_with`, with one source per input of the plan.
+    pub fn start_multi(
+        spec: &str,
+        partitions: usize,
+        memory_limit: usize,
+        spill_dir: &str,
+        sources: Vec<Source>,
+        ipc_output: bool,
+    ) -> Result<Query, PgError> {
         let handle = runtime::handle()
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
         let spec: Value = serde_json::from_str(spec)
@@ -758,125 +908,85 @@ impl Query {
         let internal = |e: String| PgError::internal(format!("cannot build DataFusion plan: {e}"));
         let df = |e: DataFusionError| internal(e.to_string());
 
-        let in_types: Vec<PgType> = field(&spec, "scan")
-            .and_then(|s| field(s, "columns"))
-            .map_err(internal)?
-            .as_array()
-            .ok_or_else(|| internal("bad scan columns".into()))?
-            .iter()
-            .map(|c| PgType::parse(c.get("type").and_then(Value::as_str).unwrap_or("")))
-            .collect::<Result<_, _>>()
-            .map_err(internal)?;
-        let in_schema: SchemaRef = Arc::new(Schema::new(
-            in_types
+        let spec = normalize_spec(spec).map_err(internal)?;
+        let inputs = field(&spec, "inputs").map_err(internal)?.as_array().cloned().unwrap_or_default();
+        if inputs.len() != sources.len() || inputs.is_empty() {
+            return Err(internal(format!("{} inputs, {} sources", inputs.len(), sources.len())));
+        }
+        let mut in_types: Vec<Vec<PgType>> = Vec::with_capacity(inputs.len());
+        let mut in_schemas: Vec<SchemaRef> = Vec::with_capacity(inputs.len());
+        for (j, inp) in inputs.iter().enumerate() {
+            let types: Vec<PgType> = field(inp, "columns")
+                .map_err(internal)?
+                .as_array()
+                .ok_or_else(|| internal("bad input columns".into()))?
                 .iter()
-                .enumerate()
-                .map(|(i, t)| Field::new(format!("c{i}"), t.arrow(), true))
-                .collect::<Vec<_>>(),
-        ));
+                .map(|c| PgType::parse(c.get("type").and_then(Value::as_str).unwrap_or("")))
+                .collect::<Result<_, _>>()
+                .map_err(internal)?;
+            in_schemas.push(Arc::new(Schema::new(
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Field::new(input_column(j, i), t.arrow(), true))
+                    .collect::<Vec<_>>(),
+            )));
+            in_types.push(types);
+        }
 
-        let grouped = spec
-            .get("aggregate")
-            .and_then(|a| a.get("group"))
-            .and_then(Value::as_array)
-            .map_or(false, |g| !g.is_empty());
-        let partitions = if grouped {
+        let plan_node = field(&spec, "plan").map_err(internal)?.clone();
+        let partitions = if has_grouped_aggregate(&plan_node) {
             partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1))
         } else {
             partitions.max(1)
         };
-        let pax_memory = match &source {
+        let pax_memory = sources.iter().find_map(|s| match s {
             Source::Pax(scan) => Some(scan.memory.clone()),
-            Source::Pushed | Source::Ipc => None,
-        };
-        let mut ipc_tx = None;
-        let mut decoder = None;
-        let (in_tx, table) = match source {
-            Source::Ipc => {
-                let positions: Vec<usize> = field(&spec, "scan")
-                    .and_then(|s| field(s, "motion_columns"))
-                    .map_err(internal)?
-                    .as_array()
-                    .ok_or_else(|| internal("bad motion columns".into()))?
-                    .iter()
-                    .map(|v| v.as_u64().map(|k| k as usize).ok_or_else(|| internal("bad motion column".into())))
-                    .collect::<Result<_, _>>()?;
-                let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
-                let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
-                decoder = Some(handle.spawn(decode_ipc(rx, in_tx, in_schema.clone(), positions)));
-                ipc_tx = Some(tx);
-                let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
-                (None, StreamingTable::try_new(in_schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
-            }
-            Source::Pushed => {
-                let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
-                let partition = ChannelPartition { schema: in_schema.clone(), rx: Mutex::new(Some(in_rx)) };
-                let table = StreamingTable::try_new(in_schema.clone(), vec![Arc::new(partition)]).map_err(df)?;
-                (Some(in_tx), table)
-            }
-            Source::Pax(scan) => {
-                let scan = Arc::new(scan);
-                let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
-                    .map(|_| {
-                        Arc::new(PaxPartition { schema: in_schema.clone(), types: in_types.clone(), scan: scan.clone() })
-                            as Arc<dyn PartitionStream>
-                    })
-                    .collect();
-                (None, StreamingTable::try_new(in_schema.clone(), parts).map_err(df)?)
-            }
-        };
+            _ => None,
+        });
+        let mut in_tx = Vec::with_capacity(sources.len());
+        let mut ipc_tx = Vec::with_capacity(sources.len());
+        let mut decoders = Vec::new();
+        let mut tables = Vec::with_capacity(sources.len());
+        for (j, source) in sources.into_iter().enumerate() {
+            let schema = in_schemas[j].clone();
+            let (tx, itx, table) = match source {
+                Source::Ipc => {
+                    let positions: Vec<usize> = field(&inputs[j], "motion_columns")
+                        .map_err(internal)?
+                        .as_array()
+                        .ok_or_else(|| internal("bad motion columns".into()))?
+                        .iter()
+                        .map(|v| v.as_u64().map(|k| k as usize).ok_or_else(|| internal("bad motion column".into())))
+                        .collect::<Result<_, _>>()?;
+                    let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
+                    let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
+                    decoders.push(handle.spawn(decode_ipc(rx, in_tx, schema.clone(), positions)));
+                    let partition = ChannelPartition { schema: schema.clone(), rx: Mutex::new(Some(in_rx)) };
+                    (None, Some(tx), StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
+                }
+                Source::Pushed => {
+                    let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
+                    let partition = ChannelPartition { schema: schema.clone(), rx: Mutex::new(Some(in_rx)) };
+                    (Some(in_tx), None, StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
+                }
+                Source::Pax(scan) => {
+                    let scan = Arc::new(scan);
+                    let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
+                        .map(|_| {
+                            Arc::new(PaxPartition { schema: schema.clone(), types: in_types[j].clone(), scan: scan.clone() })
+                                as Arc<dyn PartitionStream>
+                        })
+                        .collect();
+                    (None, None, StreamingTable::try_new(schema.clone(), parts).map_err(df)?)
+                }
+            };
+            in_tx.push(tx);
+            ipc_tx.push(itx);
+            tables.push(Some(table));
+        }
 
-        let mut b = LogicalPlanBuilder::scan("t", provider_as_source(Arc::new(table)), None).map_err(df)?;
-        if let Some(f) = spec.get("filter").filter(|v| !v.is_null()) {
-            b = b.filter(expr(f).map_err(internal)?).map_err(df)?;
-        }
-        if let Some(a) = spec.get("aggregate").filter(|v| !v.is_null()) {
-            let groups = field(a, "group").map_err(internal)?.as_array().cloned().unwrap_or_default();
-            let aggs = field(a, "aggs").map_err(internal)?.as_array().cloned().unwrap_or_default();
-            let group_exprs = groups
-                .iter()
-                .enumerate()
-                .map(|(i, g)| expr(g).map(|e| e.alias(format!("g{i}"))))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(internal)?;
-            let mut agg_exprs = Vec::with_capacity(aggs.len());
-            for (i, g) in aggs.iter().enumerate() {
-                agg_exprs.push(aggregate(g).map_err(internal)?.alias(format!("a{i}")));
-                if let Some(e) = aggregate_extra(g).map_err(internal)? {
-                    agg_exprs.push(e.alias(format!("a{i}_n")));
-                }
-            }
-            let ngroups = group_exprs.len();
-            b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
-            // A combined count is 0, not NULL, when no partial count arrived;
-            // a combined avg divides the sums, NULL without values (as
-            // PostgreSQL's float8_avg).
-            let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
-            if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge"))) {
-                let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
-                for (i, a) in aggs.iter().enumerate() {
-                    let c = col(format!("a{i}"));
-                    cols.push(match kind(a).as_deref() {
-                        Some("count_merge") => {
-                            when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
-                        }
-                        Some("avg_merge") => {
-                            let n = col(format!("a{i}_n"));
-                            let nf = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(n.clone()), DataType::Float64));
-                            when(n.clone().is_null().or(n.eq(lit(0i64))), lit(ScalarValue::Float64(None)))
-                                .otherwise(binary_expr(c, Operator::Divide, nf))
-                                .map_err(df)?
-                                .alias(format!("a{i}"))
-                        }
-                        _ => c,
-                    });
-                }
-                b = b.project(cols).map_err(df)?;
-            }
-            if let Some(h) = spec.get("having").filter(|v| !v.is_null()) {
-                b = b.filter(expr(h).map_err(internal)?).map_err(df)?;
-            }
-        }
+        let b = build_node(&plan_node, &mut tables).map_err(internal)?;
         let outputs = field(&spec, "output").map_err(internal)?.as_array().cloned().unwrap_or_default();
         let mut out_types = Vec::with_capacity(outputs.len());
         let mut out_exprs = Vec::with_capacity(outputs.len());
@@ -1001,8 +1111,8 @@ impl Query {
             handle,
             in_tx,
             ipc_tx,
-            decoder,
-            in_schema,
+            decoders,
+            in_schemas,
             in_types,
             out_rx,
             out_types,
@@ -1034,7 +1144,7 @@ impl Query {
         s
     }
 
-    pub fn num_input_columns(&self) -> usize {
+    pub fn num_inputs(&self) -> usize {
         self.in_types.len()
     }
 
@@ -1048,18 +1158,31 @@ impl Query {
     /// Each column must point to `nrows` values of its type and `nrows`
     /// null bytes.
     pub unsafe fn push(&mut self, cols: &[RawColumn], nrows: usize) -> Result<bool, PgError> {
-        let tx = self.in_tx.as_ref().ok_or_else(|| PgError::internal("input already finished"))?;
+        self.push_input(0, cols, nrows)
+    }
+
+    /// Like `push`, to input `input`.
+    ///
+    /// # Safety
+    /// As for `push`.
+    pub unsafe fn push_input(&mut self, input: usize, cols: &[RawColumn], nrows: usize) -> Result<bool, PgError> {
+        let tx = self
+            .in_tx
+            .get(input)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| PgError::internal("input not open"))?;
         if tx.capacity() == 0 {
             return Ok(false);
         }
-        if cols.len() != self.in_types.len() {
+        let types = &self.in_types[input];
+        if cols.len() != types.len() {
             return Err(PgError::internal("wrong number of input columns"));
         }
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
-        for (c, ty) in cols.iter().zip(&self.in_types) {
+        for (c, ty) in cols.iter().zip(types) {
             arrays.push(build_array(*ty, *c, nrows));
         }
-        let batch = make_batch(&self.in_schema, arrays, nrows)?;
+        let batch = make_batch(&self.in_schemas[input], arrays, nrows)?;
         match tx.try_send(Ok(batch)) {
             Ok(()) => Ok(true),
             Err(mpsc::error::TrySendError::Full(_)) => Ok(false),
@@ -1075,7 +1198,16 @@ impl Query {
     /// output instead would sleep the whole time (an aggregate's results
     /// come only at the end).  Ok(false): still full; nothing was taken.
     pub fn push_ipc(&mut self, route: i32, parts: &[&[u8]]) -> Result<bool, PgError> {
-        let tx = self.ipc_tx.as_ref().ok_or_else(|| PgError::internal("not reading Arrow IPC input"))?;
+        self.push_ipc_input(0, route, parts)
+    }
+
+    /// Like `push_ipc`, to input `input`.
+    pub fn push_ipc_input(&mut self, input: usize, route: i32, parts: &[&[u8]]) -> Result<bool, PgError> {
+        let tx = self
+            .ipc_tx
+            .get(input)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| PgError::internal("not reading Arrow IPC input"))?;
         let permit = match tx.try_reserve() {
             Ok(p) => p,
             Err(mpsc::error::TrySendError::Full(())) => {
@@ -1096,10 +1228,24 @@ impl Query {
         Ok(true)
     }
 
-    /// No more input.
+    /// No more input, on any input.
     pub fn finish_input(&mut self) {
-        self.in_tx = None;
-        self.ipc_tx = None;
+        for t in self.in_tx.iter_mut() {
+            *t = None;
+        }
+        for t in self.ipc_tx.iter_mut() {
+            *t = None;
+        }
+    }
+
+    /// No more rows for input `input`.
+    pub fn finish_input_at(&mut self, input: usize) {
+        if let Some(t) = self.in_tx.get_mut(input) {
+            *t = None;
+        }
+        if let Some(t) = self.ipc_tx.get_mut(input) {
+            *t = None;
+        }
     }
 
     /// The bytes returned by the last Poll::Bytes.
@@ -1198,9 +1344,8 @@ impl Query {
 
 impl Drop for Query {
     fn drop(&mut self) {
-        self.in_tx = None;
-        self.ipc_tx = None;
-        if let Some(t) = self.decoder.take() {
+        self.finish_input();
+        for t in self.decoders.drain(..) {
             t.abort();
         }
         if let Some(t) = self.task.take() {

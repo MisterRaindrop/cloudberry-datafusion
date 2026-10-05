@@ -116,23 +116,28 @@ uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
 DfPaxScanInfo df_last_pax_scan;
 
-typedef struct DfExec
+/* One input of the slice: a table scanned, or a Motion received from. */
+typedef struct DfInput
 {
-	PlanState  *root;			/* the slice's top node below any sending Motion */
-	PlanState  *procnode;		/* the node whose ExecProcNode is ours: root,
-								 * or the Motion we send batches through */
+	int			index;			/* in the plan's inputs */
+	DfSliceInput *spec;			/* the columns read */
 	SeqScanState *scan;			/* the scan whose table we read, or NULL */
 	MotionState *motion;		/* else the receiving Motion we read */
+	TableScanDesc scandesc;
+	int			maxattno;		/* highest column read */
 
-	/* M7b batch Motions */
-	MotionState *send;			/* the Motion we send batches through */
-	int			send_nroutes;	/* its receivers */
-	bool	   *head_sent_to;	/* per route: stream head sent */
-	bool		ipc_input;		/* 'motion' delivers batches */
-	uint8		rx_head[DF_BATCH_HEAD];	/* expected head of received streams */
-	uint8		tx_head[DF_BATCH_HEAD];	/* head of the streams we send */
-	bool		stopped;		/* the receiver asked us to stop */
-	MemoryContext chunkcxt;		/* chunks being sent */
+	/* batch being assembled or offered */
+	char	  **invalues;
+	uint8	  **innulls;
+	DfColumn   *incols;
+	int			batch_rows;
+	bool		batch_ready;	/* a filled batch waits to be pushed */
+	bool		ended;			/* no more rows to read */
+	bool		done;			/* DataFusion told so */
+
+	/* M7b: 'motion' delivers batches */
+	bool		ipc;
+	uint8		rx_head[DF_BATCH_HEAD];	/* expected head of each stream */
 	TupleChunkListItem rx_items;	/* chunks received, not yet released */
 	int16		rx_route;
 	DfSlice    *rx_slices;		/* their payloads, past each stream's head */
@@ -142,25 +147,32 @@ typedef struct DfExec
 	int			rx_nroutes;
 	int		   *rx_head_seen;	/* per route: head bytes checked */
 	bool	   *rx_ended;		/* per route: end-of-stream received */
+} DfInput;
+
+typedef struct DfExec
+{
+	PlanState  *root;			/* the slice's top node below any sending Motion */
+	PlanState  *procnode;		/* the node whose ExecProcNode is ours: root,
+								 * or the Motion we send batches through */
+	int			ninputs;
+	DfInput    *inputs;			/* fed in this order, each to its end */
+
+	/* M7b batch Motions */
+	MotionState *send;			/* the Motion we send batches through */
+	int			send_nroutes;	/* its receivers */
+	bool	   *head_sent_to;	/* per route: stream head sent */
+	uint8		tx_head[DF_BATCH_HEAD];	/* head of the streams we send */
+	bool		stopped;		/* the receiver asked us to stop */
+	MemoryContext chunkcxt;		/* chunks being sent */
 	EState	   *estate;
 	DfSliceSpec spec;
-	int			maxattno;		/* highest table column we read */
 	int64		memory_limit;	/* operator memory budget, bytes */
 	int64		headroom;		/* vmem lease ahead of the heap, bytes */
 
 	DfQuery    *query;			/* NULL until the first row is requested */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
 	DfPaxScanInfo pax_info;
-	TableScanDesc scandesc;
-
-	/* input batch being assembled or offered */
-	char	  **invalues;
-	uint8	  **innulls;
-	DfColumn   *incols;
-	int			batch_rows;
-	bool		batch_ready;	/* a filled batch waits to be pushed */
-	bool		scan_ended;
-	bool		input_done;
+	bool		input_done;		/* every input is done */
 
 	/* output batch being handed out */
 	TupleTableSlot *outslot;
@@ -297,8 +309,20 @@ df_exec_finished(DfExec *x)
 static uint32_t
 df_query_flags(DfExec *x)
 {
-	return (x->ipc_input ? DF_QUERY_IPC_INPUT : 0) |
-		(x->send ? DF_QUERY_IPC_OUTPUT : 0);
+	return x->send ? DF_QUERY_IPC_OUTPUT : 0;
+}
+
+/* Bit j set: input j arrives as batches from a Motion. */
+static uint64
+df_ipc_inputs(DfExec *x)
+{
+	uint64		mask = 0;
+	int			j;
+
+	for (j = 0; j < x->ninputs; j++)
+		if (x->inputs[j].ipc)
+			mask |= UINT64CONST(1) << j;
+	return mask;
 }
 
 /* ---------------------------------------------------------------------
@@ -358,9 +382,9 @@ df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
 
 /* Free the received chunks and give their receive buffer back. */
 static void
-df_rx_release(DfExec *x, int16 motion_id)
+df_rx_release(DfExec *x, DfInput *in, int16 motion_id)
 {
-	TupleChunkListItem item = x->rx_items;
+	TupleChunkListItem item = in->rx_items;
 
 	while (item != NULL)
 	{
@@ -369,18 +393,18 @@ df_rx_release(DfExec *x, int16 motion_id)
 		pfree(item);
 		item = next;
 	}
-	x->rx_items = NULL;
-	x->rx_nslices = 0;
+	in->rx_items = NULL;
+	in->rx_nslices = 0;
 	CurrentMotionIPCLayer->DirectPutRxBuffer(x->estate->interconnect_context,
-											 motion_id, x->rx_route);
+											 motion_id, in->rx_route);
 }
 
 /*
  * Receive the next chunks, from whichever sender has some, and note their
- * payloads in x->rx_slices, checking the head of each stream.
+ * payloads in in->rx_slices, checking the head of each stream.
  */
 static void
-df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
+df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 {
 	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
 	TupleChunkListItem item;
@@ -389,36 +413,36 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
 
 	if (x->estate->interconnect_context == NULL)
 		ereport(ERROR, (errmsg("Interconnect is down unexpectedly.")));
-	if (x->rx_head_seen == NULL)
+	if (in->rx_head_seen == NULL)
 	{
-		x->rx_nroutes = entry->num_senders;
-		x->rx_head_seen = MemoryContextAllocZero(x->estate->es_query_cxt,
-												 sizeof(int) * Max(x->rx_nroutes, 1));
-		x->rx_ended = MemoryContextAllocZero(x->estate->es_query_cxt,
-											 sizeof(bool) * Max(x->rx_nroutes, 1));
+		in->rx_nroutes = entry->num_senders;
+		in->rx_head_seen = MemoryContextAllocZero(x->estate->es_query_cxt,
+												 sizeof(int) * Max(in->rx_nroutes, 1));
+		in->rx_ended = MemoryContextAllocZero(x->estate->es_query_cxt,
+											 sizeof(bool) * Max(in->rx_nroutes, 1));
 	}
 
 	/* As execMotionUnsortedReceiver and processIncomingChunks do. */
 	x->estate->active_recv_id = motion_id;
 	oldcxt = MemoryContextSwitchTo(ml->motion_layer_mctx);
-	x->rx_items = CurrentMotionIPCLayer->RecvTupleChunkFromAny(x->estate->interconnect_context,
+	in->rx_items = CurrentMotionIPCLayer->RecvTupleChunkFromAny(x->estate->interconnect_context,
 															   motion_id, &route);
 	MemoryContextSwitchTo(oldcxt);
-	x->rx_route = route;
-	x->rx_nslices = 0;
-	x->rx_eos = false;
-	if (route < 0 || route >= x->rx_nroutes)
+	in->rx_route = route;
+	in->rx_nslices = 0;
+	in->rx_eos = false;
+	if (route < 0 || route >= in->rx_nroutes)
 		ereport(ERROR,
 				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 				 errmsg("datafusion: chunks from unexpected route %d of Motion %d",
 						route, motion_id)));
 
-	for (item = x->rx_items; item != NULL; item = item->p_next)
+	for (item = in->rx_items; item != NULL; item = item->p_next)
 	{
 		TupleChunkType type;
 		uint8	   *data;
 		size_t		len;
-		int		   *seen = &x->rx_head_seen[route];
+		int		   *seen = &in->rx_head_seen[route];
 
 		if (item->chunk_length < TUPLE_CHUNK_HEADER_SIZE)
 			ereport(ERROR,
@@ -426,14 +450,14 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
 					 errmsg("datafusion: tuple chunk of %u bytes from route %d of Motion %d",
 							item->chunk_length, route, motion_id)));
 		GetChunkType(item, &type);
-		if (x->rx_eos)
+		if (in->rx_eos)
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 					 errmsg("datafusion: data after end-of-stream from route %d of Motion %d",
 							route, motion_id)));
 		if (type == TC_END_OF_STREAM)
 		{
-			x->rx_eos = true;
+			in->rx_eos = true;
 			continue;
 		}
 		if (type != DF_CHUNK_TYPE)
@@ -449,7 +473,7 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
 		{
 			size_t		k = Min(len, (size_t) (DF_BATCH_HEAD - *seen));
 
-			if (memcmp(data, x->rx_head + *seen, k) != 0)
+			if (memcmp(data, in->rx_head + *seen, k) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 						 errmsg("datafusion: Motion %d received batches of another plan",
@@ -462,16 +486,16 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
 		}
 		if (len == 0)
 			continue;
-		if (x->rx_nslices == x->rx_maxslices)
+		if (in->rx_nslices == in->rx_maxslices)
 		{
-			x->rx_maxslices = Max(16, x->rx_maxslices * 2);
-			x->rx_slices = x->rx_slices ?
-				repalloc(x->rx_slices, sizeof(DfSlice) * x->rx_maxslices) :
-				MemoryContextAlloc(x->estate->es_query_cxt, sizeof(DfSlice) * x->rx_maxslices);
+			in->rx_maxslices = Max(16, in->rx_maxslices * 2);
+			in->rx_slices = in->rx_slices ?
+				repalloc(in->rx_slices, sizeof(DfSlice) * in->rx_maxslices) :
+				MemoryContextAlloc(x->estate->es_query_cxt, sizeof(DfSlice) * in->rx_maxslices);
 		}
-		x->rx_slices[x->rx_nslices].data = data;
-		x->rx_slices[x->rx_nslices].len = len;
-		x->rx_nslices++;
+		in->rx_slices[in->rx_nslices].data = data;
+		in->rx_slices[in->rx_nslices].len = len;
+		in->rx_nslices++;
 	}
 }
 
@@ -481,33 +505,34 @@ df_rx_take(DfExec *x, int16 motion_id, MotionNodeEntry *entry)
  * queue was full.
  */
 static void
-df_exec_receive(DfExec *x, bool *pushed, bool *full)
+df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 {
 	char		buf[DF_MSG_BUFLEN];
 	char		sqlstate[6] = "XX000";
-	int16		motion_id = ((Motion *) x->motion->ps.plan)->motionID;
+	int16		motion_id = ((Motion *) in->motion->ps.plan)->motionID;
 	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
 	MotionNodeEntry *entry = &ml->mnEntries[motion_id - 1];
 
-	if (x->rx_items == NULL)
+	if (in->rx_items == NULL)
 	{
 		if (!entry->moreNetWork)
 		{
 			/* every sender has ended its stream */
 			x->estate->active_recv_id = -1;
-			df_ffi_query_finish_input(x->query);
-			x->input_done = true;
+			df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+			in->done = true;
 			return;
 		}
-		df_rx_take(x, motion_id, entry);
-		if (x->rx_items == NULL)
+		df_rx_take(x, in, motion_id, entry);
+		if (in->rx_items == NULL)
 			return;
 	}
 
-	if (x->rx_nslices > 0)
+	if (in->rx_nslices > 0)
 	{
-		int32		status = df_ffi_query_push_ipc(x->query, x->rx_route, x->rx_slices,
-												   (uint32_t) x->rx_nslices,
+		int32		status = df_ffi_query_push_ipc(x->query, (uint32_t) in->index,
+												   in->rx_route, in->rx_slices,
+												   (uint32_t) in->rx_nslices,
 												   sqlstate, buf, sizeof(buf));
 
 		if (status == DF_PENDING)
@@ -525,33 +550,34 @@ df_exec_receive(DfExec *x, bool *pushed, bool *full)
 	}
 
 	/* The bytes are copied: account for end-of-stream, then release. */
-	if (x->rx_eos)
+	if (in->rx_eos)
 	{
-		if (x->rx_ended[x->rx_route])
+		if (in->rx_ended[in->rx_route])
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 					 errmsg("datafusion: second end-of-stream from route %d of Motion %d",
-							x->rx_route, motion_id)));
-		x->rx_ended[x->rx_route] = true;
+							in->rx_route, motion_id)));
+		in->rx_ended[in->rx_route] = true;
 		entry->num_stream_ends_recvd++;
 		if (entry->num_stream_ends_recvd == entry->num_senders)
 			entry->moreNetWork = false;
 		CurrentMotionIPCLayer->DeregisterReadInterest(x->estate->interconnect_context,
-													  motion_id, x->rx_route,
+													  motion_id, in->rx_route,
 													  "end of stream");
 	}
-	df_rx_release(x, motion_id);
+	df_rx_release(x, in, motion_id);
 }
 
 /*
  * Experimental: start the query on PAX micro-partitions that DataFusion's
  * partitions decode themselves.  Returns false when the direct reader does
- * not apply; the caller then reads through the table AM.
+ * not apply; the caller then reads through the table AM.  Only for a slice
+ * with that one input.
  */
 static bool
-df_exec_begin_pax(DfExec *x, int workers)
+df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 {
-	Relation	rel = x->scan->ss.ss_currentRelation;
+	Relation	rel = in->scan->ss.ss_currentRelation;
 	const DfPaxReader *reader;
 	char		buf[DF_MSG_BUFLEN];
 	char		sqlstate[6] = "XX000";
@@ -561,7 +587,7 @@ df_exec_begin_pax(DfExec *x, int workers)
 	int32		status;
 	int			c;
 
-	if (!df_pax_direct_read || x->scan->ss.ss_currentScanDesc != NULL)
+	if (!df_pax_direct_read || x->ninputs != 1 || in->scan->ss.ss_currentScanDesc != NULL)
 		return false;
 	{
 		char	   *amname = get_am_name(rel->rd_rel->relam);
@@ -573,19 +599,19 @@ df_exec_begin_pax(DfExec *x, int workers)
 	if (reader == NULL)
 		return false;
 
-	cols = palloc(sizeof(int) * Max(x->spec.nscan, 1));
-	widths = palloc(sizeof(int) * Max(x->spec.nscan, 1));
-	for (c = 0; c < x->spec.nscan; c++)
+	cols = palloc(sizeof(int) * Max(in->spec->ncols, 1));
+	widths = palloc(sizeof(int) * Max(in->spec->ncols, 1));
+	for (c = 0; c < in->spec->ncols; c++)
 	{
-		cols[c] = x->spec.scan_attnos[c] - 1;
-		widths[c] = df_type_width(x->spec.scan_types[c]);
+		cols[c] = in->spec->attnos[c] - 1;
+		widths[c] = df_type_width(in->spec->types[c]);
 	}
 	/*
 	 * The scan's qual only lets PAX skip micro-partitions and groups by
 	 * their min/max statistics; DataFusion still filters every row.
 	 */
-	scan = reader->begin(rel, x->estate->es_snapshot, x->scan->ss.ps.plan->qual,
-						 cols, widths, x->spec.nscan, buf, sizeof(buf));
+	scan = reader->begin(rel, x->estate->es_snapshot, in->scan->ss.ps.plan->qual,
+						 cols, widths, in->spec->ncols, buf, sizeof(buf));
 	if (scan == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -604,7 +630,7 @@ df_exec_begin_pax(DfExec *x, int workers)
 		x->query = NULL;
 		df_raise_query(status, sqlstate, buf);
 	}
-	x->input_done = true;		/* nothing to push from the main thread */
+	in->done = true;			/* nothing to push from the main thread */
 	df_pax_direct_scans++;
 	return true;
 }
@@ -616,85 +642,93 @@ df_exec_begin(DfExec *x)
 	char		sqlstate[6] = "XX000";
 	int			workers;
 	int32		status;
-	Relation	rel;
+	int			j;
 
 	workers = df_runtime_ensure();
-	if (x->scan && df_exec_begin_pax(x, workers))
+	if (x->inputs[0].scan && df_exec_begin_pax(x, &x->inputs[0], workers))
 	{
 		df_vmem_sync(x->headroom);
 		return;
 	}
 	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
 								(uint64_t) x->memory_limit, df_spill_dir(),
-								df_query_flags(x), &x->query, sqlstate, buf, sizeof(buf));
+								df_query_flags(x), (uint32_t) x->ninputs, df_ipc_inputs(x),
+								&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
 		x->query = NULL;
 		df_raise_query(status, sqlstate, buf);
 	}
 	df_vmem_sync(x->headroom);
-	if (x->motion)
-		return;					/* the Motion is ready to receive */
 
-	/*
-	 * In Cloudberry's parallel mode several QEs of one segment share the
-	 * scan: before the first row is requested, ExecutePlan has already begun
-	 * a parallel scan on the Seq Scan node (GpInsertParallelDSMHash), which
-	 * hands each QE its own part of the table.  Use it.
-	 *
-	 * Otherwise begin the scan the way the Seq Scan node would.  Column
-	 * stores (AOCS, PAX) take the node's PlanState to read only the columns
-	 * its targetlist and filter use; PAX also skips micro-partitions whose
-	 * min/max statistics rule the filter out.  DataFusion still applies the
-	 * whole filter to every row it receives.
-	 */
-	rel = x->scan->ss.ss_currentRelation;
-	if (x->scan->ss.ss_currentScanDesc != NULL)
-		x->scandesc = x->scan->ss.ss_currentScanDesc;
-	else if (rel->rd_tableam->scan_begin_extractcolumns)
-		x->scandesc = table_beginscan_es(rel, x->estate->es_snapshot, 0, NULL,
-										 NULL, &x->scan->ss.ps);
-	else
-		x->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
-	x->scan->ss.ss_currentScanDesc = x->scandesc;	/* ExecEndSeqScan closes it */
+	for (j = 0; j < x->ninputs; j++)
+	{
+		DfInput    *in = &x->inputs[j];
+		Relation	rel;
+
+		if (in->scan == NULL)
+			continue;			/* a Motion is ready to receive */
+
+		/*
+		 * In Cloudberry's parallel mode several QEs of one segment share the
+		 * scan: before the first row is requested, ExecutePlan has already
+		 * begun a parallel scan on the Seq Scan node (GpInsertParallelDSMHash),
+		 * which hands each QE its own part of the table.  Use it.
+		 *
+		 * Otherwise begin the scan the way the Seq Scan node would.  Column
+		 * stores (AOCS, PAX) take the node's PlanState to read only the
+		 * columns its targetlist and filter use; PAX also skips
+		 * micro-partitions whose min/max statistics rule the filter out.
+		 * DataFusion still applies the whole filter to every row it receives.
+		 */
+		rel = in->scan->ss.ss_currentRelation;
+		if (in->scan->ss.ss_currentScanDesc != NULL)
+			in->scandesc = in->scan->ss.ss_currentScanDesc;
+		else if (rel->rd_tableam->scan_begin_extractcolumns)
+			in->scandesc = table_beginscan_es(rel, x->estate->es_snapshot, 0, NULL,
+											  NULL, &in->scan->ss.ps);
+		else
+			in->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
+		in->scan->ss.ss_currentScanDesc = in->scandesc; /* ExecEndSeqScan closes it */
+	}
 }
 
-/* Read up to DF_BATCH_ROWS rows of the needed columns. */
+/* Read up to DF_BATCH_ROWS rows of the needed columns of input 'in'. */
 static void
-df_exec_fill(DfExec *x)
+df_exec_fill(DfExec *x, DfInput *in)
 {
-	TupleTableSlot *slot = x->scan ? x->scan->ss.ss_ScanTupleSlot : NULL;
+	TupleTableSlot *slot = in->scan ? in->scan->ss.ss_ScanTupleSlot : NULL;
 	int			n = 0;
 	int			c;
 
 	while (n < DF_BATCH_ROWS)
 	{
-		if (x->motion)
+		if (in->motion)
 		{
 			/* The Motion's own receive path, with its instrumentation. */
-			slot = ExecProcNode(&x->motion->ps);
+			slot = ExecProcNode(&in->motion->ps);
 			if (TupIsNull(slot))
 			{
-				x->scan_ended = true;
+				in->ended = true;
 				break;
 			}
 		}
-		else if (!table_scan_getnextslot(x->scandesc, ForwardScanDirection, slot))
+		else if (!table_scan_getnextslot(in->scandesc, ForwardScanDirection, slot))
 		{
-			x->scan_ended = true;
+			in->ended = true;
 			break;
 		}
-		if (x->maxattno > 0)
-			slot_getsomeattrs(slot, x->maxattno);
-		for (c = 0; c < x->spec.nscan; c++)
+		if (in->maxattno > 0)
+			slot_getsomeattrs(slot, in->maxattno);
+		for (c = 0; c < in->spec->ncols; c++)
 		{
-			int			att = x->spec.scan_attnos[c] - 1;
+			int			att = in->spec->attnos[c] - 1;
 			bool		isnull = slot->tts_isnull[att];
 			Datum		d = slot->tts_values[att];
-			char	   *dst = x->invalues[c];
+			char	   *dst = in->invalues[c];
 
-			x->innulls[c][n] = isnull ? 1 : 0;
-			switch (x->spec.scan_types[c])
+			in->innulls[c][n] = isnull ? 1 : 0;
+			switch (in->spec->types[c])
 			{
 				case BOOLOID:
 					((uint8 *) dst)[n] = isnull ? 0 : (DatumGetBool(d) ? 1 : 0);
@@ -718,13 +752,52 @@ df_exec_fill(DfExec *x)
 		}
 		n++;
 	}
-	x->batch_rows = n;
-	x->batch_ready = (n > 0);
-	if (x->scan_ended && !x->batch_ready)
+	in->batch_rows = n;
+	in->batch_ready = (n > 0);
+	if (in->ended && !in->batch_ready)
 	{
-		df_ffi_query_finish_input(x->query);
-		x->input_done = true;
+		df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+		in->done = true;
 	}
+}
+
+/*
+ * Feed input 'in' one step: push the batch it has ready, reading the next
+ * one if needed.  Sets *pushed or *full as df_exec_receive does.
+ */
+static void
+df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
+{
+	char		buf[DF_MSG_BUFLEN];
+	char		sqlstate[6] = "XX000";
+	int32		status;
+
+	if (in->ipc)
+	{
+		df_exec_receive(x, in, pushed, full);
+		return;
+	}
+	if (!in->batch_ready)
+		df_exec_fill(x, in);
+	if (!in->batch_ready)
+		return;
+	status = df_ffi_query_push(x->query, (uint32_t) in->index, in->incols,
+							   (uint32_t) in->spec->ncols, (uint32_t) in->batch_rows,
+							   sqlstate, buf, sizeof(buf));
+	if (status == DF_OK)
+	{
+		*pushed = true;
+		in->batch_ready = false;
+		if (in->ended)
+		{
+			df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+			in->done = true;
+		}
+	}
+	else if (status == DF_PENDING)
+		*full = true;
+	else
+		df_raise_query(status, sqlstate, buf);
 }
 
 static TupleTableSlot *
@@ -792,32 +865,22 @@ df_exec_next(DfExec *x)
 		if (x->done)
 			return ExecClearTuple(x->outslot);
 
-		if (!x->input_done && x->ipc_input)
-			df_exec_receive(x, &pushed, &full);
-		else if (!x->input_done)
+		/*
+		 * Feed the inputs one after the other, each to its end, in the order
+		 * the translator gave them: a join's build side first, as
+		 * PostgreSQL's Hash Join reads it, which also keeps its
+		 * interconnect deadlock-free (prefetch_inner).
+		 */
+		if (!x->input_done)
 		{
-			if (!x->batch_ready)
-				df_exec_fill(x);
-			if (x->batch_ready)
-			{
-				status = df_ffi_query_push(x->query, x->incols, (uint32_t) x->spec.nscan,
-										   (uint32_t) x->batch_rows, sqlstate,
-										   buf, sizeof(buf));
-				if (status == DF_OK)
-				{
-					pushed = true;
-					x->batch_ready = false;
-					if (x->scan_ended)
-					{
-						df_ffi_query_finish_input(x->query);
-						x->input_done = true;
-					}
-				}
-				else if (status == DF_PENDING)
-					full = true;
-				else
-					df_raise_query(status, sqlstate, buf);
-			}
+			int			j;
+
+			for (j = 0; j < x->ninputs && x->inputs[j].done; j++)
+				;
+			if (j == x->ninputs)
+				x->input_done = true;
+			else
+				df_exec_feed(x, &x->inputs[j], &pushed, &full);
 		}
 
 		status = df_ffi_query_poll(x->query,
@@ -909,6 +972,25 @@ df_batch_head(uint8 *head, Motion *motion)
  * reason, if the slice cannot be translated; it then stays on the
  * PostgreSQL executor.
  */
+/*
+ * The PlanState of 'leaf' below 'ps' in this slice: not below a Motion,
+ * which belongs to another slice.
+ */
+static PlanState *
+df_find_state(PlanState *ps, Plan *leaf)
+{
+	PlanState  *found;
+
+	if (ps == NULL)
+		return NULL;
+	if (ps->plan == leaf)
+		return ps;
+	if (IsA(ps, MotionState))
+		return NULL;
+	found = df_find_state(outerPlanState(ps), leaf);
+	return found ? found : df_find_state(innerPlanState(ps), leaf);
+}
+
 bool
 df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			   char *reason, size_t reasonlen)
@@ -916,16 +998,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	EState	   *estate = queryDesc->estate;
 	MemoryContext oldcxt;
 	DfExec	   *x;
-	PlanState  *scanps;
-	int			c;
-
-	scanps = IsA(root, AggState) ? outerPlanState(root) : root;
-	if (scanps == NULL ||
-		!(IsA(scanps, SeqScanState) || (IsA(scanps, MotionState) && scanps != root)))
-	{
-		snprintf(reason, reasonlen, "unexpected executor state for this slice");
-		return false;
-	}
+	int			c,
+				j;
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 	x = palloc0(sizeof(DfExec));
@@ -935,18 +1009,46 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		pfree(x);
 		return false;
 	}
+
+	/* Each input's executor state: a Seq Scan, or a Motion receiving. */
+	x->ninputs = x->spec.ninputs;
+	x->inputs = palloc0(sizeof(DfInput) * Max(x->ninputs, 1));
+	for (j = 0; j < x->ninputs; j++)
+	{
+		DfInput    *in = &x->inputs[j];
+		PlanState  *ps = df_find_state(root, x->spec.inputs[j].leaf);
+
+		in->index = j;
+		in->spec = &x->spec.inputs[j];
+		if (ps != NULL && IsA(ps, SeqScanState))
+			in->scan = (SeqScanState *) ps;
+		else if (ps != NULL && IsA(ps, MotionState) && ps != root)
+		{
+			in->motion = (MotionState *) ps;
+			in->ipc = df_motion_sends_batches(queryDesc->plannedstmt, (Motion *) ps->plan);
+			if (in->ipc)
+				df_batch_head(in->rx_head, (Motion *) ps->plan);
+		}
+		else
+		{
+			MemoryContextSwitchTo(oldcxt);
+			snprintf(reason, reasonlen, "unexpected executor state for this slice");
+			return false;
+		}
+		in->invalues = palloc0(sizeof(char *) * Max(in->spec->ncols, 1));
+		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
+		in->incols = palloc0(sizeof(DfColumn) * Max(in->spec->ncols, 1));
+		for (c = 0; c < in->spec->ncols; c++)
+		{
+			in->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(in->spec->types[c]));
+			in->innulls[c] = palloc(DF_BATCH_ROWS);
+			in->incols[c].values = in->invalues[c];
+			in->incols[c].nulls = in->innulls[c];
+			in->maxattno = Max(in->maxattno, in->spec->attnos[c]);
+		}
+	}
 	x->root = root;
 	x->procnode = send ? &send->ps : root;
-	if (IsA(scanps, MotionState))
-	{
-		x->motion = (MotionState *) scanps;
-		x->ipc_input = df_motion_sends_batches(queryDesc->plannedstmt,
-											   (Motion *) scanps->plan);
-		if (x->ipc_input)
-			df_batch_head(x->rx_head, (Motion *) scanps->plan);
-	}
-	else
-		x->scan = (SeqScanState *) scanps;
 	if (send)
 	{
 		Motion	   *motion = (Motion *) send->ps.plan;
@@ -988,17 +1090,6 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	x->memory_limit = df_slice_memory(root);
 	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);
 
-	x->invalues = palloc0(sizeof(char *) * Max(x->spec.nscan, 1));
-	x->innulls = palloc0(sizeof(uint8 *) * Max(x->spec.nscan, 1));
-	x->incols = palloc0(sizeof(DfColumn) * Max(x->spec.nscan, 1));
-	for (c = 0; c < x->spec.nscan; c++)
-	{
-		x->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(x->spec.scan_types[c]));
-		x->innulls[c] = palloc(DF_BATCH_ROWS);
-		x->incols[c].values = x->invalues[c];
-		x->incols[c].nulls = x->innulls[c];
-		x->maxattno = Max(x->maxattno, x->spec.scan_attnos[c]);
-	}
 	x->outcols = palloc0(sizeof(DfColumn) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
 
@@ -1010,7 +1101,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	MemoryContextSwitchTo(oldcxt);
 
 	elog(DEBUG1, "datafusion plan: %s%s%s", x->spec.json,
-		 x->ipc_input ? " (batches in)" : "", x->send ? " (batches out)" : "");
+		 df_ipc_inputs(x) ? " (batches in)" : "", x->send ? " (batches out)" : "");
 	ExecSetExecProcNode(x->procnode, df_exec_proc_node);
 	return true;
 }

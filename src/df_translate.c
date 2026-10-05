@@ -66,14 +66,21 @@ typedef enum DfLevel
 	DF_LEVEL_AGGARG				/* aggregate arguments: over the scan */
 } DfLevel;
 
+/* An input being described: its leaf and the columns read so far. */
+typedef struct DfInputDesc
+{
+	Plan	   *leaf;			/* Seq Scan or receiving Motion */
+	List	   *attnos;			/* int: table column, or Motion stream
+								 * position + 1, of each input column */
+	List	   *types;			/* oid: type of each */
+} DfInputDesc;
+
 typedef struct DfBuilder
 {
 	Index		scanrelid;		/* 0 when the input is a Motion */
 	Plan	   *scan;			/* the Seq Scan or the receiving Motion */
 	Agg		   *agg;
-	List	   *attnos;			/* int: table column (or Motion output
-								 * column) of each input column */
-	List	   *types;			/* oid: type of each scan column */
+	List	   *inputs;			/* DfInputDesc, in input order */
 	List	   *aggrefs;		/* distinct aggregate calls, in first-use order */
 	List	   *aggfns;			/* the function of each: NULL for the
 								 * Aggref's own, or "sum" / "count" for the
@@ -167,28 +174,64 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 	}
 }
 
-/* Index of the input column for column 'attno', adding it if new. */
+/* Add an input reading 'leaf'; returns its index. */
 static int
-df_input_column(DfBuilder *b, AttrNumber attno, Oid type)
+df_add_input(DfBuilder *b, Plan *leaf)
 {
+	DfInputDesc *in = palloc0(sizeof(DfInputDesc));
+
+	in->leaf = leaf;
+	b->inputs = lappend(b->inputs, in);
+	return list_length(b->inputs) - 1;
+}
+
+/* Column of input 'j' for 'attno', adding it if new; its index there. */
+static int
+df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type)
+{
+	DfInputDesc *in = list_nth(b->inputs, j);
 	ListCell   *lc;
 	int			i = 0;
 
-	foreach(lc, b->attnos)
+	foreach(lc, in->attnos)
 	{
 		if (lfirst_int(lc) == attno)
 			return i;
 		i++;
 	}
-	b->attnos = lappend_int(b->attnos, attno);
-	b->types = lappend_oid(b->types, type);
+	in->attnos = lappend_int(in->attnos, attno);
+	in->types = lappend_oid(in->types, type);
 	return i;
 }
 
-static int
-df_scan_column(DfBuilder *b, Var *var)
+/* Append a reference to that column of input 'j'. */
+static void
+df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type)
 {
-	return df_input_column(b, var->varattno, var->vartype);
+	int			k = df_input_column(b, j, attno, type);
+
+	if (j == 0)
+		appendStringInfo(out, "{\"col\":%d}", k);
+	else
+		appendStringInfo(out, "{\"col\":%d,\"input\":%d}", k, j);
+}
+
+/* The input scanning range table entry 'varno', or -1. */
+static int
+df_scan_input(DfBuilder *b, Index varno)
+{
+	ListCell   *lc;
+	int			j = 0;
+
+	foreach(lc, b->inputs)
+	{
+		Plan	   *leaf = ((DfInputDesc *) lfirst(lc))->leaf;
+
+		if (IsA(leaf, SeqScan) && ((Scan *) leaf)->scanrelid == varno)
+			return j;
+		j++;
+	}
+	return -1;
 }
 
 /*
@@ -203,9 +246,8 @@ df_emit_child_column(DfBuilder *b, StringInfo out, AttrNumber resno)
 	if (tle == NULL)
 		df_fail(b, "a reference to the child's output");
 	else if (IsA(b->scan, Motion))
-		appendStringInfo(out, "{\"col\":%d}",
-						 df_input_column(b, df_motion_stream_column((Motion *) b->scan, resno) + 1,
-										 exprType((Node *) tle->expr)));
+		df_emit_column(b, out, 0, df_motion_stream_column((Motion *) b->scan, resno) + 1,
+					   exprType((Node *) tle->expr));
 	else
 		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
 }
@@ -289,8 +331,9 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && var->varno == b->scanrelid)
-					appendStringInfo(out, "{\"col\":%d}", df_scan_column(b, var));
+				if (level == DF_LEVEL_SCAN && df_scan_input(b, var->varno) >= 0)
+					df_emit_column(b, out, df_scan_input(b, var->varno),
+								   var->varattno, var->vartype);
 				else if (level == DF_LEVEL_AGGARG && var->varno == OUTER_VAR)
 					df_emit_child_column(b, out, var->varattno);
 				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
@@ -461,6 +504,7 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		snprintf(reason, reasonlen, "cannot translate this slice shape");
 		return false;
 	}
+	df_add_input(&b, b.scan);
 
 	df_emit_qual(&b, &filter, b.scan->qual, DF_LEVEL_SCAN);
 	if (b.agg)
@@ -511,10 +555,11 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 					break;
 				}
 				pos = df_motion_stream_column((Motion *) b.scan, ((Var *) arg)->varattno);
-				appendStringInfo(&aggs, "{\"fn\":\"avg_merge\",\"arg\":{\"col\":%d},"
-								 "\"arg2\":{\"col\":%d}}",
-								 df_input_column(&b, pos + 1, FLOAT8OID),
-								 df_input_column(&b, pos + 2, INT8OID));
+				appendStringInfoString(&aggs, "{\"fn\":\"avg_merge\",\"arg\":");
+				df_emit_column(&b, &aggs, 0, pos + 1, FLOAT8OID);
+				appendStringInfoString(&aggs, ",\"arg2\":");
+				df_emit_column(&b, &aggs, 0, pos + 2, INT8OID);
+				appendStringInfoChar(&aggs, '}');
 				continue;
 			}
 			appendStringInfo(&aggs, "{\"fn\":\"%s%s\",\"arg\":", fn ? fn : name,
@@ -535,44 +580,84 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		if (b.failed)
 			return false;
 
+		/* inputs */
 		initStringInfo(&json);
-		appendStringInfoString(&json, "{\"scan\":{\"columns\":[");
+		appendStringInfoString(&json, "{\"inputs\":[");
 		i = 0;
-		foreach(lc, b.types)
+		foreach(lc, b.inputs)
 		{
-			if (i++ > 0)
-				appendStringInfoChar(&json, ',');
-			appendStringInfo(&json, "{\"type\":\"%s\"}", df_type_tag(lfirst_oid(lc)));
-		}
-		appendStringInfoChar(&json, ']');
-		if (IsA(b.scan, Motion))
-		{
-			/* The Motion column behind each input column (M7b batches). */
-			appendStringInfoString(&json, ",\"motion_columns\":[");
-			i = 0;
-			foreach(lc, b.attnos)
-				appendStringInfo(&json, "%s%d", i++ > 0 ? "," : "", lfirst_int(lc) - 1);
+			DfInputDesc *in = lfirst(lc);
+			ListCell   *lt;
+			int			k = 0;
+
+			appendStringInfoString(&json, i++ > 0 ? ",{\"columns\":[" : "{\"columns\":[");
+			foreach(lt, in->types)
+				appendStringInfo(&json, "%s{\"type\":\"%s\"}", k++ > 0 ? "," : "",
+								 df_type_tag(lfirst_oid(lt)));
 			appendStringInfoChar(&json, ']');
+			if (IsA(in->leaf, Motion))
+			{
+				/* The stream column behind each input column (M7b batches). */
+				appendStringInfoString(&json, ",\"motion_columns\":[");
+				k = 0;
+				foreach(lt, in->attnos)
+					appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "", lfirst_int(lt) - 1);
+				appendStringInfoChar(&json, ']');
+			}
+			appendStringInfoChar(&json, '}');
 		}
-		appendStringInfo(&json, "},\"filter\":%s,\"aggregate\":", filter.data);
-		if (b.agg)
-			appendStringInfo(&json, "{\"group\":%s,\"aggs\":[%s]},\"having\":%s",
-							 group.data, aggs.data, having.data);
-		else
-			appendStringInfoString(&json, "null,\"having\":null");
-		appendStringInfo(&json, ",\"output\":%s}", outputs.data);
+
+		/* the plan: the input, filtered, aggregated */
+		{
+			StringInfoData node;
+
+			initStringInfo(&node);
+			appendStringInfoString(&node, "{\"input\":0}");
+			if (strcmp(filter.data, "null") != 0)
+			{
+				StringInfoData f;
+
+				initStringInfo(&f);
+				appendStringInfo(&f, "{\"filter\":{\"input\":%s,\"pred\":%s}}",
+								 node.data, filter.data);
+				node = f;
+			}
+			if (b.agg)
+			{
+				StringInfoData a;
+
+				initStringInfo(&a);
+				appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,\"group\":%s,"
+								 "\"aggs\":[%s],\"having\":%s}}",
+								 node.data, group.data, aggs.data, having.data);
+				node = a;
+			}
+			appendStringInfo(&json, "],\"plan\":%s,\"output\":%s}", node.data, outputs.data);
+		}
 	}
 
 	spec->json = json.data;
-	spec->scanrelid = b.scanrelid;
-	spec->nscan = list_length(b.attnos);
-	spec->scan_attnos = palloc(sizeof(AttrNumber) * Max(spec->nscan, 1));
-	spec->scan_types = palloc(sizeof(Oid) * Max(spec->nscan, 1));
+	spec->ninputs = list_length(b.inputs);
+	spec->inputs = palloc0(sizeof(DfSliceInput) * spec->ninputs);
 	i = 0;
-	foreach(lc, b.attnos)
-		spec->scan_attnos[i++] = (AttrNumber) lfirst_int(lc);
-	i = 0;
-	foreach(lc, b.types)
-		spec->scan_types[i++] = lfirst_oid(lc);
+	foreach(lc, b.inputs)
+	{
+		DfInputDesc *in = lfirst(lc);
+		DfSliceInput *si = &spec->inputs[i++];
+		ListCell   *la,
+				   *lt;
+		int			k = 0;
+
+		si->leaf = in->leaf;
+		si->ncols = list_length(in->attnos);
+		si->attnos = palloc(sizeof(AttrNumber) * Max(si->ncols, 1));
+		si->types = palloc(sizeof(Oid) * Max(si->ncols, 1));
+		forboth(la, in->attnos, lt, in->types)
+		{
+			si->attnos[k] = (AttrNumber) lfirst_int(la);
+			si->types[k] = lfirst_oid(lt);
+			k++;
+		}
+	}
 	return true;
 }
