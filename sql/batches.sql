@@ -16,10 +16,11 @@
 -- under the License.
 --
 -- Gather Motions between two DataFusion slices carrying Arrow IPC batches
--- (M7b, datafusion.motion_batches).  The senders encode their results and
--- send the bytes as tuple chunks of their own type; the receiver decodes
--- them.  Each query runs with datafusion.mode off, then on; the two results
--- must match.
+-- (M7b, datafusion.motion_batches), and Redistribute Motions routing them
+-- by Cloudberry's distribution hash (M7c).  The senders encode their
+-- results and send the bytes as tuple chunks of their own type; the
+-- receivers decode them.  Each query runs with datafusion.mode off, then on;
+-- the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
@@ -94,6 +95,46 @@ CLOSE df_cur;
 COMMIT;
 SELECT count(*), sum(a) FROM df_bat WHERE e < 10;
 RESET gp_enable_multiphase_agg;
+
+-- Redistribute Motions (M7c).  The Rust transcription of cdbhash routes
+-- every row as cdbhash() does, for every key type, alone and combined, in
+-- and out of parallel mode.
+SELECT datafusion_debug_cdbhash_check(100000, 3, 1) AS mismatches,
+       datafusion_debug_cdbhash_check(100000, 7, 2) AS mismatches_parallel;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
+-- A key the planner has no statistics for: every row is redistributed.
+EXPLAIN (COSTS OFF) SELECT a % 1000, count(*), sum(a) FROM df_bat GROUP BY a % 1000;
+SET datafusion.mode = off;
+SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
+WHERE e >= 95 OR e IS NULL GROUP BY e;
+SELECT d, e, count(*), sum(a) FROM df_bat WHERE e > 90 OR e IS NULL GROUP BY d, e;
+SELECT c, count(*) FROM df_bat WHERE a < 20 OR a IS NULL GROUP BY c;
+SELECT b, count(*), sum(a) FROM df_bat GROUP BY b HAVING count(*) > 1;
+SELECT a % 1000 AS k, count(*), sum(a) FROM df_bat GROUP BY a % 1000 HAVING min(a) < 5;
+SELECT e, count(*) FROM df_bat_empty GROUP BY e;
+SET datafusion.mode = on;
+SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
+WHERE e >= 95 OR e IS NULL GROUP BY e;
+SELECT d, e, count(*), sum(a) FROM df_bat WHERE e > 90 OR e IS NULL GROUP BY d, e;
+SELECT c, count(*) FROM df_bat WHERE a < 20 OR a IS NULL GROUP BY c;
+SELECT b, count(*), sum(a) FROM df_bat GROUP BY b HAVING count(*) > 1;
+SELECT a % 1000 AS k, count(*), sum(a) FROM df_bat GROUP BY a % 1000 HAVING min(a) < 5;
+SELECT e, count(*) FROM df_bat_empty GROUP BY e;
+SELECT a % 1000, count(*), sum(a / (a - a)) FROM df_bat GROUP BY a % 1000;
+
+-- Parallel mode: each segment's receiving worker comes from the hash too.
+SET enable_parallel = on;
+SET max_parallel_workers_per_gather = 2;
+SET enable_groupagg = off;
+EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
+SET datafusion.mode = off;
+SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
+SET datafusion.mode = on;
+SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
+RESET enable_parallel;
+RESET max_parallel_workers_per_gather;
+RESET enable_groupagg;
 
 DROP TABLE df_bat, df_bat_empty;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

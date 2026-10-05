@@ -443,15 +443,62 @@ pub extern "C" fn df_ffi_query_push_ipc(
 }
 
 /// The Arrow IPC bytes returned by the last poll (DF_BYTES), valid until
-/// the next poll.
+/// the next poll, and their route: the Redistribute Motion's receiver, or
+/// -1 for a Motion's only stream.
 #[no_mangle]
-pub extern "C" fn df_ffi_query_bytes(query: *mut DfQuery, data: *mut *const u8, len: *mut usize) {
+pub extern "C" fn df_ffi_query_bytes(query: *mut DfQuery, route: *mut i32, data: *mut *const u8, len: *mut usize) {
     // SAFETY: `query` is live; the out pointers are valid.
     let q = unsafe { &(*query).0 };
     let b = q.output_bytes();
     unsafe {
+        *route = q.output_route();
         *data = b.as_ptr();
         *len = b.len();
+    }
+}
+
+/// Routes of `nrows` rows by Cloudberry's distribution hash, for checking
+/// the Rust transcription against cdbhash(): `kinds[i]` names the hash of
+/// key column `cols[i]` (0 bool, 1 int2, 2 int4, 3 int8, 4 float4,
+/// 5 float8).  Writes `nrows` routes to `out`.  DF_OK, or DF_ERROR for an
+/// unknown kind.
+#[no_mangle]
+pub extern "C" fn df_ffi_cdbhash_routes(
+    kinds: *const i32,
+    cols: *const DfColumn,
+    nkeys: u32,
+    nrows: u32,
+    segments: i32,
+    workers: i32,
+    out: *mut u32,
+) -> i32 {
+    use df_core::query::PgType;
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let mut keys = Vec::with_capacity(nkeys as usize);
+        for i in 0..nkeys as usize {
+            // SAFETY: the caller passes `nkeys` kinds and columns of `nrows` rows.
+            let (kind, c) = unsafe { (*kinds.add(i), &*cols.add(i)) };
+            let ty = match kind {
+                0 => PgType::Bool,
+                1 => PgType::Int2,
+                2 => PgType::Int4,
+                3 => PgType::Int8,
+                4 => PgType::Float4,
+                5 => PgType::Float8,
+                _ => return None,
+            };
+            let raw = df_core::query::RawColumn { values: c.values, nulls: c.nulls };
+            keys.push((ty.key_hash(), unsafe { df_core::query::build_array(ty, raw, nrows as usize) }));
+        }
+        Some(df_core::cdbhash::routes(&keys, nrows as usize, segments, workers))
+    }));
+    match r {
+        Ok(Some(routes)) => {
+            // SAFETY: `out` has room for `nrows` routes.
+            unsafe { std::ptr::copy_nonoverlapping(routes.as_ptr(), out, routes.len()) };
+            DF_OK
+        }
+        _ => DF_ERROR,
     }
 }
 

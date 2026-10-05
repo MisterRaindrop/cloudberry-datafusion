@@ -245,12 +245,12 @@ expression key it has no statistics for: each segment then redistributes
 from and to DataFusion's batches on both sides costs more than DataFusion
 saves.  Sending batches over the interconnect (M7b) is meant for that.
 
-### Experimental: batches through Gather Motions
+### Experimental: batches through Motions
 
-With `datafusion.motion_batches = on` (milestone M7b), a Gather Motion whose
-sending and receiving slices both run in DataFusion carries Arrow IPC
-batches instead of tuples; EXPLAIN marks the sending slice "sends Arrow
-batches".  Every process decides this from the plan and the synchronized
+With `datafusion.motion_batches = on` (milestones M7b and M7c), a Gather or
+Redistribute Motion whose sending and receiving slices both run in
+DataFusion carries Arrow IPC batches instead of tuples; EXPLAIN marks the
+sending slice "sends Arrow batches".  Every process decides this from the plan and the synchronized
 settings alone, so both ends agree.
 
 - **Sending.**  The slice runs in place of the Motion node.  The workers
@@ -280,8 +280,33 @@ threads per QE:
 
 Then the coordinator waits for data and the senders wait in the UDP
 interconnect's flow control: the transport is the limit (about 700 MB/s
-here).  Limits: only plain Gather Motions into a DataFusion slice (a slice
-that only receives, such as a gather to the client, stays on tuples);
+here).
+
+A Redistribute Motion (M7c) routes each row the way its PostgreSQL sender
+would: `df_core::cdbhash` transcribes Cloudberry's distribution hash (key
+hashes rotated and combined, Jump Consistent Hash over the segments, and in
+parallel mode the receiving worker from a second jump) and the hash
+functions of the supported types (`hashchar` for bool, `hashint2/4/8`,
+`hashfloat4/8` with their handling of -0 and NaN).  Each receiver gets its
+own stream.  Keys must be plain columns hashed by their type's own
+non-legacy function; random distribution, legacy and cross-type hashing
+stay on tuples.  `datafusion_debug_cdbhash_check(nrows, segments, workers)`
+routes random keys, special values mixed in, through both `cdbhash()` and
+the Rust code for every key type alone and combined, and counts the rows
+they route differently: 0 over 120 million rows (1 to 128 segments, 1 to 3
+workers), while a deliberately broken NaN case is caught.  An aggregate
+would come out right with any consistent routing, so this check, not the
+query results, is what shows the routes match.
+
+| Query (30 million rows) | PostgreSQL | tuple Motion | batch Motion |
+|---|---|---|---|
+| `GROUP BY a % 1000` (every row redistributed) | 1.44 s | 1.24 s | 0.39 s |
+| `GROUP BY b % 1000`, three aggregates | 1.54 s | 1.93 s | 0.80 s |
+| `GROUP BY b` (30 million groups) | 5.98 s | 1.86 s | 1.07 s |
+
+Limits: only Gather and Redistribute Motions between DataFusion slices (a
+slice that only receives, such as a gather to the client, stays on tuples;
+Broadcast Motions come with joins, which DataFusion does not run yet);
 EXPLAIN ANALYZE shows the Motion as never executed and the interconnect's
 per-Motion statistics are not updated; tested with the UDP interconnect.
 
@@ -303,6 +328,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M6 | AO, AOCS and PAX tables; parallel mode; experimental direct PAX reader |
 | M7a | Slices that receive through a Motion; combining aggregates |
 | M7b | Arrow IPC batches through Gather Motions between DataFusion slices |
+| M7c | Redistribute Motions with batches, routed by a checked transcription of cdbhash |
 
 ## Build
 

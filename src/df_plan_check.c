@@ -725,8 +725,52 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index)
 }
 
 /*
- * Does 'motion' carry Arrow IPC batches instead of tuples?  Only a plain
- * Gather whose sending and receiving slices both run in DataFusion.  Every
+ * Distribution key 'i' of a Redistribute Motion, if DataFusion can hash it
+ * as cdbhash() does: a plain column of a supported type, hashed by that
+ * type's own non-legacy hash function.  Sets the 0-based output column and
+ * the type tag (which also names the hash, see df_core::cdbhash).
+ */
+bool
+df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
+{
+	static const struct
+	{
+		Oid			type;
+		const char *func;
+	}			hashes[] =
+	{
+		{BOOLOID, "hashchar"}, {INT2OID, "hashint2"}, {INT4OID, "hashint4"},
+		{INT8OID, "hashint8"}, {FLOAT4OID, "hashfloat4"}, {FLOAT8OID, "hashfloat8"},
+	};
+	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);
+	Var		   *var;
+	char	   *func;
+	int			k;
+
+	while (IsA(expr, RelabelType))
+		expr = (Node *) ((RelabelType *) expr)->arg;
+	if (!IsA(expr, Var) || ((Var *) expr)->varattno <= 0)
+		return false;
+	var = (Var *) expr;
+	func = get_func_name(motion->hashFuncs[i]);
+	if (func == NULL || motion->hashFuncs[i] >= FirstGenbkiObjectId)
+		return false;
+	for (k = 0; k < lengthof(hashes); k++)
+	{
+		if (hashes[k].type == var->vartype && strcmp(hashes[k].func, func) == 0)
+		{
+			*column = var->varattno - 1;
+			*tag = df_type_tag(var->vartype);
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Does 'motion' carry Arrow IPC batches instead of tuples?  A plain Gather,
+ * or a Redistribute whose keys DataFusion hashes as cdbhash() does, whose
+ * sending and receiving slices both run in DataFusion.  Every
  * process of the query decides this from the plan and the synchronized
  * settings alone, so the senders and the receiver agree.  Should they not
  * (a slice falling back for a reason outside the plan), the chunks carry a
@@ -738,7 +782,25 @@ df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
 {
 	if (!df_motion_batches || df_mode == DF_MODE_OFF)
 		return false;
-	if (motion->motionType != MOTIONTYPE_GATHER || motion->sendSorted)
+	if (motion->sendSorted)
+		return false;
+	if (motion->motionType == MOTIONTYPE_HASH)
+	{
+		int			n = list_length(motion->hashExprs);
+		int			i;
+
+		if (n == 0)
+			return false;		/* random distribution */
+		for (i = 0; i < n; i++)
+		{
+			int			column;
+			const char *tag;
+
+			if (!df_motion_hash_key(motion, i, &column, &tag))
+				return false;
+		}
+	}
+	else if (motion->motionType != MOTIONTYPE_GATHER)
 		return false;
 	if (motion->motionID <= 0 || motion->motionID >= stmt->numSlices)
 		return false;

@@ -125,10 +125,11 @@ typedef struct DfExec
 	MotionState *motion;		/* else the receiving Motion we read */
 
 	/* M7b batch Motions */
-	MotionState *send;			/* the Gather Motion we send batches through */
+	MotionState *send;			/* the Motion we send batches through */
+	int			send_nroutes;	/* its receivers */
+	bool	   *head_sent_to;	/* per route: stream head sent */
 	bool		ipc_input;		/* 'motion' delivers batches */
 	uint8		batch_head[DF_BATCH_HEAD];	/* magic + signature */
-	bool		head_sent;
 	bool		stopped;		/* the receiver asked us to stop */
 	MemoryContext chunkcxt;		/* chunks being sent */
 	TupleChunkListItem rx_items;	/* chunks received, not yet released */
@@ -305,12 +306,12 @@ df_query_flags(DfExec *x)
  */
 
 /*
- * Send 'len' bytes of the batch stream to the receiver (route 0 of a
+ * Send 'len' bytes of the batch stream for receiver 'route' (0 for a
  * Gather), cut into tuple chunks of DF_CHUNK_TYPE.  Sets x->stopped if the
  * receiver asked the senders to stop.
  */
 static void
-df_send_bytes(DfExec *x, const uint8 *data, size_t len)
+df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
 {
 	Motion	   *motion = (Motion *) x->send->ps.plan;
 	size_t		maxdata = Gp_max_tuple_chunk_size - TUPLE_CHUNK_HEADER_SIZE;
@@ -344,7 +345,7 @@ df_send_bytes(DfExec *x, const uint8 *data, size_t len)
 	/* The interconnect copies the chunks into its own buffers. */
 	if (first != NULL &&
 		!CurrentMotionIPCLayer->SendTupleChunkToAMS(x->estate->interconnect_context,
-													motion->motionID, 0, first))
+													motion->motionID, (int16) route, first))
 		x->stopped = true;
 	MemoryContextReset(x->chunkcxt);
 }
@@ -835,16 +836,22 @@ df_exec_next(DfExec *x)
 		{
 			const uint8 *data;
 			size_t		len;
+			int32		route;
 
-			/* Our results, for the Motion's receiver. */
-			if (!x->head_sent)
+			/* Our results, for one of the Motion's receivers. */
+			df_ffi_query_bytes(x->query, &route, &data, &len);
+			if (route < 0)
+				route = 0;		/* a Gather's only receiver */
+			if (route >= x->send_nroutes)
+				elog(ERROR, "datafusion: route %d of a Motion with %d receivers",
+					 route, x->send_nroutes);
+			if (!x->head_sent_to[route])
 			{
-				df_send_bytes(x, x->batch_head, DF_BATCH_HEAD);
-				x->head_sent = true;
+				df_send_bytes(x, route, x->batch_head, DF_BATCH_HEAD);
+				x->head_sent_to[route] = true;
 			}
-			df_ffi_query_bytes(x->query, &data, &len);
 			if (!x->stopped)
-				df_send_bytes(x, data, len);
+				df_send_bytes(x, route, data, len);
 			if (x->stopped)
 			{
 				/*
@@ -941,10 +948,39 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		x->scan = (SeqScanState *) scanps;
 	if (send)
 	{
+		Motion	   *motion = (Motion *) send->ps.plan;
+
 		x->send = send;
-		df_batch_head(x->batch_head, (Motion *) send->ps.plan);
+		df_batch_head(x->batch_head, motion);
 		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion chunks",
 											ALLOCSET_DEFAULT_SIZES);
+		x->send_nroutes = 1;
+		if (motion->motionType == MOTIONTYPE_HASH)
+		{
+			/* Route rows as the Motion's cdbhash would (nodeMotion.c). */
+			StringInfoData json;
+			int			i;
+
+			x->send_nroutes = send->numHashSegments * Max(send->parallel_workers, 1);
+			initStringInfo(&json);
+			appendBinaryStringInfo(&json, x->spec.json, strlen(x->spec.json) - 1);
+			appendStringInfoString(&json, ",\"route\":{\"kind\":\"hash\",\"keys\":[");
+			for (i = 0; i < list_length(motion->hashExprs); i++)
+			{
+				int			column;
+				const char *tag;
+
+				if (!df_motion_hash_key(motion, i, &column, &tag))
+					elog(ERROR, "datafusion: unsupported distribution key in Motion %d",
+						 motion->motionID);
+				appendStringInfo(&json, "%s{\"col\":%d,\"hash\":\"%s\"}",
+								 i > 0 ? "," : "", column, tag);
+			}
+			appendStringInfo(&json, "],\"segments\":%d,\"workers\":%d}}",
+							 send->numHashSegments, Max(send->parallel_workers, 1));
+			x->spec.json = json.data;
+		}
+		x->head_sent_to = palloc0(sizeof(bool) * x->send_nroutes);
 	}
 	x->estate = estate;
 	x->memory_limit = df_slice_memory(root);

@@ -34,7 +34,10 @@
 //!                fn: count, sum, min, max, avg, or count_merge (adds up partial
 //!                counts, 0 without rows: PostgreSQL's combining count)
 //!   "having":    <expr> | null,
-//!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ] }
+//!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ],
+//!   "route":     { "kind": "hash", "keys": [ {"col": k, "hash": "int4"}, ... ],
+//!                  "segments": n, "workers": w } }   (optional, IPC output
+//!                through a Redistribute Motion: one stream per route)
 //!
 //! <expr> := {"col": i} | {"group": i} | {"agg": i}
 //!         | {"lit": {"type": t, "value": v}} | {"lit": {"type": t, "null": true}}
@@ -55,7 +58,8 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
-use datafusion::arrow::compute::cast;
+use datafusion::arrow::array::UInt32Array;
+use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
     ArrowPrimitiveType, DataType, Field, Float32Type, Float64Type, Int16Type, Int32Type,
     Int64Type, Schema, SchemaRef,
@@ -84,6 +88,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
 use crate::runtime;
@@ -133,6 +138,18 @@ impl PgType {
             "float8" => PgType::Float8,
             other => return Err(format!("unsupported type {other}")),
         })
+    }
+
+    /// The distribution hash of a column of this type.
+    pub fn key_hash(self) -> KeyHash {
+        match self {
+            PgType::Bool => KeyHash::Bool,
+            PgType::Int2 => KeyHash::Int2,
+            PgType::Int4 => KeyHash::Int4,
+            PgType::Int8 => KeyHash::Int8,
+            PgType::Float4 => KeyHash::Float4,
+            PgType::Float8 => KeyHash::Float8,
+        }
     }
 
     pub fn arrow(self) -> DataType {
@@ -620,8 +637,44 @@ pub enum Source {
 /// What the plan's task hands the main thread.
 enum Out {
     Batch(RecordBatch),
-    /// Results encoded as Arrow IPC stream bytes (`ipc_output`).
-    Bytes(Vec<u8>),
+    /// Results encoded as Arrow IPC stream bytes (`ipc_output`), for a
+    /// route, or NO_ROUTE for the only stream.
+    Bytes(i32, Vec<u8>),
+}
+
+/// Out::Bytes of the single stream of a Motion without routing.
+pub const NO_ROUTE: i32 = -1;
+
+/// How result rows are spread over a Redistribute Motion's receivers.
+struct HashRoute {
+    keys: Vec<(usize, KeyHash)>,
+    segments: i32,
+    workers: i32,
+}
+
+impl HashRoute {
+    fn parse(v: &Value) -> Result<HashRoute, String> {
+        if field(v, "kind")?.as_str() != Some("hash") {
+            return Err(format!("plan spec: unknown route {v}"));
+        }
+        let keys = field(v, "keys")?
+            .as_array()
+            .ok_or("plan spec: bad route keys")?
+            .iter()
+            .map(|k| {
+                let c = index(field(k, "col")?)?;
+                let h = field(k, "hash")?.as_str().and_then(KeyHash::parse).ok_or("plan spec: bad key hash")?;
+                Ok((c, h))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let int = |name: &str| field(v, name).ok().and_then(Value::as_i64).map(|n| n as i32);
+        let segments = int("segments").filter(|n| *n > 0).ok_or("plan spec: bad route segments")?;
+        let workers = int("workers").unwrap_or(1).max(1);
+        if keys.is_empty() {
+            return Err("plan spec: route without keys".into());
+        }
+        Ok(HashRoute { keys, segments, workers })
+    }
 }
 
 pub struct Query {
@@ -637,6 +690,7 @@ pub struct Query {
     task: Option<JoinHandle<()>>,
     current: Vec<OutColumn>,
     current_bytes: Vec<u8>,
+    current_route: i32,
     pool: Arc<TrackingPool>,
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
@@ -810,6 +864,16 @@ impl Query {
             out_types.push(ty);
         }
         let plan = b.project(out_exprs).map_err(df)?.build().map_err(df)?;
+        let route = match spec.get("route").filter(|v| !v.is_null()) {
+            Some(r) if ipc_output => Some(HashRoute::parse(r).map_err(internal)?),
+            Some(_) => return Err(internal("a route needs IPC output".into())),
+            None => None,
+        };
+        if let Some(r) = &route {
+            if r.keys.iter().any(|(c, h)| out_types.get(*c).map(|t| t.key_hash()) != Some(*h)) {
+                return Err(internal("route key does not match its output column".into()));
+            }
+        }
 
         let config = SessionConfig::new()
             .with_target_partitions(partitions)
@@ -829,6 +893,51 @@ impl Query {
                 }
                 let schema = physical.schema();
                 let mut stream = execute_stream(physical, ctx.task_ctx())?;
+                if let Some(route) = route {
+                    // One stream per receiving route, opened on its first
+                    // rows; a route without rows gets end-of-stream only.
+                    let mut writers: HashMap<u32, StreamWriter<Vec<u8>>> = HashMap::new();
+                    while let Some(batch) = stream.next().await {
+                        let batch = batch?;
+                        let n = batch.num_rows();
+                        if n == 0 {
+                            continue;
+                        }
+                        let keys: Vec<(KeyHash, ArrayRef)> =
+                            route.keys.iter().map(|(c, h)| (*h, batch.column(*c).clone())).collect();
+                        let routes = cdbhash::routes(&keys, n, route.segments, route.workers);
+                        let mut rows: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+                        for (i, r) in routes.iter().enumerate() {
+                            rows.entry(*r).or_default().push(i as u32);
+                        }
+                        for (r, idx) in rows {
+                            let idx = UInt32Array::from(idx);
+                            let cols = batch
+                                .columns()
+                                .iter()
+                                .map(|c| take(c.as_ref(), &idx, None))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let part = RecordBatch::try_new(schema.clone(), cols)?;
+                            if !writers.contains_key(&r) {
+                                writers.insert(r, StreamWriter::try_new(Vec::new(), &schema)?);
+                            }
+                            let w = writers.get_mut(&r).expect("writer just inserted");
+                            w.write(&part)?;
+                            let bytes = std::mem::take(w.get_mut());
+                            if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    for (r, mut w) in writers {
+                        w.finish()?;
+                        let bytes = std::mem::take(w.get_mut());
+                        if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    return Ok(());
+                }
                 if ipc_output {
                     // Encode here, on a worker; the main thread only copies
                     // the bytes into the interconnect.
@@ -840,13 +949,13 @@ impl Query {
                         }
                         w.write(&batch)?;
                         let bytes = std::mem::take(w.get_mut());
-                        if out_tx.send(Ok(Out::Bytes(bytes))).await.is_err() {
+                        if out_tx.send(Ok(Out::Bytes(NO_ROUTE, bytes))).await.is_err() {
                             return Ok(());
                         }
                     }
                     w.finish()?;
                     let bytes = std::mem::take(w.get_mut());
-                    let _ = out_tx.send(Ok(Out::Bytes(bytes))).await;
+                    let _ = out_tx.send(Ok(Out::Bytes(NO_ROUTE, bytes))).await;
                     return Ok(());
                 }
                 while let Some(batch) = stream.next().await {
@@ -874,6 +983,7 @@ impl Query {
             task: Some(task),
             current: Vec::new(),
             current_bytes: Vec::new(),
+            current_route: NO_ROUTE,
             pool,
             physical: physical_slot,
             partitions,
@@ -971,6 +1081,11 @@ impl Query {
         &self.current_bytes
     }
 
+    /// The route of those bytes, or NO_ROUTE.
+    pub fn output_route(&self) -> i32 {
+        self.current_route
+    }
+
     /// Wait up to `timeout` for the next result batch.
     pub fn poll(&mut self, timeout: Duration) -> Poll {
         self.current.clear();
@@ -993,7 +1108,8 @@ impl Query {
                 Ok(()) => Poll::Batch(batch.num_rows()),
                 Err(e) => Poll::Failed(e),
             },
-            Some(Ok(Out::Bytes(bytes))) => {
+            Some(Ok(Out::Bytes(route, bytes))) => {
+                self.current_route = route;
                 self.current_bytes = bytes;
                 Poll::Bytes(self.current_bytes.len())
             }
@@ -1123,7 +1239,11 @@ unsafe fn primitive<T: ArrowPrimitiveType>(c: RawColumn, n: usize, nulls: Option
     Arc::new(PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls))
 }
 
-unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
+/// An Arrow array of `n` values of `ty` from C buffers.
+///
+/// # Safety
+/// `c` must point to `n` values of `ty` and `n` null bytes.
+pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> ArrayRef {
     let null_bytes = std::slice::from_raw_parts(c.nulls, n);
     let nulls = if null_bytes.iter().any(|b| *b != 0) {
         Some(NullBuffer::from(null_bytes.iter().map(|b| *b == 0).collect::<Vec<bool>>()))
@@ -1282,6 +1402,51 @@ mod tests {
         }
         // 4 rows (one NULL): count_merge adds up the non-NULL values 10+20+30.
         assert_eq!(row, vec![60, 60, 4]);
+    }
+
+    #[test]
+    fn hash_routed_streams_follow_cdbhash() {
+        // Rows 0..999 (one NULL) routed by column 0 over 3 segments x 2
+        // workers: every route's stream holds exactly the rows cdbhash
+        // sends there.
+        runtime::init(2).unwrap();
+        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"int4"}],
+            "route":{"kind":"hash","keys":[{"col":0,"hash":"int4"}],"segments":3,"workers":2}}"#;
+        let vals: Vec<i32> = (0..1000).collect();
+        let nulls: Vec<u8> = vals.iter().map(|v| (*v == 500) as u8).collect();
+        let dir = std::env::temp_dir();
+        let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
+        let col = RawColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
+        while !unsafe { q.push(&[col], 1000) }.unwrap() {}
+        q.finish_input();
+        let mut streams: HashMap<i32, Vec<u8>> = HashMap::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Bytes(_) => streams.entry(q.output_route()).or_default().extend_from_slice(q.output_bytes()),
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Batch(_) => panic!("batch instead of IPC bytes"),
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+            }
+        }
+        let mut total = 0;
+        for (route, bytes) in streams {
+            assert!((0..6).contains(&route), "route {route}");
+            let mut d = StreamDecoder::new();
+            let mut buf = Buffer::from_vec(bytes);
+            while !buf.is_empty() {
+                if let Some(b) = d.decode(&mut buf).unwrap() {
+                    let a = b.column(0).clone();
+                    let expect = cdbhash::routes(&[(KeyHash::Int4, a.clone())], b.num_rows(), 3, 2);
+                    assert!(expect.iter().all(|r| *r as i32 == route));
+                    total += b.num_rows();
+                }
+            }
+            d.finish().unwrap();
+        }
+        assert_eq!(total, 1000);
     }
 
     #[test]

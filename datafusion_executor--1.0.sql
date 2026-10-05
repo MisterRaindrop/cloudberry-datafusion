@@ -122,3 +122,13 @@ AS 'MODULE_PATHNAME', 'datafusion_debug_last_pax'
 LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION datafusion_debug_last_pax() FROM PUBLIC;
+
+-- Rows (of nrows random keys per key-type combination) that the Rust
+-- transcription of Cloudberry's distribution hash routes differently from
+-- cdbhash(); must be 0 (M7c).
+CREATE FUNCTION datafusion_debug_cdbhash_check(nrows int4, segments int4, workers int4)
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'datafusion_debug_cdbhash_check'
+LANGUAGE C VOLATILE STRICT;
+
+REVOKE ALL ON FUNCTION datafusion_debug_cdbhash_check(int4, int4, int4) FROM PUBLIC;

@@ -18,6 +18,7 @@
 //! Engine side of datafusion_executor.  Nothing in this crate knows about
 //! PostgreSQL or C; `df_ffi` is the only bridge.
 
+pub mod cdbhash;
 pub mod debug;
 pub mod memory;
 pub mod pgfunc;

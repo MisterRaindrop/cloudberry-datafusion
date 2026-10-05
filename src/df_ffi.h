@@ -126,8 +126,18 @@ typedef struct DfSlice
 extern int32_t df_ffi_query_push_ipc(DfQuery *query, int32_t route,
 									 const DfSlice *parts, uint32_t nparts,
 									 char *sqlstate, char *buf, size_t buflen);
-/* The bytes of the last DF_BYTES poll, valid until the next poll. */
-extern void df_ffi_query_bytes(DfQuery *query, const uint8_t **data, size_t *len);
+/*
+ * The bytes of the last DF_BYTES poll, valid until the next poll, and their
+ * route (a Redistribute Motion's receiver), or -1 for the only stream.
+ */
+extern void df_ffi_query_bytes(DfQuery *query, int32_t *route,
+							   const uint8_t **data, size_t *len);
+
+/* Routes by the Rust transcription of cdbhash, for checking it. */
+extern int32_t df_ffi_cdbhash_routes(const int32_t *kinds, const DfColumn *cols,
+									 uint32_t nkeys, uint32_t nrows,
+									 int32_t segments, int32_t workers,
+									 uint32_t *out);
 extern void df_ffi_query_finish_input(DfQuery *query);
 extern int32_t df_ffi_query_poll(DfQuery *query, uint32_t timeout_ms,
 								 uint32_t *nrows, char *sqlstate,

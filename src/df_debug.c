@@ -33,11 +33,16 @@
 #include <dirent.h>
 #include <signal.h>
 
+#include <math.h>
+
 #include "access/htup_details.h"
+#include "cdb/cdbhash.h"
+#include "common/pg_prng.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 
 #include "df_executor.h"
 
@@ -53,6 +58,7 @@ PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
 PG_FUNCTION_INFO_V1(datafusion_debug_pax_direct_scans);
 PG_FUNCTION_INFO_V1(datafusion_debug_last_pax);
+PG_FUNCTION_INFO_V1(datafusion_debug_cdbhash_check);
 
 static Datum
 df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
@@ -299,4 +305,170 @@ datafusion_debug_last_pax(PG_FUNCTION_ARGS)
 	v[3] = df_last_pax_scan.groups_skipped;
 	v[4] = (int64) ((df_last_run.pax_decode_peak + 1023) / 1024);
 	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
+}
+
+/* ---------------------------------------------------------------------
+ * datafusion_debug_cdbhash_check(nrows int4, segments int4, workers int4)
+ * returns bigint
+ *
+ * Route 'nrows' rows of random keys, with the special values mixed in, by
+ * cdbhash() and by the Rust transcription (df_core::cdbhash), for every
+ * supported key type alone and for two multi-key combinations, and return
+ * the number of rows the two route differently.  With workers >= 2 the
+ * route includes the worker, as nodeMotion.c computes it in parallel mode.
+ * ---------------------------------------------------------------------
+ */
+typedef struct DfKeyType
+{
+	int32		kind;			/* as df_ffi_cdbhash_routes numbers it */
+	Oid			hashfunc;
+	int			width;
+} DfKeyType;
+
+static const DfKeyType df_key_types[] = {
+	{0, F_HASHCHAR, 1}, {1, F_HASHINT2, 2}, {2, F_HASHINT4, 4},
+	{3, F_HASHINT8, 8}, {4, F_HASHFLOAT4, 4}, {5, F_HASHFLOAT8, 8},
+};
+
+/* A random value of key type 'kind', a special value one time in four. */
+static void
+df_random_key(pg_prng_state *rng, int32 kind, void *dst)
+{
+	static const double fspecial[] = {0.0, -0.0, NAN, -NAN, INFINITY, -INFINITY, 1.5, -1e300};
+	static const int64 ispecial[] = {0, -1, 1, PG_INT64_MIN, PG_INT64_MAX,
+	PG_INT32_MIN, PG_INT32_MAX, 4294967296LL};
+	bool		special = pg_prng_uint64(rng) % 4 == 0;
+	uint64		r = pg_prng_uint64(rng);
+	int			s = r % 8;
+
+	switch (kind)
+	{
+		case 0:
+			*(uint8 *) dst = r & 1;
+			break;
+		case 1:
+			*(int16 *) dst = special ? (int16) ispecial[s] : (int16) r;
+			break;
+		case 2:
+			*(int32 *) dst = special ? (int32) ispecial[s] : (int32) r;
+			break;
+		case 3:
+			*(int64 *) dst = special ? ispecial[s] : (int64) r;
+			break;
+		case 4:
+			*(float4 *) dst = special ? (float4) fspecial[s] :
+				(float4) ((pg_prng_double(rng) - 0.5) * 1e6);
+			break;
+		case 5:
+			*(float8 *) dst = special ? fspecial[s] : (pg_prng_double(rng) - 0.5) * 1e12;
+			break;
+	}
+}
+
+static Datum
+df_key_datum(int32 kind, const void *v)
+{
+	switch (kind)
+	{
+		case 0:
+			return BoolGetDatum(*(const uint8 *) v != 0);
+		case 1:
+			return Int16GetDatum(*(const int16 *) v);
+		case 2:
+			return Int32GetDatum(*(const int32 *) v);
+		case 3:
+			return Int64GetDatum(*(const int64 *) v);
+		case 4:
+			return Float4GetDatum(*(const float4 *) v);
+		default:
+			return Float8GetDatum(*(const float8 *) v);
+	}
+}
+
+/* Mismatching rows for one combination of key types. */
+static int64
+df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
+					  int nrows, int segments, int workers)
+{
+	char	   *values[3];
+	uint8	   *nulls[3];
+	DfColumn	cols[3];
+	int32		kinds[3];
+	Oid			funcs[3];
+	uint32	   *routes = palloc(sizeof(uint32) * nrows);
+	CdbHash    *h;
+	CdbHash    *hw;
+	int64		bad = 0;
+	int			k,
+				r;
+
+	for (k = 0; k < nkeys; k++)
+	{
+		const DfKeyType *t = &df_key_types[types[k]];
+
+		kinds[k] = t->kind;
+		funcs[k] = t->hashfunc;
+		values[k] = palloc(t->width * nrows);
+		nulls[k] = palloc(nrows);
+		for (r = 0; r < nrows; r++)
+		{
+			nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
+			df_random_key(rng, t->kind, values[k] + r * t->width);
+		}
+		cols[k].values = (const void *) values[k];
+		cols[k].nulls = nulls[k];
+	}
+	h = makeCdbHash(segments, nkeys, funcs);
+	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);
+
+	if (df_ffi_cdbhash_routes(kinds, cols, nkeys, nrows, segments, workers, routes) != DF_OK)
+		elog(ERROR, "datafusion: df_ffi_cdbhash_routes failed");
+
+	for (r = 0; r < nrows; r++)
+	{
+		uint32		seg,
+					route;
+
+		cdbhashinit(h);
+		cdbhashinit(hw);
+		for (k = 0; k < nkeys; k++)
+		{
+			Datum		d = df_key_datum(kinds[k],
+										 values[k] + r * df_key_types[types[k]].width);
+
+			cdbhash(h, k + 1, d, nulls[k][r] != 0);
+			cdbhash(hw, k + 1, d, nulls[k][r] != 0);
+		}
+		seg = cdbhashreduce(h);
+		route = workers >= 2 ? seg * workers + cdbhashreduce(hw) / segments : seg;
+		if (route != routes[r])
+			bad++;
+	}
+	return bad;
+}
+
+Datum
+datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
+{
+	static const int combos[][4] = {
+		/* nkeys, key types (indexes into df_key_types) */
+		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5},
+		{2, 2, 5}, {3, 3, 1, 0},
+	};
+	int32		nrows = PG_GETARG_INT32(0);
+	int32		segments = PG_GETARG_INT32(1);
+	int32		workers = PG_GETARG_INT32(2);
+	pg_prng_state rng;
+	int64		bad = 0;
+	int			i;
+
+	if (nrows < 1 || segments < 1 || workers < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("nrows, segments and workers must be positive")));
+	pg_prng_seed(&rng, 20261005);
+	for (i = 0; i < lengthof(combos); i++)
+		bad += df_cdbhash_check_keys(&rng, &combos[i][1], combos[i][0],
+									 nrows, segments, workers);
+	PG_RETURN_INT64(bad);
 }
