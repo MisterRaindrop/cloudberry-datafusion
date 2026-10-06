@@ -196,7 +196,8 @@ pub extern "C" fn df_ffi_task_wait(
     // SAFETY: `task` came from df_ffi_debug_spin_start and is not yet freed.
     let task = unsafe { &*task };
     let polled = catch_unwind(AssertUnwindSafe(|| {
-        task.0.wait(std::time::Duration::from_millis(timeout_ms as u64))
+        task.0
+            .wait(std::time::Duration::from_millis(timeout_ms as u64))
     }));
     match polled {
         Ok(Poll::Pending) => DF_PENDING,
@@ -273,7 +274,12 @@ fn write_sqlstate(sqlstate: *mut c_char, code: &str) {
 
 /// Write the error's SQLSTATE, and its message followed, if it has one, by a
 /// newline and the detail (the C side splits at the first newline).
-fn report(e: &df_core::pgfunc::PgError, sqlstate: *mut c_char, buf: *mut c_char, buflen: usize) -> i32 {
+fn report(
+    e: &df_core::pgfunc::PgError,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
     write_sqlstate(sqlstate, e.sqlstate);
     match &e.detail {
         Some(d) => write_message(buf, buflen, &format!("{}\n{}", e.message, d)),
@@ -282,7 +288,12 @@ fn report(e: &df_core::pgfunc::PgError, sqlstate: *mut c_char, buf: *mut c_char,
     DF_ERROR
 }
 
-fn report_panic(payload: Box<dyn Any + Send>, sqlstate: *mut c_char, buf: *mut c_char, buflen: usize) -> i32 {
+fn report_panic(
+    payload: Box<dyn Any + Send>,
+    sqlstate: *mut c_char,
+    buf: *mut c_char,
+    buflen: usize,
+) -> i32 {
     write_sqlstate(sqlstate, "XX000");
     write_message(buf, buflen, panic_message(payload.as_ref()));
     DF_PANIC
@@ -361,7 +372,12 @@ pub extern "C" fn df_ffi_query_start_pax(
     buf: *mut c_char,
     buflen: usize,
 ) -> i32 {
-    let source = df_core::query::Source::Pax(df_core::query::PaxScan::new(scan, nblocks as usize, read, end));
+    let source = df_core::query::Source::Pax(df_core::query::PaxScan::new(
+        scan,
+        nblocks as usize,
+        read,
+        end,
+    ));
     let r = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller passes NUL-terminated strings.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
@@ -404,10 +420,16 @@ pub extern "C" fn df_ffi_query_push(
     let raw: Vec<df_core::query::RawColumn> = (0..ncols as usize)
         .map(|i| unsafe {
             let c = &*cols.add(i);
-            df_core::query::RawColumn { values: c.values, nulls: c.nulls, offsets: c.offsets }
+            df_core::query::RawColumn {
+                values: c.values,
+                nulls: c.nulls,
+                offsets: c.offsets,
+            }
         })
         .collect();
-    match catch_unwind(AssertUnwindSafe(|| unsafe { q.push_input(input as usize, &raw, nrows as usize) })) {
+    match catch_unwind(AssertUnwindSafe(|| unsafe {
+        q.push_input(input as usize, &raw, nrows as usize)
+    })) {
         Ok(Ok(true)) => DF_OK,
         Ok(Ok(false)) => DF_PENDING,
         Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
@@ -449,7 +471,9 @@ pub extern "C" fn df_ffi_query_push_ipc(
             }
         })
         .collect();
-    match catch_unwind(AssertUnwindSafe(|| q.push_ipc_input(input as usize, route, &pieces))) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        q.push_ipc_input(input as usize, route, &pieces)
+    })) {
         Ok(Ok(true)) => DF_OK,
         Ok(Ok(false)) => DF_PENDING,
         Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
@@ -461,7 +485,12 @@ pub extern "C" fn df_ffi_query_push_ipc(
 /// the next poll, and their route: the Redistribute Motion's receiver, or
 /// -1 for a Motion's only stream.
 #[no_mangle]
-pub extern "C" fn df_ffi_query_bytes(query: *mut DfQuery, route: *mut i32, data: *mut *const u8, len: *mut usize) {
+pub extern "C" fn df_ffi_query_bytes(
+    query: *mut DfQuery,
+    route: *mut i32,
+    data: *mut *const u8,
+    len: *mut usize,
+) {
     // SAFETY: `query` is live; the out pointers are valid.
     let q = unsafe { &(*query).0 };
     let b = q.output_bytes();
@@ -503,10 +532,22 @@ pub extern "C" fn df_ffi_cdbhash_routes(
                 6 => PgType::Text,
                 _ => return None,
             };
-            let raw = df_core::query::RawColumn { values: c.values, nulls: c.nulls, offsets: c.offsets };
-            keys.push((ty.key_hash(), unsafe { df_core::query::build_array(ty, raw, nrows as usize) }.ok()?));
+            let raw = df_core::query::RawColumn {
+                values: c.values,
+                nulls: c.nulls,
+                offsets: c.offsets,
+            };
+            keys.push((
+                ty.key_hash(),
+                unsafe { df_core::query::build_array(ty, raw, nrows as usize) }.ok()?,
+            ));
         }
-        Some(df_core::cdbhash::routes(&keys, nrows as usize, segments, workers))
+        Some(df_core::cdbhash::routes(
+            &keys,
+            nrows as usize,
+            segments,
+            workers,
+        ))
     }));
     match r {
         Ok(Some(routes)) => {

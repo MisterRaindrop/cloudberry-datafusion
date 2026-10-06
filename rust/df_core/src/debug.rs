@@ -201,7 +201,11 @@ mod tests {
         let start = Instant::now();
         t.cancel();
         assert_eq!(wait_ready(&t), Outcome::Cancelled);
-        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

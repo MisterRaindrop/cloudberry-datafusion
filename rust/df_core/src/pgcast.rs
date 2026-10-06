@@ -26,7 +26,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, Decimal256Array, Float32Array, Float64Array, Int16Array, Int32Array, Int64Array,
+    Array, ArrayRef, AsArray, Decimal256Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array,
 };
 use datafusion::arrow::datatypes::{
     i256, DataType, Decimal256Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
@@ -105,39 +106,69 @@ fn int_range(to: &DataType) -> (i64, i64) {
 /// Integers of type `to` from i64 values already checked to fit.
 fn int_array(to: &DataType, values: Vec<Option<i64>>) -> ArrayRef {
     match to {
-        DataType::Int16 => Arc::new(values.into_iter().map(|v| v.map(|v| v as i16)).collect::<Int16Array>()),
-        DataType::Int32 => Arc::new(values.into_iter().map(|v| v.map(|v| v as i32)).collect::<Int32Array>()),
+        DataType::Int16 => Arc::new(
+            values
+                .into_iter()
+                .map(|v| v.map(|v| v as i16))
+                .collect::<Int16Array>(),
+        ),
+        DataType::Int32 => Arc::new(
+            values
+                .into_iter()
+                .map(|v| v.map(|v| v as i32))
+                .collect::<Int32Array>(),
+        ),
         _ => Arc::new(values.into_iter().collect::<Int64Array>()),
     }
 }
 
 fn ints(a: &ArrayRef) -> Vec<Option<i64>> {
     match a.data_type() {
-        DataType::Int16 => a.as_primitive::<Int16Type>().iter().map(|v| v.map(i64::from)).collect(),
-        DataType::Int32 => a.as_primitive::<Int32Type>().iter().map(|v| v.map(i64::from)).collect(),
+        DataType::Int16 => a
+            .as_primitive::<Int16Type>()
+            .iter()
+            .map(|v| v.map(i64::from))
+            .collect(),
+        DataType::Int32 => a
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|v| v.map(i64::from))
+            .collect(),
         _ => a.as_primitive::<Int64Type>().iter().collect(),
     }
 }
 
 fn floats(a: &ArrayRef) -> Vec<Option<f64>> {
     match a.data_type() {
-        DataType::Float32 => a.as_primitive::<Float32Type>().iter().map(|v| v.map(f64::from)).collect(),
+        DataType::Float32 => a
+            .as_primitive::<Float32Type>()
+            .iter()
+            .map(|v| v.map(f64::from))
+            .collect(),
         _ => a.as_primitive::<Float64Type>().iter().collect(),
     }
 }
 
 fn pow10(k: u32) -> i256 {
-    i256::from_i128(10).checked_pow(k).expect("10^k within 76 digits")
+    i256::from_i128(10)
+        .checked_pow(k)
+        .expect("10^k within 76 digits")
 }
 
 /// `v` * 10^-from rounded to scale `to`, half away from zero (round_var).
 fn round_to(v: i256, from: i8, to: i8) -> i256 {
     if to >= from {
-        return v.checked_mul(pow10((to - from) as u32)).expect("within 76 digits");
+        return v
+            .checked_mul(pow10((to - from) as u32))
+            .expect("within 76 digits");
     }
     let k = pow10((from - to) as u32);
     let half = k.checked_div(i256::from_i128(2)).unwrap();
-    let a = if v.is_negative() { v.checked_neg().unwrap() } else { v };
+    let a = if v.is_negative() {
+        v.checked_neg().unwrap()
+    } else {
+        v
+    };
     let r = a.checked_add(half).unwrap().checked_div(k).unwrap();
     if v.is_negative() {
         r.checked_neg().unwrap()
@@ -151,7 +182,11 @@ fn decimal_string(v: i256, scale: i8) -> String {
     let neg = v.is_negative();
     let digits = if neg { v.checked_neg().unwrap() } else { v }.to_string();
     let scale = scale as usize;
-    let digits = if digits.len() <= scale { format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits) } else { digits };
+    let digits = if digits.len() <= scale {
+        format!("{}{}", "0".repeat(scale + 1 - digits.len()), digits)
+    } else {
+        digits
+    };
     let (int, frac) = digits.split_at(digits.len() - scale);
     let mut s = String::with_capacity(digits.len() + 2);
     if neg {
@@ -176,7 +211,13 @@ pub struct PgCast {
 
 impl PgCast {
     pub fn udf(kind: CastKind, from_scale: i8, to: DataType, precision: u8) -> ScalarUDF {
-        ScalarUDF::new_from_impl(PgCast { kind, from_scale, to, precision, signature: Signature::any(1, Volatility::Immutable) })
+        ScalarUDF::new_from_impl(PgCast {
+            kind,
+            from_scale,
+            to,
+            precision,
+            signature: Signature::any(1, Volatility::Immutable),
+        })
     }
 }
 
@@ -287,9 +328,10 @@ impl ScalarUDFImpl for PgCast {
                     .iter()
                     .map(|v| match v {
                         None => Ok(None),
-                        Some(x) if x == NUMERIC_NAN => {
-                            Err(err("0A000", &format!("cannot convert NaN to {}", int_name(to))))
-                        }
+                        Some(x) if x == NUMERIC_NAN => Err(err(
+                            "0A000",
+                            &format!("cannot convert NaN to {}", int_name(to)),
+                        )),
                         Some(x) => {
                             let r = round_to(x, self.from_scale, 0);
                             match r.to_i128() {
@@ -311,7 +353,9 @@ impl ScalarUDFImpl for PgCast {
                             if x == NUMERIC_NAN {
                                 f64::NAN
                             } else {
-                                decimal_string(x, self.from_scale).parse::<f64>().unwrap_or(f64::NAN)
+                                decimal_string(x, self.from_scale)
+                                    .parse::<f64>()
+                                    .unwrap_or(f64::NAN)
                             }
                         })
                     })
@@ -323,7 +367,11 @@ impl ScalarUDFImpl for PgCast {
                 // digits before the point
                 let scale = match to {
                     DataType::Decimal256(_, s) => *s,
-                    _ => return Err(DataFusionError::Internal("numeric typmod to a non-numeric type".into())),
+                    _ => {
+                        return Err(DataFusionError::Internal(
+                            "numeric typmod to a non-numeric type".into(),
+                        ))
+                    }
                 };
                 let p = self.precision as i8;
                 let limit = pow10(p as u32);

@@ -84,15 +84,15 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, StringArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
-use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Decimal256Type, Field, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, Schema, SchemaRef,
+    ArrowPrimitiveType, DataType, Decimal256Type, Field, Float32Type, Float64Type, Int16Type,
+    Int32Type, Int64Type, Schema, SchemaRef,
 };
 use datafusion::arrow::ipc::reader::StreamDecoder;
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -104,13 +104,13 @@ use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{binary_expr, when, Expr, LogicalPlanBuilder, Operator};
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
 use futures::StreamExt;
 use serde_json::Value;
@@ -185,7 +185,8 @@ impl PgType {
             "timestamptz" => PgType::Timestamptz,
             "text" => PgType::Text,
             "numeric" => PgType::Numeric(0),
-            other if other.starts_with("numeric:") => match other["numeric:".len()..].parse::<i8>() {
+            other if other.starts_with("numeric:") => match other["numeric:".len()..].parse::<i8>()
+            {
                 Ok(s) if (0..=76).contains(&s) => PgType::Numeric(s),
                 _ => return Err(format!("unsupported type {other}")),
             },
@@ -246,7 +247,11 @@ pub struct RawColumn {
 
 impl RawColumn {
     pub fn fixed(values: *const u8, nulls: *const u8) -> RawColumn {
-        RawColumn { values, nulls, offsets: std::ptr::null() }
+        RawColumn {
+            values,
+            nulls,
+            offsets: std::ptr::null(),
+        }
     }
 }
 
@@ -282,11 +287,14 @@ pub enum Poll {
 // ---------------------------------------------------------------------------
 
 fn field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, String> {
-    v.get(key).ok_or_else(|| format!("plan spec: missing \"{key}\""))
+    v.get(key)
+        .ok_or_else(|| format!("plan spec: missing \"{key}\""))
 }
 
 fn index(v: &Value) -> Result<usize, String> {
-    v.as_u64().map(|i| i as usize).ok_or_else(|| "plan spec: bad index".to_string())
+    v.as_u64()
+        .map(|i| i as usize)
+        .ok_or_else(|| "plan spec: bad index".to_string())
 }
 
 fn float_value(v: &Value) -> Result<f64, String> {
@@ -307,10 +315,15 @@ fn literal(v: &Value) -> Result<Expr, String> {
     let null = v.get("null").and_then(Value::as_bool).unwrap_or(false);
     let val = v.get("value");
     let int = || -> Result<i64, String> {
-        val.and_then(Value::as_i64).ok_or_else(|| "bad integer literal".to_string())
+        val.and_then(Value::as_i64)
+            .ok_or_else(|| "bad integer literal".to_string())
     };
     let sv = match ty.storage() {
-        PgType::Bool => ScalarValue::Boolean(if null { None } else { val.and_then(Value::as_bool) }),
+        PgType::Bool => ScalarValue::Boolean(if null {
+            None
+        } else {
+            val.and_then(Value::as_bool)
+        }),
         PgType::Int2 => ScalarValue::Int16(if null { None } else { Some(int()? as i16) }),
         PgType::Int4 => ScalarValue::Int32(if null { None } else { Some(int()? as i32) }),
         PgType::Int8 => ScalarValue::Int64(if null { None } else { Some(int()?) }),
@@ -327,7 +340,11 @@ fn literal(v: &Value) -> Result<Expr, String> {
         PgType::Text => ScalarValue::Utf8(if null {
             None
         } else {
-            Some(val.and_then(Value::as_str).ok_or("bad text literal")?.to_string())
+            Some(
+                val.and_then(Value::as_str)
+                    .ok_or("bad text literal")?
+                    .to_string(),
+            )
         }),
         PgType::Numeric(s) => ScalarValue::Decimal256(
             if null {
@@ -337,7 +354,9 @@ fn literal(v: &Value) -> Result<Expr, String> {
                 // NaN is "NaN": NUMERIC_NAN
                 Some(match val.and_then(Value::as_str) {
                     Some("NaN") => crate::pgnum::NUMERIC_NAN,
-                    v => v.and_then(datafusion::arrow::datatypes::i256::from_string).ok_or("bad numeric literal")?,
+                    v => v
+                        .and_then(datafusion::arrow::datatypes::i256::from_string)
+                        .ok_or("bad numeric literal")?,
                 })
             },
             crate::pgnum::NUMERIC_PRECISION,
@@ -470,7 +489,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(e) = v.get("inlist") {
         // x IN (...) / x NOT IN (...): SQL's three-valued result with NULLs.
-        let values = field(v, "values")?.as_array().ok_or("plan spec: bad inlist")?;
+        let values = field(v, "values")?
+            .as_array()
+            .ok_or("plan spec: bad inlist")?;
         let list = values.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
         let negated = v.get("negated").and_then(Value::as_bool).unwrap_or(false);
         return Ok(expr(e)?.in_list(list, negated));
@@ -480,7 +501,11 @@ fn expr(v: &Value) -> Result<Expr, String> {
         if args.len() != 2 {
             return Err("plan spec: distinct takes two arguments".into());
         }
-        return Ok(binary_expr(expr(&args[0])?, Operator::IsDistinctFrom, expr(&args[1])?));
+        return Ok(binary_expr(
+            expr(&args[0])?,
+            Operator::IsDistinctFrom,
+            expr(&args[1])?,
+        ));
     }
     if let Some(e) = v.get("not") {
         return Ok(Expr::Not(Box::new(expr(e)?)));
@@ -507,7 +532,10 @@ fn expr(v: &Value) -> Result<Expr, String> {
         return Ok(PgNumeric::udf(NumericFn::Rescale { by, to }).call(vec![expr(e)?]));
     }
     if let Some(e) = v.get("pgcast") {
-        let kind = field(v, "kind")?.as_str().and_then(crate::pgcast::CastKind::parse).ok_or("plan spec: bad cast")?;
+        let kind = field(v, "kind")?
+            .as_str()
+            .and_then(crate::pgcast::CastKind::parse)
+            .ok_or("plan spec: bad cast")?;
         let from_scale = match PgType::parse(field(v, "from")?.as_str().unwrap_or(""))? {
             PgType::Numeric(s) => s,
             _ => 0,
@@ -518,7 +546,10 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(e) = v.get("cast") {
         let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
-        return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(expr(e)?), ty)));
+        return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(
+            Box::new(expr(e)?),
+            ty,
+        )));
     }
     Err(format!("plan spec: unknown expression {v}"))
 }
@@ -530,7 +561,11 @@ fn expr(v: &Value) -> Result<Expr, String> {
 fn may_fail(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
-            if let Some(f) = map.get("call").and_then(Value::as_str).and_then(StrFn::from_pg) {
+            if let Some(f) = map
+                .get("call")
+                .and_then(Value::as_str)
+                .and_then(StrFn::from_pg)
+            {
                 if f.may_fail() {
                     return true;
                 }
@@ -547,7 +582,10 @@ fn may_fail(v: &Value) -> bool {
                     return true;
                 }
                 if (op == "~~" || op == "!~~")
-                    && map.get("args").and_then(|a| a.get(1)).is_none_or(|p| p.get("lit").is_none())
+                    && map
+                        .get("args")
+                        .and_then(|a| a.get(1))
+                        .is_none_or(|p| p.get("lit").is_none())
                 {
                     return true;
                 }
@@ -595,7 +633,9 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
 fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
     match field(v, "fn")?.as_str() {
         Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
-        Some("sum_decimal") => Ok(Some(max(PgNumeric::udf(NumericFn::IsNan).call(vec![expr(field(v, "arg")?)?])))),
+        Some("sum_decimal") => Ok(Some(max(
+            PgNumeric::udf(NumericFn::IsNan).call(vec![expr(field(v, "arg")?)?])
+        ))),
         _ => Ok(None),
     }
 }
@@ -607,7 +647,11 @@ fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
 /// the guard that keeps PostgreSQL from dividing by zero (see `expr`).  The
 /// plan comes from PostgreSQL's planner, which has already folded constants
 /// and simplified expressions, so little is lost.
-fn session_state(config: SessionConfig, pool: Arc<TrackingPool>, spill_dir: &str) -> Result<SessionState, DataFusionError> {
+fn session_state(
+    config: SessionConfig,
+    pool: Arc<TrackingPool>,
+    spill_dir: &str,
+) -> Result<SessionState, DataFusionError> {
     let runtime_env = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_disk_manager_builder(
@@ -664,7 +708,8 @@ impl PartitionStream for ChannelPartition {
 // ---------------------------------------------------------------------------
 
 /// Called by the PAX reader once per group of visible rows.
-pub type PaxEmitFn = unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32;
+pub type PaxEmitFn =
+    unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32;
 /// Called by the PAX reader with the change in bytes it holds.
 pub type PaxAccountFn = unsafe extern "C" fn(ctx: *mut c_void, delta: i64);
 /// read_block of the PAX scan interface (patches/pax): decode one block,
@@ -720,7 +765,14 @@ unsafe impl Sync for PaxScan {}
 impl PaxScan {
     /// Take ownership of a scan; `end` runs when this is dropped.
     pub fn new(scan: *mut c_void, nblocks: usize, read: PaxReadFn, end: PaxEndFn) -> Self {
-        PaxScan { scan, nblocks, read, end, next: AtomicUsize::new(0), memory: Arc::default() }
+        PaxScan {
+            scan,
+            nblocks,
+            read,
+            end,
+            next: AtomicUsize::new(0),
+            memory: Arc::default(),
+        }
     }
 }
 
@@ -775,7 +827,11 @@ unsafe extern "C" fn pax_account(ctx: *mut c_void, delta: i64) {
     ctx.memory.add(delta);
 }
 
-fn make_batch(schema: &SchemaRef, arrays: Vec<ArrayRef>, nrows: usize) -> Result<RecordBatch, PgError> {
+fn make_batch(
+    schema: &SchemaRef,
+    arrays: Vec<ArrayRef>,
+    nrows: usize,
+) -> Result<RecordBatch, PgError> {
     if arrays.is_empty() {
         RecordBatch::try_new_with_options(
             schema.clone(),
@@ -810,7 +866,11 @@ impl PartitionStream for PaxPartition {
         let schema = self.schema.clone();
         let types = self.types.clone();
         let scan = self.scan.clone();
-        let state = (scan, std::collections::VecDeque::<RecordBatch>::new(), false);
+        let state = (
+            scan,
+            std::collections::VecDeque::<RecordBatch>::new(),
+            false,
+        );
         let stream = futures::stream::unfold(state, move |(scan, mut queue, failed)| {
             let schema = schema.clone();
             let types = types.clone();
@@ -826,7 +886,13 @@ impl PartitionStream for PaxPartition {
                     if index >= scan.nblocks {
                         return None;
                     }
-                    let mut ctx = EmitContext { memory: scan.memory.clone(), schema: schema.clone(), types: types.clone(), batches: Vec::new(), error: None };
+                    let mut ctx = EmitContext {
+                        memory: scan.memory.clone(),
+                        schema: schema.clone(),
+                        types: types.clone(),
+                        batches: Vec::new(),
+                        error: None,
+                    };
                     let mut err = vec![0 as c_char; 1024];
                     // SAFETY: see PaxScan; ctx outlives the call.
                     let rc = unsafe {
@@ -842,7 +908,9 @@ impl PartitionStream for PaxPartition {
                     };
                     if rc != 0 {
                         let msg = ctx.error.take().unwrap_or_else(|| {
-                            unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned()
+                            unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                                .to_string_lossy()
+                                .into_owned()
                         });
                         let e = DataFusionError::External(Box::new(PgError::internal(msg)));
                         return Some((Err(e), (scan, queue, true)));
@@ -901,7 +969,10 @@ fn normalize_spec(mut spec: Value) -> Result<Value, String> {
 /// Does the plan group rows in an aggregate (which caps the partitions)?
 fn has_grouped_aggregate(node: &Value) -> bool {
     if let Some(a) = node.get("aggregate") {
-        let grouped = a.get("group").and_then(Value::as_array).is_some_and(|g| !g.is_empty());
+        let grouped = a
+            .get("group")
+            .and_then(Value::as_array)
+            .is_some_and(|g| !g.is_empty());
         return grouped || a.get("input").is_some_and(has_grouped_aggregate);
     }
     if let Some(f) = node.get("filter") {
@@ -916,7 +987,10 @@ fn has_grouped_aggregate(node: &Value) -> bool {
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
 /// table, taken by the node that reads it.
-fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<LogicalPlanBuilder, String> {
+fn build_node(
+    node: &Value,
+    tables: &mut Vec<Option<StreamingTable>>,
+) -> Result<LogicalPlanBuilder, String> {
     let df = |e: DataFusionError| e.to_string();
     if let Some(j) = node.get("input") {
         let j = index(j)?;
@@ -924,7 +998,12 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
             .get_mut(j)
             .and_then(Option::take)
             .ok_or_else(|| format!("plan spec: input {j} missing or read twice"))?;
-        return LogicalPlanBuilder::scan(format!("t{j}"), provider_as_source(Arc::new(table)), None).map_err(df);
+        return LogicalPlanBuilder::scan(
+            format!("t{j}"),
+            provider_as_source(Arc::new(table)),
+            None,
+        )
+        .map_err(df);
     }
     if let Some(f) = node.get("filter") {
         let b = build_node(field(f, "input")?, tables)?;
@@ -952,24 +1031,36 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
         let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
-        if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge" | "sum_decimal"))) {
+        if aggs.iter().any(|a| {
+            matches!(
+                kind(a).as_deref(),
+                Some("count_merge" | "avg_merge" | "sum_decimal")
+            )
+        }) {
             let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
             for (i, a) in aggs.iter().enumerate() {
                 let c = col(format!("a{i}"));
                 cols.push(match kind(a).as_deref() {
-                    Some("count_merge") => {
-                        when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
-                    }
+                    Some("count_merge") => when(c.clone().is_null(), lit(0i64))
+                        .otherwise(c)
+                        .map_err(df)?
+                        .alias(format!("a{i}")),
                     Some("sum_decimal") => PgNumeric::udf(NumericFn::NanIf)
                         .call(vec![c, col(format!("a{i}_n"))])
                         .alias(format!("a{i}")),
                     Some("avg_merge") => {
                         let n = col(format!("a{i}_n"));
-                        let nf = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(n.clone()), DataType::Float64));
-                        when(n.clone().is_null().or(n.eq(lit(0i64))), lit(ScalarValue::Float64(None)))
-                            .otherwise(binary_expr(c, Operator::Divide, nf))
-                            .map_err(df)?
-                            .alias(format!("a{i}"))
+                        let nf = Expr::Cast(datafusion::logical_expr::Cast::new(
+                            Box::new(n.clone()),
+                            DataType::Float64,
+                        ));
+                        when(
+                            n.clone().is_null().or(n.eq(lit(0i64))),
+                            lit(ScalarValue::Float64(None)),
+                        )
+                        .otherwise(binary_expr(c, Operator::Divide, nf))
+                        .map_err(df)?
+                        .alias(format!("a{i}"))
                     }
                     _ => c,
                 });
@@ -995,11 +1086,19 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
             other => return Err(format!("plan spec: unsupported join type {other}")),
         };
         let left = build_node(field(j, "left")?, tables)?;
-        let right = build_node(field(j, "right")?, tables)?.build().map_err(df)?;
+        let right = build_node(field(j, "right")?, tables)?
+            .build()
+            .map_err(df)?;
         let mut lkeys = Vec::new();
         let mut rkeys = Vec::new();
-        for pair in field(j, "on")?.as_array().ok_or("plan spec: bad join keys")? {
-            let pair = pair.as_array().filter(|p| p.len() == 2).ok_or("plan spec: bad join key")?;
+        for pair in field(j, "on")?
+            .as_array()
+            .ok_or("plan spec: bad join keys")?
+        {
+            let pair = pair
+                .as_array()
+                .filter(|p| p.len() == 2)
+                .ok_or("plan spec: bad join key")?;
             lkeys.push(expr(&pair[0])?);
             rkeys.push(expr(&pair[1])?);
         }
@@ -1043,17 +1142,31 @@ impl HashRoute {
             .iter()
             .map(|k| {
                 let c = index(field(k, "col")?)?;
-                let h = field(k, "hash")?.as_str().and_then(KeyHash::parse).ok_or("plan spec: bad key hash")?;
+                let h = field(k, "hash")?
+                    .as_str()
+                    .and_then(KeyHash::parse)
+                    .ok_or("plan spec: bad key hash")?;
                 Ok((c, h))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let int = |name: &str| field(v, name).ok().and_then(Value::as_i64).map(|n| n as i32);
-        let segments = int("segments").filter(|n| *n > 0).ok_or("plan spec: bad route segments")?;
+        let int = |name: &str| {
+            field(v, name)
+                .ok()
+                .and_then(Value::as_i64)
+                .map(|n| n as i32)
+        };
+        let segments = int("segments")
+            .filter(|n| *n > 0)
+            .ok_or("plan spec: bad route segments")?;
         let workers = int("workers").unwrap_or(1).max(1);
         if keys.is_empty() {
             return Err("plan spec: route without keys".into());
         }
-        Ok(HashRoute { keys, segments, workers })
+        Ok(HashRoute {
+            keys,
+            segments,
+            workers,
+        })
     }
 }
 
@@ -1111,8 +1224,20 @@ impl Query {
     /// Build the plan described by `spec` and start running it with
     /// `partitions` partitions, an operator memory budget of `memory_limit`
     /// bytes, and spill files under `spill_dir`.
-    pub fn start(spec: &str, partitions: usize, memory_limit: usize, spill_dir: &str) -> Result<Query, PgError> {
-        Self::start_with(spec, partitions, memory_limit, spill_dir, Source::Pushed, false)
+    pub fn start(
+        spec: &str,
+        partitions: usize,
+        memory_limit: usize,
+        spill_dir: &str,
+    ) -> Result<Query, PgError> {
+        Self::start_with(
+            spec,
+            partitions,
+            memory_limit,
+            spill_dir,
+            Source::Pushed,
+            false,
+        )
     }
 
     /// Like `start`, reading from `source`.  With `ipc_output`, results come
@@ -1126,7 +1251,14 @@ impl Query {
         source: Source,
         ipc_output: bool,
     ) -> Result<Query, PgError> {
-        Self::start_multi(spec, partitions, memory_limit, spill_dir, vec![source], ipc_output)
+        Self::start_multi(
+            spec,
+            partitions,
+            memory_limit,
+            spill_dir,
+            vec![source],
+            ipc_output,
+        )
     }
 
     /// Like `start_with`, with one source per input of the plan.
@@ -1146,9 +1278,17 @@ impl Query {
         let df = |e: DataFusionError| internal(e.to_string());
 
         let spec = normalize_spec(spec).map_err(internal)?;
-        let inputs = field(&spec, "inputs").map_err(internal)?.as_array().cloned().unwrap_or_default();
+        let inputs = field(&spec, "inputs")
+            .map_err(internal)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         if inputs.len() != sources.len() || inputs.is_empty() {
-            return Err(internal(format!("{} inputs, {} sources", inputs.len(), sources.len())));
+            return Err(internal(format!(
+                "{} inputs, {} sources",
+                inputs.len(),
+                sources.len()
+            )));
         }
         let mut in_types: Vec<Vec<PgType>> = Vec::with_capacity(inputs.len());
         let mut in_schemas: Vec<SchemaRef> = Vec::with_capacity(inputs.len());
@@ -1173,7 +1313,9 @@ impl Query {
 
         let plan_node = field(&spec, "plan").map_err(internal)?.clone();
         let partitions = if has_grouped_aggregate(&plan_node) {
-            partitions.max(1).min((memory_limit / MIN_PARTITION_MEMORY).max(1))
+            partitions
+                .max(1)
+                .min((memory_limit / MIN_PARTITION_MEMORY).max(1))
         } else {
             partitions.max(1)
         };
@@ -1194,28 +1336,55 @@ impl Query {
                         .as_array()
                         .ok_or_else(|| internal("bad motion columns".into()))?
                         .iter()
-                        .map(|v| v.as_u64().map(|k| k as usize).ok_or_else(|| internal("bad motion column".into())))
+                        .map(|v| {
+                            v.as_u64()
+                                .map(|k| k as usize)
+                                .ok_or_else(|| internal("bad motion column".into()))
+                        })
                         .collect::<Result<_, _>>()?;
                     let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
                     let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
                     decoders.push(handle.spawn(decode_ipc(rx, in_tx, schema.clone(), positions)));
-                    let partition = ChannelPartition { schema: schema.clone(), rx: Mutex::new(Some(in_rx)) };
-                    (None, Some(tx), StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
+                    let partition = ChannelPartition {
+                        schema: schema.clone(),
+                        rx: Mutex::new(Some(in_rx)),
+                    };
+                    (
+                        None,
+                        Some(tx),
+                        StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)])
+                            .map_err(df)?,
+                    )
                 }
                 Source::Pushed => {
                     let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
-                    let partition = ChannelPartition { schema: schema.clone(), rx: Mutex::new(Some(in_rx)) };
-                    (Some(in_tx), None, StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)]).map_err(df)?)
+                    let partition = ChannelPartition {
+                        schema: schema.clone(),
+                        rx: Mutex::new(Some(in_rx)),
+                    };
+                    (
+                        Some(in_tx),
+                        None,
+                        StreamingTable::try_new(schema.clone(), vec![Arc::new(partition)])
+                            .map_err(df)?,
+                    )
                 }
                 Source::Pax(scan) => {
                     let scan = Arc::new(scan);
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
                         .map(|_| {
-                            Arc::new(PaxPartition { schema: schema.clone(), types: in_types[j].clone(), scan: scan.clone() })
-                                as Arc<dyn PartitionStream>
+                            Arc::new(PaxPartition {
+                                schema: schema.clone(),
+                                types: in_types[j].clone(),
+                                scan: scan.clone(),
+                            }) as Arc<dyn PartitionStream>
                         })
                         .collect();
-                    (None, None, StreamingTable::try_new(schema.clone(), parts).map_err(df)?)
+                    (
+                        None,
+                        None,
+                        StreamingTable::try_new(schema.clone(), parts).map_err(df)?,
+                    )
                 }
             };
             in_tx.push(tx);
@@ -1224,11 +1393,16 @@ impl Query {
         }
 
         let b = build_node(&plan_node, &mut tables).map_err(internal)?;
-        let outputs = field(&spec, "output").map_err(internal)?.as_array().cloned().unwrap_or_default();
+        let outputs = field(&spec, "output")
+            .map_err(internal)?
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
         let mut out_types = Vec::with_capacity(outputs.len());
         let mut out_exprs = Vec::with_capacity(outputs.len());
         for (i, o) in outputs.iter().enumerate() {
-            let ty = PgType::parse(o.get("type").and_then(Value::as_str).unwrap_or("")).map_err(internal)?;
+            let ty = PgType::parse(o.get("type").and_then(Value::as_str).unwrap_or(""))
+                .map_err(internal)?;
             let e = expr(field(o, "expr").map_err(internal)?).map_err(internal)?;
             out_exprs.push(
                 Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), ty.arrow()))
@@ -1243,8 +1417,13 @@ impl Query {
             None => None,
         };
         if let Some(r) = &route {
-            if r.keys.iter().any(|(c, h)| out_types.get(*c).map(|t| t.key_hash()) != Some(*h)) {
-                return Err(internal("route key does not match its output column".into()));
+            if r.keys
+                .iter()
+                .any(|(c, h)| out_types.get(*c).map(|t| t.key_hash()) != Some(*h))
+            {
+                return Err(internal(
+                    "route key does not match its output column".into(),
+                ));
             }
         }
 
@@ -1259,7 +1438,9 @@ impl Query {
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
         let pool = Arc::new(TrackingPool::new(memory_limit.max(1)));
-        let ctx = SessionContext::new_with_state(session_state(config, pool.clone(), spill_dir).map_err(df)?);
+        let ctx = SessionContext::new_with_state(
+            session_state(config, pool.clone(), spill_dir).map_err(df)?,
+        );
         let (out_tx, out_rx) = mpsc::channel(CHANNEL_DEPTH);
         let physical_slot: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>> = Arc::new(Mutex::new(None));
         let slot = physical_slot.clone();
@@ -1283,10 +1464,14 @@ impl Query {
                         if n == 0 {
                             continue;
                         }
-                        let keys: Vec<(KeyHash, ArrayRef)> =
-                            route.keys.iter().map(|(c, h)| (*h, batch.column(*c).clone())).collect();
+                        let keys: Vec<(KeyHash, ArrayRef)> = route
+                            .keys
+                            .iter()
+                            .map(|(c, h)| (*h, batch.column(*c).clone()))
+                            .collect();
                         let routes = cdbhash::routes(&keys, n, route.segments, route.workers);
-                        let mut rows: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
+                        let mut rows: std::collections::BTreeMap<u32, Vec<u32>> =
+                            Default::default();
                         for (i, r) in routes.iter().enumerate() {
                             rows.entry(*r).or_default().push(i as u32);
                         }
@@ -1300,7 +1485,9 @@ impl Query {
                             let part = RecordBatch::try_new(schema.clone(), cols)?;
                             let w = match writers.entry(r) {
                                 Entry::Occupied(e) => e.into_mut(),
-                                Entry::Vacant(e) => e.insert(StreamWriter::try_new(Vec::new(), &schema)?),
+                                Entry::Vacant(e) => {
+                                    e.insert(StreamWriter::try_new(Vec::new(), &schema)?)
+                                }
                             };
                             w.write(&part)?;
                             let bytes = std::mem::take(w.get_mut());
@@ -1409,7 +1596,12 @@ impl Query {
     ///
     /// # Safety
     /// As for `push`.
-    pub unsafe fn push_input(&mut self, input: usize, cols: &[RawColumn], nrows: usize) -> Result<bool, PgError> {
+    pub unsafe fn push_input(
+        &mut self,
+        input: usize,
+        cols: &[RawColumn],
+        nrows: usize,
+    ) -> Result<bool, PgError> {
         let tx = self
             .in_tx
             .get(input)
@@ -1446,7 +1638,12 @@ impl Query {
     }
 
     /// Like `push_ipc`, to input `input`.
-    pub fn push_ipc_input(&mut self, input: usize, route: i32, parts: &[&[u8]]) -> Result<bool, PgError> {
+    pub fn push_ipc_input(
+        &mut self,
+        input: usize,
+        route: i32,
+        parts: &[&[u8]],
+    ) -> Result<bool, PgError> {
         let tx = self
             .ipc_tx
             .get(input)
@@ -1455,7 +1652,10 @@ impl Query {
         let permit = match tx.try_reserve() {
             Ok(p) => p,
             Err(mpsc::error::TrySendError::Full(())) => {
-                match self.handle.block_on(async { tokio::time::timeout(IPC_PUSH_WAIT, tx.reserve()).await }) {
+                match self
+                    .handle
+                    .block_on(async { tokio::time::timeout(IPC_PUSH_WAIT, tx.reserve()).await })
+                {
                     Ok(Ok(p)) => p,
                     Ok(Err(_)) => return Ok(true), // the decoder stopped; poll tells why
                     Err(_) => return Ok(false),
@@ -1514,7 +1714,10 @@ impl Query {
             }
         } else {
             let rx = &mut self.out_rx;
-            match self.handle.block_on(async { tokio::time::timeout(timeout, rx.recv()).await }) {
+            match self
+                .handle
+                .block_on(async { tokio::time::timeout(timeout, rx.recv()).await })
+            {
                 Ok(v) => v,
                 Err(_) => return Poll::Pending,
             }
@@ -1551,7 +1754,9 @@ impl Query {
 
     fn convert(&mut self, batch: &RecordBatch) -> Result<(), PgError> {
         if batch.num_columns() != self.out_types.len() {
-            return Err(PgError::internal("result batch has the wrong number of columns"));
+            return Err(PgError::internal(
+                "result batch has the wrong number of columns",
+            ));
         }
         for (i, ty) in self.out_types.iter().enumerate() {
             let mut array = batch.column(i).clone();
@@ -1563,24 +1768,53 @@ impl Query {
             let mut offsets: *const i32 = std::ptr::null();
             let (bools, values) = match ty.storage() {
                 PgType::Bool => {
-                    let b: Vec<u8> = array.as_boolean().values().iter().map(|v| v as u8).collect();
+                    let b: Vec<u8> = array
+                        .as_boolean()
+                        .values()
+                        .iter()
+                        .map(|v| v as u8)
+                        .collect();
                     let p = b.as_ptr();
                     (Some(b), p)
                 }
-                PgType::Int2 => (None, array.as_primitive::<Int16Type>().values().as_ptr() as *const u8),
-                PgType::Int4 => (None, array.as_primitive::<Int32Type>().values().as_ptr() as *const u8),
-                PgType::Int8 => (None, array.as_primitive::<Int64Type>().values().as_ptr() as *const u8),
-                PgType::Float4 => (None, array.as_primitive::<Float32Type>().values().as_ptr() as *const u8),
-                PgType::Float8 => (None, array.as_primitive::<Float64Type>().values().as_ptr() as *const u8),
+                PgType::Int2 => (
+                    None,
+                    array.as_primitive::<Int16Type>().values().as_ptr() as *const u8,
+                ),
+                PgType::Int4 => (
+                    None,
+                    array.as_primitive::<Int32Type>().values().as_ptr() as *const u8,
+                ),
+                PgType::Int8 => (
+                    None,
+                    array.as_primitive::<Int64Type>().values().as_ptr() as *const u8,
+                ),
+                PgType::Float4 => (
+                    None,
+                    array.as_primitive::<Float32Type>().values().as_ptr() as *const u8,
+                ),
+                PgType::Float8 => (
+                    None,
+                    array.as_primitive::<Float64Type>().values().as_ptr() as *const u8,
+                ),
                 PgType::Text => {
                     let a = array.as_string::<i32>();
                     offsets = a.value_offsets().as_ptr();
                     (None, a.values().as_ptr())
                 }
-                PgType::Numeric(_) => (None, array.as_primitive::<Decimal256Type>().values().as_ptr() as *const u8),
+                PgType::Numeric(_) => (
+                    None,
+                    array.as_primitive::<Decimal256Type>().values().as_ptr() as *const u8,
+                ),
                 _ => unreachable!(),
             };
-            self.current.push(OutColumn { _array: array, offsets, bools, nulls, values });
+            self.current.push(OutColumn {
+                _array: array,
+                offsets,
+                bools,
+                nulls,
+                values,
+            });
         }
         Ok(())
     }
@@ -1617,9 +1851,11 @@ async fn decode_ipc(
     positions: Vec<usize>,
 ) {
     let mut decoders: HashMap<i32, StreamDecoder> = HashMap::new();
-    let fail = |e: String| Err(DataFusionError::External(Box::new(PgError::internal(format!(
-        "cannot decode the batches received from a Motion: {e}"
-    )))));
+    let fail = |e: String| {
+        Err(DataFusionError::External(Box::new(PgError::internal(
+            format!("cannot decode the batches received from a Motion: {e}"),
+        ))))
+    };
     while let Some((route, bytes)) = rx.recv().await {
         let decoder = decoders.entry(route).or_default();
         let mut buffer = Buffer::from_vec(bytes);
@@ -1636,14 +1872,19 @@ async fn decode_ipc(
             let mut arrays = Vec::with_capacity(positions.len());
             for (i, &k) in positions.iter().enumerate() {
                 match batch.columns().get(k) {
-                    Some(a) if a.data_type() == schema.field(i).data_type() => arrays.push(a.clone()),
+                    Some(a) if a.data_type() == schema.field(i).data_type() => {
+                        arrays.push(a.clone())
+                    }
                     _ => {
-                        let _ = tx.send(fail(format!("column {k} is missing or has another type"))).await;
+                        let _ = tx
+                            .send(fail(format!("column {k} is missing or has another type")))
+                            .await;
                         return;
                     }
                 }
             }
-            let item = make_batch(&schema, arrays, n).map_err(|e| DataFusionError::External(Box::new(e)));
+            let item =
+                make_batch(&schema, arrays, n).map_err(|e| DataFusionError::External(Box::new(e)));
             if tx.send(item).await.is_err() {
                 return; // the plan stopped reading
             }
@@ -1658,7 +1899,11 @@ async fn decode_ipc(
     }
 }
 
-unsafe fn primitive<T: ArrowPrimitiveType>(c: RawColumn, n: usize, nulls: Option<NullBuffer>) -> ArrayRef {
+unsafe fn primitive<T: ArrowPrimitiveType>(
+    c: RawColumn,
+    n: usize,
+    nulls: Option<NullBuffer>,
+) -> ArrayRef {
     let values = std::slice::from_raw_parts(c.values as *const T::Native, n).to_vec();
     Arc::new(PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls))
 }
@@ -1673,22 +1918,33 @@ unsafe fn primitive<T: ArrowPrimitiveType>(c: RawColumn, n: usize, nulls: Option
 pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef, PgError> {
     let null_bytes = std::slice::from_raw_parts(c.nulls, n);
     let nulls = if null_bytes.iter().any(|b| *b != 0) {
-        Some(NullBuffer::from(null_bytes.iter().map(|b| *b == 0).collect::<Vec<bool>>()))
+        Some(NullBuffer::from(
+            null_bytes.iter().map(|b| *b == 0).collect::<Vec<bool>>(),
+        ))
     } else {
         None
     };
     Ok(match ty.storage() {
         PgType::Bool => {
             let v = std::slice::from_raw_parts(c.values, n);
-            Arc::new(BooleanArray::new(BooleanBuffer::from_iter(v.iter().map(|b| *b != 0)), nulls))
+            Arc::new(BooleanArray::new(
+                BooleanBuffer::from_iter(v.iter().map(|b| *b != 0)),
+                nulls,
+            ))
         }
         PgType::Text => {
             let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
             let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
             let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets.to_vec()));
             Arc::new(
-                StringArray::try_new(offsets, Buffer::from_slice_ref(bytes), nulls)
-                    .map_err(|e| PgError::new("22021", format!("invalid byte sequence for encoding \"UTF8\": {e}")))?,
+                StringArray::try_new(offsets, Buffer::from_slice_ref(bytes), nulls).map_err(
+                    |e| {
+                        PgError::new(
+                            "22021",
+                            format!("invalid byte sequence for encoding \"UTF8\": {e}"),
+                        )
+                    },
+                )?,
             )
         }
         PgType::Int2 => primitive::<Int16Type>(c, n, nulls),
@@ -1700,7 +1956,11 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
             // 32 little-endian bytes each; palloc aligns to 8 only.
             let p = c.values as *const [u8; 32];
             let values: Vec<datafusion::arrow::datatypes::i256> = (0..n)
-                .map(|r| datafusion::arrow::datatypes::i256::from_le_bytes(std::ptr::read_unaligned(p.add(r))))
+                .map(|r| {
+                    datafusion::arrow::datatypes::i256::from_le_bytes(std::ptr::read_unaligned(
+                        p.add(r),
+                    ))
+                })
                 .collect();
             Arc::new(
                 PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
@@ -1715,11 +1975,20 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
 mod tests {
     use super::*;
 
-    fn run(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize) -> Result<Vec<Vec<Option<i64>>>, PgError> {
+    fn run(
+        spec: &str,
+        input: Vec<(Vec<i32>, Vec<u8>)>,
+        nrows: usize,
+    ) -> Result<Vec<Vec<Option<i64>>>, PgError> {
         run_with(spec, input, nrows, 64 << 20)
     }
 
-    fn run_with(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize, limit: usize) -> Result<Vec<Vec<Option<i64>>>, PgError> {
+    fn run_with(
+        spec: &str,
+        input: Vec<(Vec<i32>, Vec<u8>)>,
+        nrows: usize,
+        limit: usize,
+    ) -> Result<Vec<Vec<Option<i64>>>, PgError> {
         runtime::init(2).unwrap();
         let dir = std::env::temp_dir();
         let mut q = Query::start(spec, 2, limit, dir.to_str().unwrap())?;
@@ -1743,7 +2012,11 @@ mod tests {
                         for c in 0..ncol {
                             let col = q.output_column(c).unwrap();
                             let null = unsafe { *col.nulls.add(r) } != 0;
-                            row.push(if null { None } else { Some(unsafe { *(col.values as *const i64).add(r) }) });
+                            row.push(if null {
+                                None
+                            } else {
+                                Some(unsafe { *(col.values as *const i64).add(r) })
+                            });
                         }
                         rows.push(row);
                     }
@@ -1777,7 +2050,12 @@ mod tests {
             "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}}]},
             "having":null,
             "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
-        let input = || vec![(vec![i32::MIN, -730, 0, 9000, i32::MAX, 5], vec![0, 0, 0, 0, 0, 1])];
+        let input = || {
+            vec![(
+                vec![i32::MIN, -730, 0, 9000, i32::MAX, 5],
+                vec![0, 0, 0, 0, 0, 1],
+            )]
+        };
         let count = |d: i32| run(&spec.replace("%D%", &d.to_string()), input(), 6).unwrap();
         assert_eq!(count(0), vec![vec![Some(2)]]);
         assert_eq!(count(i32::MAX), vec![vec![Some(4)]]);
@@ -1797,7 +2075,11 @@ mod tests {
         }
         let dir = std::env::temp_dir();
         let mut q = Query::start(spec, 2, 64 << 20, dir.to_str().unwrap())?;
-        let col = RawColumn { values: bytes.as_ptr(), nulls: nulls.as_ptr(), offsets: offsets.as_ptr() };
+        let col = RawColumn {
+            values: bytes.as_ptr(),
+            nulls: nulls.as_ptr(),
+            offsets: offsets.as_ptr(),
+        };
         while !unsafe { q.push(&[col], values.len()) }? {}
         q.finish_input();
         let mut out = Vec::new();
@@ -1810,7 +2092,8 @@ mod tests {
                             out.push(None);
                             continue;
                         }
-                        let (a, b) = unsafe { (*c.offsets.add(r) as usize, *c.offsets.add(r + 1) as usize) };
+                        let (a, b) =
+                            unsafe { (*c.offsets.add(r) as usize, *c.offsets.add(r + 1) as usize) };
                         let s = unsafe { std::slice::from_raw_parts(c.values.add(a), b - a) };
                         out.push(Some(String::from_utf8(s.to_vec()).unwrap()));
                     }
@@ -1830,18 +2113,30 @@ mod tests {
             "filter":{"op":"<>","type":"bool","args":[{"col":0},{"lit":{"type":"text","value":"b\"\\"}}]},
             "aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"text"}]}"#;
-        let input = [Some("a"), Some("b\"\\"), Some(""), None, Some("中文"), Some("b")];
+        let input = [
+            Some("a"),
+            Some("b\"\\"),
+            Some(""),
+            None,
+            Some("中文"),
+            Some("b"),
+        ];
         let mut got = run_text(spec, &input).unwrap();
         got.sort();
         let want: Vec<Option<String>> = vec![Some(""), Some("a"), Some("b"), Some("中文")]
-            .into_iter().map(|s| s.map(String::from)).collect();
+            .into_iter()
+            .map(|s| s.map(String::from))
+            .collect();
         assert_eq!(got, want);
 
         // min/max order bytes, as the C collation does.
         let spec = r#"{"scan":{"columns":[{"type":"text"}]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"max","arg":{"col":0}}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"text"}]}"#;
-        assert_eq!(run_text(spec, &input).unwrap(), vec![Some("中文".to_string())]);
+        assert_eq!(
+            run_text(spec, &input).unwrap(),
+            vec![Some("中文".to_string())]
+        );
     }
 
     #[test]
@@ -1852,7 +2147,11 @@ mod tests {
         let dir = std::env::temp_dir();
         let mut q = Query::start(spec, 2, 64 << 20, dir.to_str().unwrap()).unwrap();
         let (bytes, offsets, nulls) = ([0xffu8, 0xfe], [0i32, 2], [0u8]);
-        let col = RawColumn { values: bytes.as_ptr(), nulls: nulls.as_ptr(), offsets: offsets.as_ptr() };
+        let col = RawColumn {
+            values: bytes.as_ptr(),
+            nulls: nulls.as_ptr(),
+            offsets: offsets.as_ptr(),
+        };
         let e = unsafe { q.push(&[col], 1) }.expect_err("invalid UTF-8 accepted");
         assert_eq!(e.sqlstate, "22021");
     }
@@ -1877,7 +2176,15 @@ mod tests {
     fn run_ipc_out(spec: &str, input: Vec<(Vec<i32>, Vec<u8>)>, nrows: usize) -> Vec<u8> {
         runtime::init(2).unwrap();
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
+        let mut q = Query::start_with(
+            spec,
+            2,
+            64 << 20,
+            dir.to_str().unwrap(),
+            Source::Pushed,
+            true,
+        )
+        .unwrap();
         let cols: Vec<RawColumn> = input
             .iter()
             .map(|(v, n)| RawColumn::fixed(v.as_ptr() as *const u8, n.as_ptr()))
@@ -1913,7 +2220,8 @@ mod tests {
             "having":null,
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false).unwrap();
+        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false)
+            .unwrap();
         // Deliver route 0 in small pieces, interleaved with route 1.
         let (a1, a2) = a.split_at(a.len() / 3);
         for (route, part) in [(0, a1), (1, &b[..]), (0, a2)] {
@@ -1953,14 +2261,25 @@ mod tests {
         let vals: Vec<i32> = (0..1000).collect();
         let nulls: Vec<u8> = vals.iter().map(|v| (*v == 500) as u8).collect();
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(spec, 2, 64 << 20, dir.to_str().unwrap(), Source::Pushed, true).unwrap();
+        let mut q = Query::start_with(
+            spec,
+            2,
+            64 << 20,
+            dir.to_str().unwrap(),
+            Source::Pushed,
+            true,
+        )
+        .unwrap();
         let col = RawColumn::fixed(vals.as_ptr() as *const u8, nulls.as_ptr());
         while !unsafe { q.push(&[col], 1000) }.unwrap() {}
         q.finish_input();
         let mut streams: HashMap<i32, Vec<u8>> = HashMap::new();
         loop {
             match q.poll(Duration::from_millis(50)) {
-                Poll::Bytes(_) => streams.entry(q.output_route()).or_default().extend_from_slice(q.output_bytes()),
+                Poll::Bytes(_) => streams
+                    .entry(q.output_route())
+                    .or_default()
+                    .extend_from_slice(q.output_bytes()),
                 Poll::Pending => {}
                 Poll::Done => break,
                 Poll::Batch(_) => panic!("batch instead of IPC bytes"),
@@ -1995,7 +2314,8 @@ mod tests {
             "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false).unwrap();
+        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false)
+            .unwrap();
         while !q.push_ipc(0, &[&a[..a.len() - 20]]).unwrap() {}
         q.finish_input();
         loop {
@@ -2023,7 +2343,12 @@ mod tests {
                     {"lit":{"type":"int4","value":1}}]}]},
             "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
-        let rows = run(spec, vec![(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9], vec![0; 10])], 10).unwrap();
+        let rows = run(
+            spec,
+            vec![(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9], vec![0; 10])],
+            10,
+        )
+        .unwrap();
         assert_eq!(rows, vec![vec![Some(5)]]); // a = 1..5
     }
 
@@ -2031,20 +2356,35 @@ mod tests {
     fn nested_guards_do_not_fail() {
         // a <> 0 AND 10 / a > 0 AND 100 / (a - 1) > 0: the third argument
         // must only run where the first two are not false (a > 1 here).
-        let div = |n: i64, d: &str| format!(
-            r#"{{"op":"/","type":"int4","args":[{{"lit":{{"type":"int4","value":{n}}}}},{d}]}}"#);
+        let div = |n: i64, d: &str| {
+            format!(
+                r#"{{"op":"/","type":"int4","args":[{{"lit":{{"type":"int4","value":{n}}}}},{d}]}}"#
+            )
+        };
         let a = r#"{"col":0}"#;
-        let a_minus_1 = r#"{"op":"-","type":"int4","args":[{"col":0},{"lit":{"type":"int4","value":1}}]}"#;
-        let gt0 = |e: String| format!(r#"{{"op":">","type":"bool","args":[{e},{{"lit":{{"type":"int4","value":0}}}}]}}"#);
+        let a_minus_1 =
+            r#"{"op":"-","type":"int4","args":[{"col":0},{"lit":{"type":"int4","value":1}}]}"#;
+        let gt0 = |e: String| {
+            format!(
+                r#"{{"op":">","type":"bool","args":[{e},{{"lit":{{"type":"int4","value":0}}}}]}}"#
+            )
+        };
         let spec = format!(
             r#"{{"scan":{{"columns":[{{"type":"int4"}}]}},
                 "filter":{{"and":[{{"op":"<>","type":"bool","args":[{a},{{"lit":{{"type":"int4","value":0}}}}]}},{},{}]}},
                 "aggregate":{{"group":[],"aggs":[{{"fn":"count"}}]}},"having":null,
                 "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#,
-            gt0(div(10, a)), gt0(div(100, a_minus_1)));
+            gt0(div(10, a)),
+            gt0(div(100, a_minus_1))
+        );
         // a = 1 passes the first two (10/1 = 10 > 0) and divides by zero in
         // the third, exactly as PostgreSQL would; so leave it out.
-        let rows = run(&spec, vec![(vec![0, 2, 3, 4, 5, 6, 7, 8, 9, 10], vec![0; 10])], 10).unwrap();
+        let rows = run(
+            &spec,
+            vec![(vec![0, 2, 3, 4, 5, 6, 7, 8, 9, 10], vec![0; 10])],
+            10,
+        )
+        .unwrap();
         assert_eq!(rows, vec![vec![Some(9)]]);
     }
 
@@ -2100,7 +2440,10 @@ mod tests {
         // the whole Rust heap.
         let s = q.stats();
         assert_eq!(s.memory_limit, 1 << 20);
-        assert!(s.spill_count > 0 && s.spilled_bytes > 0, "expected spills: {s:?}");
+        assert!(
+            s.spill_count > 0 && s.spilled_bytes > 0,
+            "expected spills: {s:?}"
+        );
     }
 
     /// A fake PAX reader: block i holds rows i*10 .. i*10+9 of one int4
@@ -2119,7 +2462,10 @@ mod tests {
         for g in 0..2 {
             let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
             let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
-            let col = PaxColumn { values: vals.as_ptr() as *const u8, nulls: nulls.as_ptr() };
+            let col = PaxColumn {
+                values: vals.as_ptr() as *const u8,
+                nulls: nulls.as_ptr(),
+            };
             if emit(ctx, 5, &col) != 0 {
                 account(ctx, -1000);
                 return -1;
@@ -2144,7 +2490,15 @@ mod tests {
         let before = FAKE_ENDED.load(Ordering::SeqCst);
         let scan = PaxScan::new(std::ptr::null_mut(), 50, fake_read, fake_end);
         let dir = std::env::temp_dir();
-        let mut q = Query::start_with(spec, 4, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan), false).unwrap();
+        let mut q = Query::start_with(
+            spec,
+            4,
+            64 << 20,
+            dir.to_str().unwrap(),
+            Source::Pax(scan),
+            false,
+        )
+        .unwrap();
         let mut row = Vec::new();
         loop {
             match q.poll(Duration::from_millis(50)) {
@@ -2187,4 +2541,3 @@ mod tests {
         assert_eq!(err, PgError::new("22003", "integer out of range"));
     }
 }
-

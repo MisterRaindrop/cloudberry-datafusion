@@ -57,7 +57,11 @@ pub struct PgError {
 
 impl PgError {
     pub fn new(sqlstate: &'static str, message: impl Into<String>) -> Self {
-        PgError { sqlstate, message: message.into(), detail: None }
+        PgError {
+            sqlstate,
+            message: message.into(),
+            detail: None,
+        }
     }
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
@@ -98,10 +102,13 @@ pub fn to_pg_error(e: &DataFusionError) -> PgError {
         if let Some(ArrowError::DivideByZero) = err.downcast_ref::<ArrowError>() {
             return PgError::new(DIVISION_BY_ZERO, "division by zero");
         }
-        if let Some(DataFusionError::ResourcesExhausted(msg)) = err.downcast_ref::<DataFusionError>() {
+        if let Some(DataFusionError::ResourcesExhausted(msg)) =
+            err.downcast_ref::<DataFusionError>()
+        {
             // The operator could not stay within the slice's memory budget
             // and could not spill.
-            return PgError::new("53200", "out of memory").with_detail(format!("DataFusion: {msg}"));
+            return PgError::new("53200", "out of memory")
+                .with_detail(format!("DataFusion: {msg}"));
         }
         cur = err.source();
     }
@@ -135,9 +142,15 @@ macro_rules! int_op {
         let a = $a.as_primitive::<$t>();
         let b = $b.as_primitive::<$t>();
         let r: PrimitiveArray<$t> = match $op {
-            ArithOp::Add => try_binary(a, b, |x, y| x.checked_add(y).ok_or_else(|| out_of_range($range))),
-            ArithOp::Sub => try_binary(a, b, |x, y| x.checked_sub(y).ok_or_else(|| out_of_range($range))),
-            ArithOp::Mul => try_binary(a, b, |x, y| x.checked_mul(y).ok_or_else(|| out_of_range($range))),
+            ArithOp::Add => try_binary(a, b, |x, y| {
+                x.checked_add(y).ok_or_else(|| out_of_range($range))
+            }),
+            ArithOp::Sub => try_binary(a, b, |x, y| {
+                x.checked_sub(y).ok_or_else(|| out_of_range($range))
+            }),
+            ArithOp::Mul => try_binary(a, b, |x, y| {
+                x.checked_mul(y).ok_or_else(|| out_of_range($range))
+            }),
             ArithOp::Div => try_binary(a, b, |x, y| {
                 if y == 0 {
                     Err(division_by_zero())
@@ -172,7 +185,11 @@ where
         let underflow = || out_of_range("value out of range: underflow");
         match op {
             ArithOp::Add | ArithOp::Sub => {
-                let r = if op == ArithOp::Add { x.add(y) } else { x.sub(y) };
+                let r = if op == ArithOp::Add {
+                    x.add(y)
+                } else {
+                    x.sub(y)
+                };
                 if r.is_inf() && !x.is_inf() && !y.is_inf() {
                     return Err(overflow());
                 }
@@ -223,13 +240,27 @@ mod num_like {
     macro_rules! imp {
         ($t:ty) => {
             impl Float for $t {
-                fn add(self, o: Self) -> Self { self + o }
-                fn sub(self, o: Self) -> Self { self - o }
-                fn mul(self, o: Self) -> Self { self * o }
-                fn div(self, o: Self) -> Self { self / o }
-                fn is_inf(self) -> bool { self.is_infinite() }
-                fn is_nan(self) -> bool { <$t>::is_nan(self) }
-                fn is_zero(self) -> bool { self == 0.0 }
+                fn add(self, o: Self) -> Self {
+                    self + o
+                }
+                fn sub(self, o: Self) -> Self {
+                    self - o
+                }
+                fn mul(self, o: Self) -> Self {
+                    self * o
+                }
+                fn div(self, o: Self) -> Self {
+                    self / o
+                }
+                fn is_inf(self) -> bool {
+                    self.is_infinite()
+                }
+                fn is_nan(self) -> bool {
+                    <$t>::is_nan(self)
+                }
+                fn is_zero(self) -> bool {
+                    self == 0.0
+                }
             }
         };
     }
@@ -290,7 +321,8 @@ impl ScalarUDFImpl for PgArith {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let arrays = ColumnarValue::values_to_arrays(&args.args)?;
-        let r = apply(self.op, &arrays[0], &arrays[1]).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+        let r = apply(self.op, &arrays[0], &arrays[1])
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
         Ok(ColumnarValue::Array(r))
     }
 }
@@ -309,21 +341,29 @@ mod tests {
     fn integer_overflow_and_division() {
         let a: ArrayRef = Arc::new(Int32Array::from(vec![i32::MAX]));
         let one: ArrayRef = Arc::new(Int32Array::from(vec![1]));
-        assert_eq!(err_of(apply(ArithOp::Add, &a, &one)),
-                   PgError::new("22003", "integer out of range"));
+        assert_eq!(
+            err_of(apply(ArithOp::Add, &a, &one)),
+            PgError::new("22003", "integer out of range")
+        );
         let zero: ArrayRef = Arc::new(Int32Array::from(vec![0]));
-        assert_eq!(err_of(apply(ArithOp::Div, &a, &zero)),
-                   PgError::new("22012", "division by zero"));
+        assert_eq!(
+            err_of(apply(ArithOp::Div, &a, &zero)),
+            PgError::new("22012", "division by zero")
+        );
         let min: ArrayRef = Arc::new(Int32Array::from(vec![i32::MIN]));
         let m1: ArrayRef = Arc::new(Int32Array::from(vec![-1]));
-        assert_eq!(err_of(apply(ArithOp::Div, &min, &m1)),
-                   PgError::new("22003", "integer out of range"));
+        assert_eq!(
+            err_of(apply(ArithOp::Div, &min, &m1)),
+            PgError::new("22003", "integer out of range")
+        );
         let r = apply(ArithOp::Rem, &min, &m1).unwrap();
         assert_eq!(r.as_primitive::<Int32Type>().value(0), 0);
         let s: ArrayRef = Arc::new(Int16Array::from(vec![i16::MAX]));
         let s1: ArrayRef = Arc::new(Int16Array::from(vec![1]));
-        assert_eq!(err_of(apply(ArithOp::Add, &s, &s1)),
-                   PgError::new("22003", "smallint out of range"));
+        assert_eq!(
+            err_of(apply(ArithOp::Add, &s, &s1)),
+            PgError::new("22003", "smallint out of range")
+        );
     }
 
     #[test]
@@ -339,17 +379,27 @@ mod tests {
     #[test]
     fn float_rules() {
         let big: ArrayRef = Arc::new(Float64Array::from(vec![f64::MAX]));
-        assert_eq!(err_of(apply(ArithOp::Mul, &big, &big)),
-                   PgError::new("22003", "value out of range: overflow"));
+        assert_eq!(
+            err_of(apply(ArithOp::Mul, &big, &big)),
+            PgError::new("22003", "value out of range: overflow")
+        );
         let tiny: ArrayRef = Arc::new(Float64Array::from(vec![1e-300]));
-        assert_eq!(err_of(apply(ArithOp::Mul, &tiny, &tiny)),
-                   PgError::new("22003", "value out of range: underflow"));
+        assert_eq!(
+            err_of(apply(ArithOp::Mul, &tiny, &tiny)),
+            PgError::new("22003", "value out of range: underflow")
+        );
         let zero: ArrayRef = Arc::new(Float64Array::from(vec![0.0]));
         let one: ArrayRef = Arc::new(Float64Array::from(vec![1.0]));
-        assert_eq!(err_of(apply(ArithOp::Div, &one, &zero)),
-                   PgError::new("22012", "division by zero"));
+        assert_eq!(
+            err_of(apply(ArithOp::Div, &one, &zero)),
+            PgError::new("22012", "division by zero")
+        );
         let nan: ArrayRef = Arc::new(Float64Array::from(vec![f64::NAN]));
-        assert!(apply(ArithOp::Div, &nan, &zero).unwrap().as_primitive::<Float64Type>().value(0).is_nan());
+        assert!(apply(ArithOp::Div, &nan, &zero)
+            .unwrap()
+            .as_primitive::<Float64Type>()
+            .value(0)
+            .is_nan());
         let inf: ArrayRef = Arc::new(Float64Array::from(vec![f64::INFINITY]));
         assert!(apply(ArithOp::Add, &inf, &one).is_ok());
     }

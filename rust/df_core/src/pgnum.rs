@@ -47,12 +47,15 @@ pub fn numeric_type(scale: i8) -> DataType {
 }
 
 fn decimal(a: &ArrayRef) -> Result<&Decimal256Array> {
-    a.as_primitive_opt::<Decimal256Type>()
-        .ok_or_else(|| DataFusionError::Internal(format!("expected a numeric column, got {}", a.data_type())))
+    a.as_primitive_opt::<Decimal256Type>().ok_or_else(|| {
+        DataFusionError::Internal(format!("expected a numeric column, got {}", a.data_type()))
+    })
 }
 
 fn pow10(k: u32) -> i256 {
-    i256::from_i128(10).checked_pow(k).expect("10^k within 76 digits")
+    i256::from_i128(10)
+        .checked_pow(k)
+        .expect("10^k within 76 digits")
 }
 
 fn beyond() -> ArrowError {
@@ -94,7 +97,10 @@ impl PgNumeric {
             NumericFn::NanIf | NumericFn::Arith { .. } => 2,
             _ => 1,
         };
-        ScalarUDF::new_from_impl(PgNumeric { f, signature: Signature::any(n, Volatility::Immutable) })
+        ScalarUDF::new_from_impl(PgNumeric {
+            f,
+            signature: Signature::any(n, Volatility::Immutable),
+        })
     }
 }
 
@@ -132,12 +138,19 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::Rescale { by, to } => {
                 let k = pow10(by as u32);
                 let a: Decimal256Array = xs
-                    .try_unary(|v| if v == NUMERIC_NAN { Ok(v) } else { v.checked_mul(k).ok_or_else(beyond) })
+                    .try_unary(|v| {
+                        if v == NUMERIC_NAN {
+                            Ok(v)
+                        } else {
+                            v.checked_mul(k).ok_or_else(beyond)
+                        }
+                    })
                     .map_err(arrow)?;
                 Arc::new(a.with_data_type(numeric_type(to)))
             }
             NumericFn::NanToZero => {
-                let a: Decimal256Array = xs.unary(|v| if v == NUMERIC_NAN { i256::ZERO } else { v });
+                let a: Decimal256Array =
+                    xs.unary(|v| if v == NUMERIC_NAN { i256::ZERO } else { v });
                 Arc::new(a.with_data_type(x.data_type().clone()))
             }
             NumericFn::IsNan => Arc::new(BooleanArray::from_unary(xs, |v| v == NUMERIC_NAN)),
@@ -194,9 +207,22 @@ mod tests {
 
     fn call(f: NumericFn, args: Vec<ArrayRef>) -> ArrayRef {
         let n = args[0].len();
-        let arg_fields = args.iter().map(|a| Arc::new(Field::new("a", a.data_type().clone(), true))).collect();
-        let udf = PgNumeric { f, signature: Signature::any(args.len(), Volatility::Immutable) };
-        let ret = udf.return_type(&args.iter().map(|a| a.data_type().clone()).collect::<Vec<_>>()).unwrap();
+        let arg_fields = args
+            .iter()
+            .map(|a| Arc::new(Field::new("a", a.data_type().clone(), true)))
+            .collect();
+        let udf = PgNumeric {
+            f,
+            signature: Signature::any(args.len(), Volatility::Immutable),
+        };
+        let ret = udf
+            .return_type(
+                &args
+                    .iter()
+                    .map(|a| a.data_type().clone())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
         let out = udf
             .invoke_with_args(ScalarFunctionArgs {
                 args: args.into_iter().map(ColumnarValue::Array).collect(),
@@ -215,29 +241,67 @@ mod tests {
     #[test]
     fn nan_survives_rescaling_and_marks_sums() {
         let x: ArrayRef = Arc::new(
-            Decimal256Array::from(vec![Some(i256::from_i128(150)), Some(NUMERIC_NAN), None, Some(i256::from_i128(-1))])
-                .with_data_type(numeric_type(2)),
+            Decimal256Array::from(vec![
+                Some(i256::from_i128(150)),
+                Some(NUMERIC_NAN),
+                None,
+                Some(i256::from_i128(-1)),
+            ])
+            .with_data_type(numeric_type(2)),
         );
         let r = call(NumericFn::Rescale { by: 2, to: 4 }, vec![x.clone()]);
         let r = decimal(&r).unwrap();
         assert_eq!(r.data_type(), &numeric_type(4));
-        assert_eq!((r.value(0), r.value(1), r.is_null(2), r.value(3)), (i256::from_i128(15000), NUMERIC_NAN, true, i256::from_i128(-100)));
+        assert_eq!(
+            (r.value(0), r.value(1), r.is_null(2), r.value(3)),
+            (
+                i256::from_i128(15000),
+                NUMERIC_NAN,
+                true,
+                i256::from_i128(-100)
+            )
+        );
         let z = call(NumericFn::NanToZero, vec![x.clone()]);
         assert_eq!(decimal(&z).unwrap().value(1), i256::ZERO);
         let isnan = call(NumericFn::IsNan, vec![x.clone()]);
         assert!(isnan.as_boolean().value(1) && !isnan.as_boolean().value(0));
-        let flag: ArrayRef = Arc::new(BooleanArray::from(vec![Some(true), Some(false), Some(true), None]));
+        let flag: ArrayRef = Arc::new(BooleanArray::from(vec![
+            Some(true),
+            Some(false),
+            Some(true),
+            None,
+        ]));
         let m = call(NumericFn::NanIf, vec![x, flag]);
         let m = decimal(&m).unwrap();
-        assert_eq!((m.value(0), m.value(1), m.is_null(2), m.value(3)), (NUMERIC_NAN, NUMERIC_NAN, true, i256::from_i128(-1)));
+        assert_eq!(
+            (m.value(0), m.value(1), m.is_null(2), m.value(3)),
+            (NUMERIC_NAN, NUMERIC_NAN, true, i256::from_i128(-1))
+        );
         // 1.50 * -0.01 = -0.0150 (scales add up); NaN in, NaN out
-        let y: ArrayRef = Arc::new(Decimal256Array::from(vec![Some(i256::from_i128(-1)); 4]).with_data_type(numeric_type(2)));
-        let x2: ArrayRef = Arc::new(
-            Decimal256Array::from(vec![Some(i256::from_i128(150)), Some(NUMERIC_NAN), None, Some(i256::from_i128(-1))])
+        let y: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![Some(i256::from_i128(-1)); 4])
                 .with_data_type(numeric_type(2)),
         );
-        let p = call(NumericFn::Arith { op: NumOp::Mul, to: 4 }, vec![x2, y]);
+        let x2: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![
+                Some(i256::from_i128(150)),
+                Some(NUMERIC_NAN),
+                None,
+                Some(i256::from_i128(-1)),
+            ])
+            .with_data_type(numeric_type(2)),
+        );
+        let p = call(
+            NumericFn::Arith {
+                op: NumOp::Mul,
+                to: 4,
+            },
+            vec![x2, y],
+        );
         let p = decimal(&p).unwrap();
-        assert_eq!((p.value(0), p.value(1), p.is_null(2), p.value(3)), (i256::from_i128(-150), NUMERIC_NAN, true, i256::from_i128(1)));
+        assert_eq!(
+            (p.value(0), p.value(1), p.is_null(2), p.value(3)),
+            (i256::from_i128(-150), NUMERIC_NAN, true, i256::from_i128(1))
+        );
     }
 }

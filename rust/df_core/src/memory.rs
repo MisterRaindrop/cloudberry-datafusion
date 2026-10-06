@@ -105,7 +105,11 @@ pub struct TrackingPool {
 
 impl TrackingPool {
     pub fn new(limit: usize) -> Self {
-        TrackingPool { inner: FairSpillPool::new(limit), limit, peak: AtomicUsize::new(0) }
+        TrackingPool {
+            inner: FairSpillPool::new(limit),
+            limit,
+            peak: AtomicUsize::new(0),
+        }
     }
 
     pub fn limit(&self) -> usize {
@@ -117,13 +121,19 @@ impl TrackingPool {
     }
 
     fn note(&self) {
-        self.peak.fetch_max(self.inner.reserved(), Ordering::Relaxed);
+        self.peak
+            .fetch_max(self.inner.reserved(), Ordering::Relaxed);
     }
 }
 
 impl fmt::Display for TrackingPool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cloudberry pool (limit {} bytes, peak {} bytes)", self.limit, self.peak())
+        write!(
+            f,
+            "cloudberry pool (limit {} bytes, peak {} bytes)",
+            self.limit,
+            self.peak()
+        )
     }
 }
 

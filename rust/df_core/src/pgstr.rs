@@ -23,7 +23,8 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int32Array, Int32Builder, StringArray, StringBuilder,
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int32Array, Int32Builder, StringArray,
+    StringBuilder,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
@@ -51,9 +52,9 @@ fn utf8(a: &ArrayRef) -> Result<ArrayRef> {
 /// A scalar text argument: Some(None) for NULL, None if it is not a scalar.
 fn scalar_text(v: &ColumnarValue) -> Option<Option<String>> {
     match v {
-        ColumnarValue::Scalar(ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) | ScalarValue::Utf8View(s)) => {
-            Some(s.clone())
-        }
+        ColumnarValue::Scalar(
+            ScalarValue::Utf8(s) | ScalarValue::LargeUtf8(s) | ScalarValue::Utf8View(s),
+        ) => Some(s.clone()),
         _ => None,
     }
 }
@@ -160,7 +161,11 @@ fn match_text(t: &[u8], p: &[u8], depth: usize) -> Result<Like> {
     while pi < p.len() && p[pi] == b'%' {
         pi += 1;
     }
-    Ok(if pi >= p.len() { Like::True } else { Like::Abort })
+    Ok(if pi >= p.len() {
+        Like::True
+    } else {
+        Like::Abort
+    })
 }
 
 /// A pattern prepared once: literal pieces between %'s when it has no `_`
@@ -199,7 +204,8 @@ impl Pattern {
             Pattern::Pieces(pieces) if pieces.len() == 1 => Ok(t == pieces[0].as_slice()),
             Pattern::Pieces(pieces) => {
                 let (first, last) = (&pieces[0], &pieces[pieces.len() - 1]);
-                if t.len() < first.len() + last.len() || !t.starts_with(first) || !t.ends_with(last) {
+                if t.len() < first.len() + last.len() || !t.starts_with(first) || !t.ends_with(last)
+                {
                     return Ok(false);
                 }
                 // UTF-8 pieces can only match at character boundaries.
@@ -221,7 +227,12 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         return Some(0);
     }
     // Both are UTF-8 (whole characters), so str's searcher applies.
-    let (h, n) = unsafe { (std::str::from_utf8_unchecked(hay), std::str::from_utf8_unchecked(needle)) };
+    let (h, n) = unsafe {
+        (
+            std::str::from_utf8_unchecked(hay),
+            std::str::from_utf8_unchecked(needle),
+        )
+    };
     h.find(n)
 }
 
@@ -234,7 +245,10 @@ pub struct PgLike {
 
 impl PgLike {
     pub fn udf(negated: bool) -> ScalarUDF {
-        ScalarUDF::new_from_impl(PgLike { negated, signature: Signature::any(2, Volatility::Immutable) })
+        ScalarUDF::new_from_impl(PgLike {
+            negated,
+            signature: Signature::any(2, Volatility::Immutable),
+        })
     }
 }
 
@@ -281,7 +295,8 @@ impl ScalarUDFImpl for PgLike {
                     v.push(if text.is_null(r) || pats.is_null(r) {
                         None
                     } else {
-                        let m = match_text(text.value(r).as_bytes(), pats.value(r).as_bytes(), 0)? == Like::True;
+                        let m = match_text(text.value(r).as_bytes(), pats.value(r).as_bytes(), 0)?
+                            == Like::True;
                         Some(m != self.negated)
                     });
                 }
@@ -349,7 +364,10 @@ impl StrFn {
 
     /// Can a call raise an error (and so need the AND/OR guards)?
     pub fn may_fail(self) -> bool {
-        matches!(self, StrFn::Substr | StrFn::Repeat | StrFn::Lpad | StrFn::Rpad | StrFn::SplitPart)
+        matches!(
+            self,
+            StrFn::Substr | StrFn::Repeat | StrFn::Lpad | StrFn::Rpad | StrFn::SplitPart
+        )
     }
 
     fn name(self) -> &'static str {
@@ -480,7 +498,9 @@ impl<'a> Arg<'a> {
     fn int(&self, r: usize) -> Result<i32> {
         match self {
             Arg::Int(a) => Ok(a.value(r)),
-            Arg::Text(_) => Err(DataFusionError::Internal("expected an integer argument".into())),
+            Arg::Text(_) => Err(DataFusionError::Internal(
+                "expected an integer argument".into(),
+            )),
         }
     }
 }
@@ -520,9 +540,19 @@ fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>
     }
     let t = |i: usize| args[i].text(r);
     let n = |i: usize| args[i].int(r);
-    let set = || -> Result<&'a str> { if args.len() > 1 { t(1) } else { Ok(" ") } };
+    let set = || -> Result<&'a str> {
+        if args.len() > 1 {
+            t(1)
+        } else {
+            Ok(" ")
+        }
+    };
     Ok(Some(match f {
-        StrFn::Substr => Text::Slice(substr(t(0)?, n(1)?, if args.len() > 2 { Some(n(2)?) } else { None })?),
+        StrFn::Substr => Text::Slice(substr(
+            t(0)?,
+            n(1)?,
+            if args.len() > 2 { Some(n(2)?) } else { None },
+        )?),
         StrFn::Btrim => {
             let set = set()?;
             Text::Slice(t(0)?.trim_matches(|c| set.contains(c)))
@@ -538,13 +568,27 @@ fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>
         StrFn::Left => {
             let (s, k) = (t(0)?, n(1)? as i64);
             let keep = if k >= 0 { k } else { nchars(s) as i64 + k };
-            Text::Slice(if keep <= 0 { "" } else { first_chars(s, keep as usize) })
+            Text::Slice(if keep <= 0 {
+                ""
+            } else {
+                first_chars(s, keep as usize)
+            })
         }
         StrFn::Right => {
             let (s, k) = (t(0)?, n(1)?);
             // -INT_MIN wraps (Cloudberry builds with -fwrapv): nothing skipped.
-            let skip = if k == i32::MIN { 0 } else if k < 0 { -k as i64 } else { nchars(s) as i64 - k as i64 };
-            Text::Slice(if skip <= 0 { s } else { skip_chars(s, skip as usize) })
+            let skip = if k == i32::MIN {
+                0
+            } else if k < 0 {
+                -k as i64
+            } else {
+                nchars(s) as i64 - k as i64
+            };
+            Text::Slice(if skip <= 0 {
+                s
+            } else {
+                skip_chars(s, skip as usize)
+            })
         }
         StrFn::Reverse => Text::Owned(t(0)?.chars().rev().collect()),
         StrFn::Repeat => {
@@ -573,7 +617,11 @@ fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>
             Text::Slice(if s.is_empty() {
                 ""
             } else if sep.is_empty() {
-                if field == 1 || field == -1 { s } else { "" }
+                if field == 1 || field == -1 {
+                    s
+                } else {
+                    ""
+                }
             } else if field > 0 {
                 s.split(sep).nth(field as usize - 1).unwrap_or("")
             } else {
@@ -581,19 +629,35 @@ fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>
                 // with a separator like "aa" the matches differ).
                 let fields: Vec<&str> = s.split(sep).collect();
                 let i = fields.len() as i64 + field as i64;
-                if i < 0 { "" } else { fields[i as usize] }
+                if i < 0 {
+                    ""
+                } else {
+                    fields[i as usize]
+                }
             })
         }
         // Under the C collation PostgreSQL maps ASCII letters only.
         StrFn::Lower => {
             let s = t(0)?;
-            if s.bytes().any(|b| b.is_ascii_uppercase()) { Text::Owned(s.to_ascii_lowercase()) } else { Text::Slice(s) }
+            if s.bytes().any(|b| b.is_ascii_uppercase()) {
+                Text::Owned(s.to_ascii_lowercase())
+            } else {
+                Text::Slice(s)
+            }
         }
         StrFn::Upper => {
             let s = t(0)?;
-            if s.bytes().any(|b| b.is_ascii_lowercase()) { Text::Owned(s.to_ascii_uppercase()) } else { Text::Slice(s) }
+            if s.bytes().any(|b| b.is_ascii_lowercase()) {
+                Text::Owned(s.to_ascii_uppercase())
+            } else {
+                Text::Slice(s)
+            }
         }
-        _ => return Err(DataFusionError::Internal(format!("{f:?} is not a text function"))),
+        _ => {
+            return Err(DataFusionError::Internal(format!(
+                "{f:?} is not a text function"
+            )))
+        }
     }))
 }
 
@@ -617,7 +681,11 @@ fn call_int(f: StrFn, args: &[Arg], r: usize) -> Result<Option<i32>> {
                 }
             }
         }
-        _ => return Err(DataFusionError::Internal(format!("{f:?} is not an integer function"))),
+        _ => {
+            return Err(DataFusionError::Internal(format!(
+                "{f:?} is not an integer function"
+            )))
+        }
     }))
 }
 
@@ -630,7 +698,10 @@ pub struct PgStrFn {
 
 impl PgStrFn {
     pub fn udf(f: StrFn) -> ScalarUDF {
-        ScalarUDF::new_from_impl(PgStrFn { f, signature: Signature::variadic_any(Volatility::Immutable) })
+        ScalarUDF::new_from_impl(PgStrFn {
+            f,
+            signature: Signature::variadic_any(Volatility::Immutable),
+        })
     }
 }
 
@@ -651,7 +722,11 @@ impl ScalarUDFImpl for PgStrFn {
         use std::fmt::Write;
 
         let n = args.number_rows;
-        let owned = args.args.iter().map(|a| prepare(a.to_array(n)?)).collect::<Result<Vec<ArrayRef>>>()?;
+        let owned = args
+            .args
+            .iter()
+            .map(|a| prepare(a.to_array(n)?))
+            .collect::<Result<Vec<ArrayRef>>>()?;
         let cols: Vec<Arg> = owned
             .iter()
             .map(|a| match a.data_type() {
@@ -689,7 +764,8 @@ impl ScalarUDFImpl for PgStrFn {
                     // concat skips NULLs and is never NULL.
                     for a in &cols {
                         if !a.is_null(r) {
-                            b.write_str(a.text(r)?).map_err(|e| DataFusionError::Internal(e.to_string()))?;
+                            b.write_str(a.text(r)?)
+                                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
                         }
                     }
                     b.append_value("");
@@ -785,7 +861,11 @@ mod tests {
         if f == StrFn::Strpos {
             return call_int(f, &cols, 0).unwrap().unwrap().to_string();
         }
-        call_text(f, &cols, 0).unwrap().unwrap().as_str().to_string()
+        call_text(f, &cols, 0)
+            .unwrap()
+            .unwrap()
+            .as_str()
+            .to_string()
     }
 
     #[test]

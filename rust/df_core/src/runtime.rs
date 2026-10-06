@@ -62,11 +62,17 @@ pub fn default_workers() -> usize {
 /// `workers == 0` means `default_workers()`.  A second call returns the
 /// existing runtime's size and ignores `workers`.
 pub fn init(workers: usize) -> Result<usize, String> {
-    let mut slot = RUNTIME.lock().map_err(|_| "runtime lock poisoned".to_string())?;
+    let mut slot = RUNTIME
+        .lock()
+        .map_err(|_| "runtime lock poisoned".to_string())?;
     if let Some(rt) = slot.as_ref() {
         return Ok(rt.metrics().num_workers());
     }
-    let workers = if workers == 0 { default_workers() } else { workers };
+    let workers = if workers == 0 {
+        default_workers()
+    } else {
+        workers
+    };
     let rt = Builder::new_multi_thread()
         .worker_threads(workers)
         .max_blocking_threads(workers)

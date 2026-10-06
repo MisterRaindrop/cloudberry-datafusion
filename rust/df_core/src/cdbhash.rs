@@ -108,7 +108,9 @@ fn mix(a: &mut u32, b: &mut u32, c: &mut u32) {
 /// under a deterministic collation hashes a value's bytes with it.
 pub fn hash_bytes(k: &[u8]) -> u32 {
     let word = |i: usize| u32::from_le_bytes([k[i], k[i + 1], k[i + 2], k[i + 3]]);
-    let init = 0x9e37_79b9u32.wrapping_add(k.len() as u32).wrapping_add(3_923_095);
+    let init = 0x9e37_79b9u32
+        .wrapping_add(k.len() as u32)
+        .wrapping_add(3_923_095);
     let (mut a, mut b, mut c) = (init, init, init);
     let mut off = 0;
     while k.len() - off >= 12 {
@@ -122,17 +124,39 @@ pub fn hash_bytes(k: &[u8]) -> u32 {
     let t = &k[off..];
     let byte = |i: usize, shift: u32| (t[i] as u32) << shift;
     let n = t.len();
-    if n >= 11 { c = c.wrapping_add(byte(10, 24)); }
-    if n >= 10 { c = c.wrapping_add(byte(9, 16)); }
-    if n >= 9 { c = c.wrapping_add(byte(8, 8)); }
-    if n >= 8 { b = b.wrapping_add(byte(7, 24)); }
-    if n >= 7 { b = b.wrapping_add(byte(6, 16)); }
-    if n >= 6 { b = b.wrapping_add(byte(5, 8)); }
-    if n >= 5 { b = b.wrapping_add(byte(4, 0)); }
-    if n >= 4 { a = a.wrapping_add(byte(3, 24)); }
-    if n >= 3 { a = a.wrapping_add(byte(2, 16)); }
-    if n >= 2 { a = a.wrapping_add(byte(1, 8)); }
-    if n >= 1 { a = a.wrapping_add(byte(0, 0)); }
+    if n >= 11 {
+        c = c.wrapping_add(byte(10, 24));
+    }
+    if n >= 10 {
+        c = c.wrapping_add(byte(9, 16));
+    }
+    if n >= 9 {
+        c = c.wrapping_add(byte(8, 8));
+    }
+    if n >= 8 {
+        b = b.wrapping_add(byte(7, 24));
+    }
+    if n >= 7 {
+        b = b.wrapping_add(byte(6, 16));
+    }
+    if n >= 6 {
+        b = b.wrapping_add(byte(5, 8));
+    }
+    if n >= 5 {
+        b = b.wrapping_add(byte(4, 0));
+    }
+    if n >= 4 {
+        a = a.wrapping_add(byte(3, 24));
+    }
+    if n >= 3 {
+        a = a.wrapping_add(byte(2, 16));
+    }
+    if n >= 2 {
+        a = a.wrapping_add(byte(1, 8));
+    }
+    if n >= 1 {
+        a = a.wrapping_add(byte(0, 0));
+    }
     final_mix(a, b, c)
 }
 
@@ -147,7 +171,11 @@ pub fn hash_uint32(k: u32) -> u32 {
 #[inline]
 fn hash_8bytes(v: u64) -> u32 {
     let init = 0x9e37_79b9u32.wrapping_add(8).wrapping_add(3_923_095);
-    final_mix(init.wrapping_add(v as u32), init.wrapping_add((v >> 32) as u32), init)
+    final_mix(
+        init.wrapping_add(v as u32),
+        init.wrapping_add((v >> 32) as u32),
+        init,
+    )
 }
 
 #[inline]
@@ -164,7 +192,11 @@ fn hash_float8(v: f64) -> u32 {
         return 0; // 0 and -0
     }
     // get_float8_nan(): every NaN hashes as the canonical one.
-    let bits = if v.is_nan() { 0x7ff8_0000_0000_0000u64 } else { v.to_bits() };
+    let bits = if v.is_nan() {
+        0x7ff8_0000_0000_0000u64
+    } else {
+        v.to_bits()
+    };
     hash_8bytes(bits)
 }
 
