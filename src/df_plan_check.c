@@ -2640,8 +2640,13 @@ df_attach_worth(Plan *plan)
 	return true;
 }
 
+/*
+ * 'locale_free': skip subtrees whose verdict depends on the node's locale
+ * and look below them instead, for subtrees every node runs alike.
+ */
 static void
-df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, List **points)
+df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
+			   List **points)
 {
 	char		reason[256];
 	DfTails		tails;
@@ -2652,7 +2657,8 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, List **points)
 		return;
 	if (df_attach_worth(plan) &&
 		df_check_slice_b(stmt, plan, false, batches, &tails, reason, sizeof(reason),
-						 &locale_dependent))
+						 &locale_dependent) &&
+		!(locale_free && locale_dependent))
 	{
 		DfAttach   *a = palloc0(sizeof(DfAttach));
 
@@ -2682,18 +2688,18 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, List **points)
 		case T_Hash:
 		case T_NestLoop:
 		case T_MergeJoin:
-			df_find_attach(stmt, outerPlan(plan), batches, points);
+			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
 			return;
 		case T_HashJoin:
-			df_find_attach(stmt, outerPlan(plan), batches, points);
-			df_find_attach(stmt, innerPlan(plan), batches, points);
+			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
+			df_find_attach(stmt, innerPlan(plan), batches, locale_free, points);
 			return;
 		case T_SubqueryScan:
-			df_find_attach(stmt, ((SubqueryScan *) plan)->subplan, batches, points);
+			df_find_attach(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, points);
 			return;
 		case T_Append:
 			foreach(lc, ((Append *) plan)->appendplans)
-				df_find_attach(stmt, lfirst(lc), batches, points);
+				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
 			return;
 		default:
 			return;
@@ -2712,7 +2718,7 @@ df_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches)
 {
 	List	   *points = NIL;
 
-	df_find_attach(stmt, compute, batches, &points);
+	df_find_attach(stmt, compute, batches, false, &points);
 	return points;
 }
 
@@ -2785,14 +2791,17 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 /*
  * Would slice 'index' read the batches of receiving Motion 'motion' in
  * DataFusion?  As a whole, or in a subtree DataFusion runs below
- * PostgreSQL's nodes (T2) holding the Motion.
+ * PostgreSQL's nodes (T2) holding the Motion.  That subtree must not
+ * depend on the node's locale, as every node must agree; a node may still
+ * run more of the slice in DataFusion (such as a Sort above it by the
+ * default collation, where that is C), which reads the Motion too.
  */
 static bool
 df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *batches)
 {
 	Motion	   *sender;
 	Plan	   *compute;
-	List	   *points;
+	List	   *points = NIL;
 	ListCell   *lc;
 
 	if (df_slice_runs_in_datafusion(stmt, index, batches))
@@ -2801,7 +2810,7 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
 		return false;
 	sender = findSenderMotion(stmt, index);
 	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
-	points = df_slice_attach_points(stmt, compute, batches);
+	df_find_attach(stmt, compute, batches, true, &points);
 	foreach(lc, points)
 	{
 		DfAttach   *a = lfirst(lc);
@@ -2809,8 +2818,7 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
 		char		reason[256];
 
 		if (df_plan_contains(a->plan, (Plan *) motion))
-			return !a->locale_dependent &&
-				df_translate_slice(a->plan, &a->tails, &spec, reason, sizeof(reason));
+			return df_translate_slice(a->plan, &a->tails, &spec, reason, sizeof(reason));
 	}
 	return false;
 }

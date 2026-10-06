@@ -498,8 +498,12 @@ and `C.UTF-8` on the segments does), so EXPLAIN shows the coordinator's
 verdict, a segment may run the same slice on PostgreSQL, and the Motions
 of a slice whose verdict depends on the default collation carry tuples
 rather than batches, so that every node agrees on which Motions carry
-batches.  An explicit `COLLATE "C"` is the same everywhere and keeps the
-batches.  `ILIKE`, regular expressions, `md5`, `initcap` and other
+batches.  The exception is a Motion read by a part of the slice that does
+not depend on it: in TPC-H Q1 the aggregate under a Sort by `char(1)`
+columns reads the batches of a split numeric sum; every node runs that
+aggregate in DataFusion, and the Sort above it too where the collation is
+C, or on PostgreSQL where it is not.  An explicit `COLLATE "C"` is the
+same everywhere and keeps the batches.  `ILIKE`, regular expressions, `md5`, `initcap` and other
 string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out fixed-width values only;
 a PAX table with a string column is read through the table AM.
@@ -592,7 +596,8 @@ of Cloudberry's regression tests, slices DataFusion can run went from
 23% to 44% (Postgres planner) and from 21% to 39% (ORCA).  A Q1-like
 grouping by two char(1) columns over 10 million rows took 0.23 s
 against 1.03 s; with an ORDER BY under the database's default collation
-its slices decide per node and the batch Motions it needs are off.
+the aggregate still reads batches (TPC-H Q1 at scale factor 1 on PAX:
+0.27 s against 1.35 s).
 
 ### numeric results of integer aggregates
 

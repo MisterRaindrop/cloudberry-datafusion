@@ -20,7 +20,8 @@
 -- under any deterministic collation; ordering comparisons and min/max only
 -- under the C collation.  Whether the database's default collation is C is
 -- each node's own, so a slice that depends on it decides per node and its
--- Motions carry tuples.  Each query runs with datafusion.mode off, then
+-- Motions carry tuples, but for those read by a part of it that does not
+-- depend on it.  Each query runs with datafusion.mode off, then
 -- on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -214,6 +215,21 @@ SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') F
 WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
 SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
 SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
+
+-- A slice sorting by the default collation still reads the batches of a
+-- split numeric sum (TPC-H Q1): every node runs the aggregate below the
+-- Sort in DataFusion, and the Sort too where the collation is C.
+CREATE TABLE df_lc (id int4, f char(1), s char(1), q numeric(15,2)) DISTRIBUTED BY (id);
+INSERT INTO df_lc SELECT i, chr(65 + i % 3), chr(70 + i % 2), (i % 50) + 0.25
+FROM generate_series(1, 30000) i;
+ANALYZE df_lc;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
+SET datafusion.mode = off;
+SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
+SET datafusion.mode = on;
+SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
+DROP TABLE df_lc;
 
 DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
