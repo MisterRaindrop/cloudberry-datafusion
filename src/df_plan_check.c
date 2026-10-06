@@ -58,6 +58,7 @@
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -68,6 +69,7 @@
  * built with ICU.
  */
 extern bool lc_collate_is_c(Oid collation);
+extern bool lc_ctype_is_c(Oid collation);
 
 typedef struct DfCheckContext
 {
@@ -171,6 +173,75 @@ df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 		return "without a collation";
 	if (equality ? !get_collation_isdeterministic(collation) : !lc_collate_is_c(collation))
 		return equality ? "under a nondeterministic collation" : "under a collation other than C";
+	return NULL;
+}
+
+static const DfStringFunc df_string_funcs[] = {
+	{F_LENGTH_TEXT, "char_length", DF_COLL_ANY},
+	{F_CHAR_LENGTH_TEXT, "char_length", DF_COLL_ANY},
+	{F_CHARACTER_LENGTH_TEXT, "char_length", DF_COLL_ANY},
+	{F_OCTET_LENGTH_TEXT, "octet_length", DF_COLL_ANY},
+	{F_SUBSTR_TEXT_INT4_INT4, "substr", DF_COLL_ANY},
+	{F_SUBSTRING_TEXT_INT4_INT4, "substr", DF_COLL_ANY},
+	{F_SUBSTR_TEXT_INT4, "substr", DF_COLL_ANY},
+	{F_SUBSTRING_TEXT_INT4, "substr", DF_COLL_ANY},
+	{F_TEXTCAT, "textcat", DF_COLL_ANY},
+	{F_CONCAT, "concat", DF_COLL_ANY},
+	{F_BTRIM_TEXT_TEXT, "btrim", DF_COLL_ANY},
+	{F_BTRIM_TEXT, "btrim", DF_COLL_ANY},
+	{F_LTRIM_TEXT_TEXT, "ltrim", DF_COLL_ANY},
+	{F_LTRIM_TEXT, "ltrim", DF_COLL_ANY},
+	{F_RTRIM_TEXT_TEXT, "rtrim", DF_COLL_ANY},
+	{F_RTRIM_TEXT, "rtrim", DF_COLL_ANY},
+	{F_LEFT, "left", DF_COLL_ANY},
+	{F_RIGHT, "right", DF_COLL_ANY},
+	{F_REVERSE, "reverse", DF_COLL_ANY},
+	{F_REPEAT, "repeat", DF_COLL_ANY},
+	{F_LPAD_TEXT_INT4_TEXT, "lpad", DF_COLL_ANY},
+	{F_RPAD_TEXT_INT4_TEXT, "rpad", DF_COLL_ANY},
+	{F_STRPOS, "strpos", DF_COLL_DETERMINISTIC},
+	{F_POSITION_TEXT_TEXT, "strpos", DF_COLL_DETERMINISTIC},
+	{F_REPLACE, "replace", DF_COLL_DETERMINISTIC},
+	{F_SPLIT_PART, "split_part", DF_COLL_DETERMINISTIC},
+	{F_STARTS_WITH, "starts_with", DF_COLL_DETERMINISTIC},
+	{F_LOWER_TEXT, "lower", DF_COLL_CTYPE_C},
+	{F_UPPER_TEXT, "upper", DF_COLL_CTYPE_C},
+};
+
+const DfStringFunc *
+df_string_func(Oid funcid)
+{
+	int			i;
+
+	for (i = 0; i < lengthof(df_string_funcs); i++)
+		if (df_string_funcs[i].funcid == funcid)
+			return &df_string_funcs[i];
+	return NULL;
+}
+
+/*
+ * Why calling string function 'f' under 'collation' stays on PostgreSQL,
+ * or NULL.  Case mapping under the default collation depends on the
+ * node's LC_CTYPE, so such a verdict is marked as depending on the node.
+ */
+static const char *
+df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation)
+{
+	switch (f->rule)
+	{
+		case DF_COLL_ANY:
+			return NULL;
+		case DF_COLL_DETERMINISTIC:
+			if (!OidIsValid(collation) || !get_collation_isdeterministic(collation))
+				return "under a nondeterministic collation";
+			return NULL;
+		case DF_COLL_CTYPE_C:
+			if (collation == DEFAULT_COLLATION_OID)
+				cxt->locale_dependent = true;
+			if (!OidIsValid(collation) || !lc_ctype_is_c(collation))
+				return "under a collation other than C";
+			return NULL;
+	}
 	return NULL;
 }
 
@@ -315,7 +386,7 @@ static bool
 df_check_expr(Node *node, DfCheckContext *cxt)
 {
 	static const char *const operators[] =
-	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "~~", "!~~", NULL};
+	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "~~", "!~~", "||", NULL};
 	static const char *const aggregates[] =
 	{"count", "sum", "min", "max", "avg", NULL};
 
@@ -396,8 +467,15 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * Arithmetic on dates and times checks for overflow and
 					 * infinities, and comparing two types converts one.
 					 */
-					if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
-						(op->opresulttype != BOOLOID || ltype != rtype))
+					if (strcmp(name, "||") == 0)
+					{
+						/* text || text only, not text || anynonarray */
+						if (get_opcode(op->opno) != F_TEXTCAT)
+							df_reject(cxt, "operator || on %s and %s",
+									  format_type_be(ltype), format_type_be(rtype));
+					}
+					else if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
+							 (op->opresulttype != BOOLOID || ltype != rtype))
 						df_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
 					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
@@ -504,10 +582,34 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 
 		case T_FuncExpr:
 			{
-				char	   *name = get_func_name(((FuncExpr *) node)->funcid);
+				FuncExpr   *fe = (FuncExpr *) node;
+				const DfStringFunc *f = df_string_func(fe->funcid);
+				char	   *name = get_func_name(fe->funcid);
+				const char *problem;
+				ListCell   *lc;
 
-				df_reject(cxt, "function %s()", name ? name : "?");
-				return true;
+				if (f == NULL || fe->funcretset || fe->funcvariadic)
+				{
+					df_reject(cxt, "function %s()", name ? name : "?");
+					return true;
+				}
+				if ((problem = df_string_func_problem(cxt, f, fe->inputcollid)) != NULL)
+				{
+					df_reject(cxt, "function %s() %s", name, problem);
+					return true;
+				}
+				/* concat() takes "any": only text arguments here */
+				foreach(lc, fe->args)
+				{
+					Oid			argtype = exprType(lfirst(lc));
+
+					if (fe->funcid == F_CONCAT && !df_type_is_string(argtype))
+					{
+						df_reject(cxt, "function concat() of %s", format_type_be(argtype));
+						return true;
+					}
+				}
+				break;
 			}
 
 		case T_SubPlan:

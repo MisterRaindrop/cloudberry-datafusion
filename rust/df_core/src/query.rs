@@ -120,7 +120,7 @@ use tokio::task::JoinHandle;
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
-use crate::pgstr::PgLike;
+use crate::pgstr::{PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
 /// Rows per input batch the main thread pushes.
@@ -371,6 +371,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
         if name == "~~" || name == "!~~" {
             return Ok(PgLike::udf(name == "!~~").call(vec![a, b]));
         }
+        if name == "||" {
+            return Ok(PgStrFn::udf(StrFn::Textcat).call(vec![a, b]));
+        }
         if let Some(cmp) = comparison(name) {
             return Ok(binary_expr(a, cmp, b));
         }
@@ -422,6 +425,13 @@ fn expr(v: &Value) -> Result<Expr, String> {
     if let Some(e) = v.get("isnotnull") {
         return Ok(expr(e)?.is_not_null());
     }
+    if let Some(name) = v.get("call") {
+        let name = name.as_str().unwrap_or("");
+        let f = StrFn::from_pg(name).ok_or_else(|| format!("unsupported function {name}"))?;
+        let args = field(v, "args")?.as_array().ok_or("plan spec: bad args")?;
+        let args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
+        return Ok(PgStrFn::udf(f).call(args));
+    }
     if let Some(e) = v.get("cast") {
         let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
         return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(expr(e)?), ty)));
@@ -430,11 +440,17 @@ fn expr(v: &Value) -> Result<Expr, String> {
 }
 
 /// Can evaluating this expression raise an error?  The PostgreSQL
-/// arithmetic operators can (overflow, division by zero), and LIKE with a
-/// pattern that is not a constant (one ending in an escape character).
+/// arithmetic operators can (overflow, division by zero), LIKE with a
+/// pattern that is not a constant (one ending in an escape character), and
+/// some string functions (StrFn::may_fail).
 fn may_fail(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
+            if let Some(f) = map.get("call").and_then(Value::as_str).and_then(StrFn::from_pg) {
+                if f.may_fail() {
+                    return true;
+                }
+            }
             if let Some(op) = map.get("op").and_then(Value::as_str) {
                 if ArithOp::from_pg(op).is_some() {
                     return true;

@@ -60,7 +60,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
 -- PostgreSQL raises an error only on rows that reach the dangling escape.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE E'k1\\';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x' AND char_length(v) > 2;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
 EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
 -- Redistributed by text and varchar keys as batches (hashtext through
@@ -123,6 +123,47 @@ SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st_big 
 SELECT t AS big FROM df_st_big WHERE id = 1500 \gset
 SELECT length(:'big'), md5(:'big');
 
+-- String functions over edge values: empty, multibyte and 4-byte
+-- characters, separators, and integers at both ends of their range.
+CREATE TABLE df_sf (id serial, s text, p text, n int4) DISTRIBUTED BY (id);
+INSERT INTO df_sf (s, p, n)
+SELECT s, p, n FROM
+  unnest(ARRAY['', 'abc', ' pad  ', '中文字符串', '😀a😀', 'a,b,,c', 'aaa', NULL]) s,
+  unnest(ARRAY['', 'a', ',', 'aa', '😀', NULL]) p,
+  unnest(ARRAY[-2147483648, -2, 0, 3, 2147483647, NULL]::int4[]) n;
+ANALYZE df_sf;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 2), lower(s COLLATE "C") FROM df_sf;
+EXPLAIN (COSTS OFF) SELECT concat(s, n), s || n FROM df_sf;
+EXPLAIN (COSTS OFF) SELECT md5(s) FROM df_sf;
+SET datafusion.mode = off;
+SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
+  replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
+FROM df_sf WHERE n = 3 ORDER BY id;
+SELECT s, n, substr(s, n), substr(s, n, 3), left(s, n), right(s, n), lpad(s, n, 'xy'), rpad(s, n, 'xy')
+FROM df_sf WHERE p = 'a' AND n < 100 ORDER BY id;
+SELECT s, btrim(s), btrim(s, 'a😀'), ltrim(s, ' a'), rtrim(s), reverse(s), repeat(s, 2),
+  lower(s COLLATE "C"), upper(s COLLATE "C")
+FROM df_sf WHERE p = '' AND n = 0 ORDER BY id;
+SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
+SET datafusion.mode = on;
+SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
+  replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
+FROM df_sf WHERE n = 3 ORDER BY id;
+SELECT s, n, substr(s, n), substr(s, n, 3), left(s, n), right(s, n), lpad(s, n, 'xy'), rpad(s, n, 'xy')
+FROM df_sf WHERE p = 'a' AND n < 100 ORDER BY id;
+SELECT s, btrim(s), btrim(s, 'a😀'), ltrim(s, ' a'), rtrim(s), reverse(s), repeat(s, 2),
+  lower(s COLLATE "C"), upper(s COLLATE "C")
+FROM df_sf WHERE p = '' AND n = 0 ORDER BY id;
+SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
+-- PostgreSQL's errors, with their SQLSTATEs.
+\set VERBOSITY sqlstate
+SELECT count(substr(s, 1, -1)) FROM df_sf;
+SELECT count(split_part(s, ',', 0)) FROM df_sf;
+SELECT count(repeat(s, 1000000000)) FROM df_sf;
+SELECT count(lpad(s, 300000000, 'x')) FROM df_sf;
+\set VERBOSITY default
+
 -- Strings handed out row by row through a cursor (rows arrive from the
 -- segments in any order, so they are all alike).
 BEGIN;
@@ -132,7 +173,7 @@ FETCH 2 FROM df_st_cur;
 CLOSE df_st_cur;
 COMMIT;
 
-DROP TABLE df_st, df_st2, df_st_big;
+DROP TABLE df_st, df_st2, df_st_big, df_sf;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

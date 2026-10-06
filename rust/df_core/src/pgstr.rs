@@ -17,11 +17,14 @@
 
 //! PostgreSQL's string operators and functions over UTF-8 text, transcribed
 //! from the backend so that results and errors agree with it: LIKE
-//! (like_match.c, UTF8_MatchText).
+//! (like_match.c, UTF8_MatchText) and the functions of varlena.c and
+//! oracle_compat.c the planner hook lets through.
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int32Array, Int32Builder, StringArray, StringBuilder,
+};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue};
@@ -289,6 +292,425 @@ impl ScalarUDFImpl for PgLike {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Functions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StrFn {
+    CharLength,
+    OctetLength,
+    Substr,
+    Textcat,
+    Concat,
+    Btrim,
+    Ltrim,
+    Rtrim,
+    Left,
+    Right,
+    Reverse,
+    Repeat,
+    Lpad,
+    Rpad,
+    Strpos,
+    Replace,
+    SplitPart,
+    StartsWith,
+    Lower,
+    Upper,
+}
+
+impl StrFn {
+    pub fn from_pg(name: &str) -> Option<StrFn> {
+        Some(match name {
+            "char_length" => StrFn::CharLength,
+            "octet_length" => StrFn::OctetLength,
+            "substr" => StrFn::Substr,
+            "textcat" => StrFn::Textcat,
+            "concat" => StrFn::Concat,
+            "btrim" => StrFn::Btrim,
+            "ltrim" => StrFn::Ltrim,
+            "rtrim" => StrFn::Rtrim,
+            "left" => StrFn::Left,
+            "right" => StrFn::Right,
+            "reverse" => StrFn::Reverse,
+            "repeat" => StrFn::Repeat,
+            "lpad" => StrFn::Lpad,
+            "rpad" => StrFn::Rpad,
+            "strpos" => StrFn::Strpos,
+            "replace" => StrFn::Replace,
+            "split_part" => StrFn::SplitPart,
+            "starts_with" => StrFn::StartsWith,
+            "lower" => StrFn::Lower,
+            "upper" => StrFn::Upper,
+            _ => return None,
+        })
+    }
+
+    /// Can a call raise an error (and so need the AND/OR guards)?
+    pub fn may_fail(self) -> bool {
+        matches!(self, StrFn::Substr | StrFn::Repeat | StrFn::Lpad | StrFn::Rpad | StrFn::SplitPart)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            StrFn::CharLength => "pg_char_length",
+            StrFn::OctetLength => "pg_octet_length",
+            StrFn::Substr => "pg_substr",
+            StrFn::Textcat => "pg_textcat",
+            StrFn::Concat => "pg_concat",
+            StrFn::Btrim => "pg_btrim",
+            StrFn::Ltrim => "pg_ltrim",
+            StrFn::Rtrim => "pg_rtrim",
+            StrFn::Left => "pg_left",
+            StrFn::Right => "pg_right",
+            StrFn::Reverse => "pg_reverse",
+            StrFn::Repeat => "pg_repeat",
+            StrFn::Lpad => "pg_lpad",
+            StrFn::Rpad => "pg_rpad",
+            StrFn::Strpos => "pg_strpos",
+            StrFn::Replace => "pg_replace",
+            StrFn::SplitPart => "pg_split_part",
+            StrFn::StartsWith => "pg_starts_with",
+            StrFn::Lower => "pg_lower",
+            StrFn::Upper => "pg_upper",
+        }
+    }
+
+    fn return_type(self) -> DataType {
+        match self {
+            StrFn::CharLength | StrFn::OctetLength | StrFn::Strpos => DataType::Int32,
+            StrFn::StartsWith => DataType::Boolean,
+            _ => DataType::Utf8,
+        }
+    }
+}
+
+/// MaxAllocSize: the largest value PostgreSQL builds.
+const MAX_ALLOC: i64 = 0x3fff_ffff;
+
+fn too_large() -> DataFusionError {
+    pg_error("54000", "requested length too large")
+}
+
+fn nchars(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// The first `n` characters of `s` (all of it if it has fewer).
+fn first_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((at, _)) => &s[..at],
+        None => s,
+    }
+}
+
+/// `s` without its first `n` characters.
+fn skip_chars(s: &str, n: usize) -> &str {
+    &s[first_chars(s, n).len()..]
+}
+
+/// text_substring: characters from `start` (1-based), `len` of them or to
+/// the end.
+fn substr(s: &str, start: i32, len: Option<i32>) -> Result<&str> {
+    let s1 = start.max(1);
+    let take = match len {
+        None => None,
+        Some(l) if l < 0 => return Err(pg_error("22011", "negative substring length not allowed")),
+        Some(l) => match start.checked_add(l) {
+            None => None, // to the end
+            Some(e) if e < 1 => return Ok(""),
+            Some(e) => Some((e - s1) as usize),
+        },
+    };
+    let rest = skip_chars(s, (s1 - 1) as usize);
+    Ok(match take {
+        Some(n) => first_chars(rest, n),
+        None => rest,
+    })
+}
+
+/// lpad/rpad: `s` cut or padded to `len` characters with `fill` repeated.
+fn pad(s: &str, len: i32, fill: &str, left: bool) -> Result<String> {
+    let mut len = len.max(0) as usize;
+    let s1len = nchars(s).min(len);
+    if fill.is_empty() {
+        len = s1len;
+    }
+    // PostgreSQL sizes the result for 4-byte characters first.
+    if 4 * len as i64 + 4 > MAX_ALLOC {
+        return Err(too_large());
+    }
+    let mut out = String::new();
+    let head = first_chars(s, s1len);
+    if !left {
+        out.push_str(head);
+    }
+    let mut filler = fill.chars().cycle();
+    for _ in 0..len - s1len {
+        out.push(filler.next().unwrap());
+    }
+    if left {
+        out.push_str(head);
+    }
+    Ok(out)
+}
+
+/// An argument column: text or int4.
+enum Arg<'a> {
+    Text(&'a StringArray),
+    Int(&'a Int32Array),
+}
+
+impl<'a> Arg<'a> {
+    fn is_null(&self, r: usize) -> bool {
+        match self {
+            Arg::Text(a) => a.is_null(r),
+            Arg::Int(a) => a.is_null(r),
+        }
+    }
+
+    fn text(&self, r: usize) -> Result<&'a str> {
+        match self {
+            Arg::Text(a) => Ok(a.value(r)),
+            Arg::Int(_) => Err(DataFusionError::Internal("expected a text argument".into())),
+        }
+    }
+
+    fn int(&self, r: usize) -> Result<i32> {
+        match self {
+            Arg::Int(a) => Ok(a.value(r)),
+            Arg::Text(_) => Err(DataFusionError::Internal("expected an integer argument".into())),
+        }
+    }
+}
+
+/// An argument as text or int4 (the C side passes int2 and int8 arguments
+/// of these functions nowhere, but casting costs nothing to allow).
+fn prepare(a: ArrayRef) -> Result<ArrayRef> {
+    match a.data_type() {
+        DataType::Int32 => Ok(a),
+        DataType::Int16 | DataType::Int64 => {
+            cast(&a, &DataType::Int32).map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        }
+        _ => utf8(&a),
+    }
+}
+
+/// A text result: a piece of an argument where possible.
+enum Text<'a> {
+    Slice(&'a str),
+    Owned(String),
+}
+
+impl Text<'_> {
+    fn as_str(&self) -> &str {
+        match self {
+            Text::Slice(s) => s,
+            Text::Owned(s) => s,
+        }
+    }
+}
+
+/// Row `r` of a text-valued function other than textcat and concat; None
+/// for NULL.
+fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>>> {
+    if args.iter().any(|a| a.is_null(r)) {
+        return Ok(None); // strict
+    }
+    let t = |i: usize| args[i].text(r);
+    let n = |i: usize| args[i].int(r);
+    let set = || -> Result<&'a str> { if args.len() > 1 { t(1) } else { Ok(" ") } };
+    Ok(Some(match f {
+        StrFn::Substr => Text::Slice(substr(t(0)?, n(1)?, if args.len() > 2 { Some(n(2)?) } else { None })?),
+        StrFn::Btrim => {
+            let set = set()?;
+            Text::Slice(t(0)?.trim_matches(|c| set.contains(c)))
+        }
+        StrFn::Ltrim => {
+            let set = set()?;
+            Text::Slice(t(0)?.trim_start_matches(|c| set.contains(c)))
+        }
+        StrFn::Rtrim => {
+            let set = set()?;
+            Text::Slice(t(0)?.trim_end_matches(|c| set.contains(c)))
+        }
+        StrFn::Left => {
+            let (s, k) = (t(0)?, n(1)? as i64);
+            let keep = if k >= 0 { k } else { nchars(s) as i64 + k };
+            Text::Slice(if keep <= 0 { "" } else { first_chars(s, keep as usize) })
+        }
+        StrFn::Right => {
+            let (s, k) = (t(0)?, n(1)?);
+            // -INT_MIN wraps (Cloudberry builds with -fwrapv): nothing skipped.
+            let skip = if k == i32::MIN { 0 } else if k < 0 { -k as i64 } else { nchars(s) as i64 - k as i64 };
+            Text::Slice(if skip <= 0 { s } else { skip_chars(s, skip as usize) })
+        }
+        StrFn::Reverse => Text::Owned(t(0)?.chars().rev().collect()),
+        StrFn::Repeat => {
+            let (s, count) = (t(0)?, n(1)?.max(0) as i64);
+            let total = count * s.len() as i64;
+            if total > i32::MAX as i64 || total + 4 > MAX_ALLOC {
+                return Err(too_large());
+            }
+            Text::Owned(s.repeat(count as usize))
+        }
+        StrFn::Lpad => Text::Owned(pad(t(0)?, n(1)?, t(2)?, true)?),
+        StrFn::Rpad => Text::Owned(pad(t(0)?, n(1)?, t(2)?, false)?),
+        StrFn::Replace => {
+            let (s, from, to) = (t(0)?, t(1)?, t(2)?);
+            if s.is_empty() || from.is_empty() || !s.contains(from) {
+                Text::Slice(s)
+            } else {
+                Text::Owned(s.replace(from, to))
+            }
+        }
+        StrFn::SplitPart => {
+            let (s, sep, field) = (t(0)?, t(1)?, n(2)?);
+            if field == 0 {
+                return Err(pg_error("22023", "field position must not be zero"));
+            }
+            Text::Slice(if s.is_empty() {
+                ""
+            } else if sep.is_empty() {
+                if field == 1 || field == -1 { s } else { "" }
+            } else if field > 0 {
+                s.split(sep).nth(field as usize - 1).unwrap_or("")
+            } else {
+                // Fields as PostgreSQL finds them, left to right (not rsplit:
+                // with a separator like "aa" the matches differ).
+                let fields: Vec<&str> = s.split(sep).collect();
+                let i = fields.len() as i64 + field as i64;
+                if i < 0 { "" } else { fields[i as usize] }
+            })
+        }
+        // Under the C collation PostgreSQL maps ASCII letters only.
+        StrFn::Lower => {
+            let s = t(0)?;
+            if s.bytes().any(|b| b.is_ascii_uppercase()) { Text::Owned(s.to_ascii_lowercase()) } else { Text::Slice(s) }
+        }
+        StrFn::Upper => {
+            let s = t(0)?;
+            if s.bytes().any(|b| b.is_ascii_lowercase()) { Text::Owned(s.to_ascii_uppercase()) } else { Text::Slice(s) }
+        }
+        _ => return Err(DataFusionError::Internal(format!("{f:?} is not a text function"))),
+    }))
+}
+
+/// Row `r` of an int4-valued function; None for NULL.
+fn call_int(f: StrFn, args: &[Arg], r: usize) -> Result<Option<i32>> {
+    if args.iter().any(|a| a.is_null(r)) {
+        return Ok(None);
+    }
+    let s = args[0].text(r)?;
+    Ok(Some(match f {
+        StrFn::CharLength => nchars(s) as i32,
+        StrFn::OctetLength => s.len() as i32,
+        StrFn::Strpos => {
+            let sub = args[1].text(r)?;
+            if sub.is_empty() {
+                1
+            } else {
+                match s.find(sub) {
+                    Some(at) => nchars(&s[..at]) as i32 + 1,
+                    None => 0,
+                }
+            }
+        }
+        _ => return Err(DataFusionError::Internal(format!("{f:?} is not an integer function"))),
+    }))
+}
+
+/// One of PostgreSQL's string functions (StrFn) over text and int4 values.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PgStrFn {
+    f: StrFn,
+    signature: Signature,
+}
+
+impl PgStrFn {
+    pub fn udf(f: StrFn) -> ScalarUDF {
+        ScalarUDF::new_from_impl(PgStrFn { f, signature: Signature::variadic_any(Volatility::Immutable) })
+    }
+}
+
+impl ScalarUDFImpl for PgStrFn {
+    fn name(&self) -> &str {
+        self.f.name()
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(self.f.return_type())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        use std::fmt::Write;
+
+        let n = args.number_rows;
+        let owned = args.args.iter().map(|a| prepare(a.to_array(n)?)).collect::<Result<Vec<ArrayRef>>>()?;
+        let cols: Vec<Arg> = owned
+            .iter()
+            .map(|a| match a.data_type() {
+                DataType::Int32 => Arg::Int(a.as_primitive()),
+                _ => Arg::Text(a.as_string::<i32>()),
+            })
+            .collect();
+        let out: ArrayRef = match self.f {
+            StrFn::CharLength | StrFn::OctetLength | StrFn::Strpos => {
+                let mut b = Int32Builder::with_capacity(n);
+                for r in 0..n {
+                    b.append_option(call_int(self.f, &cols, r)?);
+                }
+                Arc::new(b.finish())
+            }
+            StrFn::StartsWith => {
+                let mut b = BooleanBuilder::with_capacity(n);
+                for r in 0..n {
+                    if cols[0].is_null(r) || cols[1].is_null(r) {
+                        b.append_null();
+                    } else {
+                        b.append_value(cols[0].text(r)?.starts_with(cols[1].text(r)?));
+                    }
+                }
+                Arc::new(b.finish())
+            }
+            StrFn::Textcat | StrFn::Concat => {
+                // Written straight into the result buffer.
+                let mut b = StringBuilder::with_capacity(n, 0);
+                for r in 0..n {
+                    if self.f == StrFn::Textcat && cols.iter().any(|a| a.is_null(r)) {
+                        b.append_null();
+                        continue;
+                    }
+                    // concat skips NULLs and is never NULL.
+                    for a in &cols {
+                        if !a.is_null(r) {
+                            b.write_str(a.text(r)?).map_err(|e| DataFusionError::Internal(e.to_string()))?;
+                        }
+                    }
+                    b.append_value("");
+                }
+                Arc::new(b.finish())
+            }
+            _ => {
+                let mut b = StringBuilder::with_capacity(n, 0);
+                for r in 0..n {
+                    match call_text(self.f, &cols, r)? {
+                        Some(v) => b.append_value(v.as_str()),
+                        None => b.append_null(),
+                    }
+                }
+                Arc::new(b.finish())
+            }
+        };
+        Ok(ColumnarValue::Array(out))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +756,72 @@ mod tests {
         ];
         for (t, p, want) in cases {
             assert_eq!(like(t, p).unwrap(), *want, "{t:?} LIKE {p:?}");
+        }
+    }
+
+    /// One row of `f` over text (`T`) and int4 (`I`) arguments.
+    enum A<'a> {
+        T(&'a str),
+        I(i32),
+    }
+
+    fn text_fn(f: StrFn, args: &[A]) -> String {
+        let owned: Vec<ArrayRef> = args
+            .iter()
+            .map(|a| -> ArrayRef {
+                match a {
+                    A::T(s) => Arc::new(StringArray::from(vec![*s])),
+                    A::I(i) => Arc::new(Int32Array::from(vec![*i])),
+                }
+            })
+            .collect();
+        let cols: Vec<Arg> = owned
+            .iter()
+            .map(|a| match a.data_type() {
+                DataType::Int32 => Arg::Int(a.as_primitive()),
+                _ => Arg::Text(a.as_string::<i32>()),
+            })
+            .collect();
+        if f == StrFn::Strpos {
+            return call_int(f, &cols, 0).unwrap().unwrap().to_string();
+        }
+        call_text(f, &cols, 0).unwrap().unwrap().as_str().to_string()
+    }
+
+    #[test]
+    fn functions_agree_with_postgresql() {
+        use A::{I, T};
+        // Expected values from PostgreSQL 16.
+        let cases: Vec<(StrFn, Vec<A>, &str)> = vec![
+            (StrFn::SplitPart, vec![T("aaa"), T("aa"), I(1)], ""),
+            (StrFn::SplitPart, vec![T("aaa"), T("aa"), I(2)], "a"),
+            (StrFn::SplitPart, vec![T("aaa"), T("aa"), I(-1)], "a"),
+            (StrFn::SplitPart, vec![T("aaa"), T("aa"), I(-2)], ""),
+            (StrFn::SplitPart, vec![T("a,b,,c"), T(","), I(-2)], ""),
+            (StrFn::SplitPart, vec![T("a,b"), T(","), I(5)], ""),
+            (StrFn::Substr, vec![T("中文字符串"), I(0), I(3)], "中文"),
+            (StrFn::Substr, vec![T("中文字符串"), I(-2), I(5)], "中文"),
+            (StrFn::Substr, vec![T("中文字符串"), I(4)], "符串"),
+            (StrFn::Substr, vec![T("abc"), I(i32::MAX), I(10)], ""),
+            (StrFn::Substr, vec![T("abc"), I(2), I(i32::MAX)], "bc"),
+            (StrFn::Left, vec![T("中文字符串"), I(-2)], "中文字"),
+            (StrFn::Right, vec![T("中文字符串"), I(-2)], "字符串"),
+            (StrFn::Right, vec![T("abc"), I(i32::MIN)], "abc"),
+            (StrFn::Left, vec![T("abc"), I(i32::MIN)], ""),
+            (StrFn::Right, vec![T("abc"), I(5)], "abc"),
+            (StrFn::Lpad, vec![T("中文"), I(5), T("xy")], "xyx中文"),
+            (StrFn::Rpad, vec![T("中文字符串"), I(3), T("x")], "中文字"),
+            (StrFn::Lpad, vec![T("ab"), I(-1), T("x")], ""),
+            (StrFn::Rpad, vec![T("ab"), I(4), T("")], "ab"),
+            (StrFn::Btrim, vec![T("xxa中xx"), T("x中")], "a"),
+            (StrFn::Ltrim, vec![T("  a  ")], "a  "),
+            (StrFn::Rtrim, vec![T("😀a😀"), T("😀")], "😀a"),
+            (StrFn::Strpos, vec![T("中文字符串"), T("字")], "3"),
+            (StrFn::Strpos, vec![T("abc"), T("")], "1"),
+            (StrFn::Replace, vec![T("aaaa"), T("aa"), T("b")], "bb"),
+        ];
+        for (f, args, want) in &cases {
+            assert_eq!(text_fn(*f, args), *want, "{f:?}");
         }
     }
 

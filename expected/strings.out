@@ -141,17 +141,17 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE E'k1\\';
  DataFusion: slice 1 not eligible: LIKE pattern ending with an escape character
 (8 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
-                          QUERY PLAN                          
---------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x' AND char_length(v) > 2;
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_st
-                     Filter: ((t || 'x'::text) = 'k1x'::text)
+                     Filter: ((char_length((v)::text) > 2) AND ((t || 'x'::text) = 'k1x'::text))
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator ||
+ DataFusion: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
@@ -520,6 +520,287 @@ SELECT length(:'big'), md5(:'big');
    9664 | 42590384552ce5ebf03a0a287b9cbb57
 (1 row)
 
+-- String functions over edge values: empty, multibyte and 4-byte
+-- characters, separators, and integers at both ends of their range.
+CREATE TABLE df_sf (id serial, s text, p text, n int4) DISTRIBUTED BY (id);
+INSERT INTO df_sf (s, p, n)
+SELECT s, p, n FROM
+  unnest(ARRAY['', 'abc', ' pad  ', '中文字符串', '😀a😀', 'a,b,,c', 'aaa', NULL]) s,
+  unnest(ARRAY['', 'a', ',', 'aa', '😀', NULL]) p,
+  unnest(ARRAY[-2147483648, -2, 0, 3, 2147483647, NULL]::int4[]) n;
+ANALYZE df_sf;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 2), lower(s COLLATE "C") FROM df_sf;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_sf
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT concat(s, n), s || n FROM df_sf;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_sf
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: function concat() of integer
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT md5(s) FROM df_sf;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_sf
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: function md5()
+(5 rows)
+
+SET datafusion.mode = off;
+SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
+  replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
+FROM df_sf WHERE n = 3 ORDER BY id;
+     s      | p  | n | char_length | octet_length |   ?column?   |    concat    | strpos |  replace   | starts_with | split_part | split_part 
+------------+----+---+-------------+--------------+--------------+--------------+--------+------------+-------------+------------+------------
+            |    | 3 |           0 |            0 |              |              |      1 |            | t           |            | 
+            | a  | 3 |           0 |            0 | a            | a            |      0 |            | f           |            | 
+            | ,  | 3 |           0 |            0 | ,            | ,            |      0 |            | f           |            | 
+            | aa | 3 |           0 |            0 | aa           | aa           |      0 |            | f           |            | 
+            | 😀 | 3 |           0 |            0 | 😀           | 😀           |      0 |            | f           |            | 
+            |    | 3 |           0 |            0 |              |              |        |            |             |            | 
+ abc        |    | 3 |           3 |            3 | abc          | abc          |      1 | abc        | t           |            | abc
+ abc        | a  | 3 |           3 |            3 | abca         | abca         |      1 | #bc        | t           | bc         | bc
+ abc        | ,  | 3 |           3 |            3 | abc,         | abc,         |      0 | abc        | f           |            | abc
+ abc        | aa | 3 |           3 |            3 | abcaa        | abcaa        |      0 | abc        | f           |            | abc
+ abc        | 😀 | 3 |           3 |            3 | abc😀        | abc😀        |      0 | abc        | f           |            | abc
+ abc        |    | 3 |           3 |            3 |              | abc          |        |            |             |            | 
+  pad       |    | 3 |           6 |            6 |  pad         |  pad         |      1 |  pad       | t           |            |  pad  
+  pad       | a  | 3 |           6 |            6 |  pad  a      |  pad  a      |      3 |  p#d       | f           | d          | d  
+  pad       | ,  | 3 |           6 |            6 |  pad  ,      |  pad  ,      |      0 |  pad       | f           |            |  pad  
+  pad       | aa | 3 |           6 |            6 |  pad  aa     |  pad  aa     |      0 |  pad       | f           |            |  pad  
+  pad       | 😀 | 3 |           6 |            6 |  pad  😀     |  pad  😀     |      0 |  pad       | f           |            |  pad  
+  pad       |    | 3 |           6 |            6 |              |  pad         |        |            |             |            | 
+ 中文字符串 |    | 3 |           5 |           15 | 中文字符串   | 中文字符串   |      1 | 中文字符串 | t           |            | 中文字符串
+ 中文字符串 | a  | 3 |           5 |           15 | 中文字符串a  | 中文字符串a  |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | ,  | 3 |           5 |           15 | 中文字符串,  | 中文字符串,  |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | aa | 3 |           5 |           15 | 中文字符串aa | 中文字符串aa |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | 😀 | 3 |           5 |           15 | 中文字符串😀 | 中文字符串😀 |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 |    | 3 |           5 |           15 |              | 中文字符串   |        |            |             |            | 
+ 😀a😀      |    | 3 |           3 |            9 | 😀a😀        | 😀a😀        |      1 | 😀a😀      | t           |            | 😀a😀
+ 😀a😀      | a  | 3 |           3 |            9 | 😀a😀a       | 😀a😀a       |      2 | 😀#😀      | f           | 😀         | 😀
+ 😀a😀      | ,  | 3 |           3 |            9 | 😀a😀,       | 😀a😀,       |      0 | 😀a😀      | f           |            | 😀a😀
+ 😀a😀      | aa | 3 |           3 |            9 | 😀a😀aa      | 😀a😀aa      |      0 | 😀a😀      | f           |            | 😀a😀
+ 😀a😀      | 😀 | 3 |           3 |            9 | 😀a😀😀      | 😀a😀😀      |      1 | #a#        | t           | a          | 
+ 😀a😀      |    | 3 |           3 |            9 |              | 😀a😀        |        |            |             |            | 
+ a,b,,c     |    | 3 |           6 |            6 | a,b,,c       | a,b,,c       |      1 | a,b,,c     | t           |            | a,b,,c
+ a,b,,c     | a  | 3 |           6 |            6 | a,b,,ca      | a,b,,ca      |      1 | #,b,,c     | t           | ,b,,c      | ,b,,c
+ a,b,,c     | ,  | 3 |           6 |            6 | a,b,,c,      | a,b,,c,      |      2 | a#b##c     | f           | b          | c
+ a,b,,c     | aa | 3 |           6 |            6 | a,b,,caa     | a,b,,caa     |      0 | a,b,,c     | f           |            | a,b,,c
+ a,b,,c     | 😀 | 3 |           6 |            6 | a,b,,c😀     | a,b,,c😀     |      0 | a,b,,c     | f           |            | a,b,,c
+ a,b,,c     |    | 3 |           6 |            6 |              | a,b,,c       |        |            |             |            | 
+ aaa        |    | 3 |           3 |            3 | aaa          | aaa          |      1 | aaa        | t           |            | aaa
+ aaa        | a  | 3 |           3 |            3 | aaaa         | aaaa         |      1 | ###        | t           |            | 
+ aaa        | ,  | 3 |           3 |            3 | aaa,         | aaa,         |      0 | aaa        | f           |            | aaa
+ aaa        | aa | 3 |           3 |            3 | aaaaa        | aaaaa        |      1 | #a         | t           | a          | a
+ aaa        | 😀 | 3 |           3 |            3 | aaa😀        | aaa😀        |      0 | aaa        | f           |            | aaa
+ aaa        |    | 3 |           3 |            3 |              | aaa          |        |            |             |            | 
+            |    | 3 |             |              |              |              |        |            |             |            | 
+            | a  | 3 |             |              |              | a            |        |            |             |            | 
+            | ,  | 3 |             |              |              | ,            |        |            |             |            | 
+            | aa | 3 |             |              |              | aa           |        |            |             |            | 
+            | 😀 | 3 |             |              |              | 😀           |        |            |             |            | 
+            |    | 3 |             |              |              |              |        |            |             |            | 
+(48 rows)
+
+SELECT s, n, substr(s, n), substr(s, n, 3), left(s, n), right(s, n), lpad(s, n, 'xy'), rpad(s, n, 'xy')
+FROM df_sf WHERE p = 'a' AND n < 100 ORDER BY id;
+     s      |      n      |   substr   | substr |  left  |   right    |  lpad  |  rpad  
+------------+-------------+------------+--------+--------+------------+--------+--------
+            | -2147483648 |            |        |        |            |        | 
+            |          -2 |            |        |        |            |        | 
+            |           0 |            |        |        |            |        | 
+            |           3 |            |        |        |            | xyx    | xyx
+ abc        | -2147483648 | abc        |        |        | abc        |        | 
+ abc        |          -2 | abc        |        | a      | c          |        | 
+ abc        |           0 | abc        | ab     |        |            |        | 
+ abc        |           3 | c          | c      | abc    | abc        | abc    | abc
+  pad       | -2147483648 |  pad       |        |        |  pad       |        | 
+  pad       |          -2 |  pad       |        |  pad   | ad         |        | 
+  pad       |           0 |  pad       |  p     |        |            |        | 
+  pad       |           3 | ad         | ad     |  pa    | d          |  pa    |  pa
+ 中文字符串 | -2147483648 | 中文字符串 |        |        | 中文字符串 |        | 
+ 中文字符串 |          -2 | 中文字符串 |        | 中文字 | 字符串     |        | 
+ 中文字符串 |           0 | 中文字符串 | 中文   |        |            |        | 
+ 中文字符串 |           3 | 字符串     | 字符串 | 中文字 | 字符串     | 中文字 | 中文字
+ 😀a😀      | -2147483648 | 😀a😀      |        |        | 😀a😀      |        | 
+ 😀a😀      |          -2 | 😀a😀      |        | 😀     | 😀         |        | 
+ 😀a😀      |           0 | 😀a😀      | 😀a    |        |            |        | 
+ 😀a😀      |           3 | 😀         | 😀     | 😀a😀  | 😀a😀      | 😀a😀  | 😀a😀
+ a,b,,c     | -2147483648 | a,b,,c     |        |        | a,b,,c     |        | 
+ a,b,,c     |          -2 | a,b,,c     |        | a,b,   | b,,c       |        | 
+ a,b,,c     |           0 | a,b,,c     | a,     |        |            |        | 
+ a,b,,c     |           3 | b,,c       | b,,    | a,b    | ,,c        | a,b    | a,b
+ aaa        | -2147483648 | aaa        |        |        | aaa        |        | 
+ aaa        |          -2 | aaa        |        | a      | a          |        | 
+ aaa        |           0 | aaa        | aa     |        |            |        | 
+ aaa        |           3 | a          | a      | aaa    | aaa        | aaa    | aaa
+            | -2147483648 |            |        |        |            |        | 
+            |          -2 |            |        |        |            |        | 
+            |           0 |            |        |        |            |        | 
+            |           3 |            |        |        |            |        | 
+(32 rows)
+
+SELECT s, btrim(s), btrim(s, 'a😀'), ltrim(s, ' a'), rtrim(s), reverse(s), repeat(s, 2),
+  lower(s COLLATE "C"), upper(s COLLATE "C")
+FROM df_sf WHERE p = '' AND n = 0 ORDER BY id;
+     s      |   btrim    |   btrim    |   ltrim    |   rtrim    |  reverse   |        repeat        |   lower    |   upper    
+------------+------------+------------+------------+------------+------------+----------------------+------------+------------
+            |            |            |            |            |            |                      |            | 
+ abc        | abc        | bc         | bc         | abc        | cba        | abcabc               | abc        | ABC
+  pad       | pad        |  pad       | pad        |  pad       |   dap      |  pad   pad           |  pad       |  PAD  
+ 中文字符串 | 中文字符串 | 中文字符串 | 中文字符串 | 中文字符串 | 串符字文中 | 中文字符串中文字符串 | 中文字符串 | 中文字符串
+ 😀a😀      | 😀a😀      |            | 😀a😀      | 😀a😀      | 😀a😀      | 😀a😀😀a😀           | 😀a😀      | 😀A😀
+ a,b,,c     | a,b,,c     | ,b,,c      | ,b,,c      | a,b,,c     | c,,b,a     | a,b,,ca,b,,c         | a,b,,c     | A,B,,C
+ aaa        | aaa        |            |            | aaa        | aaa        | aaaaaa               | aaa        | AAA
+            |            |            |            |            |            |                      |            | 
+(8 rows)
+
+SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
+ count 
+-------
+     0
+(1 row)
+
+SET datafusion.mode = on;
+SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
+  replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
+FROM df_sf WHERE n = 3 ORDER BY id;
+     s      | p  | n | char_length | octet_length |   ?column?   |    concat    | strpos |  replace   | starts_with | split_part | split_part 
+------------+----+---+-------------+--------------+--------------+--------------+--------+------------+-------------+------------+------------
+            |    | 3 |           0 |            0 |              |              |      1 |            | t           |            | 
+            | a  | 3 |           0 |            0 | a            | a            |      0 |            | f           |            | 
+            | ,  | 3 |           0 |            0 | ,            | ,            |      0 |            | f           |            | 
+            | aa | 3 |           0 |            0 | aa           | aa           |      0 |            | f           |            | 
+            | 😀 | 3 |           0 |            0 | 😀           | 😀           |      0 |            | f           |            | 
+            |    | 3 |           0 |            0 |              |              |        |            |             |            | 
+ abc        |    | 3 |           3 |            3 | abc          | abc          |      1 | abc        | t           |            | abc
+ abc        | a  | 3 |           3 |            3 | abca         | abca         |      1 | #bc        | t           | bc         | bc
+ abc        | ,  | 3 |           3 |            3 | abc,         | abc,         |      0 | abc        | f           |            | abc
+ abc        | aa | 3 |           3 |            3 | abcaa        | abcaa        |      0 | abc        | f           |            | abc
+ abc        | 😀 | 3 |           3 |            3 | abc😀        | abc😀        |      0 | abc        | f           |            | abc
+ abc        |    | 3 |           3 |            3 |              | abc          |        |            |             |            | 
+  pad       |    | 3 |           6 |            6 |  pad         |  pad         |      1 |  pad       | t           |            |  pad  
+  pad       | a  | 3 |           6 |            6 |  pad  a      |  pad  a      |      3 |  p#d       | f           | d          | d  
+  pad       | ,  | 3 |           6 |            6 |  pad  ,      |  pad  ,      |      0 |  pad       | f           |            |  pad  
+  pad       | aa | 3 |           6 |            6 |  pad  aa     |  pad  aa     |      0 |  pad       | f           |            |  pad  
+  pad       | 😀 | 3 |           6 |            6 |  pad  😀     |  pad  😀     |      0 |  pad       | f           |            |  pad  
+  pad       |    | 3 |           6 |            6 |              |  pad         |        |            |             |            | 
+ 中文字符串 |    | 3 |           5 |           15 | 中文字符串   | 中文字符串   |      1 | 中文字符串 | t           |            | 中文字符串
+ 中文字符串 | a  | 3 |           5 |           15 | 中文字符串a  | 中文字符串a  |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | ,  | 3 |           5 |           15 | 中文字符串,  | 中文字符串,  |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | aa | 3 |           5 |           15 | 中文字符串aa | 中文字符串aa |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 | 😀 | 3 |           5 |           15 | 中文字符串😀 | 中文字符串😀 |      0 | 中文字符串 | f           |            | 中文字符串
+ 中文字符串 |    | 3 |           5 |           15 |              | 中文字符串   |        |            |             |            | 
+ 😀a😀      |    | 3 |           3 |            9 | 😀a😀        | 😀a😀        |      1 | 😀a😀      | t           |            | 😀a😀
+ 😀a😀      | a  | 3 |           3 |            9 | 😀a😀a       | 😀a😀a       |      2 | 😀#😀      | f           | 😀         | 😀
+ 😀a😀      | ,  | 3 |           3 |            9 | 😀a😀,       | 😀a😀,       |      0 | 😀a😀      | f           |            | 😀a😀
+ 😀a😀      | aa | 3 |           3 |            9 | 😀a😀aa      | 😀a😀aa      |      0 | 😀a😀      | f           |            | 😀a😀
+ 😀a😀      | 😀 | 3 |           3 |            9 | 😀a😀😀      | 😀a😀😀      |      1 | #a#        | t           | a          | 
+ 😀a😀      |    | 3 |           3 |            9 |              | 😀a😀        |        |            |             |            | 
+ a,b,,c     |    | 3 |           6 |            6 | a,b,,c       | a,b,,c       |      1 | a,b,,c     | t           |            | a,b,,c
+ a,b,,c     | a  | 3 |           6 |            6 | a,b,,ca      | a,b,,ca      |      1 | #,b,,c     | t           | ,b,,c      | ,b,,c
+ a,b,,c     | ,  | 3 |           6 |            6 | a,b,,c,      | a,b,,c,      |      2 | a#b##c     | f           | b          | c
+ a,b,,c     | aa | 3 |           6 |            6 | a,b,,caa     | a,b,,caa     |      0 | a,b,,c     | f           |            | a,b,,c
+ a,b,,c     | 😀 | 3 |           6 |            6 | a,b,,c😀     | a,b,,c😀     |      0 | a,b,,c     | f           |            | a,b,,c
+ a,b,,c     |    | 3 |           6 |            6 |              | a,b,,c       |        |            |             |            | 
+ aaa        |    | 3 |           3 |            3 | aaa          | aaa          |      1 | aaa        | t           |            | aaa
+ aaa        | a  | 3 |           3 |            3 | aaaa         | aaaa         |      1 | ###        | t           |            | 
+ aaa        | ,  | 3 |           3 |            3 | aaa,         | aaa,         |      0 | aaa        | f           |            | aaa
+ aaa        | aa | 3 |           3 |            3 | aaaaa        | aaaaa        |      1 | #a         | t           | a          | a
+ aaa        | 😀 | 3 |           3 |            3 | aaa😀        | aaa😀        |      0 | aaa        | f           |            | aaa
+ aaa        |    | 3 |           3 |            3 |              | aaa          |        |            |             |            | 
+            |    | 3 |             |              |              |              |        |            |             |            | 
+            | a  | 3 |             |              |              | a            |        |            |             |            | 
+            | ,  | 3 |             |              |              | ,            |        |            |             |            | 
+            | aa | 3 |             |              |              | aa           |        |            |             |            | 
+            | 😀 | 3 |             |              |              | 😀           |        |            |             |            | 
+            |    | 3 |             |              |              |              |        |            |             |            | 
+(48 rows)
+
+SELECT s, n, substr(s, n), substr(s, n, 3), left(s, n), right(s, n), lpad(s, n, 'xy'), rpad(s, n, 'xy')
+FROM df_sf WHERE p = 'a' AND n < 100 ORDER BY id;
+     s      |      n      |   substr   | substr |  left  |   right    |  lpad  |  rpad  
+------------+-------------+------------+--------+--------+------------+--------+--------
+            | -2147483648 |            |        |        |            |        | 
+            |          -2 |            |        |        |            |        | 
+            |           0 |            |        |        |            |        | 
+            |           3 |            |        |        |            | xyx    | xyx
+ abc        | -2147483648 | abc        |        |        | abc        |        | 
+ abc        |          -2 | abc        |        | a      | c          |        | 
+ abc        |           0 | abc        | ab     |        |            |        | 
+ abc        |           3 | c          | c      | abc    | abc        | abc    | abc
+  pad       | -2147483648 |  pad       |        |        |  pad       |        | 
+  pad       |          -2 |  pad       |        |  pad   | ad         |        | 
+  pad       |           0 |  pad       |  p     |        |            |        | 
+  pad       |           3 | ad         | ad     |  pa    | d          |  pa    |  pa
+ 中文字符串 | -2147483648 | 中文字符串 |        |        | 中文字符串 |        | 
+ 中文字符串 |          -2 | 中文字符串 |        | 中文字 | 字符串     |        | 
+ 中文字符串 |           0 | 中文字符串 | 中文   |        |            |        | 
+ 中文字符串 |           3 | 字符串     | 字符串 | 中文字 | 字符串     | 中文字 | 中文字
+ 😀a😀      | -2147483648 | 😀a😀      |        |        | 😀a😀      |        | 
+ 😀a😀      |          -2 | 😀a😀      |        | 😀     | 😀         |        | 
+ 😀a😀      |           0 | 😀a😀      | 😀a    |        |            |        | 
+ 😀a😀      |           3 | 😀         | 😀     | 😀a😀  | 😀a😀      | 😀a😀  | 😀a😀
+ a,b,,c     | -2147483648 | a,b,,c     |        |        | a,b,,c     |        | 
+ a,b,,c     |          -2 | a,b,,c     |        | a,b,   | b,,c       |        | 
+ a,b,,c     |           0 | a,b,,c     | a,     |        |            |        | 
+ a,b,,c     |           3 | b,,c       | b,,    | a,b    | ,,c        | a,b    | a,b
+ aaa        | -2147483648 | aaa        |        |        | aaa        |        | 
+ aaa        |          -2 | aaa        |        | a      | a          |        | 
+ aaa        |           0 | aaa        | aa     |        |            |        | 
+ aaa        |           3 | a          | a      | aaa    | aaa        | aaa    | aaa
+            | -2147483648 |            |        |        |            |        | 
+            |          -2 |            |        |        |            |        | 
+            |           0 |            |        |        |            |        | 
+            |           3 |            |        |        |            |        | 
+(32 rows)
+
+SELECT s, btrim(s), btrim(s, 'a😀'), ltrim(s, ' a'), rtrim(s), reverse(s), repeat(s, 2),
+  lower(s COLLATE "C"), upper(s COLLATE "C")
+FROM df_sf WHERE p = '' AND n = 0 ORDER BY id;
+     s      |   btrim    |   btrim    |   ltrim    |   rtrim    |  reverse   |        repeat        |   lower    |   upper    
+------------+------------+------------+------------+------------+------------+----------------------+------------+------------
+            |            |            |            |            |            |                      |            | 
+ abc        | abc        | bc         | bc         | abc        | cba        | abcabc               | abc        | ABC
+  pad       | pad        |  pad       | pad        |  pad       |   dap      |  pad   pad           |  pad       |  PAD  
+ 中文字符串 | 中文字符串 | 中文字符串 | 中文字符串 | 中文字符串 | 串符字文中 | 中文字符串中文字符串 | 中文字符串 | 中文字符串
+ 😀a😀      | 😀a😀      |            | 😀a😀      | 😀a😀      | 😀a😀      | 😀a😀😀a😀           | 😀a😀      | 😀A😀
+ a,b,,c     | a,b,,c     | ,b,,c      | ,b,,c      | a,b,,c     | c,,b,a     | a,b,,ca,b,,c         | a,b,,c     | A,B,,C
+ aaa        | aaa        |            |            | aaa        | aaa        | aaaaaa               | aaa        | AAA
+            |            |            |            |            |            |                      |            | 
+(8 rows)
+
+SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
+ count 
+-------
+     0
+(1 row)
+
+-- PostgreSQL's errors, with their SQLSTATEs.
+\set VERBOSITY sqlstate
+SELECT count(substr(s, 1, -1)) FROM df_sf;
+ERROR:  22011
+SELECT count(split_part(s, ',', 0)) FROM df_sf;
+ERROR:  22023
+SELECT count(repeat(s, 1000000000)) FROM df_sf;
+ERROR:  54000
+SELECT count(lpad(s, 300000000, 'x')) FROM df_sf;
+ERROR:  54000
+\set VERBOSITY default
 -- Strings handed out row by row through a cursor (rows arrive from the
 -- segments in any order, so they are all alike).
 BEGIN;
@@ -540,7 +821,7 @@ FETCH 2 FROM df_st_cur;
 
 CLOSE df_st_cur;
 COMMIT;
-DROP TABLE df_st, df_st2, df_st_big;
+DROP TABLE df_st, df_st2, df_st_big, df_sf;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

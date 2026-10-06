@@ -426,6 +426,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | X1 | `text` and `varchar`; batch size from the row width |
 | X2 | Redistribute batches by `text` and `varchar` keys (`hashtext`) |
 | L1 | `LIKE` and `NOT LIKE` |
+| L2 | Common string functions and `\|\|` |
 
 ### Date and time types
 
@@ -473,8 +474,8 @@ verdict, a segment may run the same slice on PostgreSQL, and the Motions
 of a slice whose verdict depends on the default collation carry tuples
 rather than batches, so that every node agrees on which Motions carry
 batches.  An explicit `COLLATE "C"` is the same everywhere and keeps the
-batches.  Functions and operators on strings (`||`, `length`, `ILIKE`)
-stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
+batches.  `ILIKE`, regular expressions, `md5`, `initcap` and other
+string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out fixed-width values only;
 a PAX table with a string column is read through the table AM.
 
@@ -492,6 +493,32 @@ raises the same error (22025) on the same rows, and runs behind the
 guards of AND and OR like arithmetic does.  Over 20 million rows, `LIKE
 '%00042%'` took 0.24 s against 1.04 s in PostgreSQL, `LIKE 'city-4%'`
 0.23 s against 0.72 s.
+
+String functions (L2), identified by their pg_proc OID so that overloads
+on other types do not slip through, are transcribed in `df_core::pgstr`
+from varlena.c and oracle_compat.c, counting characters, not bytes,
+wherever PostgreSQL does:
+
+| Functions | Collation |
+|---|---|
+| `length`, `char_length`, `octet_length`, `substr`/`substring(s, n [, len])`, `text \|\| text`, `concat` of text, `btrim`/`ltrim`/`rtrim`, `left`, `right`, `reverse`, `repeat`, `lpad`, `rpad` | any |
+| `strpos`/`position`, `replace`, `split_part`, `starts_with` | deterministic (PostgreSQL rejects the others) |
+| `lower`, `upper` | C or POSIX (ASCII letters only, as PostgreSQL maps them there) |
+
+Their errors keep PostgreSQL's SQLSTATEs (negative substring length 22011,
+field position zero 22023, results over 1 GB 54000), and calls that can
+raise them run behind the AND/OR guards.  `text || integer`, `concat` with
+other types and `VARIADIC` calls stay on PostgreSQL.  Whether the default
+collation's LC_CTYPE is C is each node's own, so `lower` and `upper`
+under it are decided per node like ordering comparisons (in this
+container PostgreSQL itself takes the multibyte path on the coordinator,
+and these calls stay there).  A test runs every function over 6,500
+combinations of edge values (empty, multibyte and 4-byte strings,
+separators that overlap, integers from INT_MIN to INT_MAX, NULLs) with
+DataFusion off and on: identical.  Over 20 million rows,
+`upper(city COLLATE "C") || '/' || btrim(cust, 'c') = ...` took 0.27 s
+against 1.00 s in PostgreSQL, grouping by `split_part(city, '-', 2)` 0.25 s
+against 1.02 s.
 
 Redistribute Motions by a `text` or `varchar` key carry batches too (X2):
 cdbhash calls `hashtext` with the default collation, which is always

@@ -458,6 +458,23 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				return;
 			}
 
+		case T_FuncExpr:
+			{
+				FuncExpr   *fe = (FuncExpr *) node;
+				const DfStringFunc *f = df_string_func(fe->funcid);
+				const char *tag = df_type_tag(fe->funcresulttype);
+
+				if (f == NULL || tag == NULL)
+				{
+					df_fail(b, "a function call");
+					return;
+				}
+				appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"%s\",\"args\":", f->name, tag);
+				df_emit_list(b, out, fe->args, level);
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
 		case T_RelabelType:
 			/* varchar read as text, or COLLATE (checked by the planner hook) */
 			df_emit(b, out, (Node *) ((RelabelType *) node)->arg, level);

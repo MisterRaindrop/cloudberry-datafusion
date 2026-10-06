@@ -72,6 +72,23 @@ typedef struct DfSliceSpec
 	int			batch_rows;		/* rows per batch, from the widest row */
 } DfSliceSpec;
 
+/* String functions DataFusion runs (df_core::pgstr), by pg_proc OID. */
+typedef enum DfCollRule
+{
+	DF_COLL_ANY,				/* the collation does not matter */
+	DF_COLL_DETERMINISTIC,		/* substring searches: PostgreSQL rejects others */
+	DF_COLL_CTYPE_C				/* case mapping: ASCII only under C */
+} DfCollRule;
+
+typedef struct DfStringFunc
+{
+	Oid			funcid;
+	const char *name;			/* as df_core::pgstr knows it */
+	DfCollRule	rule;
+} DfStringFunc;
+
+extern const DfStringFunc *df_string_func(Oid funcid);
+
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
 						   MotionState *send, char *reason, size_t reasonlen);
