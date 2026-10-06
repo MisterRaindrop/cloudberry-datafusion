@@ -78,6 +78,17 @@ typedef struct DfTails
 								 * the Motion's keys (D3) */
 } DfTails;
 
+/*
+ * T2: a subtree of a slice DataFusion runs below PostgreSQL's nodes, when
+ * the slice as a whole cannot run (df_slice_attach_points).
+ */
+typedef struct DfAttach
+{
+	Plan	   *plan;			/* its top node */
+	DfTails		tails;			/* as df_check_slice found them */
+	bool		locale_dependent;	/* its verdict depends on the node */
+} DfAttach;
+
 /* What df_translate_slice produces for one slice. */
 typedef struct DfSliceSpec
 {
@@ -188,6 +199,7 @@ extern const char *df_cast_kind(Oid funcid);
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
 						   MotionState *send, const DfTails *tails,
 						   char *reason, size_t reasonlen);
+extern PlanState *df_exec_find_state(PlanState *ps, Plan *plan);
 extern uint64 df_runs_completed;	/* slices DataFusion ran to the end */
 extern DfQueryStats df_last_run;	/* figures of the latest one */
 
@@ -251,6 +263,7 @@ extern void df_install_hooks(void);
 /* df_plan_check.c */
 extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 						   DfTails *tails, char *reason, size_t reasonlen);
+extern List *df_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches);
 extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
 								 bool *is_sender);
 extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);

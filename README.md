@@ -752,6 +752,34 @@ or at the top of the coordinator's slice stays on PostgreSQL, since the
 query's ORDER BY may rest on its order.  `count(DISTINCT a % 100000)`
 over 30 million rows took 0.65 s against 3.29 s.
 
+### Subtrees below PostgreSQL's nodes
+
+T2: when a slice as a whole cannot run in DataFusion, DataFusion runs the
+highest subtrees of it that can, and PostgreSQL's nodes above them pull
+their rows as from any child: ORCA's Result on top, a Sort under the
+database's default collation, a Limit WITH TIES, a combining aggregate
+over a Nested Loop.  Only children their parents run once qualify: below
+Result, Sort, Limit, Unique, Material, ProjectSet, WindowAgg, Agg,
+SubqueryScan, every child of an Append, both sides of a Hash Join, the
+outer side of a Nested Loop or Merge Join (whose inner side is rescanned
+or marked), never a Hash node itself (its join builds the table through
+MultiExecProcNode; its child qualifies).  DataFusion's output is ordered
+only below a Sort of its own, which is what a GroupAggregate or WindowAgg
+above it relies on.  A subtree that only passes rows on (a Motion's, an
+unfiltered scan's) is not worth starting.  Such a slice sends tuples;
+its subtrees still read batch Motions, which the batch decision now
+counts.  EXPLAIN shows `eligible below the top: <nodes> (above:
+<reason>)`.
+
+Over the TPC-H queries of Cloudberry's regression tests, run with their
+data under both planners, 144 slices run this way (50 under the Postgres
+planner, 94 under ORCA) besides the 388 that run whole, and every query
+returns PostgreSQL's rows.  Running them found three older bugs, fixed
+before: an aggregate without outputs, a semi join reading its inner side,
+and DataFusion's own join reordering (eliminate_cross_join), which hung
+Q7.  A grouping below ORCA's Result over 30 million rows took 0.27 s
+against 1.39 s.
+
 ### Sort and LIMIT
 
 S1 runs a Sort and a Limit at the top of a slice: ORDER BY with LIMIT and

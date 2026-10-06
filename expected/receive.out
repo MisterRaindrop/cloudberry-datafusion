@@ -310,8 +310,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_
                                        Hash Key: y.e
                                        ->  Seq Scan on df_rcv y
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: aggregate over another aggregate
- DataFusion: slice 1 eligible
+ DataFusion: slice 0 eligible below the top: Aggregate (above: aggregate over another aggregate)
+ DataFusion: slice 1 eligible, sends Arrow batches
  DataFusion: slice 2 eligible, sends Arrow batches
 (15 rows)
 

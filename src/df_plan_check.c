@@ -2402,6 +2402,128 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
 }
 
 /* ---------------------------------------------------------------------
+ * T2: subtrees DataFusion runs below PostgreSQL's nodes
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * Can DataFusion take over subtree 'plan', and is it worth starting for
+ * it?  Not at a Hash node, which its Hash Join runs through
+ * MultiExecProcNode rather than ExecProcNode (its child can be taken
+ * over); not for rows it would only pass on: a Motion's, or a table's
+ * without a filter.
+ */
+static bool
+df_attach_worth(Plan *plan)
+{
+	if (IsA(plan, Motion) || IsA(plan, Hash))
+		return false;
+	if (IsA(plan, SeqScan) && plan->qual == NIL)
+		return false;
+	return true;
+}
+
+static void
+df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, List **points)
+{
+	char		reason[256];
+	DfTails		tails;
+	bool		locale_dependent = false;
+	ListCell   *lc;
+
+	if (plan == NULL || IsA(plan, Motion))
+		return;
+	if (df_attach_worth(plan) &&
+		df_check_slice_b(stmt, plan, false, batches, &tails, reason, sizeof(reason),
+						 &locale_dependent))
+	{
+		DfAttach   *a = palloc0(sizeof(DfAttach));
+
+		a->plan = plan;
+		a->tails = tails;
+		a->locale_dependent = locale_dependent;
+		*points = lappend(*points, a);
+		return;
+	}
+
+	/*
+	 * Below the PostgreSQL node, in the children it runs once: DataFusion's
+	 * stream cannot be rescanned or marked, so not a Nested Loop's inner
+	 * side, a Merge Join's, or anything else that may run again.
+	 */
+	switch (nodeTag(plan))
+	{
+		case T_Result:
+		case T_Sort:
+		case T_IncrementalSort:
+		case T_Limit:
+		case T_Unique:
+		case T_Material:
+		case T_ProjectSet:
+		case T_WindowAgg:
+		case T_Agg:
+		case T_Hash:
+		case T_NestLoop:
+		case T_MergeJoin:
+			df_find_attach(stmt, outerPlan(plan), batches, points);
+			return;
+		case T_HashJoin:
+			df_find_attach(stmt, outerPlan(plan), batches, points);
+			df_find_attach(stmt, innerPlan(plan), batches, points);
+			return;
+		case T_SubqueryScan:
+			df_find_attach(stmt, ((SubqueryScan *) plan)->subplan, batches, points);
+			return;
+		case T_Append:
+			foreach(lc, ((Append *) plan)->appendplans)
+				df_find_attach(stmt, lfirst(lc), batches, points);
+			return;
+		default:
+			return;
+	}
+}
+
+/*
+ * The subtrees of the slice computed by 'compute' (below its sending
+ * Motion, if any) that DataFusion runs when the slice as a whole cannot:
+ * the highest ones that can, below the PostgreSQL nodes above them.  NIL
+ * if none.  Their rows go to PostgreSQL's nodes as tuples, so a slice run
+ * this way sends no batches.
+ */
+List *
+df_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches)
+{
+	List	   *points = NIL;
+
+	df_find_attach(stmt, compute, batches, &points);
+	return points;
+}
+
+/* Is 'target' a node of 'plan' within its slice? */
+static bool
+df_plan_contains(Plan *plan, Plan *target)
+{
+	if (plan == NULL)
+		return false;
+	if (plan == target)
+		return true;
+	if (IsA(plan, Motion))
+		return false;
+	if (IsA(plan, SubqueryScan) && df_plan_contains(((SubqueryScan *) plan)->subplan, target))
+		return true;
+	if (IsA(plan, Append))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((Append *) plan)->appendplans)
+			if (df_plan_contains(lfirst(lc), target))
+				return true;
+	}
+	return df_plan_contains(outerPlan(plan), target) ||
+		df_plan_contains(innerPlan(plan), target);
+}
+
+/* ---------------------------------------------------------------------
  * M7b: which Gather Motions carry Arrow batches
  * ---------------------------------------------------------------------
  */
@@ -2440,6 +2562,39 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 		snprintf(reason, sizeof(reason), "its verdict depends on the node's default collation");
 	elog(DEBUG2, "datafusion: with these batch Motions slice %d cannot run: %s",
 		 index, compute ? reason : "no plan");
+	return false;
+}
+
+/*
+ * Would slice 'index' read the batches of receiving Motion 'motion' in
+ * DataFusion?  As a whole, or in a subtree DataFusion runs below
+ * PostgreSQL's nodes (T2) holding the Motion.
+ */
+static bool
+df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *batches)
+{
+	Motion	   *sender;
+	Plan	   *compute;
+	List	   *points;
+	ListCell   *lc;
+
+	if (df_slice_runs_in_datafusion(stmt, index, batches))
+		return true;
+	if (index < 0 || index >= stmt->numSlices)
+		return false;
+	sender = findSenderMotion(stmt, index);
+	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
+	points = df_slice_attach_points(stmt, compute, batches);
+	foreach(lc, points)
+	{
+		DfAttach   *a = lfirst(lc);
+		DfSliceSpec spec;
+		char		reason[256];
+
+		if (df_plan_contains(a->plan, (Plan *) motion))
+			return !a->locale_dependent &&
+				df_translate_slice(a->plan, &a->tails, &spec, reason, sizeof(reason));
+	}
 	return false;
 }
 
@@ -2575,8 +2730,8 @@ df_batch_motions(PlannedStmt *stmt)
 
 			if (bms_is_member(m->motionID, batches) &&
 				!(df_slice_runs_in_datafusion(stmt, m->motionID, batches) &&
-				  df_slice_runs_in_datafusion(stmt, stmt->slices[m->motionID].parentIndex,
-											  batches)))
+				  df_slice_reads_batches(stmt, stmt->slices[m->motionID].parentIndex,
+										 m, batches)))
 			{
 				batches = bms_del_member(batches, m->motionID);
 				changed = true;
@@ -2782,8 +2937,30 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 							 df_motion_sends_batches(stmt, (Motion *) cxt.roots[i].root) ?
 							 ", sends Arrow batches" : "");
 		else
-			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
-							 cxt.roots[i].index, reason);
+		{
+			Plan	   *compute = cxt.roots[i].is_sender ?
+				outerPlan(cxt.roots[i].root) : cxt.roots[i].root;
+			List	   *points = df_slice_attach_points(stmt, compute, df_batch_motions(stmt));
+			ListCell   *lc;
+
+			if (points == NIL)
+				appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
+								 cxt.roots[i].index, reason);
+			else
+			{
+				/* T2: what runs below PostgreSQL's nodes, and why they stay */
+				appendStringInfo(out, "DataFusion: slice %d eligible below the top:",
+								 cxt.roots[i].index);
+				foreach(lc, points)
+				{
+					Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
+
+					appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
+									 df_plan_name(p) ? df_plan_name(p) : "?");
+				}
+				appendStringInfo(out, " (above: %s)\n", reason);
+			}
+		}
 	}
 	pfree(cxt.roots);
 }

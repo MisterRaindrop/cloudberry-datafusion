@@ -127,7 +127,7 @@ EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY a FETCH FIRST 3 ROWS WITH TIES
                      ->  Seq Scan on df_so
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: LIMIT WITH TIES
- DataFusion: slice 1 not eligible: LIMIT WITH TIES
+ DataFusion: slice 1 eligible below the top: Sort (above: LIMIT WITH TIES)
 (10 rows)
 
 EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY t USING ~<~ LIMIT 3;
@@ -163,8 +163,8 @@ EXPLAIN (COSTS OFF) SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2 LIMIT 3;
                                        ->  Seq Scan on df_so
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: sort key avg returning numeric
- DataFusion: slice 2 not eligible: partial aggregate avg without batch Motions
+ DataFusion: slice 1 eligible below the top: Aggregate (above: sort key avg returning numeric)
+ DataFusion: slice 2 eligible, sends Arrow batches
 (17 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT a FROM df_so ORDER BY a LIMIT 5) s;

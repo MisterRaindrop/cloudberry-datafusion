@@ -1164,8 +1164,27 @@ df_find_state(PlanState *ps, Plan *leaf)
 		return ps;
 	if (IsA(ps, MotionState))
 		return NULL;
+	if (IsA(ps, SubqueryScanState))
+		return df_find_state(((SubqueryScanState *) ps)->subplan, leaf);
+	if (IsA(ps, AppendState))
+	{
+		AppendState *as = (AppendState *) ps;
+		int			i;
+
+		for (i = 0; i < as->as_nplans; i++)
+			if ((found = df_find_state(as->appendplans[i], leaf)) != NULL)
+				return found;
+		return NULL;
+	}
 	found = df_find_state(outerPlanState(ps), leaf);
 	return found ? found : df_find_state(innerPlanState(ps), leaf);
+}
+
+/* The PlanState of 'plan' below 'ps' in this slice, or NULL (T2). */
+PlanState *
+df_exec_find_state(PlanState *ps, Plan *plan)
+{
+	return df_find_state(ps, plan);
 }
 
 bool

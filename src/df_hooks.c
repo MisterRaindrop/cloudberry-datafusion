@@ -112,6 +112,39 @@ df_takeover_find(QueryDesc *queryDesc)
 	return NULL;
 }
 
+/*
+ * T2: run in DataFusion the subtrees below the PostgreSQL nodes at the top
+ * of slice 'slice_index' (whose top PlanState is 'top') that can run there.
+ * Returns whether any does.
+ */
+static bool
+df_attach_below(QueryDesc *queryDesc, PlanState *top, int slice_index)
+{
+	PlannedStmt *stmt = queryDesc->plannedstmt;
+	List	   *points = df_slice_attach_points(stmt, top->plan, df_batch_motions(stmt));
+	ListCell   *lc;
+	int			attached = 0;
+
+	foreach(lc, points)
+	{
+		DfAttach   *a = lfirst(lc);
+		PlanState  *ps = df_exec_find_state(top, a->plan);
+		char		reason[256];
+
+		if (ps != NULL && df_exec_attach(queryDesc, ps, NULL, &a->tails, reason, sizeof(reason)))
+			attached++;
+		else
+			elog(DEBUG1, "datafusion: a subtree of slice %d stays on the PostgreSQL executor: %s",
+				 slice_index, ps ? reason : "no executor state");
+	}
+	if (attached > 0)
+	{
+		elog(DEBUG1, "datafusion: slice %d runs %d subtrees below its top", slice_index, attached);
+		df_takeover_record(queryDesc, slice_index);
+	}
+	return attached > 0;
+}
+
 static void
 df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
@@ -157,6 +190,9 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			attach != NULL &&
 			df_exec_attach(queryDesc, attach, send, &tails, reason, sizeof(reason)))
 			df_takeover_record(queryDesc, slice_index);
+		else if (send == NULL && attach != NULL &&
+				 df_attach_below(queryDesc, attach, slice_index))
+			 /* T2: subtrees below PostgreSQL's nodes */ ;
 		else if (send != NULL)
 			/* the receiver expects batches; tuples would only fail there */
 			ereport(ERROR,

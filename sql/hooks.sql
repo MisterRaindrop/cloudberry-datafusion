@@ -36,6 +36,7 @@ FROM pg_class WHERE relhasindex AND relpages >= 0 GROUP BY relnatts;
 EXPLAIN (COSTS OFF) SELECT relname FROM pg_class;
 EXPLAIN (COSTS OFF) SELECT avg(relpages) FROM pg_class;
 EXPLAIN (COSTS OFF) SELECT count(relnatts ORDER BY relnatts) FROM pg_class;
+-- (the Aggregate below the Limit runs in DataFusion: T2)
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE abs(relpages) > 0;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relnatts IN (1, 2);
@@ -59,7 +60,7 @@ SELECT datafusion_debug_takeovers();
 SET datafusion.mode = on;
 SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0;
 SELECT datafusion_debug_takeovers();
-SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES;
+SELECT count(*) > 0 AS ok FROM pg_class WHERE relname > 'a';
 SELECT datafusion_debug_takeovers();
 INSERT INTO df_hooks_t SELECT i, i, i FROM generate_series(1, 100) i;
 SELECT sum(b), count(*) FROM df_hooks_t WHERE c > 50;
