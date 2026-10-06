@@ -127,6 +127,9 @@ df_type_tag(Oid type)
 		case TEXTOID:
 		case VARCHAROID:
 			return "text";
+		case NUMERICOID:
+			/* only results of aggregates over integers so far: scale 0 */
+			return "numeric";
 		default:
 			return NULL;
 	}
@@ -325,16 +328,13 @@ df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
 	return i;
 }
 
-/* Is 'node' a partial avg, whose state goes out as sum and count? */
-static bool
-df_is_partial_avg(Node *node)
+/* The DataFusion state a partial aggregate sends instead of its own. */
+static DfAggState
+df_partial_state(Node *node)
 {
-	char	   *name;
-
 	if (!IsA(node, Aggref) || ((Aggref *) node)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
-		return false;
-	name = get_func_name(((Aggref *) node)->aggfnoid);
-	return name != NULL && strcmp(name, "avg") == 0;
+		return DF_AGG_PLAIN;
+	return df_agg_state((Aggref *) node);
 }
 
 static void
@@ -484,6 +484,12 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			if (level != DF_LEVEL_AGG)
 			{
 				df_fail(b, "an aggregate outside the aggregate node");
+				return;
+			}
+			if (df_agg_state((Aggref *) node) == DF_AGG_AVG_INT)
+			{
+				/* only a whole output column (df_emit_outputs) */
+				df_fail(b, "an avg returning numeric inside an expression");
 				return;
 			}
 			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
@@ -639,29 +645,65 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 	ListCell   *lc;
 	int			i = 0;
 
-	spec->nout = list_length(tlist);
+	spec->nout = 0;
 	foreach(lc, tlist)
-		if (df_is_partial_avg((Node *) lfirst_node(TargetEntry, lc)->expr))
+	{
+		Node	   *expr = (Node *) lfirst_node(TargetEntry, lc)->expr;
+
+		if (level == DF_LEVEL_AGG && df_partial_state(expr) != DF_AGG_PLAIN)
+			spec->nout += df_agg_state_ncols(df_partial_state(expr));
+		else if (level == DF_LEVEL_AGG && IsA(expr, Aggref) &&
+				 df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT)
+			spec->nout += 2;	/* numeric sum and count */
+		else
 			spec->nout++;
+	}
 	spec->out_types = palloc(sizeof(Oid) * Max(spec->nout, 1));
+	spec->out_kinds = palloc0(sizeof(uint8) * Max(spec->nout, 1));
 	appendStringInfoChar(out, '[');
 	foreach(lc, tlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 		Oid			type = exprType((Node *) tle->expr);
 		const char *tag = df_type_tag(type);
+		DfAggState	state = level == DF_LEVEL_AGG ?
+			df_partial_state((Node *) tle->expr) : DF_AGG_PLAIN;
 
-		if (level == DF_LEVEL_AGG && df_is_partial_avg((Node *) tle->expr))
+		if (state != DF_AGG_PLAIN)
 		{
-			/* DataFusion's avg state: sum, then count (M7d) */
+			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1) */
 			Aggref	   *agg = (Aggref *) tle->expr;
+			bool		fsum = state == DF_AGG_AVG_FLOAT;
 
-			spec->out_types[i++] = FLOAT8OID;
+			spec->out_types[i++] = fsum ? FLOAT8OID : NUMERICOID;
+			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
+							 i > 1 ? "," : "",
+							 df_agg_ref(b, agg, fsum ? "sum" : "sum_numeric"),
+							 fsum ? "float8" : "numeric");
+			if (df_agg_state_ncols(state) == 2)
+			{
+				spec->out_types[i++] = INT8OID;
+				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
+								 df_agg_ref(b, agg, "count"));
+			}
+			continue;
+		}
+		if (level == DF_LEVEL_AGG && IsA(tle->expr, Aggref) &&
+			df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT)
+		{
+			/* avg = numeric sum / count, divided on the C side (N1) */
+			Aggref	   *agg = (Aggref *) tle->expr;
+			bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+
+			spec->out_kinds[i] = DF_OUT_NUMERIC_AVG;
+			spec->out_types[i++] = NUMERICOID;
+			spec->out_kinds[i] = DF_OUT_PART;
 			spec->out_types[i++] = INT8OID;
-			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"float8\"},"
+			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"numeric\"},"
 							 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
 							 i > 2 ? "," : "",
-							 df_agg_ref(b, agg, "sum"), df_agg_ref(b, agg, "count"));
+							 df_agg_ref(b, agg, combine ? "merge_sum" : "sum_numeric"),
+							 df_agg_ref(b, agg, combine ? "merge_count" : "count"));
 			continue;
 		}
 		if (tag == NULL)
@@ -771,6 +813,29 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 
 			if (i++ > 0)
 				appendStringInfoChar(&aggs, ',');
+			if (combine && df_agg_state(agg) != DF_AGG_AVG_FLOAT &&
+				df_agg_state(agg) != DF_AGG_PLAIN)
+			{
+				/* sum(int8), avg(int): the stream's numeric sum and count columns */
+				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+				Plan	   *child = outerPlan(b.agg);
+				bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
+				int			pos;
+
+				if (!IsA(child, Motion) || !IsA(arg, Var))
+				{
+					df_fail(&b, "a combining aggregate");
+					break;
+				}
+				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
+				appendStringInfoString(&aggs, "{\"fn\":\"sum\",\"arg\":");
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + (count ? 2 : 1),
+							   count ? INT8OID : NUMERICOID);
+				appendStringInfoChar(&aggs, '}');
+				continue;
+			}
+			if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
+				fn = "sum_numeric";	/* exact, and numeric as PostgreSQL's */
 			if (combine && strcmp(name, "avg") == 0)
 			{
 				/* DataFusion's avg state: the stream's sum and count columns */

@@ -71,12 +71,12 @@ EXPLAIN (COSTS OFF) SELECT relname FROM pg_class;
 (3 rows)
 
 EXPLAIN (COSTS OFF) SELECT avg(relpages) FROM pg_class;
-                            QUERY PLAN                             
--------------------------------------------------------------------
+             QUERY PLAN              
+-------------------------------------
  Aggregate
    ->  Seq Scan on pg_class
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: aggregate avg returning numeric
+ DataFusion: slice 0 eligible
 (4 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT relnatts) FROM pg_class;
@@ -147,15 +147,15 @@ EXPLAIN (COSTS OFF) SELECT a, b FROM df_hooks_t WHERE c > 0;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(b) FROM df_hooks_t;
-                                         QUERY PLAN                                         
---------------------------------------------------------------------------------------------
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_hooks_t
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining stage of aggregate sum
- DataFusion: slice 1 not eligible: partial aggregate sum with a serialized transition state
+ DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 1 not eligible: partial aggregate sum without batch Motions
 (7 rows)
 
 -- Structured formats are left untouched.

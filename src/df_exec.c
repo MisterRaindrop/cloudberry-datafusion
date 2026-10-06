@@ -84,6 +84,7 @@
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/numeric.h"
 #include "utils/snapmgr.h"
 
 #include "df_executor.h"
@@ -876,12 +877,60 @@ df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		df_raise_query(status, sqlstate, buf);
 }
 
+/*
+ * A numeric of 'v' * 10^-scale, through numeric_in so that its display
+ * scale is 'scale', as PostgreSQL's own would be.
+ */
+static Datum
+df_numeric_datum(int128 v, int scale)
+{
+	char		digits[48];
+	char		buf[64];
+	int			n = 0,
+				len = 0,
+				i;
+	bool		neg = v < 0;
+
+	/* the digits, least significant first (|INT128_MIN| has 39) */
+	do
+	{
+		int			d = (int) (v % 10);
+
+		digits[n++] = (char) ('0' + (d < 0 ? -d : d));
+		v /= 10;
+	} while (v != 0);
+	while (n <= scale)
+		digits[n++] = '0';		/* at least one digit before the point */
+	if (neg)
+		buf[len++] = '-';
+	for (i = n - 1; i >= 0; i--)
+	{
+		buf[len++] = digits[i];
+		if (i == scale && scale > 0)
+			buf[len++] = '.';
+	}
+	buf[len] = '\0';
+	return DirectFunctionCall3(numeric_in, CStringGetDatum(buf),
+							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+}
+
+static int128
+df_read_int128(const void *values, uint32 r)
+{
+	int128		v;
+
+	/* Arrow aligns its buffers, but do not rely on it */
+	memcpy(&v, (const char *) values + (size_t) r * sizeof(int128), sizeof(int128));
+	return v;
+}
+
 static TupleTableSlot *
 df_exec_emit(DfExec *x)
 {
 	TupleTableSlot *slot = x->outslot;
 	uint32		r = x->out_row++;
-	int			c;
+	int			c,
+				k = 0;			/* the tuple's column */
 
 	ExecClearTuple(slot);
 	MemoryContextReset(x->rowcxt);
@@ -889,50 +938,80 @@ df_exec_emit(DfExec *x)
 	{
 		const void *v = x->outcols[c].values;
 		bool		isnull = x->outcols[c].nulls[r] != 0;
+		uint8		kind = x->spec.out_kinds ? x->spec.out_kinds[c] : DF_OUT_PLAIN;
+		MemoryContext oldcxt;
 
-		slot->tts_isnull[c] = isnull;
+		if (kind == DF_OUT_PART)
+			continue;
+		if (kind == DF_OUT_NUMERIC_AVG)
+		{
+			/* avg(int) = numeric_div(sum, count), as int8_avg and numeric_poly_avg */
+			int64		count = x->outcols[c + 1].nulls[r] ? 0 :
+				((const int64 *) x->outcols[c + 1].values)[r];
+
+			slot->tts_isnull[k] = isnull || count == 0;
+			slot->tts_values[k] = (Datum) 0;
+			if (!slot->tts_isnull[k])
+			{
+				oldcxt = MemoryContextSwitchTo(x->rowcxt);
+				slot->tts_values[k] =
+					DirectFunctionCall2(numeric_div,
+										df_numeric_datum(df_read_int128(v, r), 0),
+										NumericGetDatum(int64_to_numeric(count)));
+				MemoryContextSwitchTo(oldcxt);
+			}
+			k++;
+			continue;
+		}
+		slot->tts_isnull[k] = isnull;
 		if (isnull)
 		{
-			slot->tts_values[c] = (Datum) 0;
+			slot->tts_values[k++] = (Datum) 0;
 			continue;
 		}
 		switch (x->spec.out_types[c])
 		{
 			case BOOLOID:
-				slot->tts_values[c] = BoolGetDatum(((const uint8 *) v)[r] != 0);
+				slot->tts_values[k] = BoolGetDatum(((const uint8 *) v)[r] != 0);
 				break;
 			case INT2OID:
-				slot->tts_values[c] = Int16GetDatum(((const int16 *) v)[r]);
+				slot->tts_values[k] = Int16GetDatum(((const int16 *) v)[r]);
 				break;
 			case INT4OID:
 			case DATEOID:
-				slot->tts_values[c] = Int32GetDatum(((const int32 *) v)[r]);
+				slot->tts_values[k] = Int32GetDatum(((const int32 *) v)[r]);
 				break;
 			case INT8OID:
 			case TIMEOID:
 			case TIMESTAMPOID:
 			case TIMESTAMPTZOID:
-				slot->tts_values[c] = Int64GetDatum(((const int64 *) v)[r]);
+				slot->tts_values[k] = Int64GetDatum(((const int64 *) v)[r]);
 				break;
 			case FLOAT4OID:
-				slot->tts_values[c] = Float4GetDatum(((const float4 *) v)[r]);
+				slot->tts_values[k] = Float4GetDatum(((const float4 *) v)[r]);
 				break;
 			case FLOAT8OID:
-				slot->tts_values[c] = Float8GetDatum(((const float8 *) v)[r]);
+				slot->tts_values[k] = Float8GetDatum(((const float8 *) v)[r]);
 				break;
 			case TEXTOID:
 			case VARCHAROID:
 				{
 					const int32 *off = x->outcols[c].offsets;
-					MemoryContext oldcxt = MemoryContextSwitchTo(x->rowcxt);
 
-					slot->tts_values[c] =
+					oldcxt = MemoryContextSwitchTo(x->rowcxt);
+					slot->tts_values[k] =
 						PointerGetDatum(cstring_to_text_with_len((const char *) v + off[r],
 																 off[r + 1] - off[r]));
 					MemoryContextSwitchTo(oldcxt);
 				}
 				break;
+			case NUMERICOID:
+				oldcxt = MemoryContextSwitchTo(x->rowcxt);
+				slot->tts_values[k] = df_numeric_datum(df_read_int128(v, r), 0);
+				MemoryContextSwitchTo(oldcxt);
+				break;
 		}
+		k++;
 	}
 	return ExecStoreVirtualTuple(slot);
 }

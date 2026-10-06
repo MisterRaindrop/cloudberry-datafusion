@@ -427,6 +427,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | X2 | Redistribute batches by `text` and `varchar` keys (`hashtext`) |
 | L1 | `LIKE` and `NOT LIKE` |
 | L2 | Common string functions and `\|\|` |
+| N1 | numeric results of `sum(int8)` and `avg` of integers |
 
 ### Date and time types
 
@@ -546,6 +547,24 @@ PostgreSQL; grouping by a `varchar` of 500 values with `max(cust COLLATE
 "C")` 0.26 s and 1.00 s; grouping by a `text` of 200,000 values 0.67 s
 and 1.57 s.  Grouping 300,000 keys of 1 kB with `work_mem = 4MB` spills
 in both and took 2.16 s in DataFusion against 1.42 s.
+
+### numeric results of integer aggregates
+
+`sum(int8)` and `avg` of `int2`, `int4` and `int8` return numeric (N1).
+DataFusion adds the values exactly as `Decimal128(38, 0)`; the C side
+builds the numeric values with `numeric_in`, and avg as `numeric_div(sum,
+count)`, which is what `int8_avg` and `numeric_poly_avg` compute, so
+values and display scales are PostgreSQL's (`1.5000000000000000`, sums
+beyond int8).  Grouped by the distribution key the aggregate runs in one
+stage; split in two, its partial stage would have to send PostgreSQL's
+serialized state, so it stays on PostgreSQL unless batch Motions carry
+DataFusion's state instead (the exact sum, and the count for avg, as for
+avg of floats in M7d).  An avg returning numeric is divided where tuples
+are made, so it does not go into a batch Motion itself.  Computing on
+numeric values (`avg(a) + 1`, `HAVING sum(b) > 10`) and numeric columns
+stay on PostgreSQL for now.  Over 30 million heap rows, `sum(b), avg(a),
+avg(b)` took 0.26 s with batch Motions against 1.04 s in PostgreSQL, and
+grouped by a column 0.31 s against 1.46 s.
 
 ## Build
 

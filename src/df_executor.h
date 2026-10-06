@@ -69,8 +69,35 @@ typedef struct DfSliceSpec
 	DfSliceInput *inputs;
 	int			nout;			/* output columns, in targetlist order */
 	Oid		   *out_types;
+	uint8	   *out_kinds;		/* DfOutKind of each */
 	int			batch_rows;		/* rows per batch, from the widest row */
 } DfSliceSpec;
+
+/*
+ * Aggregates whose state DataFusion keeps itself.  Split through a batch
+ * Motion, the partial stage sends that state (one or two columns) instead
+ * of PostgreSQL's; numeric results are built on the C side with
+ * PostgreSQL's own functions.
+ */
+typedef enum DfAggState
+{
+	DF_AGG_PLAIN,				/* the result type is the state */
+	DF_AGG_AVG_FLOAT,			/* avg(float4/8): float8 sum, int8 count */
+	DF_AGG_AVG_INT,				/* avg(int2/4/8): numeric sum, int8 count */
+	DF_AGG_SUM_INT8				/* sum(int8): numeric sum */
+} DfAggState;
+
+extern DfAggState df_agg_state(Aggref *agg);
+extern int	df_agg_state_ncols(DfAggState state);
+
+/* How an output column of the slice becomes a value of its tuple. */
+typedef enum DfOutKind
+{
+	DF_OUT_PLAIN,				/* one column, one value */
+	DF_OUT_NUMERIC_AVG,			/* numeric sum and the next column's count:
+								 * avg = sum / count (numeric_div) */
+	DF_OUT_PART					/* consumed with the column before */
+} DfOutKind;
 
 /* String functions DataFusion runs (df_core::pgstr), by pg_proc OID. */
 typedef enum DfCollRule
@@ -144,7 +171,7 @@ extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */
 extern bool df_motion_batches;	/* GUC datafusion.motion_batches */
 extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);
 extern Bitmapset *df_batch_motions(PlannedStmt *stmt);
-extern bool df_motion_state_column(Motion *motion, AttrNumber resno);
+extern int	df_motion_state_columns(Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern uint64 df_motion_signature(Motion *motion);
 extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **tag);

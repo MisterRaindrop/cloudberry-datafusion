@@ -1,0 +1,182 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- numeric results of aggregates over integers (N1): sum(int8) and avg of
+-- int2, int4 and int8.  DataFusion adds the values exactly as
+-- Decimal128(38, 0); the C side builds the numeric values with
+-- numeric_in, and avg as numeric_div(sum, count), the way int8_avg and
+-- numeric_poly_avg do, so display scales are PostgreSQL's.  Split through
+-- a batch Motion, the partial stage sends that sum (and count) instead of
+-- PostgreSQL's serialized state.  Each query runs with datafusion.mode
+-- off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+CREATE TABLE df_nm (g int4, a int4, b int8, e int2) DISTRIBUTED BY (g);
+INSERT INTO df_nm SELECT i % 20, i, i::int8 * 1000003, (i % 300)::int2 FROM generate_series(1, 100000) i;
+-- sums beyond int8, and the extremes of each type
+INSERT INTO df_nm SELECT 77, 2147483647, 9223372036854775807, 32767 FROM generate_series(1, 5);
+INSERT INTO df_nm SELECT 78, -2147483648, -9223372036854775808, -32768 FROM generate_series(1, 3);
+INSERT INTO df_nm VALUES (79, NULL, NULL, NULL), (80, 1, 1, 1), (80, 2, 2, 2), (81, 1, -1, 1), (81, 0, 0, 0);
+CREATE TABLE df_nm_empty (g int4, a int4, b int8, e int2) DISTRIBUTED BY (g);
+ANALYZE df_nm;
+SET datafusion.mode = explain;
+-- grouped by the distribution key: one stage
+EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(a) FROM df_nm GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: g
+         ->  Seq Scan on df_nm
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(7 rows)
+
+-- two stages: PostgreSQL's serialized states, unless batch Motions carry ours
+EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nm
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 1 not eligible: partial aggregate sum without batch Motions
+(7 rows)
+
+SET datafusion.motion_batches = on;
+EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nm
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+-- numeric results are not computed on further yet
+EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: g
+         ->  Seq Scan on df_nm
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: operator + returning numeric
+(7 rows)
+
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+SELECT g, sum(b), avg(a), avg(b), avg(e), count(*) FROM df_nm WHERE g >= 15 GROUP BY g ORDER BY g;
+ g  |          sum          |          avg           |           avg           |          avg           | count 
+----+-----------------------+------------------------+-------------------------+------------------------+-------
+ 15 |       250025750075000 |     50005.000000000000 |    50005150015.00000000 |   154.9000000000000000 |  5000
+ 16 |       250030750090000 |     50006.000000000000 |    50006150018.00000000 |   155.9000000000000000 |  5000
+ 17 |       250035750105000 |     50007.000000000000 |    50007150021.00000000 |   156.9000000000000000 |  5000
+ 18 |       250040750120000 |     50008.000000000000 |    50008150024.00000000 |   157.9000000000000000 |  5000
+ 19 |       250045750135000 |     50009.000000000000 |    50009150027.00000000 |   158.9000000000000000 |  5000
+ 77 |  46116860184273879035 |    2147483647.00000000 |     9223372036854775807 |     32767.000000000000 |     5
+ 78 | -27670116110564327424 |   -2147483648.00000000 |    -9223372036854775808 |    -32768.000000000000 |     3
+ 79 |                       |                        |                         |                        |     1
+ 80 |                     3 |     1.5000000000000000 |      1.5000000000000000 |     1.5000000000000000 |     2
+ 81 |                    -1 | 0.50000000000000000000 | -0.50000000000000000000 | 0.50000000000000000000 |     2
+(10 rows)
+
+SELECT sum(b), avg(a), avg(b), avg(e) FROM df_nm;
+         sum          |        avg         |         avg          |         avg          
+----------------------+--------------------+----------------------+----------------------
+ 18451744138709701613 | 92939.020267567892 | 184495301950862.9126 | 150.0383453985521737
+(1 row)
+
+SELECT sum(b), avg(a), avg(b), avg(e) FROM df_nm_empty;
+ sum | avg | avg | avg 
+-----+-----+-----+-----
+     |     |     |    
+(1 row)
+
+SET datafusion.mode = on;
+SELECT g, sum(b), avg(a), avg(b), avg(e), count(*) FROM df_nm WHERE g >= 15 GROUP BY g ORDER BY g;
+ g  |          sum          |          avg           |           avg           |          avg           | count 
+----+-----------------------+------------------------+-------------------------+------------------------+-------
+ 15 |       250025750075000 |     50005.000000000000 |    50005150015.00000000 |   154.9000000000000000 |  5000
+ 16 |       250030750090000 |     50006.000000000000 |    50006150018.00000000 |   155.9000000000000000 |  5000
+ 17 |       250035750105000 |     50007.000000000000 |    50007150021.00000000 |   156.9000000000000000 |  5000
+ 18 |       250040750120000 |     50008.000000000000 |    50008150024.00000000 |   157.9000000000000000 |  5000
+ 19 |       250045750135000 |     50009.000000000000 |    50009150027.00000000 |   158.9000000000000000 |  5000
+ 77 |  46116860184273879035 |    2147483647.00000000 |     9223372036854775807 |     32767.000000000000 |     5
+ 78 | -27670116110564327424 |   -2147483648.00000000 |    -9223372036854775808 |    -32768.000000000000 |     3
+ 79 |                       |                        |                         |                        |     1
+ 80 |                     3 |     1.5000000000000000 |      1.5000000000000000 |     1.5000000000000000 |     2
+ 81 |                    -1 | 0.50000000000000000000 | -0.50000000000000000000 | 0.50000000000000000000 |     2
+(10 rows)
+
+SET datafusion.motion_batches = on;
+SELECT sum(b), avg(a), avg(b), avg(e) FROM df_nm;
+         sum          |        avg         |         avg          |         avg          
+----------------------+--------------------+----------------------+----------------------
+ 18451744138709701613 | 92939.020267567892 | 184495301950862.9126 | 150.0383453985521737
+(1 row)
+
+SELECT sum(b), avg(a), avg(b), avg(e) FROM df_nm_empty;
+ sum | avg | avg | avg 
+-----+-----+-----+-----
+     |     |     |    
+(1 row)
+
+SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
+ k  |          sum          |         avg          
+----+-----------------------+----------------------
+ -2 | -27670116110564327424 |  -32768.000000000000
+  0 |       714266427792855 | 149.3899622007559849
+  1 |  46117574464987714748 | 160.7925557965437627
+  2 |       714294999878573 | 149.4056834884860363
+  3 |       714309285921429 | 149.4080218395632087
+  4 |       714323571964287 | 149.4000419991600168
+  5 |       714337858007145 | 149.3920621587568249
+  6 |       714252142750000 | 149.3874693734686734
+    |                       |                     
+(9 rows)
+
+SET datafusion.mode = off;
+SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
+ k  |          sum          |         avg          
+----+-----------------------+----------------------
+ -2 | -27670116110564327424 |  -32768.000000000000
+  0 |       714266427792855 | 149.3899622007559849
+  1 |  46117574464987714748 | 160.7925557965437627
+  2 |       714294999878573 | 149.4056834884860363
+  3 |       714309285921429 | 149.4080218395632087
+  4 |       714323571964287 | 149.4000419991600168
+  5 |       714337858007145 | 149.3920621587568249
+  6 |       714252142750000 | 149.3874693734686734
+    |                       |                     
+(9 rows)
+
+DROP TABLE df_nm, df_nm_empty;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

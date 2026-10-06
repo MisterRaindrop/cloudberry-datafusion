@@ -81,6 +81,7 @@ typedef struct DfCheckContext
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
 	bool		final_states;	/* this Agg may read DataFusion avg states */
+	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
 	bool		failed;
 	char	   *reason;
@@ -526,32 +527,38 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
-				else if (strcmp(name, "avg") == 0 && agg->aggsplit != AGGSPLIT_SIMPLE)
+				else if (df_agg_state(agg) == DF_AGG_AVG_INT &&
+						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL && cxt->agg_to_batches)
+					/* avg = sum / count is computed where tuples are made */
+					df_reject(cxt, "aggregate avg returning numeric into a batch Motion");
+				else if (df_agg_state(agg) != DF_AGG_PLAIN && agg->aggsplit != AGGSPLIT_SIMPLE)
 				{
 					/*
-					 * M7d: through a batch Motion, a split avg of float4 or
-					 * float8 passes DataFusion's state (sum and count)
-					 * instead of PostgreSQL's array.
+					 * M7d, N1: through a batch Motion, a split avg or
+					 * sum(int8) passes DataFusion's state (sum, and count
+					 * for avg) instead of PostgreSQL's array or serialized
+					 * state.
 					 */
-					Oid			argtype = list_length(agg->aggargtypes) == 1 ?
-						linitial_oid(agg->aggargtypes) : InvalidOid;
 					bool		allowed = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ?
 						cxt->partial_states : cxt->final_states;
 
-					if (argtype != FLOAT4OID && argtype != FLOAT8OID)
-						df_reject(cxt, "split aggregate avg of %s", format_type_be(argtype));
-					else if (!allowed)
-						df_reject(cxt, "%s aggregate avg without batch Motions",
-								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining");
+					if (!allowed)
+						df_reject(cxt, "%s aggregate %s without batch Motions",
+								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining",
+								  name);
 					else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 					{
 						/* its argument is the state column of the Motion below */
 						if (list_length(agg->args) != 1 ||
 							!IsA(linitial_node(TargetEntry, agg->args)->expr, Var))
-							df_reject(cxt, "combining aggregate avg over an expression");
+							df_reject(cxt, "combining aggregate %s over an expression", name);
 						return cxt->failed;
 					}
 				}
+				else if (strcmp(name, "avg") == 0 && agg->aggsplit != AGGSPLIT_SIMPLE)
+					df_reject(cxt, "split aggregate avg of %s",
+							  format_type_be(list_length(agg->aggargtypes) == 1 ?
+											 linitial_oid(agg->aggargtypes) : InvalidOid));
 				else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
 						 agg->aggtranstype != agg->aggtype)
 					/*
@@ -564,8 +571,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggtype == BYTEAOID)
 					df_reject(cxt, "partial aggregate %s with a serialized transition state", name);
-				else if (!df_type_supported(agg->aggtype) &&
-						 !(strcmp(name, "avg") == 0 && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL))
+				else if (!df_type_supported(agg->aggtype) && df_agg_state(agg) == DF_AGG_PLAIN)
 					df_reject(cxt, "aggregate %s returning %s", name,
 							  format_type_be(agg->aggtype));
 				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
@@ -950,6 +956,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					}
 				}
 				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
+				cxt->agg_to_batches = cxt->batch_sender;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(child, Motion) &&
 					bms_is_member(((Motion *) child)->motionID, cxt->batches);
@@ -960,6 +967,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->allow_aggref = false;
 				cxt->partial_states = false;
 				cxt->final_states = false;
+				cxt->agg_to_batches = false;
 
 				/* The child must produce what the aggregate reads. */
 				df_collect_outer_refs((Node *) plan->targetlist, &child_needed);
@@ -1159,7 +1167,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 						if (bms_is_member(tle->resno, needed) && !df_type_supported(type) &&
 							!(bms_is_member(motion->motionID, cxt->batches) &&
-							  df_motion_state_column(motion, tle->resno)))
+							  df_motion_state_columns(motion, tle->resno) > 0))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;
@@ -1449,31 +1457,68 @@ df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
 }
 
 /*
- * Does column 'resno' of 'motion' carry a partial avg's state?  Through a
- * batch Motion that state is DataFusion's, two columns in the stream (M7d).
+ * Columns of DataFusion state that column 'resno' of 'motion' carries
+ * through a batch Motion: 2 for a partial avg (sum, count), 1 for a partial
+ * sum(int8), 0 for an ordinary column.
  */
-bool
-df_motion_state_column(Motion *motion, AttrNumber resno)
+int
+df_motion_state_columns(Motion *motion, AttrNumber resno)
 {
 	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
 	Plan	   *child = outerPlan(motion);
 	Node	   *expr;
-	char	   *name;
 
 	if (tle == NULL || child == NULL)
-		return false;
+		return 0;
 	expr = (Node *) tle->expr;
 	if (IsA(expr, Var) && ((Var *) expr)->varno == OUTER_VAR)
 	{
 		tle = get_tle_by_resno(child->targetlist, ((Var *) expr)->varattno);
 		if (tle == NULL)
-			return false;
+			return 0;
 		expr = (Node *) tle->expr;
 	}
 	if (!IsA(expr, Aggref) || ((Aggref *) expr)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
-		return false;
-	name = get_func_name(((Aggref *) expr)->aggfnoid);
-	return name != NULL && strcmp(name, "avg") == 0;
+		return 0;
+	return df_agg_state_ncols(df_agg_state((Aggref *) expr));
+}
+
+/* Which state DataFusion keeps for 'agg'. */
+DfAggState
+df_agg_state(Aggref *agg)
+{
+	char	   *name = get_func_name(agg->aggfnoid);
+	Oid			argtype = list_length(agg->aggargtypes) == 1 ?
+		linitial_oid(agg->aggargtypes) : InvalidOid;
+
+	if (name == NULL || agg->aggfnoid >= FirstGenbkiObjectId)
+		return DF_AGG_PLAIN;
+	if (strcmp(name, "avg") == 0)
+	{
+		if (argtype == FLOAT4OID || argtype == FLOAT8OID)
+			return DF_AGG_AVG_FLOAT;
+		if (argtype == INT2OID || argtype == INT4OID || argtype == INT8OID)
+			return DF_AGG_AVG_INT;
+	}
+	if (strcmp(name, "sum") == 0 && argtype == INT8OID)
+		return DF_AGG_SUM_INT8;
+	return DF_AGG_PLAIN;
+}
+
+/* Columns its state takes in a batch stream (0 for a plain aggregate). */
+int
+df_agg_state_ncols(DfAggState state)
+{
+	switch (state)
+	{
+		case DF_AGG_AVG_FLOAT:
+		case DF_AGG_AVG_INT:
+			return 2;
+		case DF_AGG_SUM_INT8:
+			return 1;
+		default:
+			return 0;
+	}
 }
 
 /*
@@ -1487,7 +1532,7 @@ df_motion_stream_column(Motion *motion, AttrNumber resno)
 	AttrNumber	r;
 
 	for (r = 1; r < resno; r++)
-		pos += df_motion_state_column(motion, r) ? 2 : 1;
+		pos += Max(df_motion_state_columns(motion, r), 1);
 	return pos;
 }
 
