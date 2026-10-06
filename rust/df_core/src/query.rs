@@ -756,13 +756,21 @@ impl Post {
     }
 }
 
-/// DataFusion's default session, minus expression simplification.
+/// DataFusion's default session, minus expression simplification and the
+/// rebuilding of inner join trees.
 ///
 /// The simplifier rewrites `CASE WHEN x IS FALSE THEN false ELSE x AND y
 /// END` back into `x AND y`, which evaluates `y` on every row and undoes
 /// the guard that keeps PostgreSQL from dividing by zero (see `expr`).  The
 /// plan comes from PostgreSQL's planner, which has already folded constants
 /// and simplified expressions, so little is lost.
+///
+/// eliminate_cross_join flattens a tree of inner joins with a filter above
+/// and joins its inputs again in an order of its own.  The main thread
+/// feeds the inputs one after the other in the order of PostgreSQL's plan,
+/// each join's build side first; a plan that reads another input first
+/// waits for it while the main thread waits for room in the one it feeds
+/// (TPC-H Q7 hung that way).  PostgreSQL's planner has chosen the order.
 fn session_state(
     config: SessionConfig,
     pool: Arc<TrackingPool>,
@@ -783,7 +791,7 @@ fn session_state(
     let rules: Vec<_> = state
         .optimizers()
         .iter()
-        .filter(|r| r.name() != "simplify_expressions")
+        .filter(|r| !matches!(r.name(), "simplify_expressions" | "eliminate_cross_join"))
         .cloned()
         .collect();
     Ok(SessionStateBuilder::new_from_existing(state)
@@ -1787,6 +1795,12 @@ impl Query {
         let mut config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
+        // The inputs are fed one after the other, each to its end, in the
+        // order PostgreSQL's plan reads them: a join's build side (its Hash
+        // side) first.  DataFusion must not swap a join's sides by its
+        // statistics, or it waits for an input the main thread has not
+        // reached while that one waits for room.
+        config.options_mut().optimizer.join_reordering = false;
         // A sort reserves this much up front to merge its spilled runs
         // (10 MB by default): keep it within a partition's share.
         let execution = &mut config.options_mut().execution;
@@ -2385,6 +2399,104 @@ mod tests {
                 Poll::Panicked(m) => panic!("{m}"),
             }
         }
+    }
+
+    /// TPC-H Q7's join tree as ORCA plans it: inner joins with a filter
+    /// over two of their inputs at the top, a large probe side (input 4)
+    /// fed before a later build side (input 5).  The inputs are fed one
+    /// after the other, each to its end, as the main thread does; a plan
+    /// that read input 5 first (DataFusion's eliminate_cross_join rebuilt
+    /// the tree that way) never finished.
+    #[test]
+    fn joins_read_inputs_in_plan_order() {
+        let spec = r#"{"inputs":[
+            {"columns":[{"type":"int4"},{"type":"int4"}]},
+            {"columns":[{"type":"int4"},{"type":"int4"}]},
+            {"columns":[{"type":"int4"},{"type":"int4"}]},
+            {"columns":[{"type":"int4"},{"type":"int4"}]},
+            {"columns":[{"type":"int4"},{"type":"int4"}]},
+            {"columns":[{"type":"int4"},{"type":"int4"}]}],
+          "plan":{"aggregate":{"input":{"join":{"type":"inner",
+            "left":{"join":{"type":"inner","left":{"input":0},"right":{"input":1},
+                    "on":[[{"col":1},{"col":1,"input":1}]],"filter":null}},
+            "right":{"join":{"type":"inner",
+                "left":{"join":{"type":"inner",
+                    "left":{"join":{"type":"inner","left":{"input":2},"right":{"input":3},
+                            "on":[[{"col":1,"input":2},{"col":1,"input":3}]],"filter":null}},
+                    "right":{"input":4},
+                    "on":[[{"col":0,"input":3},{"col":1,"input":4}]],"filter":null}},
+                "right":{"input":5},
+                "on":[[{"col":0,"input":4},{"col":0,"input":5}]],"filter":null}},
+            "on":[[{"col":0,"input":1},{"col":1,"input":5}]],
+            "filter":{"or":[
+                {"and":[{"op":"=","type":"bool","args":[{"col":0,"input":2},{"lit":{"type":"int4","value":2}}]},
+                        {"op":"=","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":1}}]}]},
+                {"and":[{"op":"=","type":"bool","args":[{"col":0,"input":2},{"lit":{"type":"int4","value":1}}]},
+                        {"op":"=","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":2}}]}]}]}}},
+            "group":[],"aggs":[{"fn":"count"}],"having":null}},
+          "output":[{"expr":{"agg":0},"type":"int8"}],"batch_rows":1000}"#;
+        // nations 0..4 named by their key; 100 suppliers, 1500 customers,
+        // 15000 orders, 200 batches of 1000 lineitems
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = |m: i32| -> i32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as i32
+        };
+        let mut pairs = |n: usize, a: Option<i32>, b: i32| -> Vec<(i32, i32)> {
+            (0..n)
+                .map(|i| (a.map_or(i as i32, &mut rnd), rnd(b)))
+                .collect()
+        };
+        let inputs: Vec<Vec<(i32, i32)>> = vec![
+            pairs(5, None, 5),                // n2 (name, key): key random
+            pairs(1500, None, 5),             // customer (custkey, nationkey)
+            pairs(5, None, 5),                // n1
+            pairs(100, None, 5),              // supplier (suppkey, nationkey)
+            pairs(200_000, Some(15000), 100), // lineitem (orderkey, suppkey)
+            pairs(15000, None, 1500),         // orders (orderkey, custkey)
+        ];
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            runtime::init(2).unwrap();
+            let dir = std::env::temp_dir();
+            let sources = (0..6).map(|_| Source::Pushed).collect();
+            let mut q =
+                Query::start_multi(spec, 2, 64 << 20, dir.to_str().unwrap(), sources, false)
+                    .unwrap();
+            for (j, rows) in inputs.iter().enumerate() {
+                for chunk in rows.chunks(1000) {
+                    let a: Vec<i32> = chunk.iter().map(|r| r.0).collect();
+                    let b: Vec<i32> = chunk.iter().map(|r| r.1).collect();
+                    let nulls = vec![0u8; chunk.len()];
+                    let cols = [
+                        RawColumn::fixed(a.as_ptr() as *const u8, nulls.as_ptr()),
+                        RawColumn::fixed(b.as_ptr() as *const u8, nulls.as_ptr()),
+                    ];
+                    while !unsafe { q.push_input(j, &cols, chunk.len()) }.unwrap() {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                q.finish_input_at(j);
+            }
+            let mut count = None;
+            loop {
+                match q.poll(Duration::from_millis(50)) {
+                    Poll::Batch(_) => {
+                        count = Some(unsafe { *(q.output_column(0).unwrap().values as *const i64) })
+                    }
+                    Poll::Pending => {}
+                    Poll::Done => break,
+                    _ => panic!("query failed"),
+                }
+            }
+            let _ = done_tx.send(count);
+        });
+        let count = done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the join did not finish: it waits for an input not fed yet");
+        assert!(count.is_some_and(|c| c > 0), "{count:?}");
     }
 
     #[test]
