@@ -454,6 +454,18 @@ SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
    452
 (1 row)
 
+SELECT count(*) FROM df_nc WHERE a = 'NaN';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < 'NaN';
+ count 
+-------
+ 50005
+(1 row)
+
 SET datafusion.mode = on;
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
@@ -493,6 +505,19 @@ SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
  count 
 -------
    452
+(1 row)
+
+-- a NaN constant is Decimal256's NaN (it was int128's for a while)
+SELECT count(*) FROM df_nc WHERE a = 'NaN';
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < 'NaN';
+ count 
+-------
+ 50005
 (1 row)
 
 RESET datafusion.motion_batches;

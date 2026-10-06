@@ -52,9 +52,11 @@
 #include <math.h>
 
 #include "catalog/pg_type_d.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -86,6 +88,7 @@ typedef struct DfBuilder
 	List	   *aggfns;			/* the function of each: NULL for the
 								 * Aggref's own, or "sum" / "count" for the
 								 * parts of a partial avg's state */
+	Node	   *case_arg;		/* the value of the CASE being emitted (E1) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -285,6 +288,12 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 		df_fail(b, "a numeric constant");
 		return;
 	}
+	if (v == DF_NUMERIC_NAN)
+	{
+		/* NaN of the Decimal256 representation is the Rust side's to make */
+		appendStringInfoString(out, ",\"value\":\"NaN\"}}");
+		return;
+	}
 	/* the integer, as a JSON string (beyond what JSON numbers carry) */
 	neg = v < 0;
 	do
@@ -328,6 +337,53 @@ df_emit_numeric_at(DfBuilder *b, StringInfo out, Node *e, int scale, DfLevel lev
 	appendStringInfoString(out, "{\"rescale\":");
 	df_emit(b, out, e, level);
 	appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}", scale - own, df_tag(NUMERICOID, scale));
+}
+
+/* The context of expressions at 'level'. */
+static Plan *
+df_level_ctx(DfBuilder *b, DfLevel level)
+{
+	return level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+}
+
+/* The scale numeric 'l' and 'r' are compared at: the larger one. */
+static int
+df_common_scale(Plan *ctx, Node *l, Node *r)
+{
+	return Max(df_scale_of(ctx, l), df_scale_of(ctx, r));
+}
+
+/* "[l, r]", numeric operands at their common scale (E1). */
+static void
+df_emit_operands(DfBuilder *b, StringInfo out, Node *l, Node *r, DfLevel level)
+{
+	appendStringInfoChar(out, '[');
+	if (exprType(l) == NUMERICOID)
+	{
+		Plan	   *ctx = df_level_ctx(b, level);
+		int			t = df_common_scale(ctx, l, r);
+
+		df_emit_numeric_at(b, out, l, t, level, ctx);
+		appendStringInfoChar(out, ',');
+		df_emit_numeric_at(b, out, r, t, level, ctx);
+	}
+	else
+	{
+		df_emit(b, out, l, level);
+		appendStringInfoChar(out, ',');
+		df_emit(b, out, r, level);
+	}
+	appendStringInfoChar(out, ']');
+}
+
+/* A result of a CASE or COALESCE of 'type' (numeric: at 'scale'). */
+static void
+df_emit_result(DfBuilder *b, StringInfo out, Node *e, Oid type, int scale, DfLevel level)
+{
+	if (type == NUMERICOID)
+		df_emit_numeric_at(b, out, e, scale, level, df_level_ctx(b, level));
+	else
+		df_emit(b, out, e, level);
 }
 
 /* Add an input reading 'leaf'; returns its index. */
@@ -606,6 +662,163 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit_list(b, out, be->args, level);
 				}
 				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_CaseExpr:
+			{
+				/* E1: {"case": [{"when": c, "then": r}, ...], "else": e} */
+				CaseExpr   *ce = (CaseExpr *) node;
+				int			scale = df_scale_of(df_level_ctx(b, level), node);
+				Node	   *saved = b->case_arg;
+				ListCell   *lc;
+
+				b->case_arg = (Node *) ce->arg;
+				appendStringInfoString(out, "{\"case\":[");
+				foreach(lc, ce->args)
+				{
+					CaseWhen   *w = lfirst_node(CaseWhen, lc);
+
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					appendStringInfoString(out, "{\"when\":");
+					df_emit(b, out, (Node *) w->expr, level);
+					appendStringInfoString(out, ",\"then\":");
+					df_emit_result(b, out, (Node *) w->result, ce->casetype, scale, level);
+					appendStringInfoChar(out, '}');
+				}
+				b->case_arg = saved;
+				appendStringInfoString(out, "],\"else\":");
+				df_emit_result(b, out, (Node *) ce->defresult, ce->casetype, scale, level);
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_CaseTestExpr:
+			/* the value of a simple CASE (CASE x WHEN ...) */
+			if (b->case_arg == NULL)
+			{
+				df_fail(b, "a CASE value outside a CASE");
+				return;
+			}
+			df_emit(b, out, b->case_arg, level);
+			return;
+
+		case T_CoalesceExpr:
+			{
+				/*
+				 * E1: as CASE WHEN a IS NOT NULL THEN a ... ELSE last END,
+				 * so that later arguments only run where the earlier ones
+				 * are NULL, as in PostgreSQL.
+				 */
+				CoalesceExpr *co = (CoalesceExpr *) node;
+				int			scale = df_scale_of(df_level_ctx(b, level), node);
+				int			n = list_length(co->args);
+				ListCell   *lc;
+
+				appendStringInfoString(out, "{\"case\":[");
+				foreach(lc, co->args)
+				{
+					if (foreach_current_index(lc) == n - 1)
+						break;
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					appendStringInfoString(out, "{\"when\":{\"isnotnull\":");
+					df_emit(b, out, lfirst(lc), level);
+					appendStringInfoString(out, "},\"then\":");
+					df_emit_result(b, out, lfirst(lc), co->coalescetype, scale, level);
+					appendStringInfoChar(out, '}');
+				}
+				appendStringInfoString(out, "],\"else\":");
+				df_emit_result(b, out, llast(co->args), co->coalescetype, scale, level);
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_NullIfExpr:
+			{
+				/* E1: CASE WHEN a = b THEN NULL ELSE a END */
+				NullIfExpr *ni = (NullIfExpr *) node;
+				OpExpr	   *eq = makeNode(OpExpr);
+				Oid			type = exprType(linitial(ni->args));
+				int			scale = df_scale_of(df_level_ctx(b, level), linitial(ni->args));
+
+				*eq = *(OpExpr *) ni;
+				eq->xpr.type = T_OpExpr;
+				eq->opresulttype = BOOLOID;
+				appendStringInfoString(out, "{\"case\":[{\"when\":");
+				df_emit(b, out, (Node *) eq, level);
+				appendStringInfoString(out, ",\"then\":");
+				df_emit_result(b, out,
+							   (Node *) makeNullConst(type, -1, ni->inputcollid),
+							   type, scale, level);
+				appendStringInfoString(out, "}],\"else\":");
+				df_emit_result(b, out, linitial(ni->args), type, scale, level);
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_DistinctExpr:
+			{
+				/* E1: {"distinct": [a, b]}; IS NOT DISTINCT FROM is NOT of it */
+				DistinctExpr *de = (DistinctExpr *) node;
+
+				appendStringInfoString(out, "{\"distinct\":");
+				df_emit_operands(b, out, linitial(de->args), lsecond(de->args), level);
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_ScalarArrayOpExpr:
+			{
+				/* E1: {"inlist": x, "values": [...], "negated": bool} */
+				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) node;
+				Node	   *left = linitial(sa->args);
+				Const	   *arr = lsecond(sa->args);
+				ArrayType  *a = DatumGetArrayTypeP(arr->constvalue);
+				Oid			elemtype = ARR_ELEMTYPE(a);
+				Plan	   *ctx = df_level_ctx(b, level);
+				Datum	   *elems;
+				bool	   *nulls;
+				int			nelems,
+							i,
+							scale;
+				int16		elmlen;
+				bool		elmbyval;
+				char		elmalign;
+
+				get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+				deconstruct_array(a, elemtype, elmlen, elmbyval, elmalign,
+								  &elems, &nulls, &nelems);
+				/* numeric: the column and every element at the largest scale */
+				scale = df_scale_of(ctx, left);
+				for (i = 0; i < nelems && elemtype == NUMERICOID; i++)
+				{
+					int			p,
+								s;
+
+					if (!nulls[i] && df_numeric_const_ps(elems[i], &p, &s))
+						scale = Max(scale, s);
+				}
+				appendStringInfoString(out, "{\"inlist\":");
+				if (elemtype == NUMERICOID)
+					df_emit_numeric_at(b, out, left, scale, level, ctx);
+				else
+					df_emit(b, out, left, level);
+				appendStringInfoString(out, ",\"values\":[");
+				for (i = 0; i < nelems; i++)
+				{
+					Const	   *c = makeConst(elemtype, -1, sa->inputcollid, elmlen,
+											  elems[i], nulls[i], elmbyval);
+
+					if (i > 0)
+						appendStringInfoChar(out, ',');
+					if (elemtype == NUMERICOID)
+						df_emit_numeric_const(b, out, c, scale);
+					else
+						df_emit_const(b, out, c);
+				}
+				appendStringInfo(out, "],\"negated\":%s}", sa->useOr ? "false" : "true");
 				return;
 			}
 

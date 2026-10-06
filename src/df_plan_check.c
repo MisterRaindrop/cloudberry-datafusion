@@ -52,11 +52,13 @@
 #include "executor/execUtils.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "nodes/bitmapset.h"
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -327,6 +329,42 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					return false;	/* / and %: the scale depends on the values */
 				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 			}
+		case T_CaseExpr:
+		case T_CoalesceExpr:
+			{
+				/* E1: branches of one scale (checked), the widest precision */
+				List	   *results = NIL;
+				ListCell   *lc;
+				bool		found = false;
+
+				if (IsA(expr, CaseExpr))
+				{
+					foreach(lc, ((CaseExpr *) expr)->args)
+						results = lappend(results, lfirst_node(CaseWhen, lc)->result);
+					results = lappend(results, ((CaseExpr *) expr)->defresult);
+				}
+				else
+					results = ((CoalesceExpr *) expr)->args;
+				*precision = 1;
+				*scale = 0;
+				foreach(lc, results)
+				{
+					Node	   *e = lfirst(lc);
+					int			p,
+								s;
+
+					if (IsA(e, Const) && ((Const *) e)->constisnull)
+						continue;
+					if (!df_numeric_ps(ctx, e, &p, &s) || (found && s != *scale))
+						return false;
+					*precision = Max(*precision, p);
+					*scale = s;
+					found = true;
+				}
+				return true;
+			}
+		case T_NullIfExpr:
+			return df_numeric_ps(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale);
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) expr;
@@ -397,6 +435,67 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 		default:
 			return false;
 	}
+}
+
+/*
+ * Can 'l' and 'r' be compared for equality as PostgreSQL does (E1: IN
+ * lists, IS DISTINCT FROM, NULLIF)?  The rules of = (N2, X1).  Rejects if
+ * not.
+ */
+static void
+df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid collation)
+{
+	Oid			lt = exprType(l);
+	Oid			rt = exprType(r);
+	int			lp,
+				ls,
+				rp,
+				rs,
+				t;
+	const char *problem;
+
+	/* integers of two widths, or floats, compare in the wider one */
+	if (!df_type_supported(lt) || (lt != rt && !OidIsValid(df_join_key_type(lt, rt))))
+		df_reject(cxt, "%s on %s and %s", what, format_type_be(lt), format_type_be(rt));
+	else if (lt == NUMERICOID)
+	{
+		if (!df_numeric_ps(cxt->node, l, &lp, &ls) || !df_numeric_ps(cxt->node, r, &rp, &rs))
+			df_reject(cxt, "%s on numeric of unknown precision", what);
+		else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
+				 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
+			df_reject(cxt, "%s on numeric beyond %d digits at a common scale",
+					  what, DF_NUMERIC_MAX_EXPR_PRECISION);
+	}
+	else if (df_type_is_string(lt) &&
+			 (problem = df_string_compare_problem(cxt, "=", collation)) != NULL)
+		df_reject(cxt, "%s on %s %s", what, format_type_be(lt), problem);
+}
+
+/*
+ * Do the numeric expressions in 'exprs' all have scale 'scale' (the first
+ * one's when 'scale' < 0)?  A numeric value carries its display scale, so
+ * a CASE or COALESCE whose branches have different scales returns values
+ * displayed differently from row to row, which one Decimal256 column of
+ * one scale cannot.  A NULL constant fits any scale.
+ */
+static bool
+df_numeric_same_scale(Plan *ctx, List *exprs, int scale)
+{
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		Node	   *e = lfirst(lc);
+		int			p,
+					s;
+
+		if (IsA(e, Const) && ((Const *) e)->constisnull)
+			continue;
+		if (!df_numeric_ps(ctx, e, &p, &s) || (scale >= 0 && s != scale))
+			return false;
+		scale = s;
+	}
+	return true;
 }
 
 /* Is 'node' a constant LIKE pattern whose last backslash escapes nothing? */
@@ -843,12 +942,115 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			return true;
 
 		case T_CaseExpr:
-			df_reject(cxt, "CASE expression");
-			return true;
+			{
+				/* E1: DataFusion evaluates a branch only on the rows reaching it */
+				CaseExpr   *ce = (CaseExpr *) node;
+				List	   *results = NIL;
+				ListCell   *lc;
+
+				if (!df_type_supported(ce->casetype))
+				{
+					df_reject(cxt, "CASE returning %s", format_type_be(ce->casetype));
+					return true;
+				}
+				if (ce->arg != NULL && exprType((Node *) ce->arg) == NUMERICOID)
+				{
+					df_reject(cxt, "CASE on a numeric value");
+					return true;
+				}
+				foreach(lc, ce->args)
+					results = lappend(results, lfirst_node(CaseWhen, lc)->result);
+				results = lappend(results, ce->defresult);
+				if (ce->casetype == NUMERICOID && !df_numeric_same_scale(cxt->node, results, -1))
+				{
+					df_reject(cxt, "CASE returning numeric of different scales");
+					return true;
+				}
+				break;
+			}
+
+		case T_CaseWhen:
+		case T_CaseTestExpr:
+			break;
+
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *co = (CoalesceExpr *) node;
+
+				if (!df_type_supported(co->coalescetype))
+				{
+					df_reject(cxt, "COALESCE of %s", format_type_be(co->coalescetype));
+					return true;
+				}
+				if (co->coalescetype == NUMERICOID &&
+					!df_numeric_same_scale(cxt->node, co->args, -1))
+				{
+					df_reject(cxt, "COALESCE of numeric of different scales");
+					return true;
+				}
+				break;
+			}
+
+		case T_NullIfExpr:
+			{
+				NullIfExpr *ni = (NullIfExpr *) node;
+
+				if (list_length(ni->args) != 2)
+				{
+					df_reject(cxt, "NULLIF");
+					return true;
+				}
+				df_check_equality(cxt, "NULLIF", linitial(ni->args), lsecond(ni->args),
+								  ni->inputcollid);
+				if (cxt->failed)
+					return true;
+				break;
+			}
 
 		case T_ScalarArrayOpExpr:
-			df_reject(cxt, "IN or ANY list");
-			return true;
+			{
+				/* E1: x IN (constants), x NOT IN (constants) */
+				ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) node;
+				char	   *name = get_opname(sa->opno);
+				Node	   *left = linitial(sa->args);
+				Const	   *arr = lsecond(sa->args);
+				Datum	   *elems;
+				bool	   *nulls;
+				int			nelems,
+							i;
+				int16		elmlen;
+				bool		elmbyval;
+				char		elmalign;
+				Oid			elemtype;
+
+				if (name == NULL || sa->opno >= FirstGenbkiObjectId ||
+					!((sa->useOr && strcmp(name, "=") == 0) ||
+					  (!sa->useOr && strcmp(name, "<>") == 0)))
+				{
+					df_reject(cxt, "%s %s list", name ? name : "?", sa->useOr ? "ANY" : "ALL");
+					return true;
+				}
+				if (!IsA(arr, Const) || arr->constisnull)
+				{
+					df_reject(cxt, "IN list that is not a constant");
+					return true;
+				}
+				elemtype = ARR_ELEMTYPE(DatumGetArrayTypeP(arr->constvalue));
+				get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+				deconstruct_array(DatumGetArrayTypeP(arr->constvalue), elemtype,
+								  elmlen, elmbyval, elmalign, &elems, &nulls, &nelems);
+				for (i = 0; i < nelems && !cxt->failed; i++)
+				{
+					Const	   *c = makeConst(elemtype, -1, sa->inputcollid, elmlen,
+											  elems[i], nulls[i], elmbyval);
+
+					df_check_equality(cxt, sa->useOr ? "IN list" : "NOT IN list", left,
+									  (Node *) c, sa->inputcollid);
+				}
+				if (!cxt->failed)
+					df_check_expr(left, cxt);
+				return cxt->failed;
+			}
 
 		case T_RelabelType:
 			{
@@ -872,8 +1074,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			return true;
 
 		case T_DistinctExpr:
-			df_reject(cxt, "IS DISTINCT FROM");
-			return true;
+			{
+				DistinctExpr *de = (DistinctExpr *) node;
+
+				if (list_length(de->args) != 2)
+				{
+					df_reject(cxt, "IS DISTINCT FROM");
+					return true;
+				}
+				df_check_equality(cxt, "IS DISTINCT FROM", linitial(de->args),
+								  lsecond(de->args), de->inputcollid);
+				if (cxt->failed)
+					return true;
+				break;
+			}
 
 		default:
 			df_reject(cxt, "expression node type %d", (int) nodeTag(node));

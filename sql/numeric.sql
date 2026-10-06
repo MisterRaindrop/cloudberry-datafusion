@@ -122,11 +122,16 @@ SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
 SELECT g, sum(a * (1 - b)), sum(a * (1 - b) * (1 + a)), avg(a - 1) FROM df_nc GROUP BY g ORDER BY g;
 SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
+SELECT count(*) FROM df_nc WHERE a = 'NaN';
+SELECT count(*) FROM df_nc WHERE b < 'NaN';
 SET datafusion.mode = on;
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
 SELECT g, sum(a * (1 - b)), sum(a * (1 - b) * (1 + a)), avg(a - 1) FROM df_nc GROUP BY g ORDER BY g;
 SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
+-- a NaN constant is Decimal256's NaN (it was int128's for a while)
+SELECT count(*) FROM df_nc WHERE a = 'NaN';
+SELECT count(*) FROM df_nc WHERE b < 'NaN';
 RESET datafusion.motion_batches;
 
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;

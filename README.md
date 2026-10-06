@@ -430,6 +430,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | N1 | numeric results of `sum(int8)` and `avg` of integers |
 | N2 | `numeric(p, s)` columns with p <= 38 |
 | N3 | numeric `+`, `-`, `*`; Decimal256 |
+| E1 | `IN`/`NOT IN` lists, `CASE`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM` |
 
 ### Date and time types
 
@@ -603,6 +604,28 @@ columns to the table AM.  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
 against 2.31 s in PostgreSQL.
+
+### Expressions
+
+E1 adds the expressions found most in filters and select lists:
+
+| Expression | How |
+|---|---|
+| `x IN (...)`, `x NOT IN (...)` of constants (`= ANY`, `<> ALL`) | DataFusion's InList, whose NULL rules are SQL's: `2 IN (1, NULL)` is NULL |
+| `CASE WHEN ... THEN ... END`, `CASE x WHEN ...` | DataFusion's CASE, which evaluates a branch only on the rows reaching it, so `CASE WHEN b = 0 THEN 0 ELSE 100 / b END` never divides by zero |
+| `COALESCE(a, b, ...)` | as `CASE WHEN a IS NOT NULL THEN a ...`, so later arguments only run where the earlier ones are NULL, as in PostgreSQL |
+| `NULLIF(a, b)` | `CASE WHEN a = b THEN NULL ELSE a END` |
+| `IS [NOT] DISTINCT FROM` | DataFusion's operator |
+
+Comparisons follow the rules of `=`: integers of two widths or floats
+compare in the wider type, numeric at the larger scale, strings under a
+deterministic collation.  A numeric value carries its display scale, so a
+CASE or COALESCE returning numeric runs only when every branch has the
+same scale (`CASE WHEN n > 1 THEN n ELSE 0 END` returns `0` and `1.50`
+in PostgreSQL, not one column of one scale).  Other ANY/ALL operators
+(`> ALL`) stay on PostgreSQL.  Over 20 million rows, an IN list of five
+strings with a NOT IN of integers took 0.21 s against 0.86 s, a CASE with
+COALESCE and NULLIF grouped 0.26 s against 1.25 s.
 
 ## Build
 

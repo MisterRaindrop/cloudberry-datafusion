@@ -333,11 +333,11 @@ fn literal(v: &Value) -> Result<Expr, String> {
                 None
             } else {
                 // the integer times 10^-s, as a string (beyond JSON numbers)
-                Some(
-                    val.and_then(Value::as_str)
-                        .and_then(datafusion::arrow::datatypes::i256::from_string)
-                        .ok_or("bad numeric literal")?,
-                )
+                // NaN is "NaN": NUMERIC_NAN
+                Some(match val.and_then(Value::as_str) {
+                    Some("NaN") => crate::pgnum::NUMERIC_NAN,
+                    v => v.and_then(datafusion::arrow::datatypes::i256::from_string).ok_or("bad numeric literal")?,
+                })
             },
             crate::pgnum::NUMERIC_PRECISION,
             s,
@@ -449,6 +449,37 @@ fn expr(v: &Value) -> Result<Expr, String> {
             };
         }
         return Ok(acc);
+    }
+    if let Some(branches) = v.get("case") {
+        // CASE: DataFusion evaluates a branch only on the rows reaching it.
+        let branches = branches.as_array().ok_or("plan spec: bad case")?;
+        let mut cb: Option<datafusion::logical_expr::conditional_expressions::CaseBuilder> = None;
+        for w in branches {
+            let (c, t) = (expr(field(w, "when")?)?, expr(field(w, "then")?)?);
+            cb = Some(match cb {
+                None => when(c, t),
+                Some(mut b) => b.when(c, t),
+            });
+        }
+        let otherwise = expr(field(v, "else")?)?;
+        return match cb {
+            Some(mut b) => b.otherwise(otherwise).map_err(|e| e.to_string()),
+            None => Ok(otherwise),
+        };
+    }
+    if let Some(e) = v.get("inlist") {
+        // x IN (...) / x NOT IN (...): SQL's three-valued result with NULLs.
+        let values = field(v, "values")?.as_array().ok_or("plan spec: bad inlist")?;
+        let list = values.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
+        let negated = v.get("negated").and_then(Value::as_bool).unwrap_or(false);
+        return Ok(expr(e)?.in_list(list, negated));
+    }
+    if let Some(args) = v.get("distinct") {
+        let args = args.as_array().ok_or("plan spec: bad distinct")?;
+        if args.len() != 2 {
+            return Err("plan spec: distinct takes two arguments".into());
+        }
+        return Ok(binary_expr(expr(&args[0])?, Operator::IsDistinctFrom, expr(&args[1])?));
     }
     if let Some(e) = v.get("not") {
         return Ok(Expr::Not(Box::new(expr(e)?)));

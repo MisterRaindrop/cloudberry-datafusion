@@ -116,7 +116,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relnatts IN (1, 2);
    ->  Seq Scan on pg_class
          Filter: (relnatts = ANY ('{1,2}'::integer[]))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: IN or ANY list
+ DataFusion: slice 0 eligible
 (5 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid;
