@@ -174,6 +174,7 @@ typedef struct DfStringFunc
 } DfStringFunc;
 
 extern const DfStringFunc *df_string_func(Oid funcid);
+extern const char *df_bpchar_func(Oid funcid);
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 
 /*

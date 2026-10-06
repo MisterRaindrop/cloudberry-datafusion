@@ -204,7 +204,7 @@ static DfExec *df_execs = NULL;
 static bool
 df_type_is_string(Oid type)
 {
-	return type == TEXTOID || type == VARCHAROID;
+	return type == TEXTOID || type == VARCHAROID || type == BPCHAROID;
 }
 
 /* Bytes per value of a fixed-width type. */
@@ -817,6 +817,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 					break;
 				case TEXTOID:
 				case VARCHAROID:
+				case BPCHAROID:
 					{
 						int32	   *off = in->inoffsets[c];
 						Size		end = off[n];
@@ -975,6 +976,7 @@ df_exec_emit(DfExec *x)
 				break;
 			case TEXTOID:
 			case VARCHAROID:
+			case BPCHAROID:
 				{
 					const int32 *off = x->outcols[c].offsets;
 

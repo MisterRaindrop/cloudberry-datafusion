@@ -42,6 +42,7 @@ pub enum KeyHash {
     Float4, // hashfloat4
     Float8, // hashfloat8
     Text,   // hashtext (cdbhash passes the default collation: deterministic)
+    Bpchar, // hashbpchar: hashtext of the value without trailing blanks
 }
 
 impl KeyHash {
@@ -56,6 +57,7 @@ impl KeyHash {
             "date" => KeyHash::Int4,
             "time" | "timestamp" | "timestamptz" => KeyHash::Int8,
             "text" => KeyHash::Text,
+            "bpchar" => KeyHash::Bpchar,
             _ => return None,
         })
     }
@@ -227,6 +229,9 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
         KeyHash::Float4 => hash_float8(a.as_primitive::<Float32Type>().value(r) as f64),
         KeyHash::Float8 => hash_float8(a.as_primitive::<Float64Type>().value(r)),
         KeyHash::Text => hash_bytes(a.as_string::<i32>().value(r).as_bytes()),
+        KeyHash::Bpchar => {
+            hash_bytes(crate::pgstr::bpchar_trim(a.as_string::<i32>().value(r)).as_bytes())
+        }
     })
 }
 

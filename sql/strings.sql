@@ -173,7 +173,49 @@ FETCH 2 FROM df_st_cur;
 CLOSE df_st_cur;
 COMMIT;
 
-DROP TABLE df_st, df_st2, df_st_big, df_sf;
+-- character (B1): values as stored, blank-padded, so they print and match
+-- LIKE padded; compared, hashed, grouped and sorted without trailing blanks
+-- (a tab sorts before the end of the value, not after the padding), as
+-- bpcharcmp does.  The cast to text drops the blanks; length counts without
+-- them, octet_length with.  min and max stay on PostgreSQL.
+CREATE TABLE df_bp (id int, f char(1), c char(10), w char(25)) DISTRIBUTED BY (id);
+INSERT INTO df_bp SELECT i,
+  CASE i % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END,
+  CASE WHEN i % 17 = 0 THEN NULL WHEN i % 13 = 0 THEN E'ab\t' WHEN i % 11 = 0 THEN 'ab'
+       WHEN i % 7 = 0 THEN ' x ' ELSE 'SEG' || (i % 5) END,
+  'NATION_' || (i % 25)
+FROM generate_series(1, 20000) i;
+CREATE TABLE df_bp2 (k char(15), n int) DISTRIBUTED BY (n);
+INSERT INTO df_bp2 SELECT 'SEG' || i, i FROM generate_series(0, 6) i;
+INSERT INTO df_bp2 VALUES ('ab', 100), (E'ab\t', 101);
+ANALYZE df_bp;
+ANALYZE df_bp2;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2') GROUP BY f, c;
+EXPLAIN (COSTS OFF) SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n;
+EXPLAIN (COSTS OFF) SELECT max(c) FROM df_bp;
+SET datafusion.mode = off;
+SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
+SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
+SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
+SELECT count(*) FROM df_bp WHERE c COLLATE "C" < 'ab' OR c COLLATE "C" > E'ab\t';
+SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2', E'ab\t') GROUP BY f, c ORDER BY f, c COLLATE "C";
+SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') FROM df_bp
+WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
+SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
+SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
+SET datafusion.mode = on;
+SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
+SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
+SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
+SELECT count(*) FROM df_bp WHERE c COLLATE "C" < 'ab' OR c COLLATE "C" > E'ab\t';
+SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2', E'ab\t') GROUP BY f, c ORDER BY f, c COLLATE "C";
+SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') FROM df_bp
+WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
+SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
+SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
+
+DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

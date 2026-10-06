@@ -31,7 +31,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Expr, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
 use crate::pgfunc::PgError;
@@ -234,6 +234,55 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
         )
     };
     h.find(n)
+}
+
+/// B1: a character value as bpcharcmp, hashbpchar and the cast to text see
+/// it: without trailing blanks (bcTruelen; only ' ', which UTF-8 never uses
+/// inside another character).  Values themselves keep their padding.
+pub fn bpchar_trim(v: &str) -> &str {
+    v.trim_end_matches(' ')
+}
+
+/// `bpchar_key(x)`: x without trailing blanks; a constant is trimmed here.
+pub fn bpchar_key(e: Expr) -> Expr {
+    match e {
+        Expr::Literal(ScalarValue::Utf8(v), m) => {
+            Expr::Literal(ScalarValue::Utf8(v.map(|v| bpchar_trim(&v).to_string())), m)
+        }
+        e => ScalarUDF::new_from_impl(PgBpcharKey {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        })
+        .call(vec![e]),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct PgBpcharKey {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for PgBpcharKey {
+    fn name(&self) -> &str {
+        "pg_bpchar_key"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let a = utf8(&args.args[0].to_array(args.number_rows)?)?;
+        let out: StringArray = a
+            .as_string::<i32>()
+            .iter()
+            .map(|v| v.map(bpchar_trim))
+            .collect();
+        Ok(ColumnarValue::Array(Arc::new(out)))
+    }
 }
 
 /// `text LIKE pattern` (`~~`) and `NOT LIKE` (`!~~`).

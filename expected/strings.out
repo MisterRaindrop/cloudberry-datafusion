@@ -825,7 +825,246 @@ FETCH 2 FROM df_st_cur;
 
 CLOSE df_st_cur;
 COMMIT;
-DROP TABLE df_st, df_st2, df_st_big, df_sf;
+-- character (B1): values as stored, blank-padded, so they print and match
+-- LIKE padded; compared, hashed, grouped and sorted without trailing blanks
+-- (a tab sorts before the end of the value, not after the padding), as
+-- bpcharcmp does.  The cast to text drops the blanks; length counts without
+-- them, octet_length with.  min and max stay on PostgreSQL.
+CREATE TABLE df_bp (id int, f char(1), c char(10), w char(25)) DISTRIBUTED BY (id);
+INSERT INTO df_bp SELECT i,
+  CASE i % 3 WHEN 0 THEN 'A' WHEN 1 THEN 'N' ELSE 'R' END,
+  CASE WHEN i % 17 = 0 THEN NULL WHEN i % 13 = 0 THEN E'ab\t' WHEN i % 11 = 0 THEN 'ab'
+       WHEN i % 7 = 0 THEN ' x ' ELSE 'SEG' || (i % 5) END,
+  'NATION_' || (i % 25)
+FROM generate_series(1, 20000) i;
+CREATE TABLE df_bp2 (k char(15), n int) DISTRIBUTED BY (n);
+INSERT INTO df_bp2 SELECT 'SEG' || i, i FROM generate_series(0, 6) i;
+INSERT INTO df_bp2 VALUES ('ab', 100), (E'ab\t', 101);
+ANALYZE df_bp;
+ANALYZE df_bp2;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2') GROUP BY f, c;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: f, c
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: f, c
+               ->  Streaming Partial HashAggregate
+                     Group Key: f, c
+                     ->  Seq Scan on df_bp
+                           Filter: (c = ANY ('{ab,SEG2}'::bpchar[]))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: b.n
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: b.n
+               ->  Streaming Partial HashAggregate
+                     Group Key: b.n
+                     ->  Hash Join
+                           Hash Cond: (a.c = b.k)
+                           ->  Seq Scan on df_bp a
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on df_bp2 b
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(18 rows)
+
+EXPLAIN (COSTS OFF) SELECT max(c) FROM df_bp;
+                          QUERY PLAN                          
+--------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_bp
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: aggregate max of character
+ DataFusion: slice 1 not eligible: aggregate max of character
+(7 rows)
+
+SET datafusion.mode = off;
+SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
+ count 
+-------
+  4288
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
+ count 
+-------
+ 13539
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
+ count 
+-------
+  1581
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c COLLATE "C" < 'ab' OR c COLLATE "C" > E'ab\t';
+ count 
+-------
+ 15795
+(1 row)
+
+SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2', E'ab\t') GROUP BY f, c ORDER BY f, c COLLATE "C";
+ f |        c        | count 
+---+-----------------+-------
+ A | SEG2            |   902
+ A | ab              |   527
+ A | ab              |   482
+ N | SEG2            |   901
+ N | ab              |   527
+ N | ab              |   483
+ R | SEG2            |   905
+ R | ab              |   527
+ R | ab              |   483
+(9 rows)
+
+SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') FROM df_bp
+WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
+  id   |        c        |     t     | length | octet_length |      concat      
+-------+-----------------+-----------+--------+--------------+------------------
+  1001 | ab              | |ab     | |      3 |           10 | ab             |
+  2002 | ab              | |ab     | |      3 |           10 | ab             |
+  3003 | ab              | |ab     | |      3 |           10 | ab             |
+  4004 | ab              | |ab     | |      3 |           10 | ab             |
+  5005 | ab              | |ab     | |      3 |           10 | ab             |
+  6006 | ab              | |ab     | |      3 |           10 | ab             |
+  7007 | ab              | |ab     | |      3 |           10 | ab             |
+ 13000 | ab              | |ab     | |      3 |           10 | ab             |
+ 14001 | ab              | |ab     | |      3 |           10 | ab             |
+ 15002 | ab              | |ab     | |      3 |           10 | ab             |
+ 16003 | ab              | |ab     | |      3 |           10 | ab             |
+ 17004 | ab              | |ab     | |      3 |           10 | ab             |
+(12 rows)
+
+SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
+  n  | count 
+-----+-------
+   0 |  2708
+   1 |  2707
+   2 |  2708
+   3 |  2708
+   4 |  2708
+ 100 |  1581
+ 101 |  1448
+(7 rows)
+
+SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
+    s     | count | count 
+----------+-------+-------
+ NATION_0 |     4 |   800
+ NATION_1 |     8 |  8800
+ NATION_2 |     8 |  4800
+ NATION_3 |     4 |   800
+ NATION_4 |     4 |   800
+ NATION_5 |     4 |   800
+ NATION_6 |     4 |   800
+ NATION_7 |     4 |   800
+ NATION_8 |     4 |   800
+ NATION_9 |     4 |   800
+(10 rows)
+
+SET datafusion.mode = on;
+SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
+ count 
+-------
+  4288
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
+ count 
+-------
+ 13539
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
+ count 
+-------
+  1581
+(1 row)
+
+SELECT count(*) FROM df_bp WHERE c COLLATE "C" < 'ab' OR c COLLATE "C" > E'ab\t';
+ count 
+-------
+ 15795
+(1 row)
+
+SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2', E'ab\t') GROUP BY f, c ORDER BY f, c COLLATE "C";
+ f |        c        | count 
+---+-----------------+-------
+ A | SEG2            |   902
+ A | ab              |   527
+ A | ab              |   482
+ N | SEG2            |   901
+ N | ab              |   527
+ N | ab              |   483
+ R | SEG2            |   905
+ R | ab              |   527
+ R | ab              |   483
+(9 rows)
+
+SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') FROM df_bp
+WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
+  id   |        c        |     t     | length | octet_length |      concat      
+-------+-----------------+-----------+--------+--------------+------------------
+  1001 | ab              | |ab     | |      3 |           10 | ab             |
+  2002 | ab              | |ab     | |      3 |           10 | ab             |
+  3003 | ab              | |ab     | |      3 |           10 | ab             |
+  4004 | ab              | |ab     | |      3 |           10 | ab             |
+  5005 | ab              | |ab     | |      3 |           10 | ab             |
+  6006 | ab              | |ab     | |      3 |           10 | ab             |
+  7007 | ab              | |ab     | |      3 |           10 | ab             |
+ 13000 | ab              | |ab     | |      3 |           10 | ab             |
+ 14001 | ab              | |ab     | |      3 |           10 | ab             |
+ 15002 | ab              | |ab     | |      3 |           10 | ab             |
+ 16003 | ab              | |ab     | |      3 |           10 | ab             |
+ 17004 | ab              | |ab     | |      3 |           10 | ab             |
+(12 rows)
+
+SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
+  n  | count 
+-----+-------
+   0 |  2708
+   1 |  2707
+   2 |  2708
+   3 |  2708
+   4 |  2708
+ 100 |  1581
+ 101 |  1448
+(7 rows)
+
+SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
+    s     | count | count 
+----------+-------+-------
+ NATION_0 |     4 |   800
+ NATION_1 |     8 |  8800
+ NATION_2 |     8 |  4800
+ NATION_3 |     4 |   800
+ NATION_4 |     4 |   800
+ NATION_5 |     4 |   800
+ NATION_6 |     4 |   800
+ NATION_7 |     4 |   800
+ NATION_8 |     4 |   800
+ NATION_9 |     4 |   800
+(10 rows)
+
+DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

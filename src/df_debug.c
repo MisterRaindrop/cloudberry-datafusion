@@ -328,7 +328,7 @@ typedef struct DfKeyType
 static const DfKeyType df_key_types[] = {
 	{0, F_HASHCHAR, 1}, {1, F_HASHINT2, 2}, {2, F_HASHINT4, 4},
 	{3, F_HASHINT8, 8}, {4, F_HASHFLOAT4, 4}, {5, F_HASHFLOAT8, 8},
-	{6, F_HASHTEXT, 0},
+	{6, F_HASHTEXT, 0}, {7, F_HASHBPCHAR, 0},
 };
 
 /*
@@ -446,6 +446,14 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 			{
 				nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
 				df_random_string(rng, &buf);
+				if (t->kind == 7)
+				{
+					/* character: blank padding, which hashbpchar leaves out */
+					int			pad = pg_prng_uint64(rng) % 4;
+
+					while (pad-- > 0)
+						appendStringInfoChar(&buf, ' ');
+				}
 				offsets[k][r + 1] = buf.len;
 			}
 			values[k] = buf.data;
@@ -502,8 +510,8 @@ datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
 {
 	static const int combos[][4] = {
 		/* nkeys, key types (indexes into df_key_types) */
-		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6},
-		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3},
+		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7},
+		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3}, {2, 7, 2},
 	};
 	int32		nrows = PG_GETARG_INT32(0);
 	int32		segments = PG_GETARG_INT32(1);

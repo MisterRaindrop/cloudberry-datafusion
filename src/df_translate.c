@@ -102,6 +102,7 @@ typedef struct DfBuilder
 
 static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
+static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
 
 static void
 df_fail(DfBuilder *b, const char *what)
@@ -139,6 +140,8 @@ df_type_tag(Oid type)
 		case TEXTOID:
 		case VARCHAROID:
 			return "text";
+		case BPCHAROID:
+			return "bpchar";
 		case NUMERICOID:
 			/* of scale 0; see df_tag for others */
 			return "numeric";
@@ -263,6 +266,7 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 				break;
 			case TEXTOID:
 			case VARCHAROID:
+			case BPCHAROID:
 				{
 					text	   *t = DatumGetTextPP(c->constvalue);
 
@@ -361,21 +365,41 @@ df_common_scale(Plan *ctx, Node *l, Node *r)
 
 /*
  * An operand of a comparison: a float as PostgreSQL compares it, -0 as 0
- * and every NaN as one, above all numbers (df_core::pgfloat).
+ * and every NaN as one, above all numbers (df_core::pgfloat); a character
+ * value without its trailing blanks (B1).
  */
 static void
 df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
 {
 	Oid			type = exprType(e);
+	const char *key = type == FLOAT4OID || type == FLOAT8OID ? "floatkey" :
+		type == BPCHAROID ? "bpkey" : NULL;
 
-	if (type != FLOAT4OID && type != FLOAT8OID)
+	if (key == NULL)
 	{
 		df_emit(b, out, e, level);
 		return;
 	}
-	appendStringInfoString(out, "{\"floatkey\":");
+	appendStringInfo(out, "{\"%s\":", key);
 	df_emit(b, out, e, level);
 	appendStringInfoChar(out, '}');
+}
+
+/*
+ * A grouping key, DISTINCT argument: character ones marked, which group by
+ * their value without trailing blanks (df_core::query::build_node).
+ */
+static void
+df_emit_grouped(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
+{
+	TargetEntry *tle = get_tle_by_resno(child->targetlist, resno);
+	bool		bp = tle != NULL && exprType((Node *) tle->expr) == BPCHAROID;
+
+	if (bp)
+		appendStringInfoString(out, "{\"bpchar\":");
+	df_emit_output_of(b, out, child, resno);
+	if (bp)
+		appendStringInfoChar(out, '}');
 }
 
 /* "[l, r]", numeric operands at their common scale (E1). */
@@ -681,9 +705,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					appendStringInfoString(out, "]}");
 					return;
 				}
-				if (op->opresulttype == BOOLOID && list_length(op->args) == 2)
+				if (op->opresulttype == BOOLOID && list_length(op->args) == 2 &&
+					strcmp(name, "~~") != 0 && strcmp(name, "!~~") != 0)
 				{
-					/* a comparison */
+					/* a comparison (LIKE sees character values padded: bpcharlike) */
 					df_emit_operands(b, out, linitial(op->args), lsecond(op->args), level);
 					appendStringInfoChar(out, '}');
 					return;
@@ -885,6 +910,21 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				const DfStringFunc *f = df_string_func(fe->funcid);
 				const char *tag = df_type_tag(fe->funcresulttype);
 
+				if (df_bpchar_func(fe->funcid) != NULL)
+				{
+					/* B1: character to text drops trailing blanks; lengths */
+					const char *fn = df_bpchar_func(fe->funcid);
+
+					if (strcmp(fn, "bpkey") == 0)
+						appendStringInfoString(out, "{\"bpkey\":");
+					else
+						appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"int4\",\"args\":[%s",
+										 fn, strcmp(fn, "char_length") == 0 ? "{\"bpkey\":" : "");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfoString(out, strcmp(fn, "bpkey") == 0 ? "}" :
+										   strcmp(fn, "char_length") == 0 ? "}]}" : "]}");
+					return;
+				}
 				if (df_cast_kind(fe->funcid) != NULL && strcmp(df_cast_kind(fe->funcid), "widen") == 0)
 				{
 					/* exact, or rounding as C does (E2) */
@@ -977,7 +1017,7 @@ df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
 	}
 	if (exprType(key) == type)
 	{
-		df_emit(b, out, key, DF_LEVEL_SCAN);
+		df_emit_compared(b, out, key, DF_LEVEL_SCAN);
 		return;
 	}
 	appendStringInfoString(out, "{\"cast\":");
@@ -1039,7 +1079,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				{
 					if (i > 0)
 						appendStringInfoChar(out, ',');
-					df_emit_output_of(b, out, outerPlan(plan), agg->grpColIdx[i]);
+					df_emit_grouped(b, out, outerPlan(plan), agg->grpColIdx[i]);
 				}
 				appendStringInfo(out, "],\"aggs\":[],\"having\":null,\"name\":\"q%d\"}}",
 								 plan->plan_node_id);
@@ -1477,7 +1517,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 		{
 			if (i > 0)
 				appendStringInfoChar(&group, ',');
-			df_emit_output_of(&b, &group, outerPlan(root), b.agg->grpColIdx[i]);
+			df_emit_grouped(&b, &group, outerPlan(root), b.agg->grpColIdx[i]);
 		}
 		appendStringInfoChar(&group, ']');
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
@@ -1583,10 +1623,15 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 			else
 			{
 				/* arguments are expressions of the aggregate over its child */
+				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+				bool		bp = agg->aggdistinct != NIL && !combine && exprType(arg) == BPCHAROID;
+
 				b.ctx = (Plan *) b.agg;
-				df_emit(&b, &aggs,
-						(Node *) linitial_node(TargetEntry, agg->args)->expr,
-						DF_LEVEL_SCAN);
+				if (bp)
+					appendStringInfoString(&aggs, "{\"bpchar\":");	/* told apart without blanks */
+				df_emit(&b, &aggs, arg, DF_LEVEL_SCAN);
+				if (bp)
+					appendStringInfoChar(&aggs, '}');
 			}
 			/*
 			 * D1: over distinct arguments (min and max are the same without).

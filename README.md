@@ -552,6 +552,28 @@ PostgreSQL; grouping by a `varchar` of 500 values with `max(cust COLLATE
 and 1.57 s.  Grouping 300,000 keys of 1 kB with `work_mem = 4MB` spills
 in both and took 2.16 s in DataFusion against 1.42 s.
 
+### character
+
+B1 runs `char(n)` (bpchar) columns, the most frequent reason TPC-H slices
+stayed on PostgreSQL.  Values travel as stored, blank-padded, so they
+print as PostgreSQL prints them and match LIKE padded (`bpcharlike`:
+`'ab'::char(5) LIKE 'ab'` is false).  Everything that compares them
+does so without trailing blanks, as `bpcharcmp` and `hashbpchar` do:
+comparison operands, IN lists and join keys go through
+`pg_bpchar_key`, grouping keys and DISTINCT arguments group by it
+(keeping one of the group's padded values), sort keys sort by it (a tab
+then sorts before the end of the value, not after the padding), and a
+Redistribute Motion hashes it (checked against cdbhash with random
+padding).  The cast to text (and varchar) is that key; `length` counts
+without the blanks, `octet_length` with them; `concat` prints them.
+min and max of character stay on PostgreSQL (they compare without the
+blanks but return the padded value).  Over the TPC-H and TPC-DS queries
+of Cloudberry's regression tests, slices DataFusion can run went from
+23% to 44% (Postgres planner) and from 21% to 39% (ORCA).  A Q1-like
+grouping by two char(1) columns over 10 million rows took 0.23 s
+against 1.03 s; with an ORDER BY under the database's default collation
+its slices decide per node and the batch Motions it needs are off.
+
 ### numeric results of integer aggregates
 
 `sum(int8)` and `avg` of `int2`, `int4` and `int8` return numeric (N1).

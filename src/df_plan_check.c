@@ -144,6 +144,7 @@ df_type_supported(Oid type)
 			return true;
 		case TEXTOID:
 		case VARCHAROID:
+		case BPCHAROID:
 			/* Arrow's strings are UTF-8. */
 			return GetDatabaseEncoding() == PG_UTF8;
 		case NUMERICOID:
@@ -169,12 +170,14 @@ df_type_is_datetime(Oid type)
 /*
  * text and varchar travel as their bytes, which DataFusion compares byte by
  * byte: equality agrees with PostgreSQL under a deterministic collation,
- * ordering (and min/max) only under the C collation.
+ * ordering (and min/max) only under the C collation.  character (B1) as
+ * stored, blank-padded; it compares, hashes, groups and sorts without its
+ * trailing blanks (df_core::pgstr::bpchar_key), as bpcharcmp does.
  */
 static bool
 df_type_is_string(Oid type)
 {
-	return type == TEXTOID || type == VARCHAROID;
+	return type == TEXTOID || type == VARCHAROID || type == BPCHAROID;
 }
 
 /*
@@ -230,6 +233,29 @@ static const DfStringFunc df_string_funcs[] = {
 	{F_LOWER_TEXT, "lower", DF_COLL_CTYPE_C},
 	{F_UPPER_TEXT, "upper", DF_COLL_CTYPE_C},
 };
+
+/*
+ * B1: functions of character DataFusion runs: the cast to text (and
+ * varchar), which drops trailing blanks ("bpkey"), and the lengths
+ * ("char_length" of that; "octet_length" of the padded value).
+ */
+const char *
+df_bpchar_func(Oid funcid)
+{
+	switch (funcid)
+	{
+		case F_TEXT_BPCHAR:
+			return "bpkey";
+		case F_LENGTH_BPCHAR:
+		case F_CHAR_LENGTH_BPCHAR:
+		case F_CHARACTER_LENGTH_BPCHAR:
+			return "char_length";
+		case F_OCTET_LENGTH_BPCHAR:
+			return "octet_length";
+		default:
+			return NULL;
+	}
+}
 
 static const struct
 {
@@ -905,7 +931,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					{
 						const char *problem;
 
-						if (op->opresulttype != BOOLOID || ltype != rtype)
+						/* character LIKE text: bpcharlike, on the padded value */
+						bool		bplike = ltype == BPCHAROID && rtype == TEXTOID &&
+							(strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0);
+
+						if (op->opresulttype != BOOLOID || (ltype != rtype && !bplike))
 							df_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
 						else if ((problem = df_string_compare_problem(cxt, name, op->inputcollid)) != NULL)
@@ -1018,6 +1048,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
 					/* PostgreSQL adds real values in single precision. */
 					df_reject(cxt, "sum of real values");
+				else if (agg->aggtype == BPCHAROID)
+					/* bpchar_larger compares without trailing blanks, returns the padded value */
+					df_reject(cxt, "aggregate %s of character", name);
 				else if (df_type_is_string(agg->aggtype) &&
 						 df_string_compare_problem(cxt, name, agg->inputcollid) != NULL)
 					df_reject(cxt, "aggregate %s of %s %s", name, format_type_be(agg->aggtype),
@@ -1060,6 +1093,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					}
 					break;
 				}
+				if (df_bpchar_func(fe->funcid) != NULL)
+					break;		/* B1: character to text, lengths */
 				if (f == NULL || fe->funcretset || fe->funcvariadic)
 				{
 					df_reject(cxt, "function %s()", name ? name : "?");
@@ -2371,6 +2406,8 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 #ifndef WORDS_BIGENDIAN
 		/* cdbhash passes the default collation: hash_any of the bytes */
 		{TEXTOID, "hashtext"}, {VARCHAROID, "hashtext"},
+		/* the bytes without trailing blanks */
+		{BPCHAROID, "hashbpchar"},
 #endif
 	};
 	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);

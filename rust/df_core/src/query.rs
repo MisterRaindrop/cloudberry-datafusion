@@ -134,7 +134,7 @@ use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
 use crate::pgnum::{NumOp, NumericFn, PgNumeric};
-use crate::pgstr::{PgLike, PgStrFn, StrFn};
+use crate::pgstr::{bpchar_key, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
 /// Rows per input batch the main thread pushes.
@@ -177,6 +177,9 @@ pub enum PgType {
     Timestamptz,
     // text and varchar: UTF-8 bytes, compared byte by byte.
     Text,
+    // character: stored as Text, blank-padded; compared, hashed, grouped and
+    // sorted without its trailing blanks (pgstr::bpchar_key).
+    Bpchar,
     // numeric of a fixed scale, as Decimal256(76, scale): the C side builds
     // PostgreSQL's numeric values from the integers (pgnum).
     Numeric(i8),
@@ -196,6 +199,7 @@ impl PgType {
             "timestamp" => PgType::Timestamp,
             "timestamptz" => PgType::Timestamptz,
             "text" => PgType::Text,
+            "bpchar" => PgType::Bpchar,
             "numeric" => PgType::Numeric(0),
             other if other.starts_with("numeric:") => match other["numeric:".len()..].parse::<i8>()
             {
@@ -211,6 +215,7 @@ impl PgType {
         match self {
             PgType::Date => PgType::Int4,
             PgType::Time | PgType::Timestamp | PgType::Timestamptz => PgType::Int8,
+            PgType::Bpchar => PgType::Text,
             t => t,
         }
     }
@@ -218,6 +223,9 @@ impl PgType {
     /// The distribution hash of a column of this type: hashint4 for date,
     /// and time_hash and timestamp_hash are hashint8.
     pub fn key_hash(self) -> KeyHash {
+        if self == PgType::Bpchar {
+            return KeyHash::Bpchar;
+        }
         match self.storage() {
             PgType::Text => KeyHash::Text,
             PgType::Bool => KeyHash::Bool,
@@ -422,6 +430,13 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(e) = v.get("floatkey") {
         return Ok(FloatFn::Key.apply(expr(e)?));
+    }
+    if let Some(e) = v.get("bpkey") {
+        return Ok(bpchar_key(expr(e)?));
+    }
+    if let Some(e) = v.get("bpchar") {
+        // a character grouping key or DISTINCT argument (see build_node)
+        return expr(e);
     }
     if let Some(op) = v.get("op") {
         let name = op.as_str().unwrap_or("");
@@ -1140,12 +1155,19 @@ fn build_node(
         let mut group_exprs = Vec::with_capacity(groups.len());
         let mut float_groups = Vec::new();
         let mut agg_exprs = Vec::with_capacity(aggs.len());
+        // A character key (B1) groups without trailing blanks; its value is
+        // one of the group's, padded as stored.
+        let mut bp_groups = Vec::new();
         for (i, g) in groups.iter().enumerate() {
             let e = expr(g)?;
             if is_float_expr(&e, b.schema()) {
                 group_exprs.push(FloatFn::Key.apply(e.clone()).alias(format!("g{i}")));
                 agg_exprs.push(min(FloatFn::OrderKey.apply(e)).alias(format!("g{i}_v")));
                 float_groups.push(i);
+            } else if g.get("bpchar").is_some() {
+                group_exprs.push(bpchar_key(e.clone()).alias(format!("g{i}")));
+                agg_exprs.push(min(e).alias(format!("g{i}_v")));
+                bp_groups.push(i);
             } else {
                 group_exprs.push(e.alias(format!("g{i}")));
             }
@@ -1187,7 +1209,13 @@ fn build_node(
             let mut inner_aggs = agg_exprs;
             let key = |j: usize| -> Result<Expr, String> {
                 let x = expr(dargs[j])?;
-                Ok(if float_d[j] { FloatFn::Key.apply(x) } else { x })
+                Ok(if float_d[j] {
+                    FloatFn::Key.apply(x)
+                } else if dargs[j].get("bpchar").is_some() {
+                    bpchar_key(x)
+                } else {
+                    x
+                })
             };
             if simple {
                 inner.push(key(0)?.alias("d0"));
@@ -1254,6 +1282,7 @@ fn build_node(
                 .collect();
             agg_exprs = float_groups
                 .iter()
+                .chain(&bp_groups)
                 .map(|i| min(col(format!("g{i}_v"))).alias(format!("g{i}_v")))
                 .collect();
         }
@@ -1288,13 +1317,18 @@ fn build_node(
         // A combined count is 0, not NULL, when no partial count arrived;
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
-        if !float_groups.is_empty() || post.iter().any(|p| *p != Post::None) {
+        if !float_groups.is_empty()
+            || !bp_groups.is_empty()
+            || post.iter().any(|p| *p != Post::None)
+        {
             let mut cols: Vec<Expr> = (0..ngroups)
                 .map(|i| {
                     if float_groups.contains(&i) {
                         FloatFn::FromOrderKey
                             .apply(col(format!("g{i}_v")))
                             .alias(format!("g{i}"))
+                    } else if bp_groups.contains(&i) {
+                        col(format!("g{i}_v")).alias(format!("g{i}"))
                     } else {
                         col(format!("g{i}"))
                     }
@@ -1706,6 +1740,8 @@ impl Query {
                 let e = col(format!("o{c}"));
                 let e = if is_float(&ty.arrow()) {
                     FloatFn::Key.apply(e)
+                } else if *ty == PgType::Bpchar {
+                    bpchar_key(e)
                 } else {
                     e
                 };
