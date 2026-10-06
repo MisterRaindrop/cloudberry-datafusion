@@ -75,6 +75,7 @@
 //!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
 //! ```
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::fmt;
@@ -546,7 +547,7 @@ fn may_fail(v: &Value) -> bool {
                     return true;
                 }
                 if (op == "~~" || op == "!~~")
-                    && map.get("args").and_then(|a| a.get(1)).map_or(true, |p| p.get("lit").is_none())
+                    && map.get("args").and_then(|a| a.get(1)).is_none_or(|p| p.get("lit").is_none())
                 {
                     return true;
                 }
@@ -633,7 +634,7 @@ fn session_state(config: SessionConfig, pool: Arc<TrackingPool>, spill_dir: &str
 /// Single-use stream fed by the main thread.
 struct ChannelPartition {
     schema: SchemaRef,
-    rx: Mutex<Option<mpsc::Receiver<Result<RecordBatch, DataFusionError>>>>,
+    rx: Mutex<Option<BatchReceiver>>,
 }
 
 impl fmt::Debug for ChannelPartition {
@@ -900,15 +901,15 @@ fn normalize_spec(mut spec: Value) -> Result<Value, String> {
 /// Does the plan group rows in an aggregate (which caps the partitions)?
 fn has_grouped_aggregate(node: &Value) -> bool {
     if let Some(a) = node.get("aggregate") {
-        let grouped = a.get("group").and_then(Value::as_array).map_or(false, |g| !g.is_empty());
-        return grouped || a.get("input").map_or(false, has_grouped_aggregate);
+        let grouped = a.get("group").and_then(Value::as_array).is_some_and(|g| !g.is_empty());
+        return grouped || a.get("input").is_some_and(has_grouped_aggregate);
     }
     if let Some(f) = node.get("filter") {
-        return f.get("input").map_or(false, has_grouped_aggregate);
+        return f.get("input").is_some_and(has_grouped_aggregate);
     }
     if let Some(j) = node.get("join") {
-        return j.get("left").map_or(false, has_grouped_aggregate)
-            || j.get("right").map_or(false, has_grouped_aggregate);
+        return j.get("left").is_some_and(has_grouped_aggregate)
+            || j.get("right").is_some_and(has_grouped_aggregate);
     }
     false
 }
@@ -1056,12 +1057,19 @@ impl HashRoute {
     }
 }
 
+/// Channel ends that carry an input's batches into its plan source.
+type BatchSender = mpsc::Sender<Result<RecordBatch, DataFusionError>>;
+type BatchReceiver = mpsc::Receiver<Result<RecordBatch, DataFusionError>>;
+/// Channel ends that carry Arrow IPC stream bytes, tagged by route.
+type IpcSender = mpsc::Sender<(i32, Vec<u8>)>;
+type IpcReceiver = mpsc::Receiver<(i32, Vec<u8>)>;
+
 pub struct Query {
     handle: Handle,
     /// Per input: Source::Pushed batches.
-    in_tx: Vec<Option<mpsc::Sender<Result<RecordBatch, DataFusionError>>>>,
+    in_tx: Vec<Option<BatchSender>>,
     /// Per input: Source::Ipc stream bytes, by route, for its decoding task.
-    ipc_tx: Vec<Option<mpsc::Sender<(i32, Vec<u8>)>>>,
+    ipc_tx: Vec<Option<IpcSender>>,
     decoders: Vec<JoinHandle<()>>,
     in_schemas: Vec<SchemaRef>,
     in_types: Vec<Vec<PgType>>,
@@ -1290,10 +1298,10 @@ impl Query {
                                 .map(|c| take(c.as_ref(), &idx, None))
                                 .collect::<Result<Vec<_>, _>>()?;
                             let part = RecordBatch::try_new(schema.clone(), cols)?;
-                            if !writers.contains_key(&r) {
-                                writers.insert(r, StreamWriter::try_new(Vec::new(), &schema)?);
-                            }
-                            let w = writers.get_mut(&r).expect("writer just inserted");
+                            let w = match writers.entry(r) {
+                                Entry::Occupied(e) => e.into_mut(),
+                                Entry::Vacant(e) => e.insert(StreamWriter::try_new(Vec::new(), &schema)?),
+                            };
                             w.write(&part)?;
                             let bytes = std::mem::take(w.get_mut());
                             if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
@@ -1603,8 +1611,8 @@ impl Drop for Query {
 /// feed their rows to the plan: input column i is the stream's column
 /// `positions[i]`.  A malformed stream fails the plan.
 async fn decode_ipc(
-    mut rx: mpsc::Receiver<(i32, Vec<u8>)>,
-    tx: mpsc::Sender<Result<RecordBatch, DataFusionError>>,
+    mut rx: IpcReceiver,
+    tx: BatchSender,
     schema: SchemaRef,
     positions: Vec<usize>,
 ) {
@@ -1613,7 +1621,7 @@ async fn decode_ipc(
         "cannot decode the batches received from a Motion: {e}"
     )))));
     while let Some((route, bytes)) = rx.recv().await {
-        let decoder = decoders.entry(route).or_insert_with(StreamDecoder::new);
+        let decoder = decoders.entry(route).or_default();
         let mut buffer = Buffer::from_vec(bytes);
         while !buffer.is_empty() {
             let batch = match decoder.decode(&mut buffer) {
@@ -1845,7 +1853,7 @@ mod tests {
         let mut q = Query::start(spec, 2, 64 << 20, dir.to_str().unwrap()).unwrap();
         let (bytes, offsets, nulls) = ([0xffu8, 0xfe], [0i32, 2], [0u8]);
         let col = RawColumn { values: bytes.as_ptr(), nulls: nulls.as_ptr(), offsets: offsets.as_ptr() };
-        let e = unsafe { q.push(&[col], 1) }.err().expect("invalid UTF-8 accepted");
+        let e = unsafe { q.push(&[col], 1) }.expect_err("invalid UTF-8 accepted");
         assert_eq!(e.sqlstate, "22021");
     }
 

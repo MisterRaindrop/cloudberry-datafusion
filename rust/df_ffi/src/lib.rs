@@ -23,6 +23,11 @@
 //! into the caller's buffer.  The C side raises the ereport after the call
 //! returns, so PostgreSQL's longjmp never unwinds through Rust frames.
 
+// The entry points take raw pointers from C and dereference them after the
+// checks each SAFETY comment names.  Marking them `unsafe fn` would change
+// nothing for the C callers, the only callers there are.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::any::Any;
 use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};

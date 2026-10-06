@@ -828,7 +828,7 @@ mod tests {
     #[test]
     fn dangling_escape_errors_only_when_reached() {
         // 'xbc' LIKE 'a\' fails on 'x' before reaching the escape.
-        assert_eq!(like("xbc", "a\\").unwrap(), false);
+        assert!(!like("xbc", "a\\").unwrap());
         assert!(like("abc", "a\\").is_err());
         assert!(like("abc", "%\\").is_err());
     }
