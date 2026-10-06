@@ -93,6 +93,8 @@ typedef struct DfBuilder
 								 * Aggref's own, or "sum" / "count" for the
 								 * parts of a partial avg's state */
 	Node	   *case_arg;		/* the value of the CASE being emitted (E1) */
+	bool		join_sides;		/* emitting a join's keys or filter, which
+								 * read both sides as they are */
 	int		   *out_col;		/* output column of each value
 								 * (df_emit_outputs) */
 	bool		failed;
@@ -610,6 +612,15 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
+				if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR && !b->join_sides &&
+					IsA(b->ctx, HashJoin) &&
+					((HashJoin *) b->ctx)->join.jointype == JOIN_SEMI &&
+					df_semi_key_for((HashJoin *) b->ctx, var) != NULL)
+				{
+					/* the equal key of the side a semi join keeps */
+					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
+					return;
+				}
 				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
 					df_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
 				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
@@ -1134,6 +1145,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				df_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"on\":[");
 				b->ctx = plan;
+				b->join_sides = true;
 				foreach(lc, hj->hashclauses)
 				{
 					OpExpr	   *op = lfirst_node(OpExpr, lc);
@@ -1154,6 +1166,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				appendStringInfoString(out, "],\"filter\":");
 				b->ctx = plan;
 				df_emit_qual(b, out, hj->join.joinqual, DF_LEVEL_SCAN);
+				b->join_sides = false;
 				appendStringInfoString(out, "}}");
 				if (plan->qual != NIL)
 				{

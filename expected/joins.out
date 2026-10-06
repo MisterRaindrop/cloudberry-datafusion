@@ -675,6 +675,79 @@ SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
   1250
 (1 row)
 
+-- A semi join may output a column of its inner side, which DataFusion's
+-- semi join drops: one equal to an outer hash key reads that key (TPC-H's
+-- Q20 shape, where p_partkey stands for ps_partkey above the join).
+CREATE TABLE df_sj_ps (ps_partkey int, ps_suppkey int, ps_availqty int) DISTRIBUTED BY (ps_availqty);
+CREATE TABLE df_sj_p (p_partkey int, p_name text) DISTRIBUTED BY (p_partkey);
+CREATE TABLE df_sj_l (l_partkey int, l_suppkey int, l_quantity numeric(15,2)) DISTRIBUTED BY (l_quantity);
+INSERT INTO df_sj_ps SELECT i % 2000, i % 100, i % 900 FROM generate_series(1, 8000) i;
+INSERT INTO df_sj_p SELECT i, CASE WHEN i % 3 = 0 THEN 'medium ' ELSE 'small ' END || i
+FROM generate_series(1, 2000) i;
+INSERT INTO df_sj_l SELECT i % 2000, i % 100, i % 50 FROM generate_series(1, 60000) i;
+ANALYZE df_sj_ps;
+ANALYZE df_sj_p;
+ANALYZE df_sj_l;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+                                                             QUERY PLAN                                                             
+------------------------------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: ((df_sj_ps.ps_partkey = "Expr_SUBQUERY".csq_c0) AND (df_sj_ps.ps_suppkey = "Expr_SUBQUERY".csq_c1))
+                     Join Filter: ((df_sj_ps.ps_availqty)::numeric > "Expr_SUBQUERY".csq_c2)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: df_sj_ps.ps_partkey, df_sj_ps.ps_suppkey
+                           ->  Hash Semi Join
+                                 Hash Cond: (df_sj_ps.ps_partkey = df_sj_p.p_partkey)
+                                 ->  Seq Scan on df_sj_ps
+                                 ->  Hash
+                                       ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                             ->  Seq Scan on df_sj_p
+                                                   Filter: (p_name ~~ 'medium%'::text)
+                     ->  Hash
+                           ->  Subquery Scan on "Expr_SUBQUERY"
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_sj_l.l_partkey, df_sj_l.l_suppkey
+                                       ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                             Hash Key: df_sj_l.l_partkey, df_sj_l.l_suppkey
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_sj_l.l_partkey, df_sj_l.l_suppkey
+                                                   ->  Seq Scan on df_sj_l
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 not eligible: partial aggregate sum without batch Motions
+(30 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+ count |   sum   
+-------+---------
+  1556 | 1540827
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+ count |   sum   
+-------+---------
+  1556 | 1540827
+(1 row)
+
+RESET datafusion.motion_batches;
+DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

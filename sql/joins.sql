@@ -147,6 +147,36 @@ SELECT count(*), sum(ja.a) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb j
 SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
 SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
 
+-- A semi join may output a column of its inner side, which DataFusion's
+-- semi join drops: one equal to an outer hash key reads that key (TPC-H's
+-- Q20 shape, where p_partkey stands for ps_partkey above the join).
+CREATE TABLE df_sj_ps (ps_partkey int, ps_suppkey int, ps_availqty int) DISTRIBUTED BY (ps_availqty);
+CREATE TABLE df_sj_p (p_partkey int, p_name text) DISTRIBUTED BY (p_partkey);
+CREATE TABLE df_sj_l (l_partkey int, l_suppkey int, l_quantity numeric(15,2)) DISTRIBUTED BY (l_quantity);
+INSERT INTO df_sj_ps SELECT i % 2000, i % 100, i % 900 FROM generate_series(1, 8000) i;
+INSERT INTO df_sj_p SELECT i, CASE WHEN i % 3 = 0 THEN 'medium ' ELSE 'small ' END || i
+FROM generate_series(1, 2000) i;
+INSERT INTO df_sj_l SELECT i % 2000, i % 100, i % 50 FROM generate_series(1, 60000) i;
+ANALYZE df_sj_ps;
+ANALYZE df_sj_p;
+ANALYZE df_sj_l;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF)
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+SET datafusion.mode = off;
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+SET datafusion.mode = on;
+SELECT count(*), sum(ps_partkey) FROM df_sj_ps
+WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
+  AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
+RESET datafusion.motion_batches;
+DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -558,6 +558,31 @@ df_collect_aggrefs(Node *node, List **aggs)
 }
 
 /*
+ * The kept side's hash key of semi join 'hj' that inner column 'var' equals
+ * exactly (a hash clause outer = var of a type whose equal values are the
+ * same: integers, dates and times, bool), or NULL.
+ */
+Node *
+df_semi_key_for(HashJoin *hj, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, hj->hashclauses)
+	{
+		OpExpr	   *op = lfirst(lc);
+		Node	   *outer = linitial(op->args);
+		Node	   *inner = lsecond(op->args);
+		Oid			type = exprType(inner);
+
+		if (equal(inner, var) && exprType(outer) == type &&
+			(type == INT2OID || type == INT4OID || type == INT8OID || type == BOOLOID ||
+			 df_type_is_datetime(type)))
+			return outer;
+	}
+	return NULL;
+}
+
+/*
  * D2: can DataFusion run Agg 'agg' as a grouping below another aggregate:
  * no aggregates, no filter, and the output columns in 'needed' grouping
  * columns?  (The planner may carry other columns the aggregate above does
@@ -1981,6 +2006,40 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				df_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
 					return;
+
+				/*
+				 * A semi or anti join keeps one side's rows, and DataFusion's
+				 * outputs that side alone.  PostgreSQL's semi join may still
+				 * read the other side's columns (the planner picks any member
+				 * of an equivalence class): one equal to the kept side's
+				 * hash key by an exact equality reads that key instead.
+				 */
+				if (join->jointype == JOIN_SEMI || join->jointype == JOIN_ANTI ||
+					join->jointype == JOIN_RIGHT_ANTI)
+				{
+					List	   *vars = NIL;
+					int			dropped = join->jointype == JOIN_RIGHT_ANTI ? OUTER_VAR : INNER_VAR;
+
+					foreach(lc, plan->targetlist)
+					{
+						TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+						if (needed == NULL || bms_is_member(tle->resno, needed))
+							vars = list_concat(vars, pull_var_clause((Node *) tle->expr, 0));
+					}
+					vars = list_concat(vars, pull_var_clause((Node *) plan->qual, 0));
+					foreach(lc, vars)
+					{
+						Var		   *var = lfirst_node(Var, lc);
+
+						if (var->varno == dropped &&
+							(join->jointype != JOIN_SEMI || df_semi_key_for(hj, var) == NULL))
+						{
+							df_reject(cxt, "column of the side a semi or anti join drops");
+							return;
+						}
+					}
+				}
 
 				/* What each side must produce. */
 				foreach(lc, plan->targetlist)

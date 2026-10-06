@@ -259,6 +259,7 @@ extern Oid	df_join_key_type(Oid a, Oid b);
 extern bool df_limit_value(Node *expr, int64 *value);
 extern bool df_sort_direction(Oid sortop, Oid type, bool *desc);
 extern bool df_passes_through(Plan *plan);
+extern Node *df_semi_key_for(HashJoin *hj, Var *var);
 
 /* 'plan', or the child of it if it is a Sort (one D2 leaves out) */
 static inline Plan *
