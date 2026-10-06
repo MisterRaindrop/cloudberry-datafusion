@@ -695,16 +695,27 @@ distinct accumulators keep every distinct value in memory and fail beyond
 the slice's budget (30 million distinct values under a 32 MB
 statement_mem did), where PostgreSQL sorts and spills.  So the Agg runs
 as a grouping by its groups and the argument, which spills like any
-grouping, then as the aggregates over the distinct values.  That fixes
-what one Agg may hold: DISTINCT aggregates of one argument and min and
-max of it.  `count(DISTINCT a), count(*)`, DISTINCT aggregates of two
-arguments, sum and avg of distinct floats (of -0 and 0 PostgreSQL keeps
-one, and the sum shows its sign) and min or max of floats next to a
-DISTINCT stay on PostgreSQL, as does ORDER BY inside an aggregate.  A
-combining stage keeps the DISTINCT of the call but adds up partial
-results, which the planner splits only where each segment sees all of a
-value.  `count(DISTINCT b)` over 30 million distinct values took 1.21 s
-against 3.68 s under that 32 MB.
+grouping, then as the aggregates over the distinct values.  With several
+DISTINCT arguments, or other aggregates beside (D3), each input row is
+repeated once per argument and once for the other aggregates (a cross
+join with the numbers 0..k, the small side buffered), copy j keeping
+argument j; the grouping then holds each argument's distinct values, the
+other aggregates take partial results over copy 0 only (FILTER), and the
+aggregate above merges them, as Cloudberry's TupleSplit does.  Floats are
+told apart through `pg_float_key`, strings need a deterministic
+collation.  Sum and avg of distinct floats (of -0 and 0 PostgreSQL keeps
+one, and the sum shows its sign) and ORDER BY inside an aggregate stay
+on PostgreSQL.  A combining stage keeps the DISTINCT of the call but adds
+up partial results, which the planner splits only where each segment sees
+all of a value.  `count(DISTINCT b)` over 30 million distinct values took
+1.21 s against 3.68 s under that 32 MB; `count(DISTINCT b), count(DISTINCT
+a % 1000), count(*), sum(c)` 2.8 s against 6.1 s.
+
+A plan with several groupings and sorts holds that many shares of the
+budget per partition, so a slice runs on budget / (2 MB x their number)
+partitions at most, and a sort reserves at most a quarter of a share to
+merge its spilled runs (10 MB by default, which several partitions of a
+16 MB slice could not get).
 
 D2 runs the planner's own form of DISTINCT aggregates: an aggregate over
 a grouping by the argument (`HashAggregate` below `Partial Aggregate`,
@@ -712,8 +723,10 @@ or two `HashAggregate`s), within one slice.  The grouping, without
 aggregates and with only grouping columns read above it, becomes a named
 aggregate node of the spec.  And a GroupAggregate whose order no one
 reads, below an unsorted Motion, a Sort or another aggregate, runs
-hashed without the Sort below it; one below a sorted Motion, a Limit or
-at the top of the coordinator's slice stays on PostgreSQL, since the
+hashed without the Sort below it.  Below a sorted Motion whose keys are
+its groups (D3), it runs hashed and the slice sorts its output by those
+keys: the groups are unique, so the order is the same.  One below a Limit
+or at the top of the coordinator's slice stays on PostgreSQL, since the
 query's ORDER BY may rest on its order.  `count(DISTINCT a % 100000)`
 over 30 million rows took 0.65 s against 3.29 s.
 

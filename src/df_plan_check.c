@@ -565,52 +565,6 @@ df_grouping_problem(Agg *agg, Bitmapset *needed)
 }
 
 /*
- * D1: DataFusion runs the DISTINCT aggregates of an Agg over a grouping by
- * their argument (df_core::query::build_node), so all of them must have
- * one argument, and the Agg no other aggregates than min and max of it.
- * Of a float argument the grouping keeps one of -0 and 0, which min and
- * max must not see.  The reason, or NULL.
- */
-static const char *
-df_distinct_mix_problem(Agg *agg)
-{
-	List	   *aggs = NIL;
-	ListCell   *lc;
-	Node	   *arg = NULL;
-
-	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
-	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
-	foreach(lc, aggs)
-	{
-		Aggref	   *a = lfirst_node(Aggref, lc);
-		char	   *name = get_func_name(a->aggfnoid);
-
-		if (a->aggdistinct != NIL && a->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
-			strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
-		{
-			arg = (Node *) linitial_node(TargetEntry, a->args)->expr;
-			break;
-		}
-	}
-	if (arg == NULL)
-		return NULL;
-	foreach(lc, aggs)
-	{
-		Aggref	   *a = lfirst_node(Aggref, lc);
-		char	   *name = get_func_name(a->aggfnoid);
-		bool		minmax = strcmp(name, "min") == 0 || strcmp(name, "max") == 0;
-
-		if (a->args == NIL || (!minmax && a->aggdistinct == NIL))
-			return "alongside other aggregates";
-		if (!equal(linitial_node(TargetEntry, a->args)->expr, arg))
-			return "of different arguments";
-		if (minmax && (exprType(arg) == FLOAT4OID || exprType(arg) == FLOAT8OID))
-			return "alongside min or max of floats";
-	}
-	return NULL;
-}
-
-/*
  * Can 'l' and 'r' be compared for equality as PostgreSQL does (E1: IN
  * lists, IS DISTINCT FROM, NULLIF)?  The rules of = (N2, X1).  Rejects if
  * not.
@@ -1704,6 +1658,56 @@ df_sorted_for(Plan *top, Motion *motion)
 	return true;
 }
 
+/*
+ * D3: may the slice below sorted Motion 'motion' run its GroupAggregate
+ * hashed and sort the result by the Motion's keys?  The keys must be the
+ * Agg's grouping columns, in its default order.  Records it.
+ */
+static bool
+df_check_resort(DfCheckContext *cxt, Motion *motion)
+{
+	Agg		   *agg = (Agg *) outerPlan(motion);
+	int			i,
+				k;
+
+	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
+		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) || motion->numSortCols == 0)
+		return false;
+	for (i = 0; i < motion->numSortCols; i++)
+	{
+		TargetEntry *mtle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
+		Var		   *var = mtle ? (Var *) mtle->expr : NULL;
+		TargetEntry *atle;
+		Var		   *grp;
+		Oid			type;
+		bool		desc;
+
+		if (var == NULL || !IsA(var, Var) || var->varno != OUTER_VAR)
+			return false;
+		atle = get_tle_by_resno(agg->plan.targetlist, var->varattno);
+		grp = atle ? (Var *) atle->expr : NULL;
+		if (grp == NULL || !IsA(grp, Var) || grp->varno != OUTER_VAR)
+			return false;
+		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != grp->varattno; k++)
+			;
+		if (k == agg->numCols)
+			return false;
+		type = exprType((Node *) grp);
+		if (!df_type_supported(type) || !df_sort_direction(motion->sortOperators[i], type, &desc))
+			return false;
+		if (df_type_is_string(type) &&
+			df_string_compare_problem(cxt, "<", motion->collations[i]) != NULL)
+		{
+			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  df_string_compare_problem(cxt, "<", motion->collations[i]));
+			return false;
+		}
+		cxt->sort_keys = bms_add_member(cxt->sort_keys, var->varattno);
+	}
+	cxt->tails.resort = motion;
+	return true;
+}
+
 static void
 df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			  bool root_is_sender)
@@ -1805,11 +1809,6 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "combining stage of a multi-stage aggregation");
-					return;
-				}
-				if (df_distinct_mix_problem(agg) != NULL)
-				{
-					df_reject(cxt, "DISTINCT aggregates %s", df_distinct_mix_problem(agg));
 					return;
 				}
 				for (i = 0; i < agg->numCols && child != NULL; i++)
@@ -2201,8 +2200,17 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (motion->sendSorted &&
 					(outerPlan(plan) == NULL || !df_sorted_for(outerPlan(plan), motion)))
 				{
-					df_reject(cxt, "sorted %s without a Sort below it", df_plan_name(plan));
-					return;
+					/*
+					 * D3: a GroupAggregate below sorts by its groups, which
+					 * are unique: the slice runs it hashed and sorts its
+					 * output by the Motion's keys, the same order.
+					 */
+					if (!df_check_resort(cxt, motion))
+					{
+						if (!cxt->failed)
+							df_reject(cxt, "sorted %s without a Sort below it", df_plan_name(plan));
+						return;
+					}
 				}
 				if (motion->motionType != MOTIONTYPE_GATHER &&
 					motion->motionType != MOTIONTYPE_GATHER_SINGLE &&
@@ -2214,7 +2222,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				cxt->agg_input = false;
 				cxt->batch_sender = bms_is_member(motion->motionID, cxt->batches);
-				cxt->order_free = !motion->sendSorted;
+				cxt->order_free = !motion->sendSorted || cxt->tails.resort != NULL;
 				df_check_plan(outerPlan(plan), cxt, NULL, false);
 				cxt->batch_sender = false;
 				return;

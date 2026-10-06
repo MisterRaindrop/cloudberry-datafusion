@@ -1389,6 +1389,38 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 }
 
 /*
+ * D3: the order of sorted Motion 'motion' above 'body', a GroupAggregate
+ * run hashed, as the spec's "sort" by output columns.
+ */
+static void
+df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSliceSpec *spec)
+{
+	int			i;
+
+	appendStringInfoString(out, ",\"sort\":[");
+	for (i = 0; i < motion->numSortCols; i++)
+	{
+		TargetEntry *mtle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
+		AttrNumber	k = mtle && IsA(mtle->expr, Var) ? ((Var *) mtle->expr)->varattno : 0;
+		TargetEntry *tle = k > 0 ? get_tle_by_resno(body->targetlist, k) : NULL;
+		bool		desc;
+		int			c;
+
+		if (tle == NULL || spec->col_value[k - 1] < 0 ||
+			!df_sort_direction(motion->sortOperators[i], exprType((Node *) tle->expr), &desc))
+		{
+			df_fail(b, "a sort key of the Motion");
+			return;
+		}
+		c = b->out_col[spec->col_value[k - 1]];
+		appendStringInfo(out, "%s{\"col\":%d,\"desc\":%s,\"nulls_first\":%s}",
+						 i > 0 ? "," : "", c, desc ? "true" : "false",
+						 motion->nullsFirst[i] ? "true" : "false");
+	}
+	appendStringInfoChar(out, ']');
+}
+
+/*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
  */
@@ -1462,6 +1494,13 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 	initStringInfo(&sortlimit);
 	if (!b.failed)
 		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
+	if (!b.failed && tails != NULL && tails->resort != NULL)
+	{
+		if (sort != NULL || limit != NULL)
+			df_fail(&b, "a Sort below a sorted Motion's GroupAggregate");
+		else
+			df_emit_resort(&b, &sortlimit, tails->resort, root, spec);
+	}
 	if (b.failed)
 		return false;
 

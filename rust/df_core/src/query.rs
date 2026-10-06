@@ -116,7 +116,7 @@ use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::logical_expr::{
-    binary_expr, when, Expr, ExprSchemable, LogicalPlanBuilder, Operator,
+    binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, LogicalPlanBuilder, Operator,
 };
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -694,22 +694,51 @@ fn aggregate_extra(v: &Value, over: Option<&Expr>) -> Result<Option<Expr>, Strin
     }
 }
 
-/// D1: the argument of the aggregates of `aggs` if they are over distinct
-/// values: count, sum and avg with "distinct", min and max, all of one
-/// argument (the checker allows no other mix).
-fn distinct_argument(aggs: &[Value]) -> Result<Option<&Value>, String> {
-    let flag = |a: &Value| a.get("distinct").and_then(Value::as_bool).unwrap_or(false);
-    let Some(first) = aggs.iter().find(|a| flag(a)) else {
-        return Ok(None);
-    };
-    let arg = field(first, "arg")?;
+/// D1, D3: the distinct arguments of the DISTINCT aggregates of `aggs`, in
+/// order of appearance.
+fn distinct_arguments(aggs: &[Value]) -> Result<Vec<&Value>, String> {
+    let mut args: Vec<&Value> = Vec::new();
     for a in aggs {
-        let minmax = matches!(field(a, "fn")?.as_str(), Some("min" | "max"));
-        if (!flag(a) && !minmax) || a.get("arg") != Some(arg) {
-            return Err("plan spec: DISTINCT aggregates with others".into());
+        if a.get("distinct").and_then(Value::as_bool).unwrap_or(false) {
+            let arg = field(a, "arg")?;
+            if !args.contains(&arg) {
+                args.push(arg);
+            }
         }
     }
-    Ok(Some(arg))
+    Ok(args)
+}
+
+/// What the projection after an aggregate does to its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Post {
+    None,
+    /// a count combined from partial counts: 0, not NULL, without any
+    CountZero,
+    /// sum_decimal: NaN where the second aggregate saw one
+    NanIf,
+    /// an avg from a sum and a count (the second aggregate): NULL for none
+    AvgDivide,
+    /// min or max of floats, run on order keys (pgfloat)
+    FromOrderKey,
+}
+
+impl Post {
+    fn of(a: &Value) -> Result<Post, String> {
+        Ok(match field(a, "fn")?.as_str() {
+            Some("count_merge") => Post::CountZero,
+            Some("sum_decimal") => Post::NanIf,
+            Some("avg_merge") => Post::AvgDivide,
+            _ => Post::None,
+        })
+    }
+
+    fn is_minmax(a: &Value) -> bool {
+        matches!(
+            a.get("fn").and_then(Value::as_str),
+            Some("min") | Some("max")
+        )
+    }
 }
 
 /// DataFusion's default session, minus expression simplification.
@@ -1049,23 +1078,32 @@ fn has_full_sort(spec: &Value) -> bool {
             .is_none()
 }
 
-/// Does the plan group rows in an aggregate (which caps the partitions)?
-fn has_grouped_aggregate(node: &Value) -> bool {
+/// The operators of plan `node` that hold a partition's share of the
+/// memory budget: a grouped aggregate (partial and final), one more for
+/// the grouping below DISTINCT aggregates (D1, D3), each grouping below
+/// another aggregate (D2).  Each needs MIN_PARTITION_MEMORY per partition.
+fn memory_consumers(node: &Value) -> usize {
     if let Some(a) = node.get("aggregate") {
         let grouped = a
             .get("group")
             .and_then(Value::as_array)
             .is_some_and(|g| !g.is_empty());
-        return grouped || a.get("input").is_some_and(has_grouped_aggregate);
+        let distinct = a.get("aggs").and_then(Value::as_array).is_some_and(|aggs| {
+            aggs.iter()
+                .any(|g| g.get("distinct") == Some(&Value::Bool(true)))
+        });
+        return usize::from(grouped)
+            + usize::from(distinct)
+            + a.get("input").map_or(0, memory_consumers);
     }
     if let Some(f) = node.get("filter") {
-        return f.get("input").is_some_and(has_grouped_aggregate);
+        return f.get("input").map_or(0, memory_consumers);
     }
     if let Some(j) = node.get("join") {
-        return j.get("left").is_some_and(has_grouped_aggregate)
-            || j.get("right").is_some_and(has_grouped_aggregate);
+        return j.get("left").map_or(0, memory_consumers)
+            + j.get("right").map_or(0, memory_consumers);
     }
-    false
+    0
 }
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
@@ -1112,22 +1150,105 @@ fn build_node(
                 group_exprs.push(e.alias(format!("g{i}")));
             }
         }
-        // D1: DISTINCT aggregates run over a grouping by the groups and
-        // their argument, which spills as any grouping does, and then over
-        // its distinct values, "dx".  DataFusion's own distinct accumulators
-        // keep every value in memory.  The checker allows count, sum and avg
-        // DISTINCT and min and max of one argument, not a float one.
-        let mut over = None;
-        if let Some(arg) = distinct_argument(&aggs)? {
-            let x = expr(arg)?;
-            let x = if is_float_expr(&x, b.schema()) {
-                FloatFn::Key.apply(x)
-            } else {
-                x
-            };
+        // D1, D3: DISTINCT aggregates run over a grouping by the groups and
+        // their arguments, which spills as any grouping does, and then over
+        // its distinct values.  DataFusion's own distinct accumulators keep
+        // every value in memory.  One argument with only min and max of it
+        // beside: a grouping by it ("d0").  Otherwise each row is repeated
+        // once per argument and once for the other aggregates, tagged
+        // "dtag" 1..k and 0 (by a cross join with those numbers, the small
+        // side buffered); copy j holds argument j as "d<j-1>", and the other
+        // aggregates take partial results over copy 0 only, merged above.
+        let mut float_aggs = Vec::new();
+        for (i, g) in aggs.iter().enumerate() {
+            if float_min_max(g, b.schema(), None)? {
+                float_aggs.push(i);
+            }
+        }
+        let mut post: Vec<Post> = aggs.iter().map(Post::of).collect::<Result<_, _>>()?;
+        for i in &float_aggs {
+            post[*i] = Post::FromOrderKey;
+        }
+        let dargs = distinct_arguments(&aggs)?;
+        let flag = |a: &Value| a.get("distinct").and_then(Value::as_bool).unwrap_or(false);
+        // the argument of each aggregate: its distinct column, or None
+        let mut over: Vec<Option<Expr>> = vec![None; aggs.len()];
+        if !dargs.is_empty() {
+            let float_d: Vec<bool> = dargs
+                .iter()
+                .map(|d| Ok::<_, String>(is_float_expr(&expr(d)?, b.schema())))
+                .collect::<Result<_, _>>()?;
+            let simple = dargs.len() == 1
+                && aggs.iter().all(|a| {
+                    a.get("arg") == Some(dargs[0])
+                        && (flag(a) || (!float_d[0] && Post::is_minmax(a)))
+                });
             let mut inner = group_exprs;
-            inner.push(x.alias("dx"));
-            b = b.aggregate(inner, agg_exprs).map_err(df)?;
+            let mut inner_aggs = agg_exprs;
+            let key = |j: usize| -> Result<Expr, String> {
+                let x = expr(dargs[j])?;
+                Ok(if float_d[j] { FloatFn::Key.apply(x) } else { x })
+            };
+            if simple {
+                inner.push(key(0)?.alias("d0"));
+                for o in over.iter_mut() {
+                    *o = Some(col("d0"));
+                }
+            } else {
+                let tags = LogicalPlanBuilder::values(
+                    (0..=dargs.len()).map(|t| vec![lit(t as i64)]).collect(),
+                )
+                .map_err(df)?
+                .project(vec![col("column1").alias("dtag")])
+                .map_err(df)?;
+                let input_schema = b.schema().clone();
+                b = tags.cross_join(b.build().map_err(df)?).map_err(df)?;
+                for j in 0..dargs.len() {
+                    inner.push(
+                        when(col("dtag").eq(lit(j as i64 + 1)), key(j)?)
+                            .end()
+                            .map_err(df)?
+                            .alias(format!("d{j}")),
+                    );
+                }
+                let copy0 = col("dtag").eq(lit(0i64));
+                let filtered = |e: Expr| -> Result<Expr, String> {
+                    e.filter(copy0.clone()).build().map_err(|e| e.to_string())
+                };
+                for (i, a) in aggs.iter().enumerate() {
+                    if flag(a) {
+                        let j = dargs.iter().position(|d| a.get("arg") == Some(*d)).unwrap();
+                        over[i] = Some(col(format!("d{j}")));
+                        continue;
+                    }
+                    // the partial results of the others, over copy 0
+                    let name = field(a, "fn")?.as_str().unwrap_or("");
+                    let arg = agg_arg(a, None)?;
+                    let p = format!("p{i}");
+                    match name {
+                        "count" => {
+                            inner_aggs
+                                .push(filtered(count(arg.unwrap_or_else(|| lit(1i64))))?.alias(&p));
+                            post[i] = Post::CountZero;
+                        }
+                        "avg" => {
+                            let x = arg.ok_or("avg needs an argument")?;
+                            inner_aggs.push(filtered(sum(x.clone()))?.alias(&p));
+                            inner_aggs.push(filtered(count(x))?.alias(format!("{p}_n")));
+                            post[i] = Post::AvgDivide;
+                        }
+                        "sum" | "sum_numeric" | "sum_decimal" | "min" | "max" => {
+                            inner_aggs
+                                .push(filtered(aggregate(a, &input_schema, None)?)?.alias(&p));
+                            if let Some(e) = aggregate_extra(a, None)? {
+                                inner_aggs.push(filtered(e)?.alias(format!("{p}_n")));
+                            }
+                        }
+                        other => return Err(format!("plan spec: {other} beside DISTINCT")),
+                    }
+                }
+            }
+            b = b.aggregate(inner, inner_aggs).map_err(df)?;
             group_exprs = (0..groups.len())
                 .map(|i| col(format!("g{i}")).alias(format!("g{i}")))
                 .collect();
@@ -1135,16 +1256,31 @@ fn build_node(
                 .iter()
                 .map(|i| min(col(format!("g{i}_v"))).alias(format!("g{i}_v")))
                 .collect();
-            over = Some(col("dx"));
         }
-        let mut float_aggs = Vec::new();
         for (i, g) in aggs.iter().enumerate() {
-            if float_min_max(g, b.schema(), over.as_ref())? {
-                float_aggs.push(i);
+            let a = format!("a{i}");
+            if !dargs.is_empty() && over[i].is_none() {
+                // merging the partial results of copy 0
+                let p = col(format!("p{i}"));
+                let pn = col(format!("p{i}_n"));
+                match field(g, "fn")?.as_str().unwrap_or("") {
+                    "min" => agg_exprs.push(min(p).alias(&a)),
+                    "max" => agg_exprs.push(max(p).alias(&a)),
+                    "avg" => {
+                        agg_exprs.push(sum(p).alias(&a));
+                        agg_exprs.push(sum(pn).alias(format!("{a}_n")));
+                    }
+                    "sum_decimal" => {
+                        agg_exprs.push(sum(p).alias(&a));
+                        agg_exprs.push(max(pn).alias(format!("{a}_n")));
+                    }
+                    _ => agg_exprs.push(sum(p).alias(&a)),
+                }
+                continue;
             }
-            agg_exprs.push(aggregate(g, b.schema(), over.as_ref())?.alias(format!("a{i}")));
-            if let Some(e) = aggregate_extra(g, over.as_ref())? {
-                agg_exprs.push(e.alias(format!("a{i}_n")));
+            agg_exprs.push(aggregate(g, b.schema(), over[i].as_ref())?.alias(&a));
+            if let Some(e) = aggregate_extra(g, over[i].as_ref())? {
+                agg_exprs.push(e.alias(format!("{a}_n")));
             }
         }
         let ngroups = group_exprs.len();
@@ -1152,16 +1288,7 @@ fn build_node(
         // A combined count is 0, not NULL, when no partial count arrived;
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
-        let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
-        if !float_groups.is_empty()
-            || !float_aggs.is_empty()
-            || aggs.iter().any(|a| {
-                matches!(
-                    kind(a).as_deref(),
-                    Some("count_merge" | "avg_merge" | "sum_decimal")
-                )
-            })
-        {
+        if !float_groups.is_empty() || post.iter().any(|p| *p != Post::None) {
             let mut cols: Vec<Expr> = (0..ngroups)
                 .map(|i| {
                     if float_groups.contains(&i) {
@@ -1173,35 +1300,32 @@ fn build_node(
                     }
                 })
                 .collect();
-            for (i, a) in aggs.iter().enumerate() {
+            for (i, p) in post.iter().enumerate() {
                 let c = col(format!("a{i}"));
-                cols.push(match kind(a).as_deref() {
-                    Some("count_merge") => when(c.clone().is_null(), lit(0i64))
-                        .otherwise(c)
-                        .map_err(df)?
-                        .alias(format!("a{i}")),
-                    Some("sum_decimal") => PgNumeric::udf(NumericFn::NanIf)
-                        .call(vec![c, col(format!("a{i}_n"))])
-                        .alias(format!("a{i}")),
-                    Some("avg_merge") => {
-                        let n = col(format!("a{i}_n"));
-                        let nf = Expr::Cast(datafusion::logical_expr::Cast::new(
-                            Box::new(n.clone()),
-                            DataType::Float64,
-                        ));
-                        when(
-                            n.clone().is_null().or(n.eq(lit(0i64))),
-                            lit(ScalarValue::Float64(None)),
-                        )
-                        .otherwise(binary_expr(c, Operator::Divide, nf))
-                        .map_err(df)?
-                        .alias(format!("a{i}"))
+                let n = col(format!("a{i}_n"));
+                cols.push(
+                    match p {
+                        Post::None => c,
+                        Post::CountZero => when(c.clone().is_null(), lit(0i64))
+                            .otherwise(c)
+                            .map_err(df)?,
+                        Post::NanIf => PgNumeric::udf(NumericFn::NanIf).call(vec![c, n]),
+                        Post::AvgDivide => {
+                            let nf = Expr::Cast(datafusion::logical_expr::Cast::new(
+                                Box::new(n.clone()),
+                                DataType::Float64,
+                            ));
+                            when(
+                                n.clone().is_null().or(n.eq(lit(0i64))),
+                                lit(ScalarValue::Float64(None)),
+                            )
+                            .otherwise(binary_expr(c, Operator::Divide, nf))
+                            .map_err(df)?
+                        }
+                        Post::FromOrderKey => FloatFn::FromOrderKey.apply(c),
                     }
-                    _ if float_aggs.contains(&i) => {
-                        FloatFn::FromOrderKey.apply(c).alias(format!("a{i}"))
-                    }
-                    _ => c,
-                });
+                    .alias(format!("a{i}")),
+                );
             }
             b = b.project(cols).map_err(df)?;
         }
@@ -1467,10 +1591,11 @@ impl Query {
         }
 
         let plan_node = field(&spec, "plan").map_err(internal)?.clone();
-        let partitions = if has_grouped_aggregate(&plan_node) || has_full_sort(&spec) {
+        let consumers = memory_consumers(&plan_node) + usize::from(has_full_sort(&spec));
+        let partitions = if consumers > 0 {
             partitions
                 .max(1)
-                .min((memory_limit / MIN_PARTITION_MEMORY).max(1))
+                .min((memory_limit / (MIN_PARTITION_MEMORY * consumers)).max(1))
         } else {
             partitions.max(1)
         };
@@ -1616,9 +1741,16 @@ impl Query {
             .and_then(Value::as_u64)
             .map(|n| (n as usize).clamp(1, BATCH_ROWS))
             .unwrap_or(BATCH_ROWS);
-        let config = SessionConfig::new()
+        let mut config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
+        // A sort reserves this much up front to merge its spilled runs
+        // (10 MB by default): keep it within a partition's share.
+        let execution = &mut config.options_mut().execution;
+        execution.sort_spill_reservation_bytes = execution
+            .sort_spill_reservation_bytes
+            .min(memory_limit / (4 * partitions * consumers.max(1)))
+            .max(64 << 10);
         let pool = Arc::new(TrackingPool::new(memory_limit.max(1)));
         let ctx = SessionContext::new_with_state(
             session_state(config, pool.clone(), spill_dir).map_err(df)?,

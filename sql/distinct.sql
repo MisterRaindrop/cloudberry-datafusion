@@ -15,14 +15,16 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Aggregates over DISTINCT arguments (D1, D2).  DataFusion runs the DISTINCT
--- aggregates of an Agg over a grouping by their argument, which spills as
--- any grouping does, then over its distinct values: count, sum and avg
--- DISTINCT and min and max of one argument.  Floats are told apart as
+-- Aggregates over DISTINCT arguments (D1, D2, D3).  DataFusion runs the
+-- DISTINCT aggregates of an Agg over a grouping by their arguments, which
+-- spills as any grouping does, then over the distinct values; with several
+-- arguments or other aggregates, each row is repeated once per argument
+-- and once for the others, which take partial results.  Floats are told apart as
 -- PostgreSQL does (-0 = 0, one NaN), numeric NaN is one value, strings need
 -- a deterministic collation.  The planner's own form, an aggregate over a
 -- grouping by the argument, runs as two aggregates (D2), and a
--- GroupAggregate whose order no one reads runs hashed, without its Sort.
+-- GroupAggregate whose order no one reads runs hashed, without its Sort;
+-- below a sorted Motion it runs hashed and sorts by the Motion's keys.
 -- Each query runs with datafusion.mode off, then on; the two results must
 -- match.
 --
@@ -54,11 +56,13 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di;
 EXPLAIN (COSTS OFF) SELECT a % 5 AS k, count(DISTINCT b) FROM df_di GROUP BY 1;
 -- a GroupAggregate below an unsorted Gather (D2)
 EXPLAIN (COSTS OFF) SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di GROUP BY a;
--- these stay on PostgreSQL, with the reason
+-- several arguments, and other aggregates beside (D3)
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(*) FROM df_di;
-EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(DISTINCT b) FROM df_di WHERE id < 0;
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(DISTINCT b), max(f) FROM df_di WHERE id > 5;
+-- a GroupAggregate below a sorted Gather, sorted by its groups (D3)
+EXPLAIN (COSTS OFF) SELECT id % 3 AS k, count(DISTINCT a), count(DISTINCT b) FROM df_di GROUP BY 1 ORDER BY 1;
+-- these stay on PostgreSQL, with the reason
 EXPLAIN (COSTS OFF) SELECT sum(DISTINCT f) FROM df_di WHERE id < 0;
-EXPLAIN (COSTS OFF) SELECT count(DISTINCT f), max(f) FROM df_di WHERE id < 0;
 EXPLAIN (COSTS OFF) SELECT count(a ORDER BY a) FROM df_di;
 -- ORDER BY: a Sort over the two aggregates (S1, D2)
 EXPLAIN (COSTS OFF) SELECT a, count(DISTINCT b) FROM df_di GROUP BY a ORDER BY a;
@@ -77,6 +81,11 @@ SELECT a % 5 AS k, count(DISTINCT b), avg(DISTINCT b) FROM df_di GROUP BY 1 ORDE
 SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE a < 6 GROUP BY a ORDER BY a;
 SELECT count(DISTINCT a % 7) FROM df_di WHERE b > 500;
 SELECT count(*) FROM (SELECT a, count(DISTINCT n) AS c FROM df_di GROUP BY a) s WHERE c > 70;
+SELECT count(DISTINCT a), count(*), count(n), sum(b), avg(f), min(b), max(f), avg(a), avg(n) FROM df_di;
+SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT f), count(DISTINCT t COLLATE "C"),
+  sum(DISTINCT n), avg(DISTINCT a), max(f) FROM df_di WHERE id > 5;
+SELECT id % 3 AS k, count(DISTINCT a), count(DISTINCT b), count(*), sum(n) FROM df_di GROUP BY 1 ORDER BY 1;
+SELECT count(DISTINCT a), count(DISTINCT b), count(*), sum(b) FROM df_di WHERE id < 0;
 SET datafusion.mode = on;
 SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
 SELECT count(DISTINCT id), sum(DISTINCT id), avg(DISTINCT id) FROM df_di;
@@ -91,6 +100,11 @@ SELECT a % 5 AS k, count(DISTINCT b), avg(DISTINCT b) FROM df_di GROUP BY 1 ORDE
 SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE a < 6 GROUP BY a ORDER BY a;
 SELECT count(DISTINCT a % 7) FROM df_di WHERE b > 500;
 SELECT count(*) FROM (SELECT a, count(DISTINCT n) AS c FROM df_di GROUP BY a) s WHERE c > 70;
+SELECT count(DISTINCT a), count(*), count(n), sum(b), avg(f), min(b), max(f), avg(a), avg(n) FROM df_di;
+SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT f), count(DISTINCT t COLLATE "C"),
+  sum(DISTINCT n), avg(DISTINCT a), max(f) FROM df_di WHERE id > 5;
+SELECT id % 3 AS k, count(DISTINCT a), count(DISTINCT b), count(*), sum(n) FROM df_di GROUP BY 1 ORDER BY 1;
+SELECT count(DISTINCT a), count(DISTINCT b), count(*), sum(b) FROM df_di WHERE id < 0;
 
 DROP TABLE df_di;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

@@ -73,6 +73,9 @@ typedef struct DfTails
 {
 	List	   *tles;			/* TargetEntry of each such column */
 	List	   *leaves;			/* Node: subexpressions DataFusion computes */
+	Motion	   *resort;			/* a sorted Motion whose GroupAggregate below
+								 * runs hashed: the slice sorts its output by
+								 * the Motion's keys (D3) */
 } DfTails;
 
 /* What df_translate_slice produces for one slice. */
