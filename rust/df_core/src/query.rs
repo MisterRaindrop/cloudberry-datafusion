@@ -1313,6 +1313,13 @@ fn build_node(
             }
         }
         let ngroups = group_exprs.len();
+        if group_exprs.is_empty() && agg_exprs.is_empty() {
+            // An aggregate whose output no one reads (the planner leaves a
+            // Partial Aggregate under count(*) of a subquery without
+            // columns) still makes its one row; DataFusion wants something
+            // to compute for it.
+            agg_exprs.push(count(lit(1i64)).alias("a_rows"));
+        }
         b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
         // A combined count is 0, not NULL, when no partial count arrived;
         // a combined avg divides the sums, NULL without values (as

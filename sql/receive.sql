@@ -99,6 +99,17 @@ SELECT memory_limit_kb = pg_size_bytes(current_setting('work_mem')) / 1024 AS wo
        spills
 FROM datafusion_debug_last_run();
 
+-- A partial aggregate whose output no one reads (count(*) of a subquery
+-- without columns) still makes its one row per segment.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+SET datafusion.mode = off;
+SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+SET datafusion.mode = on;
+SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+RESET datafusion.motion_batches;
+
 DROP TABLE df_rcv, df_rcv_empty;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

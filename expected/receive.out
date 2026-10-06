@@ -140,9 +140,9 @@ WHERE e >= 95 OR e IS NULL GROUP BY e;
     |     1 |     0 |           |       |        
  99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
  97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
- 96 |  2000 |  2000 | 200092000 |    24 | 1999960
  95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
  98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
 (6 rows)
 
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
@@ -160,22 +160,22 @@ SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count | count |    sum    |  min  |   max   
 ----+-------+-------+-----------+-------+---------
- 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
- 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
- 96 |  2000 |  2000 | 200092000 |    24 | 1999960
- 97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
  99 |  2000 |  2000 | 200098000 | 24.75 | 1999990
+ 97 |  2000 |  2000 | 200094000 | 24.25 | 1999970
     |     1 |     0 |           |       |        
+ 98 |  2000 |  2000 | 200096000 |  24.5 | 1999980
+ 95 |  2000 |  2000 | 200090000 | 23.75 | 1999950
+ 96 |  2000 |  2000 | 200092000 |    24 | 1999960
 (6 rows)
 
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
  e  | count 
 ----+-------
+ 96 |  2000
  99 |  2000
  97 |  2000
- 98 |  2000
   0 |  2000
- 96 |  2000
+ 98 |  2000
 (5 rows)
 
 -- No rows: count is 0, the other aggregates NULL.
@@ -232,12 +232,12 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
 SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
- 98 |  2000 | 200096000 |  24.5
- 95 |  2000 | 200090000 | 23.75
- 96 |  2000 | 200092000 |    24
     |     1 |           |      
  99 |  2000 | 200098000 | 24.75
  97 |  2000 | 200094000 | 24.25
+ 98 |  2000 | 200096000 |  24.5
+ 95 |  2000 | 200090000 | 23.75
+ 96 |  2000 | 200092000 |    24
 (6 rows)
 
 SET datafusion.mode = on;
@@ -250,10 +250,10 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
 SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
- 96 |  2000 | 200092000 |    24
- 99 |  2000 | 200098000 | 24.75
- 97 |  2000 | 200094000 | 24.25
     |     1 |           |      
+ 97 |  2000 | 200094000 | 24.25
+ 99 |  2000 | 200098000 | 24.75
+ 96 |  2000 | 200092000 |    24
  95 |  2000 | 200090000 | 23.75
  98 |  2000 | 200096000 |  24.5
 (6 rows)
@@ -291,6 +291,45 @@ FROM datafusion_debug_last_run();
  t               |      0
 (1 row)
 
+-- A partial aggregate whose output no one reads (count(*) of a subquery
+-- without columns) still makes its one row per segment.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Aggregate
+   ->  Finalize Aggregate
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Partial Aggregate
+                     ->  Hash Join
+                           Hash Cond: (x.a = y.e)
+                           ->  Seq Scan on df_rcv x
+                           ->  Hash
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: y.e
+                                       ->  Seq Scan on df_rcv y
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: aggregate over another aggregate
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(15 rows)
+
+SET datafusion.mode = off;
+SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+ count 
+-------
+     1
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
+ count 
+-------
+     1
+(1 row)
+
+RESET datafusion.motion_batches;
 DROP TABLE df_rcv, df_rcv_empty;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
