@@ -15,13 +15,16 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Aggregates over DISTINCT arguments (D1).  DataFusion runs the DISTINCT
+-- Aggregates over DISTINCT arguments (D1, D2).  DataFusion runs the DISTINCT
 -- aggregates of an Agg over a grouping by their argument, which spills as
 -- any grouping does, then over its distinct values: count, sum and avg
 -- DISTINCT and min and max of one argument.  Floats are told apart as
 -- PostgreSQL does (-0 = 0, one NaN), numeric NaN is one value, strings need
--- a deterministic collation.  Each query runs with datafusion.mode off,
--- then on; the two results must match.
+-- a deterministic collation.  The planner's own form, an aggregate over a
+-- grouping by the argument, runs as two aggregates (D2), and a
+-- GroupAggregate whose order no one reads runs hashed, without its Sort.
+-- Each query runs with datafusion.mode off, then on; the two results must
+-- match.
 --
 CREATE EXTENSION datafusion_executor;
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
@@ -68,6 +71,65 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT id), sum(DISTINCT id) FROM df_di;
  DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible, sends Arrow batches
 (7 rows)
+
+-- an aggregate over a grouping (D2)
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  HashAggregate
+                     Group Key: b
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: b
+                           ->  Streaming HashAggregate
+                                 Group Key: b
+                                 ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT a % 5 AS k, count(DISTINCT b) FROM df_di GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: ((a % 5))
+         ->  HashAggregate
+               Group Key: ((a % 5)), b
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: ((a % 5))
+                     ->  Streaming HashAggregate
+                           Group Key: (a % 5), b
+                           ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+-- a GroupAggregate below an unsorted Gather (D2)
+EXPLAIN (COSTS OFF) SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di GROUP BY a;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: a
+         ->  HashAggregate
+               Group Key: a, b
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: a
+                     ->  Streaming HashAggregate
+                           Group Key: a, b
+                           ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
 
 -- these stay on PostgreSQL, with the reason
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(*) FROM df_di;
@@ -132,6 +194,29 @@ EXPLAIN (COSTS OFF) SELECT count(a ORDER BY a) FROM df_di;
  DataFusion: slice 1 eligible
 (6 rows)
 
+-- ORDER BY: a Sort over the two aggregates (S1, D2)
+EXPLAIN (COSTS OFF) SELECT a, count(DISTINCT b) FROM df_di GROUP BY a ORDER BY a;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: a
+   ->  Sort
+         Sort Key: a
+         ->  HashAggregate
+               Group Key: a
+               ->  HashAggregate
+                     Group Key: a, b
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a
+                           ->  Streaming HashAggregate
+                                 Group Key: a, b
+                                 ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(17 rows)
+
 SET datafusion.mode = off;
 SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
  count | sum  |         avg         | min | max 
@@ -181,6 +266,46 @@ SELECT count(DISTINCT a), sum(DISTINCT a) FROM df_di WHERE id < 0;
      0 |    
 (1 row)
 
+SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di;
+ count |  sum   
+-------+--------
+  1009 | 508536
+(1 row)
+
+SELECT a % 5 AS k, count(DISTINCT b), avg(DISTINCT b) FROM df_di GROUP BY 1 ORDER BY 1;
+ k | count |         avg          
+---+-------+----------------------
+ 0 |  1009 | 504.0000000000000000
+ 1 |  1009 | 504.0000000000000000
+ 2 |  1009 | 504.0000000000000000
+ 3 |  1009 | 504.0000000000000000
+ 4 |  1009 | 504.0000000000000000
+   |  1009 | 504.0000000000000000
+(6 rows)
+
+SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE a < 6 GROUP BY a ORDER BY a;
+ a | count |  sum   
+---+-------+--------
+ 0 |   286 | 144355
+ 1 |   286 | 143998
+ 2 |   286 | 144650
+ 3 |   286 | 144293
+ 4 |   286 | 143936
+ 5 |   286 | 143579
+(6 rows)
+
+SELECT count(DISTINCT a % 7) FROM df_di WHERE b > 500;
+ count 
+-------
+     7
+(1 row)
+
+SELECT count(*) FROM (SELECT a, count(DISTINCT n) AS c FROM df_di GROUP BY a) s WHERE c > 70;
+ count 
+-------
+    98
+(1 row)
+
 SET datafusion.mode = on;
 SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
  count | sum  |         avg         | min | max 
@@ -228,6 +353,46 @@ SELECT count(DISTINCT a), sum(DISTINCT a) FROM df_di WHERE id < 0;
  count | sum 
 -------+-----
      0 |    
+(1 row)
+
+SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di;
+ count |  sum   
+-------+--------
+  1009 | 508536
+(1 row)
+
+SELECT a % 5 AS k, count(DISTINCT b), avg(DISTINCT b) FROM df_di GROUP BY 1 ORDER BY 1;
+ k | count |         avg          
+---+-------+----------------------
+ 0 |  1009 | 504.0000000000000000
+ 1 |  1009 | 504.0000000000000000
+ 2 |  1009 | 504.0000000000000000
+ 3 |  1009 | 504.0000000000000000
+ 4 |  1009 | 504.0000000000000000
+   |  1009 | 504.0000000000000000
+(6 rows)
+
+SELECT a, count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE a < 6 GROUP BY a ORDER BY a;
+ a | count |  sum   
+---+-------+--------
+ 0 |   286 | 144355
+ 1 |   286 | 143998
+ 2 |   286 | 144650
+ 3 |   286 | 144293
+ 4 |   286 | 143936
+ 5 |   286 | 143579
+(6 rows)
+
+SELECT count(DISTINCT a % 7) FROM df_di WHERE b > 500;
+ count 
+-------
+     7
+(1 row)
+
+SELECT count(*) FROM (SELECT a, count(DISTINCT n) AS c FROM df_di GROUP BY a) s WHERE c > 70;
+ count 
+-------
+    98
 (1 row)
 
 DROP TABLE df_di;

@@ -95,7 +95,7 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT e) FROM df_rcv;
                                  ->  Seq Scan on df_rcv
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: aggregate over another aggregate
+ DataFusion: slice 1 eligible
  DataFusion: slice 2 eligible
 (14 rows)
 

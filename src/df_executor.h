@@ -256,6 +256,13 @@ extern bool df_limit_value(Node *expr, int64 *value);
 extern bool df_sort_direction(Oid sortop, Oid type, bool *desc);
 extern bool df_passes_through(Plan *plan);
 
+/* 'plan', or the child of it if it is a Sort (one D2 leaves out) */
+static inline Plan *
+df_below_sort(Plan *plan)
+{
+	return plan != NULL && IsA(plan, Sort) ? outerPlan(plan) : plan;
+}
+
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);
 extern const char *df_spill_dir(void);

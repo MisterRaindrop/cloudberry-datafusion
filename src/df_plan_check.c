@@ -94,6 +94,11 @@ typedef struct DfCheckContext
 	Bitmapset  *sort_keys;		/* its columns the slice's Sort orders by */
 	bool		tails_ok;		/* PostgreSQL may finish output columns (P1):
 								 * the slice does not send batches */
+	bool		order_free;		/* set for a child: no one reads the order of
+								 * its rows (D2) */
+	bool		node_order_free;	/* that, for the node being checked */
+	Plan	   *skipped_sort;	/* the Sort below such a sorted Agg, which
+								 * DataFusion leaves out (D2) */
 	DfTails		tails;			/* the columns it finishes */
 	bool		failed;
 	char	   *reason;
@@ -524,6 +529,39 @@ df_collect_aggrefs(Node *node, List **aggs)
 		return false;
 	}
 	return expression_tree_walker(node, df_collect_aggrefs, aggs);
+}
+
+/*
+ * D2: can DataFusion run Agg 'agg' as a grouping below another aggregate:
+ * no aggregates, no filter, and the output columns in 'needed' grouping
+ * columns?  (The planner may carry other columns the aggregate above does
+ * not read.)  What it is otherwise, or NULL.
+ */
+static const char *
+df_grouping_problem(Agg *agg, Bitmapset *needed)
+{
+	List	   *aggs = NIL;
+	ListCell   *lc;
+
+	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	if (aggs != NIL || agg->plan.qual != NIL || agg->aggsplit != AGGSPLIT_SIMPLE)
+		return "another aggregate";
+	foreach(lc, agg->plan.targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Var		   *var = (Var *) tle->expr;
+		int			i;
+
+		if (IsA(var, Const) || !bms_is_member(tle->resno, needed))
+			continue;
+		if (!IsA(var, Var) || var->varno != OUTER_VAR)
+			return "a grouping that computes columns";
+		for (i = 0; i < agg->numCols && agg->grpColIdx[i] != var->varattno; i++)
+			;
+		if (i == agg->numCols)
+			return "a grouping that outputs an ungrouped column";
+	}
+	return NULL;
 }
 
 /*
@@ -1673,6 +1711,8 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 	Plan	   *saved = cxt->node;
 
 	cxt->node = plan;
+	cxt->node_order_free = cxt->order_free;
+	cxt->order_free = false;
 	df_check_plan_node(plan, cxt, needed, root_is_sender);
 	cxt->node = saved;
 }
@@ -1725,7 +1765,17 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Bitmapset  *child_needed = NULL;
 				int			i;
 
-				if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
+				if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
+					child != NULL && IsA(child, Sort))
+				{
+					/*
+					 * D2: a GroupAggregate whose order no one reads (below an
+					 * unsorted Motion, a Sort, or another Agg) runs hashed,
+					 * without the Sort below it.
+					 */
+					cxt->skipped_sort = child;
+				}
+				else if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
 				{
 					df_reject(cxt, "sorted or mixed aggregation");
 					return;
@@ -1745,7 +1795,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
-					if (child == NULL || !IsA(child, Motion))
+					if (child == NULL || !IsA(df_below_sort(child), Motion))
 					{
 						df_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
 						return;
@@ -1755,12 +1805,6 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "combining stage of a multi-stage aggregation");
-					return;
-				}
-				if (child != NULL && IsA(child, Agg))
-				{
-					/* e.g. DISTINCT aggregates: an aggregate over a grouping */
-					df_reject(cxt, "aggregate over another aggregate");
 					return;
 				}
 				if (df_distinct_mix_problem(agg) != NULL)
@@ -1802,8 +1846,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
 				cxt->agg_to_batches = cxt->batch_sender;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
-					IsA(child, Motion) &&
-					bms_is_member(((Motion *) child)->motionID, cxt->batches);
+					IsA(df_below_sort(child), Motion) &&
+					bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches);
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
@@ -1820,7 +1864,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					child_needed = bms_add_member(child_needed, agg->grpColIdx[i]);
 				/* count(*) alone reads no column; keep the set non-NULL. */
 				child_needed = bms_add_member(child_needed, 0);
+				if (child != NULL && IsA(child, Agg) &&
+					df_grouping_problem((Agg *) child, child_needed) != NULL)
+				{
+					/* D2: an aggregate over a grouping, as DISTINCT aggregates are planned */
+					df_reject(cxt, "aggregate over %s",
+							  df_grouping_problem((Agg *) child, child_needed));
+					return;
+				}
 				cxt->agg_input = true;
+				cxt->order_free = true; /* hashed: the order of its input is not read */
 				df_check_plan(child, cxt, child_needed, false);
 				cxt->agg_input = false;
 				return;
@@ -2013,6 +2066,19 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Bitmapset  *child_needed = needed ? bms_copy(needed) : NULL;
 				int			i;
 
+				if (plan == cxt->skipped_sort)
+				{
+					/* D2: below a GroupAggregate DataFusion runs hashed */
+					cxt->skipped_sort = NULL;
+					if (!df_passes_through(plan))
+					{
+						df_reject(cxt, "Sort that computes columns");
+						return;
+					}
+					cxt->order_free = true;
+					df_check_plan(child, cxt, needed, false);
+					return;
+				}
 				if (plan != cxt->top)
 				{
 					df_reject(cxt, "Sort below the top of the slice");
@@ -2068,6 +2134,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->sort_keys = bms_add_member(cxt->sort_keys, sort->sortColIdx[i]);
 				}
 				cxt->output = child;
+				cxt->order_free = true; /* sorted here */
 				df_check_plan(child, cxt, child_needed, false);
 				return;
 			}
@@ -2147,6 +2214,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				cxt->agg_input = false;
 				cxt->batch_sender = bms_is_member(motion->motionID, cxt->batches);
+				cxt->order_free = !motion->sendSorted;
 				df_check_plan(outerPlan(plan), cxt, NULL, false);
 				cxt->batch_sender = false;
 				return;

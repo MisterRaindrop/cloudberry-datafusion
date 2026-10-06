@@ -706,6 +706,17 @@ results, which the planner splits only where each segment sees all of a
 value.  `count(DISTINCT b)` over 30 million distinct values took 1.21 s
 against 3.68 s under that 32 MB.
 
+D2 runs the planner's own form of DISTINCT aggregates: an aggregate over
+a grouping by the argument (`HashAggregate` below `Partial Aggregate`,
+or two `HashAggregate`s), within one slice.  The grouping, without
+aggregates and with only grouping columns read above it, becomes a named
+aggregate node of the spec.  And a GroupAggregate whose order no one
+reads, below an unsorted Motion, a Sort or another aggregate, runs
+hashed without the Sort below it; one below a sorted Motion, a Limit or
+at the top of the coordinator's slice stays on PostgreSQL, since the
+query's ORDER BY may rest on its order.  `count(DISTINCT a % 100000)`
+over 30 million rows took 0.65 s against 3.29 s.
+
 ### Sort and LIMIT
 
 S1 runs a Sort and a Limit at the top of a slice: ORDER BY with LIMIT and

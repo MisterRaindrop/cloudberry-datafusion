@@ -483,6 +483,20 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
+	else if (IsA(child, Agg) && IsA(tle->expr, Var))
+	{
+		/* D2: a grouping below the aggregate, by its name (df_emit_node) */
+		Agg		   *agg = (Agg *) child;
+		int			i;
+
+		for (i = 0; i < agg->numCols; i++)
+			if (agg->grpColIdx[i] == ((Var *) tle->expr)->varattno)
+				break;
+		if (i == agg->numCols)
+			df_fail(b, "a reference to an ungrouped column");
+		else
+			appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", child->plan_node_id, i);
+	}
 	else if (IsA(child, Motion))
 		df_emit_column(b, out, df_input_of(b, child),
 					   df_motion_stream_column((Motion *) child, resno) + 1,
@@ -1004,6 +1018,34 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 			df_emit_node(b, out, outerPlan(plan));
 			return;
 
+		case T_Sort:
+			/* below a GroupAggregate run hashed (D2) */
+			df_emit_node(b, out, outerPlan(plan));
+			return;
+
+		case T_Agg:
+			{
+				/*
+				 * D2: a grouping below the aggregate, without aggregates
+				 * (df_check_slice), its columns named q<plan_node_id>_g<i>.
+				 */
+				Agg		   *agg = (Agg *) plan;
+				int			i;
+
+				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
+				df_emit_node(b, out, outerPlan(plan));
+				appendStringInfoString(out, ",\"group\":[");
+				for (i = 0; i < agg->numCols; i++)
+				{
+					if (i > 0)
+						appendStringInfoChar(out, ',');
+					df_emit_output_of(b, out, outerPlan(plan), agg->grpColIdx[i]);
+				}
+				appendStringInfo(out, "],\"aggs\":[],\"having\":null,\"name\":\"q%d\"}}",
+								 plan->plan_node_id);
+				return;
+			}
+
 		case T_HashJoin:
 			{
 				HashJoin   *hj = (HashJoin *) plan;
@@ -1448,7 +1490,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 			{
 				/* sum(int8), avg(int): the stream's numeric sum and count columns */
 				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				Plan	   *child = outerPlan(b.agg);
+				Plan	   *child = df_below_sort(outerPlan(b.agg));
 				bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
 				int			pos;
 
@@ -1475,7 +1517,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 				int			pos;
 
-				Plan	   *child = outerPlan(b.agg);
+				Plan	   *child = df_below_sort(outerPlan(b.agg));
 
 				if (!IsA(child, Motion) || !IsA(arg, Var))
 				{

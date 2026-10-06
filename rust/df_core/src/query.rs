@@ -42,7 +42,9 @@
 //! <node> := {"input": j}
 //!         | {"filter": {"input": <node>, "pred": <expr>}}
 //!         | {"aggregate": {"input": <node>, "group": [<expr>...],
-//!                          "aggs": [...], "having": <expr> | null}}
+//!                          "aggs": [...], "having": <expr> | null,
+//!                          "name": s}}   (name: a grouping without aggs
+//!                          below another aggregate, its columns s_g<i>)
 //!         | {"join": {"type": "inner" | "left" | "right" | "full" | "leftsemi"
 //!                           | "rightsemi" | "leftanti" | "rightanti",
 //!                     "left": <node>, "right": <node>,
@@ -72,7 +74,7 @@
 //!                  "segments": n, "workers": w } }   (optional, IPC output
 //!                through a Redistribute Motion: one stream per route)
 //!
-//! <expr> := {"col": i} | {"group": i} | {"agg": i}
+//! <expr> := {"col": i} | {"group": i} | {"agg": i} | {"name": s}
 //!         | {"lit": {"type": t, "value": v}} | {"lit": {"type": t, "null": true}}
 //!         | {"op": "+", "type": t, "args": [<expr>, <expr>]}
 //!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
@@ -408,6 +410,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(i) = v.get("group") {
         return Ok(col(format!("g{}", index(i)?)));
+    }
+    if let Some(n) = v.get("name").and_then(Value::as_str) {
+        return Ok(col(n));
     }
     if let Some(i) = v.get("agg") {
         return Ok(col(format!("a{}", index(i)?)));
@@ -1202,6 +1207,16 @@ fn build_node(
         }
         if let Some(h) = a.get("having").filter(|v| !v.is_null()) {
             b = b.filter(expr(h)?).map_err(df)?;
+        }
+        // D2: a grouping below another aggregate names its columns
+        // <name>_g<i>, apart from that aggregate's own g<i>.
+        if let Some(name) = a.get("name").and_then(Value::as_str) {
+            if !aggs.is_empty() {
+                return Err("plan spec: a named aggregate with aggregates".into());
+            }
+            b = b
+                .project((0..ngroups).map(|i| col(format!("g{i}")).alias(format!("{name}_g{i}"))))
+                .map_err(df)?;
         }
         return Ok(b);
     }
