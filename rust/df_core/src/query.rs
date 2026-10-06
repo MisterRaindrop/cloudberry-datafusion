@@ -611,11 +611,10 @@ fn aggregate(v: &Value, input: &DFSchema) -> Result<Expr, String> {
         Some(a) if !a.is_null() => Some(expr(a)?),
         _ => None,
     };
-    // PostgreSQL's NaN is the largest float, whatever its sign bit.
+    // Floats as integers in PostgreSQL's order (pgfloat); the projection
+    // after the aggregate maps the result back.
     let arg = match arg {
-        Some(a) if matches!(name, "min" | "max") && is_float_expr(&a, input) => {
-            Some(FloatFn::Nan.apply(a))
-        }
+        Some(a) if float_min_max(v, input)? => Some(FloatFn::OrderKey.apply(a)),
         a => a,
     };
     let need = |a: Option<Expr>| a.ok_or_else(|| format!("aggregate {name} needs an argument"));
@@ -645,6 +644,17 @@ fn aggregate(v: &Value, input: &DFSchema) -> Result<Expr, String> {
 
 /// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
 /// counts, sum_decimal's "some value is NaN".
+/// Is `v` a min or max of a float4 or float8 argument over `input`?
+fn float_min_max(v: &Value, input: &DFSchema) -> Result<bool, String> {
+    if !matches!(field(v, "fn")?.as_str(), Some("min" | "max")) {
+        return Ok(false);
+    }
+    match v.get("arg").filter(|a| !a.is_null()) {
+        Some(a) => Ok(is_float_expr(&expr(a)?, input)),
+        None => Ok(false),
+    }
+}
+
 /// Is `e`, over `input`, of type float4 or float8?
 fn is_float_expr(e: &Expr, input: &DFSchema) -> bool {
     e.get_type(input).is_ok_and(|t| is_float(&t))
@@ -1034,8 +1044,8 @@ fn build_node(
         let groups = field(a, "group")?.as_array().cloned().unwrap_or_default();
         let aggs = field(a, "aggs")?.as_array().cloned().unwrap_or_default();
         // A float key groups by its PostgreSQL value (pgfloat); the group's
-        // value is the smallest of its members, so that a group of -0 alone
-        // shows -0.
+        // value is the smallest of its members (by their order keys), so
+        // that a group of -0 alone shows -0.
         let mut group_exprs = Vec::with_capacity(groups.len());
         let mut float_groups = Vec::new();
         let mut agg_exprs = Vec::with_capacity(aggs.len());
@@ -1043,13 +1053,17 @@ fn build_node(
             let e = expr(g)?;
             if is_float_expr(&e, b.schema()) {
                 group_exprs.push(FloatFn::Key.apply(e.clone()).alias(format!("g{i}")));
-                agg_exprs.push(min(e).alias(format!("g{i}_v")));
+                agg_exprs.push(min(FloatFn::OrderKey.apply(e)).alias(format!("g{i}_v")));
                 float_groups.push(i);
             } else {
                 group_exprs.push(e.alias(format!("g{i}")));
             }
         }
+        let mut float_aggs = Vec::new();
         for (i, g) in aggs.iter().enumerate() {
+            if float_min_max(g, b.schema())? {
+                float_aggs.push(i);
+            }
             agg_exprs.push(aggregate(g, b.schema())?.alias(format!("a{i}")));
             if let Some(e) = aggregate_extra(g)? {
                 agg_exprs.push(e.alias(format!("a{i}_n")));
@@ -1062,6 +1076,7 @@ fn build_node(
         // PostgreSQL's float8_avg).
         let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
         if !float_groups.is_empty()
+            || !float_aggs.is_empty()
             || aggs.iter().any(|a| {
                 matches!(
                     kind(a).as_deref(),
@@ -1072,7 +1087,9 @@ fn build_node(
             let mut cols: Vec<Expr> = (0..ngroups)
                 .map(|i| {
                     if float_groups.contains(&i) {
-                        col(format!("g{i}_v")).alias(format!("g{i}"))
+                        FloatFn::FromOrderKey
+                            .apply(col(format!("g{i}_v")))
+                            .alias(format!("g{i}"))
                     } else {
                         col(format!("g{i}"))
                     }
@@ -1101,6 +1118,9 @@ fn build_node(
                         .otherwise(binary_expr(c, Operator::Divide, nf))
                         .map_err(df)?
                         .alias(format!("a{i}"))
+                    }
+                    _ if float_aggs.contains(&i) => {
+                        FloatFn::FromOrderKey.apply(c).alias(format!("a{i}"))
                     }
                     _ => c,
                 });

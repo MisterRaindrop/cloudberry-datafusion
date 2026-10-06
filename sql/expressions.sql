@@ -146,11 +146,25 @@ SELECT g, count(*) FROM df_fl GROUP BY g ORDER BY 2, 1;
 SELECT count(*) FROM (SELECT f FROM df_fl GROUP BY f) s;
 SELECT max(f), max(g), min(g) FROM df_fl WHERE k % 6 <> 1;
 SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
+-- min and max of floats: a group of +Infinity alone (DataFusion's grouped
+-- min starts from the largest finite float), NaN above all in any order.
+CREATE TABLE df_fl2 (k int, f float8, g float4) DISTRIBUTED BY (k);
+INSERT INTO df_fl2 SELECT i, CASE i % 4 WHEN 0 THEN 'Infinity'::float8 WHEN 1 THEN '-Infinity'
+  WHEN 2 THEN CASE WHEN i % 8 = 2 THEN 'NaN'::float8 ELSE 1 END END,
+  CASE i % 4 WHEN 0 THEN 'Infinity'::float4 WHEN 1 THEN '-Infinity' END
+FROM generate_series(1, 4000) i;
+SET datafusion.mode = off;
+SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
+SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
+SET datafusion.mode = on;
+SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
+SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END), count(nullif(f, 'NaN')) FROM df_fl;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
 
-DROP TABLE df_ex, df_cs, df_fl;
+DROP TABLE df_ex, df_cs, df_fl, df_fl2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

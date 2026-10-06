@@ -653,9 +653,15 @@ and above all numbers.  Comparison operands, IN lists, join and grouping
 keys therefore go through `pg_float_key`, which makes -0 0 and every NaN
 the positive one; on those values total order is PostgreSQL's.  Values
 keep their bits: a float grouping key shows the smallest member of its
-group, so a group of -0 alone shows `-0`, and min/max only make NaN
-positive, returning either of -0 and 0 when both are present, as
-PostgreSQL does depending on row order.
+group, so a group of -0 alone shows `-0`.
+
+min and max of floats run on integers (F1): DataFusion's grouped min and
+max start from the largest and smallest finite float, so a group holding
+only +Infinity came out as `1.7976931348623157e+308`, and they let a NaN
+replace or be replaced depending on row order.  `pg_float_order_key` maps
+a float, NaN made positive, to an integer of its width in total order,
+and the result is mapped back.  Of -0 and 0, min returns -0 and max 0;
+PostgreSQL returns either, depending on row order.
 
 ## Build
 

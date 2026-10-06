@@ -420,6 +420,49 @@ SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k <
   2492
 (1 row)
 
+-- min and max of floats: a group of +Infinity alone (DataFusion's grouped
+-- min starts from the largest finite float), NaN above all in any order.
+CREATE TABLE df_fl2 (k int, f float8, g float4) DISTRIBUTED BY (k);
+INSERT INTO df_fl2 SELECT i, CASE i % 4 WHEN 0 THEN 'Infinity'::float8 WHEN 1 THEN '-Infinity'
+  WHEN 2 THEN CASE WHEN i % 8 = 2 THEN 'NaN'::float8 ELSE 1 END END,
+  CASE i % 4 WHEN 0 THEN 'Infinity'::float4 WHEN 1 THEN '-Infinity' END
+FROM generate_series(1, 4000) i;
+SET datafusion.mode = off;
+SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
+ p |    min    |    max    |    min    |    max    
+---+-----------+-----------+-----------+-----------
+ 0 |  Infinity |  Infinity |  Infinity |  Infinity
+ 1 | -Infinity | -Infinity | -Infinity | -Infinity
+ 2 |         1 |       NaN |           |          
+ 3 |           |           |           |          
+(4 rows)
+
+SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
+ p | min | max | count 
+---+-----+-----+-------
+ 0 |   1 | NaN |   333
+ 1 |   1 | NaN |   333
+ 2 |   1 | NaN |   334
+(3 rows)
+
+SET datafusion.mode = on;
+SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
+ p |    min    |    max    |    min    |    max    
+---+-----------+-----------+-----------+-----------
+ 0 |  Infinity |  Infinity |  Infinity |  Infinity
+ 1 | -Infinity | -Infinity | -Infinity | -Infinity
+ 2 |         1 |       NaN |           |          
+ 3 |           |           |           |          
+(4 rows)
+
+SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
+ p | min | max | count 
+---+-----+-----+-------
+ 0 |   1 | NaN |   333
+ 1 |   1 | NaN |   333
+ 2 |   1 | NaN |   334
+(3 rows)
+
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END), count(nullif(f, 'NaN')) FROM df_fl;
                     QUERY PLAN                     
@@ -450,6 +493,23 @@ EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
  DataFusion: slice 2 eligible, sends Arrow batches
 (12 rows)
 
+EXPLAIN (COSTS OFF) SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: ((k % 4))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: ((k % 4))
+               ->  Streaming Partial HashAggregate
+                     Group Key: (k % 4)
+                     ->  Seq Scan on df_fl2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -474,6 +534,6 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE
  DataFusion: slice 3 eligible, sends Arrow batches
 (19 rows)
 
-DROP TABLE df_ex, df_cs, df_fl;
+DROP TABLE df_ex, df_cs, df_fl, df_fl2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
