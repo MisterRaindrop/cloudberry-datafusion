@@ -79,13 +79,13 @@ EXPLAIN (COSTS OFF) SELECT avg(relpages) FROM pg_class;
  DataFusion: slice 0 eligible
 (4 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(DISTINCT relnatts) FROM pg_class;
+EXPLAIN (COSTS OFF) SELECT count(relnatts ORDER BY relnatts) FROM pg_class;
                                   QUERY PLAN                                   
 -------------------------------------------------------------------------------
  Aggregate
    ->  Seq Scan on pg_class
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: DISTINCT or ORDER BY inside aggregate count
+ DataFusion: slice 0 not eligible: ORDER BY inside aggregate count
 (4 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES;

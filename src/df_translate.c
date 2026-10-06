@@ -1507,6 +1507,15 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 						(Node *) linitial_node(TargetEntry, agg->args)->expr,
 						DF_LEVEL_SCAN);
 			}
+			/*
+			 * D1: over distinct arguments (min and max are the same without).
+			 * A combining stage keeps the DISTINCT of the call, but adds up
+			 * the partial results: the planner splits it only where each
+			 * segment sees all of a value.
+			 */
+			if (agg->aggdistinct != NIL && !combine &&
+				strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
+				appendStringInfoString(&aggs, ",\"distinct\":true");
 			appendStringInfoChar(&aggs, '}');
 		}
 		if (b.failed)

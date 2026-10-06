@@ -610,16 +610,26 @@ fn may_fail(v: &Value) -> bool {
     }
 }
 
-fn aggregate(v: &Value, input: &DFSchema) -> Result<Expr, String> {
+/// The argument of aggregate spec `v`: `over` if given (D1: the distinct
+/// value of the grouping below, see `build_node`), else its "arg".
+fn agg_arg(v: &Value, over: Option<&Expr>) -> Result<Option<Expr>, String> {
+    match v.get("arg") {
+        Some(a) if !a.is_null() => match over {
+            Some(e) => Ok(Some(e.clone())),
+            None => Ok(Some(expr(a)?)),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Aggregate spec `v` over `input` (with its argument `over`, if given).
+fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, String> {
     let name = field(v, "fn")?.as_str().unwrap_or("");
-    let arg = match v.get("arg") {
-        Some(a) if !a.is_null() => Some(expr(a)?),
-        _ => None,
-    };
+    let arg = agg_arg(v, over)?;
     // Floats as integers in PostgreSQL's order (pgfloat); the projection
     // after the aggregate maps the result back.
     let arg = match arg {
-        Some(a) if float_min_max(v, input)? => Some(FloatFn::OrderKey.apply(a)),
+        Some(a) if float_min_max(v, input, over)? => Some(FloatFn::OrderKey.apply(a)),
         a => a,
     };
     let need = |a: Option<Expr>| a.ok_or_else(|| format!("aggregate {name} needs an argument"));
@@ -630,34 +640,36 @@ fn aggregate(v: &Value, input: &DFSchema) -> Result<Expr, String> {
         "count_merge" => sum(need(arg)?),
         // The sum of the sums; the counts are a second aggregate (`aggregate_extra`).
         "avg_merge" => sum(need(arg)?),
-        "sum" => sum(need(arg)?),
-        // PostgreSQL's sum(int8) and avg(int)'s sum: exact, as numeric.
+        // sum_numeric: PostgreSQL's sum(int8) and avg(int)'s sum, exact, as
+        // numeric.  sum_decimal: sum of numeric(p, s), NaN aside; the second
+        // aggregate notes NaNs (`aggregate_extra`) and the projection after
+        // the aggregate makes the sum NaN then.
+        _ => aggregate_of(name, need(arg)?)?,
+    })
+}
+
+/// Aggregate `name` (as in `aggregate`) of `a`.
+fn aggregate_of(name: &str, a: Expr) -> Result<Expr, String> {
+    Ok(match name {
+        "sum" => sum(a),
         "sum_numeric" => sum(Expr::Cast(datafusion::logical_expr::Cast::new(
-            Box::new(need(arg)?),
+            Box::new(a),
             crate::pgnum::numeric_type(0),
         ))),
-        // sum of numeric(p, s), NaN aside; the second aggregate notes NaNs
-        // (`aggregate_extra`) and the projection after the aggregate makes
-        // the sum NaN then.
-        "sum_decimal" => sum(PgNumeric::udf(NumericFn::NanToZero).call(vec![need(arg)?])),
-        "min" => min(need(arg)?),
-        "max" => max(need(arg)?),
-        "avg" => avg(need(arg)?),
+        "sum_decimal" => sum(PgNumeric::udf(NumericFn::NanToZero).call(vec![a])),
+        "min" => min(a),
+        "max" => max(a),
+        "avg" => avg(a),
         other => return Err(format!("unsupported aggregate {other}")),
     })
 }
 
-/// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
-/// counts, sum_decimal's "some value is NaN".
 /// Is `v` a min or max of a float4 or float8 argument over `input`?
-fn float_min_max(v: &Value, input: &DFSchema) -> Result<bool, String> {
+fn float_min_max(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<bool, String> {
     if !matches!(field(v, "fn")?.as_str(), Some("min" | "max")) {
         return Ok(false);
     }
-    match v.get("arg").filter(|a| !a.is_null()) {
-        Some(a) => Ok(is_float_expr(&expr(a)?, input)),
-        None => Ok(false),
-    }
+    Ok(agg_arg(v, over)?.is_some_and(|a| is_float_expr(&a, input)))
 }
 
 /// Is `e`, over `input`, of type float4 or float8?
@@ -665,14 +677,34 @@ fn is_float_expr(e: &Expr, input: &DFSchema) -> bool {
     e.get_type(input).is_ok_and(|t| is_float(&t))
 }
 
-fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
+/// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
+/// counts, sum_decimal's "some value is NaN".
+fn aggregate_extra(v: &Value, over: Option<&Expr>) -> Result<Option<Expr>, String> {
     match field(v, "fn")?.as_str() {
         Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
-        Some("sum_decimal") => Ok(Some(max(
-            PgNumeric::udf(NumericFn::IsNan).call(vec![expr(field(v, "arg")?)?])
-        ))),
+        Some("sum_decimal") => Ok(Some(max(PgNumeric::udf(NumericFn::IsNan).call(vec![
+            agg_arg(v, over)?.ok_or("sum_decimal needs an argument")?,
+        ])))),
         _ => Ok(None),
     }
+}
+
+/// D1: the argument of the aggregates of `aggs` if they are over distinct
+/// values: count, sum and avg with "distinct", min and max, all of one
+/// argument (the checker allows no other mix).
+fn distinct_argument(aggs: &[Value]) -> Result<Option<&Value>, String> {
+    let flag = |a: &Value| a.get("distinct").and_then(Value::as_bool).unwrap_or(false);
+    let Some(first) = aggs.iter().find(|a| flag(a)) else {
+        return Ok(None);
+    };
+    let arg = field(first, "arg")?;
+    for a in aggs {
+        let minmax = matches!(field(a, "fn")?.as_str(), Some("min" | "max"));
+        if (!flag(a) && !minmax) || a.get("arg") != Some(arg) {
+            return Err("plan spec: DISTINCT aggregates with others".into());
+        }
+    }
+    Ok(Some(arg))
 }
 
 /// DataFusion's default session, minus expression simplification.
@@ -1075,13 +1107,38 @@ fn build_node(
                 group_exprs.push(e.alias(format!("g{i}")));
             }
         }
+        // D1: DISTINCT aggregates run over a grouping by the groups and
+        // their argument, which spills as any grouping does, and then over
+        // its distinct values, "dx".  DataFusion's own distinct accumulators
+        // keep every value in memory.  The checker allows count, sum and avg
+        // DISTINCT and min and max of one argument, not a float one.
+        let mut over = None;
+        if let Some(arg) = distinct_argument(&aggs)? {
+            let x = expr(arg)?;
+            let x = if is_float_expr(&x, b.schema()) {
+                FloatFn::Key.apply(x)
+            } else {
+                x
+            };
+            let mut inner = group_exprs;
+            inner.push(x.alias("dx"));
+            b = b.aggregate(inner, agg_exprs).map_err(df)?;
+            group_exprs = (0..groups.len())
+                .map(|i| col(format!("g{i}")).alias(format!("g{i}")))
+                .collect();
+            agg_exprs = float_groups
+                .iter()
+                .map(|i| min(col(format!("g{i}_v"))).alias(format!("g{i}_v")))
+                .collect();
+            over = Some(col("dx"));
+        }
         let mut float_aggs = Vec::new();
         for (i, g) in aggs.iter().enumerate() {
-            if float_min_max(g, b.schema())? {
+            if float_min_max(g, b.schema(), over.as_ref())? {
                 float_aggs.push(i);
             }
-            agg_exprs.push(aggregate(g, b.schema())?.alias(format!("a{i}")));
-            if let Some(e) = aggregate_extra(g)? {
+            agg_exprs.push(aggregate(g, b.schema(), over.as_ref())?.alias(format!("a{i}")));
+            if let Some(e) = aggregate_extra(g, over.as_ref())? {
                 agg_exprs.push(e.alias(format!("a{i}_n")));
             }
         }

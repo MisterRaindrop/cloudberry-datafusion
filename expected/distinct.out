@@ -1,0 +1,235 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Aggregates over DISTINCT arguments (D1).  DataFusion runs the DISTINCT
+-- aggregates of an Agg over a grouping by their argument, which spills as
+-- any grouping does, then over its distinct values: count, sum and avg
+-- DISTINCT and min and max of one argument.  Floats are told apart as
+-- PostgreSQL does (-0 = 0, one NaN), numeric NaN is one value, strings need
+-- a deterministic collation.  Each query runs with datafusion.mode off,
+-- then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+CREATE TABLE df_di (id int, a int, b int8, f float8, n numeric(10,2), t text) DISTRIBUTED BY (id);
+INSERT INTO df_di SELECT i,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE i % 97 END,
+  (i * 7919) % 1009,
+  CASE i % 7 WHEN 0 THEN '-0'::float8 WHEN 1 THEN 0 WHEN 2 THEN 'NaN' WHEN 3 THEN '-NaN' WHEN 4 THEN NULL
+    ELSE i % 50 END,
+  CASE WHEN i % 11 = 0 THEN 'NaN' WHEN i % 17 = 0 THEN NULL ELSE (i % 300) / 4.0 END,
+  CASE WHEN i % 19 = 0 THEN NULL ELSE 'k' || (i % 211) END
+FROM generate_series(1, 30000) i;
+ANALYZE df_di;
+SET datafusion.mode = explain;
+-- one argument, split at its distribution (batches carry the partial counts)
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: a
+                     ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(10 rows)
+
+-- distinct by id, the distribution key: each segment counts its own
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT id), sum(DISTINCT id) FROM df_di;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+-- these stay on PostgreSQL, with the reason
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(*) FROM df_di;
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: a
+                     ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: DISTINCT aggregates alongside other aggregates
+ DataFusion: slice 2 eligible
+(10 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), count(DISTINCT b) FROM df_di WHERE id < 0;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_di
+               Filter: (id < 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: DISTINCT aggregates of different arguments
+ DataFusion: slice 1 eligible
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(DISTINCT f) FROM df_di WHERE id < 0;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_di
+               Filter: (id < 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: DISTINCT inside aggregate sum of floats
+ DataFusion: slice 1 eligible
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(DISTINCT f), max(f) FROM df_di WHERE id < 0;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_di
+               Filter: (id < 0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: DISTINCT aggregates alongside min or max of floats
+ DataFusion: slice 1 eligible
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(a ORDER BY a) FROM df_di;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_di
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: ORDER BY inside aggregate count
+ DataFusion: slice 1 eligible
+(6 rows)
+
+SET datafusion.mode = off;
+SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
+ count | sum  |         avg         | min | max 
+-------+------+---------------------+-----+-----
+    97 | 4656 | 48.0000000000000000 |   0 |  96
+(1 row)
+
+SELECT count(DISTINCT id), sum(DISTINCT id), avg(DISTINCT id) FROM df_di;
+ count |    sum    |        avg         
+-------+-----------+--------------------
+ 30000 | 450015000 | 15000.500000000000
+(1 row)
+
+SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE id % 4 = 1;
+ count |  sum   
+-------+--------
+  1009 | 508536
+(1 row)
+
+SELECT count(DISTINCT n), sum(DISTINCT n), avg(DISTINCT n), min(n), max(DISTINCT n) FROM df_di;
+ count | sum | avg | min  | max 
+-------+-----+-----+------+-----
+   301 | NaN | NaN | 0.00 | NaN
+(1 row)
+
+SELECT count(DISTINCT n), sum(DISTINCT n), avg(DISTINCT n) FROM df_di WHERE n <> 'NaN';
+ count |   sum    |         avg         
+-------+----------+---------------------
+   300 | 11212.50 | 37.3750000000000000
+(1 row)
+
+SELECT count(DISTINCT f) FROM df_di;
+ count 
+-------
+    51
+(1 row)
+
+SELECT count(DISTINCT t COLLATE "C"), min(t COLLATE "C"), max(t COLLATE "C") FROM df_di;
+ count | min | max 
+-------+-----+-----
+   211 | k0  | k99
+(1 row)
+
+SELECT count(DISTINCT a), sum(DISTINCT a) FROM df_di WHERE id < 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
+ count | sum  |         avg         | min | max 
+-------+------+---------------------+-----+-----
+    97 | 4656 | 48.0000000000000000 |   0 |  96
+(1 row)
+
+SELECT count(DISTINCT id), sum(DISTINCT id), avg(DISTINCT id) FROM df_di;
+ count |    sum    |        avg         
+-------+-----------+--------------------
+ 30000 | 450015000 | 15000.500000000000
+(1 row)
+
+SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE id % 4 = 1;
+ count |  sum   
+-------+--------
+  1009 | 508536
+(1 row)
+
+SELECT count(DISTINCT n), sum(DISTINCT n), avg(DISTINCT n), min(n), max(DISTINCT n) FROM df_di;
+ count | sum | avg | min  | max 
+-------+-----+-----+------+-----
+   301 | NaN | NaN | 0.00 | NaN
+(1 row)
+
+SELECT count(DISTINCT n), sum(DISTINCT n), avg(DISTINCT n) FROM df_di WHERE n <> 'NaN';
+ count |   sum    |         avg         
+-------+----------+---------------------
+   300 | 11212.50 | 37.3750000000000000
+(1 row)
+
+SELECT count(DISTINCT f) FROM df_di;
+ count 
+-------
+    51
+(1 row)
+
+SELECT count(DISTINCT t COLLATE "C"), min(t COLLATE "C"), max(t COLLATE "C") FROM df_di;
+ count | min | max 
+-------+-----+-----
+   211 | k0  | k99
+(1 row)
+
+SELECT count(DISTINCT a), sum(DISTINCT a) FROM df_di WHERE id < 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+DROP TABLE df_di;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

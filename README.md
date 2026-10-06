@@ -688,6 +688,24 @@ Over 30 million rows, `sum(b) / count(*)::numeric, 100.0 * sum(a) /
 sum(b)` grouped took 0.30 s against 1.50 s, a filtered `sum(b)::numeric
 / nullif(sum(a), 0)` 0.29 s against 1.03 s.
 
+### DISTINCT aggregates
+
+D1 runs count, sum and avg over DISTINCT arguments.  DataFusion's own
+distinct accumulators keep every distinct value in memory and fail beyond
+the slice's budget (30 million distinct values under a 32 MB
+statement_mem did), where PostgreSQL sorts and spills.  So the Agg runs
+as a grouping by its groups and the argument, which spills like any
+grouping, then as the aggregates over the distinct values.  That fixes
+what one Agg may hold: DISTINCT aggregates of one argument and min and
+max of it.  `count(DISTINCT a), count(*)`, DISTINCT aggregates of two
+arguments, sum and avg of distinct floats (of -0 and 0 PostgreSQL keeps
+one, and the sum shows its sign) and min or max of floats next to a
+DISTINCT stay on PostgreSQL, as does ORDER BY inside an aggregate.  A
+combining stage keeps the DISTINCT of the call but adds up partial
+results, which the planner splits only where each segment sees all of a
+value.  `count(DISTINCT b)` over 30 million distinct values took 1.21 s
+against 3.68 s under that 32 MB.
+
 ### Sort and LIMIT
 
 S1 runs a Sort and a Limit at the top of a slice: ORDER BY with LIMIT and

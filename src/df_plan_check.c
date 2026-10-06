@@ -492,6 +492,87 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 }
 
 /*
+ * D1: what keeps DataFusion from telling the arguments of aggregate 'agg'
+ * apart as its DISTINCT does, by equality, or NULL.  Strings need a
+ * deterministic collation.  Of -0 and 0, equal, PostgreSQL keeps one, and
+ * which one changes a sum's sign of zero: sum and avg of distinct floats
+ * stay on PostgreSQL (count, min and max are not affected).
+ */
+static const char *
+df_distinct_problem(DfCheckContext *cxt, Aggref *agg)
+{
+	Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+	Oid			type = exprType(arg);
+	char	   *name = get_func_name(agg->aggfnoid);
+
+	if (df_type_is_string(type))
+		return df_string_compare_problem(cxt, "=", agg->inputcollid);
+	if ((type == FLOAT4OID || type == FLOAT8OID) &&
+		(strcmp(name, "sum") == 0 || strcmp(name, "avg") == 0))
+		return "of floats";
+	return NULL;
+}
+
+static bool
+df_collect_aggrefs(Node *node, List **aggs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Aggref))
+	{
+		*aggs = lappend(*aggs, node);
+		return false;
+	}
+	return expression_tree_walker(node, df_collect_aggrefs, aggs);
+}
+
+/*
+ * D1: DataFusion runs the DISTINCT aggregates of an Agg over a grouping by
+ * their argument (df_core::query::build_node), so all of them must have
+ * one argument, and the Agg no other aggregates than min and max of it.
+ * Of a float argument the grouping keeps one of -0 and 0, which min and
+ * max must not see.  The reason, or NULL.
+ */
+static const char *
+df_distinct_mix_problem(Agg *agg)
+{
+	List	   *aggs = NIL;
+	ListCell   *lc;
+	Node	   *arg = NULL;
+
+	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
+	foreach(lc, aggs)
+	{
+		Aggref	   *a = lfirst_node(Aggref, lc);
+		char	   *name = get_func_name(a->aggfnoid);
+
+		if (a->aggdistinct != NIL && a->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
+			strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
+		{
+			arg = (Node *) linitial_node(TargetEntry, a->args)->expr;
+			break;
+		}
+	}
+	if (arg == NULL)
+		return NULL;
+	foreach(lc, aggs)
+	{
+		Aggref	   *a = lfirst_node(Aggref, lc);
+		char	   *name = get_func_name(a->aggfnoid);
+		bool		minmax = strcmp(name, "min") == 0 || strcmp(name, "max") == 0;
+
+		if (a->args == NIL || (!minmax && a->aggdistinct == NIL))
+			return "alongside other aggregates";
+		if (!equal(linitial_node(TargetEntry, a->args)->expr, arg))
+			return "of different arguments";
+		if (minmax && (exprType(arg) == FLOAT4OID || exprType(arg) == FLOAT8OID))
+			return "alongside min or max of floats";
+	}
+	return NULL;
+}
+
+/*
  * Can 'l' and 'r' be compared for equality as PostgreSQL does (E1: IN
  * lists, IS DISTINCT FROM, NULLIF)?  The rules of = (N2, X1).  Rejects if
  * not.
@@ -870,8 +951,12 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "user-defined aggregate %s", name ? name : "?");
 				else if (name == NULL || !df_name_in(name, aggregates))
 					df_reject(cxt, "aggregate %s", name ? name : "?");
-				else if (agg->aggdistinct != NIL || agg->aggorder != NIL)
-					df_reject(cxt, "DISTINCT or ORDER BY inside aggregate %s", name);
+				else if (agg->aggorder != NIL)
+					df_reject(cxt, "ORDER BY inside aggregate %s", name);
+				else if (agg->aggdistinct != NIL && agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
+						 df_distinct_problem(cxt, agg) != NULL)
+					df_reject(cxt, "DISTINCT inside aggregate %s %s", name,
+							  df_distinct_problem(cxt, agg));
 				else if (agg->aggfilter != NULL)
 					df_reject(cxt, "FILTER clause on aggregate %s", name);
 				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
@@ -947,7 +1032,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							  df_string_compare_problem(cxt, name, agg->inputcollid));
 				if (cxt->failed)
 					return true;
-				break;
+				/* the arguments; aggdistinct holds sort clauses, checked above */
+				return df_check_expr((Node *) agg->args, cxt);
 			}
 
 		case T_FuncExpr:
@@ -1675,6 +1761,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				{
 					/* e.g. DISTINCT aggregates: an aggregate over a grouping */
 					df_reject(cxt, "aggregate over another aggregate");
+					return;
+				}
+				if (df_distinct_mix_problem(agg) != NULL)
+				{
+					df_reject(cxt, "DISTINCT aggregates %s", df_distinct_mix_problem(agg));
 					return;
 				}
 				for (i = 0; i < agg->numCols && child != NULL; i++)
