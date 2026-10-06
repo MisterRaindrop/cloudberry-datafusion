@@ -62,6 +62,19 @@ typedef struct DfSliceInput
 	int16	   *scales;			/* of numeric columns (Decimal128) */
 } DfSliceInput;
 
+/*
+ * Output columns PostgreSQL finishes (P1): the slice's output columns that
+ * DataFusion cannot compute whole, and the subexpressions of them that it
+ * computes.  PostgreSQL evaluates the rest of each such column over those
+ * values, row by row, as its own projection would (numeric division, any
+ * function).  df_check_slice finds them; df_translate_slice uses them.
+ */
+typedef struct DfTails
+{
+	List	   *tles;			/* TargetEntry of each such column */
+	List	   *leaves;			/* Node: subexpressions DataFusion computes */
+} DfTails;
+
 /* What df_translate_slice produces for one slice. */
 typedef struct DfSliceSpec
 {
@@ -73,6 +86,19 @@ typedef struct DfSliceSpec
 	uint8	   *out_kinds;		/* DfOutKind of each */
 	int16	   *out_scales;		/* of numeric ones */
 	int			batch_rows;		/* rows per batch, from the widest row */
+
+	/*
+	 * The tuple's columns (P1).  The output columns above are values: one
+	 * per value, two for DF_OUT_NUMERIC_AVG.  Column k of the tuple is value
+	 * col_value[k], or, if that is -1, col_tail[k] evaluated over the values
+	 * (Vars of OUTER_VAR, attno = value + 1).  col_tail is NULL without
+	 * such columns.
+	 */
+	int			ncols;
+	int		   *col_value;
+	Expr	  **col_tail;
+	int			nvalues;
+	Oid		   *value_types;
 } DfSliceSpec;
 
 /*
@@ -156,13 +182,14 @@ extern const char *df_cast_kind(Oid funcid);
 
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
-						   MotionState *send, char *reason, size_t reasonlen);
+						   MotionState *send, const DfTails *tails,
+						   char *reason, size_t reasonlen);
 extern uint64 df_runs_completed;	/* slices DataFusion ran to the end */
 extern DfQueryStats df_last_run;	/* figures of the latest one */
 
 /* df_translate.c */
 extern const char *df_type_tag(Oid type);
-extern bool df_translate_slice(Plan *root, DfSliceSpec *spec,
+extern bool df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 							   char *reason, size_t reasonlen);
 
 /*
@@ -219,7 +246,7 @@ extern void df_install_hooks(void);
 
 /* df_plan_check.c */
 extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-						   char *reason, size_t reasonlen);
+						   DfTails *tails, char *reason, size_t reasonlen);
 extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
 								 bool *is_sender);
 extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);

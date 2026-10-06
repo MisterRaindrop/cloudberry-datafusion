@@ -93,8 +93,8 @@ typedef struct DfBuilder
 								 * Aggref's own, or "sum" / "count" for the
 								 * parts of a partial avg's state */
 	Node	   *case_arg;		/* the value of the CASE being emitted (E1) */
-	int		   *out_col;		/* output column of each targetlist entry, by
-								 * resno (df_emit_outputs) */
+	int		   *out_col;		/* output column of each value
+								 * (df_emit_outputs) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -1089,17 +1089,21 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 	}
 }
 
+/*
+ * The output columns of the spec: the values of 'values', expressions at
+ * 'level' over the inputs of node 'ctx'.
+ */
 static void
-df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
+df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				DfSliceSpec *spec, Plan *ctx)
 {
 	ListCell   *lc;
 	int			i = 0;
 
 	spec->nout = 0;
-	foreach(lc, tlist)
+	foreach(lc, values)
 	{
-		Node	   *expr = (Node *) lfirst_node(TargetEntry, lc)->expr;
+		Node	   *expr = (Node *) lfirst(lc);
 
 		if (level == DF_LEVEL_AGG && df_partial_state(expr) != DF_AGG_PLAIN)
 			spec->nout += df_agg_state_ncols(df_partial_state(expr));
@@ -1110,24 +1114,24 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		else
 			spec->nout++;
 	}
-	b->out_col = palloc0(sizeof(int) * (list_length(tlist) + 1));
+	b->out_col = palloc0(sizeof(int) * (list_length(values) + 1));
 	spec->out_types = palloc(sizeof(Oid) * Max(spec->nout, 1));
 	spec->out_kinds = palloc0(sizeof(uint8) * Max(spec->nout, 1));
 	spec->out_scales = palloc0(sizeof(int16) * Max(spec->nout, 1));
 	appendStringInfoChar(out, '[');
-	foreach(lc, tlist)
+	foreach(lc, values)
 	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-		Oid			type = exprType((Node *) tle->expr);
+		Expr	   *value = (Expr *) lfirst(lc);
+		Oid			type = exprType((Node *) value);
 		const char *tag = df_type_tag(type);
 		DfAggState	state = level == DF_LEVEL_AGG ?
-			df_partial_state((Node *) tle->expr) : DF_AGG_PLAIN;
+			df_partial_state((Node *) value) : DF_AGG_PLAIN;
 
-		b->out_col[tle->resno] = i;
+		b->out_col[foreach_current_index(lc)] = i;
 		if (state != DF_AGG_PLAIN)
 		{
 			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1, N2) */
-			Aggref	   *agg = (Aggref *) tle->expr;
+			Aggref	   *agg = (Aggref *) value;
 			bool		fsum = state == DF_AGG_AVG_FLOAT;
 			bool		dsum = state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC;
 			int			scale = df_scale_of(ctx, (Node *) agg);
@@ -1146,12 +1150,12 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 			}
 			continue;
 		}
-		if (level == DF_LEVEL_AGG && IsA(tle->expr, Aggref) &&
-			(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
-			 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
+		if (level == DF_LEVEL_AGG && IsA(value, Aggref) &&
+			(df_agg_state((Aggref *) value) == DF_AGG_AVG_INT ||
+			 df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC))
 		{
 			/* avg = numeric sum / count, divided on the C side (N1, N2) */
-			Aggref	   *agg = (Aggref *) tle->expr;
+			Aggref	   *agg = (Aggref *) value;
 			bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
 			bool		dsum = df_agg_state(agg) == DF_AGG_AVG_NUMERIC;
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
@@ -1177,14 +1181,14 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		}
 		if (type == NUMERICOID)
 		{
-			spec->out_scales[i] = (int16) df_scale_of(ctx, (Node *) tle->expr);
+			spec->out_scales[i] = (int16) df_scale_of(ctx, (Node *) value);
 			tag = df_tag(type, spec->out_scales[i]);
 		}
 		spec->out_types[i++] = type;
 		if (i > 1)
 			appendStringInfoChar(out, ',');
 		appendStringInfoString(out, "{\"expr\":");
-		df_emit(b, out, (Node *) tle->expr, level);
+		df_emit(b, out, (Node *) value, level);
 		appendStringInfo(out, ",\"type\":\"%s\"}", tag);
 	}
 	appendStringInfoChar(out, ']');
@@ -1216,6 +1220,69 @@ df_slice_width(Plan *plan)
 	return Max(width, Max(df_slice_width(outerPlan(plan)), df_slice_width(innerPlan(plan))));
 }
 
+/* P1: building the expression PostgreSQL finishes an output column with */
+typedef struct DfTailContext
+{
+	const DfTails *tails;
+	List	  **values;
+} DfTailContext;
+
+/* 'node' with each leaf DataFusion computes replaced by a Var of its value */
+static Node *
+df_tail_mutator(Node *node, DfTailContext *c)
+{
+	if (node == NULL)
+		return NULL;
+	if (list_member_ptr(c->tails->leaves, node))
+	{
+		int			v = list_length(*c->values);
+
+		*c->values = lappend(*c->values, node);
+		return (Node *) makeVar(OUTER_VAR, v + 1, exprType(node), exprTypmod(node),
+								exprCollation(node), 0);
+	}
+	return expression_tree_mutator(node, df_tail_mutator, c);
+}
+
+/*
+ * The values DataFusion computes for the targetlist of 'body', and how each
+ * of its columns is made of them (spec->col_value, col_tail).
+ */
+static List *
+df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec)
+{
+	List	   *values = NIL;
+	ListCell   *lc;
+	DfTailContext c = {tails, &values};
+
+	spec->ncols = list_length(body->targetlist);
+	spec->col_value = palloc(sizeof(int) * Max(spec->ncols, 1));
+	spec->col_tail = NULL;
+	foreach(lc, body->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		int			k = foreach_current_index(lc);
+
+		if (tails != NULL && list_member_ptr(tails->tles, tle))
+		{
+			if (spec->col_tail == NULL)
+				spec->col_tail = palloc0(sizeof(Expr *) * spec->ncols);
+			spec->col_value[k] = -1;
+			spec->col_tail[k] = (Expr *) df_tail_mutator((Node *) tle->expr, &c);
+		}
+		else
+		{
+			spec->col_value[k] = list_length(values);
+			values = lappend(values, tle->expr);
+		}
+	}
+	spec->nvalues = list_length(values);
+	spec->value_types = palloc(sizeof(Oid) * Max(spec->nvalues, 1));
+	foreach(lc, values)
+		spec->value_types[foreach_current_index(lc)] = exprType(lfirst(lc));
+	return values;
+}
+
 /*
  * S1: the slice's Sort keys, as output columns of the spec, and its Limit:
  * ,"sort":[{"col": c, "desc": b, "nulls_first": b}, ...],"limit":{...}
@@ -1242,7 +1309,12 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 				df_fail(b, "a sort key");
 				return;
 			}
-			c = b->out_col[k];
+			if (spec->col_value[k - 1] < 0)
+			{
+				df_fail(b, "a sort key PostgreSQL computes");
+				return;
+			}
+			c = b->out_col[spec->col_value[k - 1]];
 			if (spec->out_kinds[c] != DF_OUT_PLAIN ||
 				spec->out_types[c] != exprType((Node *) tle->expr))
 			{
@@ -1279,7 +1351,8 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
  * false, with a reason, if something cannot be expressed.
  */
 bool
-df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen)
+df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
+				   char *reason, size_t reasonlen)
 {
 	DfBuilder	b;
 	StringInfoData node,
@@ -1292,6 +1365,7 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 	int			i;
 	Limit	   *limit = NULL;
 	Sort	   *sort = NULL;
+	List	   *values;
 
 	/* S1: a Limit and a Sort at the top, over the rows of the rest */
 	if (IsA(root, Limit))
@@ -1333,13 +1407,15 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		}
 		appendStringInfoChar(&group, ']');
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
-		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_AGG, spec, root);
+		values = df_output_values(root, tails, spec);
+		df_emit_outputs(&b, &outputs, values, DF_LEVEL_AGG, spec, root);
 	}
 	else
 	{
 		df_emit_node(&b, &node, root);
 		b.ctx = root;
-		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_SCAN, spec, root);
+		values = df_output_values(root, tails, spec);
+		df_emit_outputs(&b, &outputs, values, DF_LEVEL_SCAN, spec, root);
 	}
 	initStringInfo(&sortlimit);
 	if (!b.failed)

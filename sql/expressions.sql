@@ -39,7 +39,7 @@ ANALYZE df_ex;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE a IN (1, 3) AND t NOT IN ('k1') AND coalesce(b, 0) > 1;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE a > ALL ('{0}');
-EXPLAIN (COSTS OFF) SELECT CASE WHEN n > 1 THEN n ELSE 0 END FROM df_ex;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE CASE WHEN n > 1 THEN n ELSE 0 END > 0.5;
 
 SET datafusion.mode = off;
 SELECT count(*), count(a) FROM df_ex WHERE a IN (1, 3, 5);

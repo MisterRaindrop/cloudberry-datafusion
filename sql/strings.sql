@@ -134,8 +134,8 @@ SELECT s, p, n FROM
 ANALYZE df_sf;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 2), lower(s COLLATE "C") FROM df_sf;
-EXPLAIN (COSTS OFF) SELECT concat(s, n), s || n FROM df_sf;
-EXPLAIN (COSTS OFF) SELECT md5(s) FROM df_sf;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE concat(s, n) = s;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE md5(s) = s;
 SET datafusion.mode = off;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
   replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)

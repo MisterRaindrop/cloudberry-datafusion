@@ -78,17 +78,18 @@ EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
 (7 rows)
 
 -- an avg's numeric result has no fixed scale: not computed on further
-EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT g FROM df_nm GROUP BY g HAVING avg(a) + 1 > 2;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  HashAggregate
          Group Key: g
+         Filter: ((avg(a) + '1'::numeric) > '2'::numeric)
          ->  Seq Scan on df_nm
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: operator + on numeric: of unknown precision or more than 76 digits
-(7 rows)
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+(8 rows)
 
 RESET datafusion.motion_batches;
 SET datafusion.mode = off;
@@ -252,15 +253,18 @@ EXPLAIN (COSTS OFF) SELECT a + 1, a * b, a - id FROM df_nc;
  DataFusion: slice 1 eligible
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT a / b FROM df_nc;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)
-   ->  Seq Scan on df_nc
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a / b > 1;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+                     Filter: ((a / b) > '1'::numeric)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: operator / on numeric: its scale depends on the values
-(5 rows)
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+(8 rows)
 
 SET datafusion.mode = off;
 SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
@@ -520,6 +524,159 @@ SELECT count(*) FROM df_nc WHERE b < 'NaN';
  50005
 (1 row)
 
+-- Output columns PostgreSQL finishes (P1): DataFusion computes the largest
+-- parts it can (columns, + - *, aggregates) and PostgreSQL evaluates the
+-- rest over them, row by row: numeric / with its scale chosen per value,
+-- functions DataFusion lacks.  Filters and sort keys stay DataFusion's.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(a) / sum(b), 100.00 * sum(a) / count(*) FROM df_nc GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g
+               ->  Streaming Partial HashAggregate
+                     Group Key: g
+                     ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, a / b, round(a * 2, 1), abs(c) FROM df_nc WHERE a > 0;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_nc
+         Filter: (a > '0'::numeric)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(6 rows)
+
+-- not a sort key: DataFusion sorts by what it computes
+EXPLAIN (COSTS OFF) SELECT id, a / b FROM df_nc ORDER BY a / b LIMIT 3;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: ((a / b))
+         ->  Limit
+               ->  Sort
+                     Sort Key: ((a / b))
+                     ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: operator / on numeric: its scale depends on the values
+(10 rows)
+
+SET datafusion.mode = off;
+SELECT g, sum(a) / nullif(sum(b), 0), 100.00 * sum(a) / count(*), round(avg(a), 3) FROM df_nc GROUP BY g ORDER BY g;
+ g  |        ?column?         |        ?column?        | round  
+----+-------------------------+------------------------+--------
+  0 |     10.2067813924319159 |   242.0539064687762532 |  2.421
+  1 |      1.0861742829648403 |   -98.8147837043259135 | -0.988
+  2 |  0.83066107588229159217 |   -19.6579868402631947 | -0.197
+  3 |      3.2258064516129032 |  -220.4955900881982360 | -2.205
+  4 |      4.9543924494606232 |  -421.3331933361332773 | -4.213
+  5 |     19.2962921266527644 |  -342.1763964720705586 | -3.422
+  6 | -0.14334428309114496783 |    16.9748005039899202 |  0.170
+ 90 |                     NaN |                    NaN |    NaN
+ 91 |                         |                        |       
+ 92 |                         | 0.00000000000000000000 |  0.000
+ 93 |  1.00006667111140742716 |    75.0000000000000000 |  0.750
+(11 rows)
+
+SELECT sum(b) / sum(a), sum(c) / 7, avg(id) / 3 FROM df_nc WHERE id > 0;
+        ?column?        |             ?column?             |       ?column?        
+------------------------+----------------------------------+-----------------------
+ 0.45107883817427385892 | 17857499999999999999999821425000 | 8333.5000000000000000
+(1 row)
+
+SELECT id, a / b, a / 3, d / 7.0, c / (id + 1), round(a * 2, 1), abs(b), (a + 1) / nullif(b, 0)
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+  id   |        ?column?        |        ?column?        |            ?column?            |                ?column?                 |    round     |       abs        |        ?column?         
+-------+------------------------+------------------------+--------------------------------+-----------------------------------------+--------------+------------------+-------------------------
+    -7 | 1.00000000000000000000 | 0.50000000000000000000 |         0.21428571428571428571 |                 -0.16666666666666666667 |          3.0 |           1.5000 |      1.6666666666666667
+    -6 |     0.0000000000000000 | 0.00000000000000000000 |         0.00000000000000000000 |                  0.00000000000000000000 |          0.0 |           0.0001 | -10000.0000000000000000
+    -5 | 0.00099999999990000100 | -33333333.330000000000 | -142857142857142857.1428571428 |  25000000000000000000000000000000000000 | -200000000.0 | 99999999999.9999 |  0.00099999998990000100
+    -4 | 0.00099999999990000100 |  33333333.330000000000 |  142857142857142857.1428571428 | -33333333333333333333333333333333333333 |  200000000.0 | 99999999999.9999 |  0.00100000000990000100
+    -3 |                        |                        |                                |                                         |              |                  |                        
+    -2 | 0.66666666666666666667 | 0.50000000000000000000 | 0.0000000000142857142857142857 |                     -3.0000000000000000 |          3.0 |           2.2500 |  1.11111111111111111111
+    -1 |                    NaN |                    NaN |                            NaN |                                     NaN |          NaN |              NaN |                     NaN
+  9973 | 0.43001739175030423374 |   -79.3766666666666667 |     0.000018861442857142857143 |                 99989973932223781832764 |       -476.3 |         553.7683 |  0.42821158235312494413
+ 19946 |   -88.5627776961518218 |  3174.5800000000000000 |     0.000037722885714285714286 |                 99994986714794204642301 |      19047.5 |         107.5366 |    -88.5720768556937824
+ 29919 |    -2.1092422063383852 |  -238.1300000000000000 |     0.000056584328571428571429 |                 99996657754010695187165 |      -1428.8 |         338.6951 |     -2.1062896983156827
+ 39892 |    11.5265270595933277 |  3015.8266666666666667 |     0.000075445771428571428571 |                 99997493294562955907050 |      18095.0 |         784.9268 |     11.5278010637425044
+ 49865 |     1.5486286835453081 |  -396.8833333333333333 |     0.000094307214285714285714 |                 99997994625596598885011 |      -2381.3 |         768.8415 |      1.5473280253472270
+(12 rows)
+
+SELECT id, CASE WHEN a = 0 THEN 0 ELSE b / a END FROM df_nc WHERE id IN (-6, -2, 9973) ORDER BY id;
+  id  |        case        
+------+--------------------
+   -6 |                  0
+   -2 | 1.5000000000000000
+ 9973 | 2.3254873388485281
+(3 rows)
+
+SET datafusion.mode = on;
+SELECT g, sum(a) / nullif(sum(b), 0), 100.00 * sum(a) / count(*), round(avg(a), 3) FROM df_nc GROUP BY g ORDER BY g;
+ g  |        ?column?         |        ?column?        | round  
+----+-------------------------+------------------------+--------
+  0 |     10.2067813924319159 |   242.0539064687762532 |  2.421
+  1 |      1.0861742829648403 |   -98.8147837043259135 | -0.988
+  2 |  0.83066107588229159217 |   -19.6579868402631947 | -0.197
+  3 |      3.2258064516129032 |  -220.4955900881982360 | -2.205
+  4 |      4.9543924494606232 |  -421.3331933361332773 | -4.213
+  5 |     19.2962921266527644 |  -342.1763964720705586 | -3.422
+  6 | -0.14334428309114496783 |    16.9748005039899202 |  0.170
+ 90 |                     NaN |                    NaN |    NaN
+ 91 |                         |                        |       
+ 92 |                         | 0.00000000000000000000 |  0.000
+ 93 |  1.00006667111140742716 |    75.0000000000000000 |  0.750
+(11 rows)
+
+SELECT sum(b) / sum(a), sum(c) / 7, avg(id) / 3 FROM df_nc WHERE id > 0;
+        ?column?        |             ?column?             |       ?column?        
+------------------------+----------------------------------+-----------------------
+ 0.45107883817427385892 | 17857499999999999999999821425000 | 8333.5000000000000000
+(1 row)
+
+SELECT id, a / b, a / 3, d / 7.0, c / (id + 1), round(a * 2, 1), abs(b), (a + 1) / nullif(b, 0)
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+  id   |        ?column?        |        ?column?        |            ?column?            |                ?column?                 |    round     |       abs        |        ?column?         
+-------+------------------------+------------------------+--------------------------------+-----------------------------------------+--------------+------------------+-------------------------
+    -7 | 1.00000000000000000000 | 0.50000000000000000000 |         0.21428571428571428571 |                 -0.16666666666666666667 |          3.0 |           1.5000 |      1.6666666666666667
+    -6 |     0.0000000000000000 | 0.00000000000000000000 |         0.00000000000000000000 |                  0.00000000000000000000 |          0.0 |           0.0001 | -10000.0000000000000000
+    -5 | 0.00099999999990000100 | -33333333.330000000000 | -142857142857142857.1428571428 |  25000000000000000000000000000000000000 | -200000000.0 | 99999999999.9999 |  0.00099999998990000100
+    -4 | 0.00099999999990000100 |  33333333.330000000000 |  142857142857142857.1428571428 | -33333333333333333333333333333333333333 |  200000000.0 | 99999999999.9999 |  0.00100000000990000100
+    -3 |                        |                        |                                |                                         |              |                  |                        
+    -2 | 0.66666666666666666667 | 0.50000000000000000000 | 0.0000000000142857142857142857 |                     -3.0000000000000000 |          3.0 |           2.2500 |  1.11111111111111111111
+    -1 |                    NaN |                    NaN |                            NaN |                                     NaN |          NaN |              NaN |                     NaN
+  9973 | 0.43001739175030423374 |   -79.3766666666666667 |     0.000018861442857142857143 |                 99989973932223781832764 |       -476.3 |         553.7683 |  0.42821158235312494413
+ 19946 |   -88.5627776961518218 |  3174.5800000000000000 |     0.000037722885714285714286 |                 99994986714794204642301 |      19047.5 |         107.5366 |    -88.5720768556937824
+ 29919 |    -2.1092422063383852 |  -238.1300000000000000 |     0.000056584328571428571429 |                 99996657754010695187165 |      -1428.8 |         338.6951 |     -2.1062896983156827
+ 39892 |    11.5265270595933277 |  3015.8266666666666667 |     0.000075445771428571428571 |                 99997493294562955907050 |      18095.0 |         784.9268 |     11.5278010637425044
+ 49865 |     1.5486286835453081 |  -396.8833333333333333 |     0.000094307214285714285714 |                 99997994625596598885011 |      -2381.3 |         768.8415 |      1.5473280253472270
+(12 rows)
+
+-- PostgreSQL only divides where a <> 0, here too
+SELECT id, CASE WHEN a = 0 THEN 0 ELSE b / a END FROM df_nc WHERE id IN (-6, -2, 9973) ORDER BY id;
+  id  |        case        
+------+--------------------
+   -6 |                  0
+   -2 | 1.5000000000000000
+ 9973 | 2.3254873388485281
+(3 rows)
+
+-- and raises its own error
+\set VERBOSITY sqlstate
+SELECT id, b / a FROM df_nc WHERE id = -6;
+ERROR:  22012
+\set VERBOSITY default
 RESET datafusion.motion_batches;
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

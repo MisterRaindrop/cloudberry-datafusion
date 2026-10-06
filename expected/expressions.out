@@ -61,15 +61,18 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE a > ALL ('{0}');
  DataFusion: slice 1 not eligible: > ALL list
 (8 rows)
 
-EXPLAIN (COSTS OFF) SELECT CASE WHEN n > 1 THEN n ELSE 0 END FROM df_ex;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)
-   ->  Seq Scan on df_ex
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE CASE WHEN n > 1 THEN n ELSE 0 END > 0.5;
+                                          QUERY PLAN                                           
+-----------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ex
+                     Filter: (CASE WHEN (n > '1'::numeric) THEN n ELSE '0'::numeric END > 0.5)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: CASE returning numeric of different scales
-(5 rows)
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+(8 rows)
 
 SET datafusion.mode = off;
 SELECT count(*), count(a) FROM df_ex WHERE a IN (1, 3, 5);

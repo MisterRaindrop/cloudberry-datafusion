@@ -131,6 +131,7 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		char		reason[256];
 		int			slice_index;
 		bool		is_sender;
+		DfTails		tails;
 		Plan	   *root = df_local_slice_root(queryDesc, &slice_index, &is_sender);
 
 		/*
@@ -151,10 +152,10 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		else if (is_sender)
 			attach = NULL;
 
-		if (df_check_slice(queryDesc->plannedstmt, root, is_sender,
+		if (df_check_slice(queryDesc->plannedstmt, root, is_sender, &tails,
 						   reason, sizeof(reason)) &&
 			attach != NULL &&
-			df_exec_attach(queryDesc, attach, send, reason, sizeof(reason)))
+			df_exec_attach(queryDesc, attach, send, &tails, reason, sizeof(reason)))
 			df_takeover_record(queryDesc, slice_index);
 		else if (send != NULL)
 			/* the receiver expects batches; tuples would only fail there */

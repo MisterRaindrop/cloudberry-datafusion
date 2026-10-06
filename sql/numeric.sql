@@ -47,7 +47,7 @@ EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
 SET datafusion.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
 -- an avg's numeric result has no fixed scale: not computed on further
-EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT g FROM df_nm GROUP BY g HAVING avg(a) + 1 > 2;
 RESET datafusion.motion_batches;
 
 SET datafusion.mode = off;
@@ -91,7 +91,7 @@ EXPLAIN (COSTS OFF) SELECT sum(c * c) FROM df_nc;
 EXPLAIN (COSTS OFF) SELECT min(u) FROM df_nc;
 -- + - * (N3) have a fixed scale, / and % one that depends on the values
 EXPLAIN (COSTS OFF) SELECT a + 1, a * b, a - id FROM df_nc;
-EXPLAIN (COSTS OFF) SELECT a / b FROM df_nc;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a / b > 1;
 
 SET datafusion.mode = off;
 SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
@@ -132,6 +132,33 @@ SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
 -- a NaN constant is Decimal256's NaN (it was int128's for a while)
 SELECT count(*) FROM df_nc WHERE a = 'NaN';
 SELECT count(*) FROM df_nc WHERE b < 'NaN';
+
+-- Output columns PostgreSQL finishes (P1): DataFusion computes the largest
+-- parts it can (columns, + - *, aggregates) and PostgreSQL evaluates the
+-- rest over them, row by row: numeric / with its scale chosen per value,
+-- functions DataFusion lacks.  Filters and sort keys stay DataFusion's.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(a) / sum(b), 100.00 * sum(a) / count(*) FROM df_nc GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT id, a / b, round(a * 2, 1), abs(c) FROM df_nc WHERE a > 0;
+-- not a sort key: DataFusion sorts by what it computes
+EXPLAIN (COSTS OFF) SELECT id, a / b FROM df_nc ORDER BY a / b LIMIT 3;
+SET datafusion.mode = off;
+SELECT g, sum(a) / nullif(sum(b), 0), 100.00 * sum(a) / count(*), round(avg(a), 3) FROM df_nc GROUP BY g ORDER BY g;
+SELECT sum(b) / sum(a), sum(c) / 7, avg(id) / 3 FROM df_nc WHERE id > 0;
+SELECT id, a / b, a / 3, d / 7.0, c / (id + 1), round(a * 2, 1), abs(b), (a + 1) / nullif(b, 0)
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+SELECT id, CASE WHEN a = 0 THEN 0 ELSE b / a END FROM df_nc WHERE id IN (-6, -2, 9973) ORDER BY id;
+SET datafusion.mode = on;
+SELECT g, sum(a) / nullif(sum(b), 0), 100.00 * sum(a) / count(*), round(avg(a), 3) FROM df_nc GROUP BY g ORDER BY g;
+SELECT sum(b) / sum(a), sum(c) / 7, avg(id) / 3 FROM df_nc WHERE id > 0;
+SELECT id, a / b, a / 3, d / 7.0, c / (id + 1), round(a * 2, 1), abs(b), (a + 1) / nullif(b, 0)
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+-- PostgreSQL only divides where a <> 0, here too
+SELECT id, CASE WHEN a = 0 THEN 0 ELSE b / a END FROM df_nc WHERE id IN (-6, -2, 9973) ORDER BY id;
+-- and raises its own error
+\set VERBOSITY sqlstate
+SELECT id, b / a FROM df_nc WHERE id = -6;
+\set VERBOSITY default
 RESET datafusion.motion_batches;
 
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;

@@ -89,6 +89,12 @@ typedef struct DfCheckContext
 	Plan	   *node;			/* the node whose expressions are checked */
 	Plan	   *top;			/* where a Limit or Sort may be: the top of
 								 * the slice, or below its Limit (S1) */
+	Plan	   *output;			/* the node whose targetlist is the slice's
+								 * output: below any Limit and Sort */
+	Bitmapset  *sort_keys;		/* its columns the slice's Sort orders by */
+	bool		tails_ok;		/* PostgreSQL may finish output columns (P1):
+								 * the slice does not send batches */
+	DfTails		tails;			/* the columns it finishes */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -1300,17 +1306,136 @@ df_hash_budget(Plan *hash)
  * "physical" targetlist) even when the node above uses only a few; columns
  * nobody reads do not matter.
  */
+/* ---------------------------------------------------------------------
+ * P1: output columns PostgreSQL finishes over DataFusion's values
+ * ---------------------------------------------------------------------
+ */
+
+/* Could DataFusion compute 'node' whole?  Leaves no trace of a failure. */
+static bool
+df_expr_ok(Node *node, DfCheckContext *cxt)
+{
+	bool		ok;
+
+	Assert(!cxt->failed);
+	df_check_expr(node, cxt);
+	ok = !cxt->failed;
+	cxt->failed = false;
+	cxt->reason[0] = '\0';
+	return ok;
+}
+
+static void df_check_tail(Node *node, DfCheckContext *cxt);
+
+static bool
+df_check_tail_walker(Node *node, DfCheckContext *cxt)
+{
+	df_check_tail(node, cxt);
+	return cxt->failed;
+}
+
+/*
+ * Part of an output column PostgreSQL evaluates: what DataFusion cannot
+ * compute is evaluated by PostgreSQL's expression machinery over the
+ * values of the largest subexpressions DataFusion can compute (the
+ * leaves), so it may hold any expression that needs no more than those
+ * values: no subplans, parameters, window functions or set-returning
+ * functions, and no CaseTestExpr to split from its CASE.
+ */
+static void
+df_check_tail(Node *node, DfCheckContext *cxt)
+{
+	if (node == NULL || cxt->failed)
+		return;
+	if (IsA(node, List))
+	{
+		ListCell   *lc;
+
+		foreach(lc, (List *) node)
+			df_check_tail(lfirst(lc), cxt);
+		return;
+	}
+	if (IsA(node, CaseWhen))
+	{
+		/* part of its CASE, never an expression of its own */
+		df_check_tail((Node *) ((CaseWhen *) node)->expr, cxt);
+		df_check_tail((Node *) ((CaseWhen *) node)->result, cxt);
+		return;
+	}
+	if (df_expr_ok(node, cxt))
+	{
+		cxt->tails.leaves = lappend(cxt->tails.leaves, node);
+		return;
+	}
+	switch (nodeTag(node))
+	{
+		case T_Const:
+			return;
+		case T_OpExpr:
+			if (((OpExpr *) node)->opretset)
+			{
+				df_reject(cxt, "set-returning operator in an output column");
+				return;
+			}
+			break;
+		case T_FuncExpr:
+			if (((FuncExpr *) node)->funcretset)
+			{
+				df_reject(cxt, "set-returning function in an output column");
+				return;
+			}
+			break;
+		case T_CaseExpr:
+			if (((CaseExpr *) node)->arg != NULL)
+			{
+				df_check_expr(node, cxt);	/* DataFusion's reason */
+				return;
+			}
+			break;
+		case T_BoolExpr:
+		case T_CoalesceExpr:
+		case T_NullIfExpr:
+		case T_MinMaxExpr:
+		case T_NullTest:
+		case T_BooleanTest:
+		case T_RelabelType:
+		case T_CoerceViaIO:
+		case T_ScalarArrayOpExpr:
+		case T_DistinctExpr:
+			break;
+		default:
+			/* a column, an aggregate, ...: DataFusion's reason */
+			df_check_expr(node, cxt);
+			if (!cxt->failed)
+				df_reject(cxt, "expression node %d in an output column", (int) nodeTag(node));
+			return;
+	}
+	(void) expression_tree_walker(node, df_check_tail_walker, cxt);
+}
+
 static void
 df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 {
 	ListCell   *lc;
+	bool		output = cxt->tails_ok && cxt->node == cxt->output;
 
 	foreach(lc, targetlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
-		if (needed == NULL || bms_is_member(tle->resno, needed))
+		if (cxt->failed)
+			return;
+		if (needed != NULL && !bms_is_member(tle->resno, needed))
+			continue;
+		if (!output || bms_is_member(tle->resno, cxt->sort_keys) ||
+			df_expr_ok((Node *) tle->expr, cxt))
 			df_check_expr((Node *) tle->expr, cxt);
+		else
+		{
+			/* P1: PostgreSQL finishes it */
+			df_check_tail((Node *) tle->expr, cxt);
+			cxt->tails.tles = lappend(cxt->tails.tles, tle);
+		}
 	}
 }
 
@@ -1785,6 +1910,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				/* a Sort may be below it */
 				cxt->top = outerPlan(plan);
+				cxt->output = outerPlan(plan);
 				df_check_plan(outerPlan(plan), cxt, needed, false);
 				return;
 			}
@@ -1847,7 +1973,10 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					}
 					if (child_needed)
 						child_needed = bms_add_member(child_needed, sort->sortColIdx[i]);
+					/* sorted in DataFusion, so computed there */
+					cxt->sort_keys = bms_add_member(cxt->sort_keys, sort->sortColIdx[i]);
 				}
+				cxt->output = child;
 				df_check_plan(child, cxt, child_needed, false);
 				return;
 			}
@@ -1946,7 +2075,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  */
 static bool
 df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-				 Bitmapset *batches, char *reason, size_t reasonlen,
+				 Bitmapset *batches, DfTails *tails, char *reason, size_t reasonlen,
 				 bool *locale_dependent)
 {
 	DfCheckContext cxt;
@@ -1970,25 +2099,33 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	else
 	{
 		cxt.top = root_is_sender ? outerPlan(root) : root;
+		cxt.output = cxt.top;
+		cxt.tails_ok = !(root_is_sender &&
+						 bms_is_member(((Motion *) root)->motionID, batches));
 		df_check_plan(root, &cxt, NULL, root_is_sender);
 	}
 
 	if (locale_dependent)
 		*locale_dependent = cxt.locale_dependent;
+	if (tails)
+		*tails = cxt.tails;
 	return !cxt.failed;
 }
 
 bool
 df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-			   char *reason, size_t reasonlen)
+			   DfTails *tails, char *reason, size_t reasonlen)
 {
 	return df_check_slice_b(stmt, root, root_is_sender, df_batch_motions(stmt),
-							reason, reasonlen, NULL);
+							tails, reason, reasonlen, NULL);
 }
 
 /*
  * The top plan node of the slice this process executes: the Motion it sends
- * through, or the plan's top node for the top slice.
+ * through, or the plan's top node for the top slice.  On the coordinator
+ * that is the tree its executor runs: the dispatcher replaces
+ * plannedstmt->planTree by a copy with parameters folded, for the
+ * segments, after the executor was set up on the original.
  */
 Plan *
 df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
@@ -1998,7 +2135,9 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
 
 	*slice_index = idx;
 	*is_sender = (sender != NULL);
-	return sender ? (Plan *) sender : queryDesc->plannedstmt->planTree;
+	if (sender)
+		return (Plan *) sender;
+	return queryDesc->planstate ? queryDesc->planstate->plan : queryDesc->plannedstmt->planTree;
 }
 
 /* ---------------------------------------------------------------------
@@ -2019,6 +2158,7 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	char		reason[256];
 	DfSliceSpec spec;
+	DfTails		tails;
 	Motion	   *sender;
 	Plan	   *root;
 	Plan	   *compute;
@@ -2030,10 +2170,10 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 	root = sender ? (Plan *) sender : stmt->planTree;
 	compute = sender ? outerPlan(root) : root;
 	if (compute != NULL &&
-		df_check_slice_b(stmt, root, sender != NULL, batches, reason, sizeof(reason),
+		df_check_slice_b(stmt, root, sender != NULL, batches, &tails, reason, sizeof(reason),
 						 &locale_dependent) &&
 		!locale_dependent &&
-		df_translate_slice(compute, &spec, reason, sizeof(reason)))
+		df_translate_slice(compute, &tails, &spec, reason, sizeof(reason)))
 		return true;
 	if (locale_dependent)
 		snprintf(reason, sizeof(reason), "its verdict depends on the node's default collation");
@@ -2372,7 +2512,7 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 	{
 		char		reason[256];
 
-		if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender,
+		if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender, NULL,
 						   reason, sizeof(reason)))
 			appendStringInfo(out, "DataFusion: slice %d eligible%s\n", cxt.roots[i].index,
 							 cxt.roots[i].is_sender &&

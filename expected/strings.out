@@ -540,25 +540,29 @@ EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 
  DataFusion: slice 1 eligible
 (5 rows)
 
-EXPLAIN (COSTS OFF) SELECT concat(s, n), s || n FROM df_sf;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)
-   ->  Seq Scan on df_sf
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE concat(s, n) = s;
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_sf
+               Filter: (concat(s, n) = s)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 not eligible: function concat() of integer
-(5 rows)
+(7 rows)
 
-EXPLAIN (COSTS OFF) SELECT md5(s) FROM df_sf;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
- Gather Motion 3:1  (slice1; segments: 3)
-   ->  Seq Scan on df_sf
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE md5(s) = s;
+                    QUERY PLAN                    
+--------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_sf
+               Filter: (md5(s) = s)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 not eligible: function md5()
-(5 rows)
+(7 rows)
 
 SET datafusion.mode = off;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),

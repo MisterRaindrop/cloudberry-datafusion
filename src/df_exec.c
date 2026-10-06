@@ -185,6 +185,10 @@ typedef struct DfExec
 
 	/* output batch being handed out */
 	TupleTableSlot *outslot;
+	TupleTableSlot *valslot;	/* P1: DataFusion's values, if PostgreSQL
+								 * finishes some columns; else outslot */
+	ExprState **tail_states;	/* per column: what finishes it, or NULL */
+	ExprContext *tailcxt;
 	MemoryContext rowcxt;		/* the strings of the row handed out */
 	DfColumn   *outcols;
 	uint32		out_nrows;
@@ -902,7 +906,7 @@ df_numeric_at(const void *values, uint32 r)
 static TupleTableSlot *
 df_exec_emit(DfExec *x)
 {
-	TupleTableSlot *slot = x->outslot;
+	TupleTableSlot *slot = x->valslot ? x->valslot : x->outslot;
 	uint32		r = x->out_row++;
 	int			c,
 				k = 0;			/* the tuple's column */
@@ -990,7 +994,29 @@ df_exec_emit(DfExec *x)
 		}
 		k++;
 	}
-	return ExecStoreVirtualTuple(slot);
+	ExecStoreVirtualTuple(slot);
+	if (x->valslot == NULL)
+		return slot;
+
+	/* P1: the columns PostgreSQL finishes, over the values */
+	ExecClearTuple(x->outslot);
+	ResetExprContext(x->tailcxt);
+	x->tailcxt->ecxt_outertuple = x->valslot;
+	for (k = 0; k < x->spec.ncols; k++)
+	{
+		int			v = x->spec.col_value[k];
+
+		if (v >= 0)
+		{
+			x->outslot->tts_values[k] = slot->tts_values[v];
+			x->outslot->tts_isnull[k] = slot->tts_isnull[v];
+		}
+		else
+			x->outslot->tts_values[k] =
+				ExecEvalExprSwitchContext(x->tail_states[k], x->tailcxt,
+										  &x->outslot->tts_isnull[k]);
+	}
+	return ExecStoreVirtualTuple(x->outslot);
 }
 
 static TupleTableSlot *
@@ -1142,7 +1168,7 @@ df_find_state(PlanState *ps, Plan *leaf)
 
 bool
 df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
-			   char *reason, size_t reasonlen)
+			   const DfTails *tails, char *reason, size_t reasonlen)
 {
 	EState	   *estate = queryDesc->estate;
 	MemoryContext oldcxt;
@@ -1152,7 +1178,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 	x = palloc0(sizeof(DfExec));
-	if (!df_translate_slice(root->plan, &x->spec, reason, reasonlen))
+	if (!df_translate_slice(root->plan, tails, &x->spec, reason, reasonlen))
 	{
 		MemoryContextSwitchTo(oldcxt);
 		pfree(x);
@@ -1252,6 +1278,20 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 
 	x->outcols = palloc0(sizeof(DfColumn) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
+	if (x->spec.col_tail != NULL)
+	{
+		/* P1: DataFusion's values, and what finishes the other columns */
+		TupleDesc	desc = CreateTemplateTupleDesc(x->spec.nvalues);
+
+		for (c = 0; c < x->spec.nvalues; c++)
+			TupleDescInitEntry(desc, c + 1, NULL, x->spec.value_types[c], -1, 0);
+		x->valslot = ExecInitExtraTupleSlot(estate, desc, &TTSOpsVirtual);
+		x->tailcxt = CreateExprContext(estate);
+		x->tail_states = palloc0(sizeof(ExprState *) * x->spec.ncols);
+		for (c = 0; c < x->spec.ncols; c++)
+			if (x->spec.col_tail[c] != NULL)
+				x->tail_states[c] = ExecInitExpr(x->spec.col_tail[c], NULL);
+	}
 	x->rowcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion row",
 									  ALLOCSET_SMALL_SIZES);
 

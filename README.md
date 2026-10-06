@@ -663,6 +663,31 @@ a float, NaN made positive, to an integer of its width in total order,
 and the result is mapped back.  Of -0 and 0, min returns -0 and max 0;
 PostgreSQL returns either, depending on row order.
 
+### Output columns PostgreSQL finishes
+
+P1: an output column DataFusion cannot compute whole is split.  DataFusion
+computes its largest parts it can (columns, + - *, aggregates, also an
+avg returning numeric); PostgreSQL's expression machinery evaluates the
+rest over those values, row by row, as its own projection would.  That
+covers numeric division, whose result scale PostgreSQL picks from each
+pair of values (`select_div_scale`), so a fixed-scale column cannot hold
+it, and any function or operator DataFusion lacks (`round`, `abs`,
+`to_char`, casts to text, ...).  `CASE WHEN b = 0 THEN 0 ELSE a / b END`
+still divides only where b is not 0, and `a / 0` raises PostgreSQL's
+error.  Not finished this way: filters, HAVING, sort keys (DataFusion
+sorts by what it computes), output sent as Arrow batches, and parts
+needing more than the values (subplans, parameters, window or
+set-returning functions, a simple `CASE x WHEN` around such a part).
+
+The top slice is checked on the tree the coordinator executes: the
+dispatcher replaces `plannedstmt->planTree` with a copy (parameters
+folded, for the segments) after the executor was set up, and the parts
+PostgreSQL finishes are found by node.
+
+Over 30 million rows, `sum(b) / count(*)::numeric, 100.0 * sum(a) /
+sum(b)` grouped took 0.30 s against 1.50 s, a filtered `sum(b)::numeric
+/ nullif(sum(a), 0)` 0.29 s against 1.03 s.
+
 ### Sort and LIMIT
 
 S1 runs a Sort and a Limit at the top of a slice: ORDER BY with LIMIT and
