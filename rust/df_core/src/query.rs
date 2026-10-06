@@ -505,6 +505,16 @@ fn expr(v: &Value) -> Result<Expr, String> {
         };
         return Ok(PgNumeric::udf(NumericFn::Rescale { by, to }).call(vec![expr(e)?]));
     }
+    if let Some(e) = v.get("pgcast") {
+        let kind = field(v, "kind")?.as_str().and_then(crate::pgcast::CastKind::parse).ok_or("plan spec: bad cast")?;
+        let from_scale = match PgType::parse(field(v, "from")?.as_str().unwrap_or(""))? {
+            PgType::Numeric(s) => s,
+            _ => 0,
+        };
+        let to = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
+        let precision = v.get("precision").and_then(Value::as_u64).unwrap_or(0) as u8;
+        return Ok(crate::pgcast::PgCast::udf(kind, from_scale, to, precision).call(vec![expr(e)?]));
+    }
     if let Some(e) = v.get("cast") {
         let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
         return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(expr(e)?), ty)));
@@ -521,6 +531,13 @@ fn may_fail(v: &Value) -> bool {
         Value::Object(map) => {
             if let Some(f) = map.get("call").and_then(Value::as_str).and_then(StrFn::from_pg) {
                 if f.may_fail() {
+                    return true;
+                }
+            }
+            if map.contains_key("pgcast") {
+                // range errors (timestamp_date and numeric_float8 never fail)
+                let kind = map.get("kind").and_then(Value::as_str);
+                if !matches!(kind, Some("timestamp_date" | "numeric_float8")) {
                     return true;
                 }
             }

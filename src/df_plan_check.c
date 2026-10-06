@@ -217,6 +217,39 @@ static const DfStringFunc df_string_funcs[] = {
 	{F_UPPER_TEXT, "upper", DF_COLL_CTYPE_C},
 };
 
+static const struct
+{
+	Oid			funcid;
+	const char *kind;
+}			df_casts[] =
+{
+	/* exact, or rounding as C converts */
+	{F_INT4_INT2, "widen"}, {F_INT8_INT2, "widen"}, {F_INT8_INT4, "widen"},
+	{F_FLOAT8_INT2, "widen"}, {F_FLOAT8_INT4, "widen"}, {F_FLOAT8_INT8, "widen"},
+	{F_FLOAT4_INT2, "widen"}, {F_FLOAT4_INT4, "widen"}, {F_FLOAT4_INT8, "widen"},
+	{F_FLOAT8_FLOAT4, "widen"},
+	/* PostgreSQL's range checks and rounding */
+	{F_INT2_INT4, "int"}, {F_INT2_INT8, "int"}, {F_INT4_INT8, "int"},
+	{F_INT2_FLOAT8, "float_int"}, {F_INT4_FLOAT8, "float_int"}, {F_INT8_FLOAT8, "float_int"},
+	{F_INT2_FLOAT4, "float_int"}, {F_INT4_FLOAT4, "float_int"}, {F_INT8_FLOAT4, "float_int"},
+	{F_FLOAT4_FLOAT8, "float8_float4"},
+	{F_TIMESTAMP_DATE, "date_timestamp"}, {F_DATE_TIMESTAMP, "timestamp_date"},
+	{F_INT2_NUMERIC, "numeric_int"}, {F_INT4_NUMERIC, "numeric_int"}, {F_INT8_NUMERIC, "numeric_int"},
+	{F_FLOAT8_NUMERIC, "numeric_float8"},
+	{F_NUMERIC_NUMERIC_INT4, "numeric_typmod"},
+};
+
+const char *
+df_cast_kind(Oid funcid)
+{
+	int			i;
+
+	for (i = 0; i < lengthof(df_casts); i++)
+		if (df_casts[i].funcid == funcid)
+			return df_casts[i].kind;
+	return NULL;
+}
+
 const DfStringFunc *
 df_string_func(Oid funcid)
 {
@@ -382,6 +415,18 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					case F_NUMERIC_INT8:
 						*precision = 19;
 						return true;
+					case F_NUMERIC_NUMERIC_INT4:
+						{
+							/* coerced to numeric(p, s) (E2) */
+							Node	   *tm = lsecond(fe->args);
+							int			ap,
+										as;
+
+							return IsA(tm, Const) && !((Const *) tm)->constisnull &&
+								df_numeric_ps(ctx, linitial(fe->args), &ap, &as) &&
+								df_numeric_typmod(DatumGetInt32(((Const *) tm)->constvalue),
+												  precision, scale);
+						}
 					default:
 						return false;
 				}
@@ -907,7 +952,27 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							ns;
 
 				if (fe->funcresulttype == NUMERICOID && df_numeric_ps(cxt->node, node, &np, &ns))
-					break;		/* an integer made numeric (N3) */
+				{
+					/* an integer made numeric (N3), numeric(p, s) (E2) */
+					if (fe->funcid == F_NUMERIC_NUMERIC_INT4)
+					{
+						df_check_expr(linitial(fe->args), cxt);
+						return cxt->failed;
+					}
+					break;
+				}
+				if (df_cast_kind(fe->funcid) != NULL && fe->funcid != F_NUMERIC_NUMERIC_INT4)
+				{
+					Node	   *arg = linitial(fe->args);
+
+					/* E2: a numeric argument needs a precision */
+					if (exprType(arg) == NUMERICOID && !df_numeric_ps(cxt->node, arg, &np, &ns))
+					{
+						df_reject(cxt, "cast of numeric of unknown precision");
+						return true;
+					}
+					break;
+				}
 				if (f == NULL || fe->funcretset || fe->funcvariadic)
 				{
 					df_reject(cxt, "function %s()", name ? name : "?");

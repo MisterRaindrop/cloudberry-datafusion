@@ -839,6 +839,33 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				const DfStringFunc *f = df_string_func(fe->funcid);
 				const char *tag = df_type_tag(fe->funcresulttype);
 
+				if (df_cast_kind(fe->funcid) != NULL && strcmp(df_cast_kind(fe->funcid), "widen") == 0)
+				{
+					/* exact, or rounding as C does (E2) */
+					appendStringInfoString(out, "{\"cast\":");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfo(out, ",\"type\":\"%s\"}", tag);
+					return;
+				}
+				if (df_cast_kind(fe->funcid) != NULL)
+				{
+					/* PostgreSQL's rounding and errors (E2): df_core::pgcast */
+					Plan	   *ctx = df_level_ctx(b, level);
+					Node	   *arg = linitial(fe->args);
+					int			rs = fe->funcresulttype == NUMERICOID ? df_scale_of(ctx, node) : 0;
+					int			p = 0,
+								s;
+
+					if (fe->funcresulttype == NUMERICOID)
+						(void) df_numeric_ps(ctx, node, &p, &s);
+					appendStringInfoString(out, "{\"pgcast\":");
+					df_emit(b, out, arg, level);
+					appendStringInfo(out, ",\"kind\":\"%s\",\"from\":\"%s\",\"type\":\"%s\",\"precision\":%d}",
+									 df_cast_kind(fe->funcid),
+									 df_tag(exprType(arg), df_scale_of(ctx, arg)),
+									 df_tag(fe->funcresulttype, rs), p);
+					return;
+				}
 				if (fe->funcid == F_NUMERIC_INT2 || fe->funcid == F_NUMERIC_INT4 ||
 					fe->funcid == F_NUMERIC_INT8)
 				{

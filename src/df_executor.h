@@ -147,6 +147,13 @@ typedef struct DfStringFunc
 extern const DfStringFunc *df_string_func(Oid funcid);
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 
+/*
+ * Casts DataFusion runs (E2), by pg_proc OID: "widen" ones are exact or
+ * round as C does (DataFusion's cast); the others are df_core::pgcast's,
+ * with PostgreSQL's rounding and errors.
+ */
+extern const char *df_cast_kind(Oid funcid);
+
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
 						   MotionState *send, char *reason, size_t reasonlen);

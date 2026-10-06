@@ -78,7 +78,7 @@ EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k
  DataFusion: slice 1 eligible
 (13 rows)
 
--- These stay on PostgreSQL, with the reason.
+-- This stays on PostgreSQL, with the reason.
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FROM df_jb);
                                 QUERY PLAN                                 
 ---------------------------------------------------------------------------
@@ -97,6 +97,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FR
  DataFusion: slice 2 eligible
 (13 rows)
 
+-- Keys cast to floats run since E2 (int4 and int8 to float8 and real).
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::real;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -114,7 +115,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::
                                  ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function float8()
+ DataFusion: slice 1 eligible
  DataFusion: slice 2 eligible
  DataFusion: slice 3 eligible
 (17 rows)

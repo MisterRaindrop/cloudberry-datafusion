@@ -431,6 +431,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | N2 | `numeric(p, s)` columns with p <= 38 |
 | N3 | numeric `+`, `-`, `*`; Decimal256 |
 | E1 | `IN`/`NOT IN` lists, `CASE`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM` |
+| E2 | Casts between integers, floats, date/timestamp and numeric |
 
 ### Date and time types
 
@@ -626,6 +627,23 @@ in PostgreSQL, not one column of one scale).  Other ANY/ALL operators
 (`> ALL`) stay on PostgreSQL.  Over 20 million rows, an IN list of five
 strings with a NOT IN of integers took 0.21 s against 0.86 s, a CASE with
 COALESCE and NULLIF grouped 0.26 s against 1.25 s.
+
+Casts (E2), known by the cast function's pg_proc OID:
+
+| Cast | How |
+|---|---|
+| int2 to int4/int8, int4 to int8, integers to float4/float8, float4 to float8 | DataFusion's cast: exact, or rounding to nearest as C converts |
+| int8/int4 to a narrower integer | range errors (22003, "integer out of range") |
+| float4/float8 to integers | `rint` (half to even), then the range of float.c and int8.c |
+| float8 to float4 | overflow and underflow errors |
+| date to timestamp | infinities kept, dates from 294277 on out of range (22008) |
+| timestamp to date | days rounded down |
+| numeric to integers | half away from zero (`round_var`); NaN is an error (0A000) |
+| numeric to float8 | the decimal string, correctly rounded (as `float8in`) |
+| numeric to numeric(p, s) | rounded to s, "numeric field overflow" with PostgreSQL's detail beyond p digits |
+
+Casts that can fail run behind the AND/OR guards.  Casts involving
+time zones (timestamptz), text and float to numeric stay on PostgreSQL.
 
 ## Build
 

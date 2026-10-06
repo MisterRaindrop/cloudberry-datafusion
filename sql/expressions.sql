@@ -17,7 +17,7 @@
 --
 -- Expressions (E1): IN and NOT IN lists of constants, CASE (searched and
 -- simple), COALESCE and NULLIF (as CASE, so that later arguments only run
--- where PostgreSQL runs them), IS [NOT] DISTINCT FROM.  NULLs follow SQL's
+-- where PostgreSQL runs them), IS [NOT] DISTINCT FROM; casts (E2).  NULLs follow SQL's
 -- three-valued logic as in PostgreSQL.  Each query runs with
 -- datafusion.mode off, then on; the two results must match.
 --
@@ -76,6 +76,44 @@ SELECT count(*) FROM df_ex WHERE a IS NOT DISTINCT FROM NULL OR t IS NOT DISTINC
 SELECT count(*) FROM df_ex WHERE n IS DISTINCT FROM m;
 SELECT coalesce(n, m) AS v, count(*) FROM df_ex GROUP BY 1 ORDER BY 1;
 
-DROP TABLE df_ex;
+-- Casts (E2): widening as DataFusion casts (exact, or rounding as C);
+-- narrowing, float to integer (rint), float8 to float4, date/timestamp,
+-- numeric to integer (half away from zero), to float8 and to numeric(p, s)
+-- with PostgreSQL's rounding and errors.
+CREATE TABLE df_cs (id int, i2 int2, i4 int4, i8 int8, f4 float4, f8 float8, d date, ts timestamp,
+  n numeric(12,3)) DISTRIBUTED BY (id);
+INSERT INTO df_cs SELECT i, (i % 30000)::int2, i * 7, i::int8 * 1000003, i / 4.0 - 1000.5, i / 8.0 - 5000.5,
+  date '1999-12-25' + (i % 20), timestamp '1999-12-31 23:00' + i * interval '17 minutes', (i - 50000) / 8.0
+FROM generate_series(1, 50000) i;
+INSERT INTO df_cs VALUES
+  (-1, 32767, 2147483647, 9223372036854775807, 'NaN', 'NaN', 'infinity', 'infinity', 'NaN'),
+  (-2, -32768, -2147483648, -9223372036854775808, '-Infinity', 'Infinity', '-infinity', '-infinity',
+   -999999999.999),
+  (-3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
+  (-4, 0, 40000, 3000000000, 2.5, -2.5, '4713-01-01 BC', '4713-01-01 00:00:01 BC', 2.5),
+  (-5, 1, -40000, -3000000000, -0.5, 1e300, '294276-12-31', '294276-12-31 23:59:59', -2.5),
+  (-6, 2, 3, 4, 3.5, 1e-300, '2000-01-01', '1999-12-31 23:59:59.999999', 0.0005);
+ANALYZE df_cs;
+SET datafusion.mode = off;
+SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
+  ts::date, n::int4, n::float8, n::numeric(10,1)
+FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
+SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
+SET datafusion.mode = on;
+SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
+  ts::date, n::int4, n::float8, n::numeric(10,1)
+FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
+SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
+-- PostgreSQL's errors, with their SQLSTATEs
+\set VERBOSITY sqlstate
+SELECT count(i4::int2) FROM df_cs;
+SELECT count(f8::int4) FROM df_cs WHERE id = -1;
+SELECT count(f8::float4) FROM df_cs WHERE id = -6;
+SELECT count(d::timestamp) FROM df_cs WHERE id = -5;
+SELECT count(n::int4) FROM df_cs WHERE id = -1;
+SELECT count(n::numeric(5,2)) FROM df_cs;
+\set VERBOSITY default
+
+DROP TABLE df_ex, df_cs;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
