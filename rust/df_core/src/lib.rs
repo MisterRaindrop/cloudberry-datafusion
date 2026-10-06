@@ -22,6 +22,7 @@ pub mod cdbhash;
 pub mod debug;
 pub mod memory;
 pub mod pgcast;
+pub mod pgfloat;
 pub mod pgfunc;
 pub mod pgnum;
 pub mod pgstr;

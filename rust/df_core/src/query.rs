@@ -73,6 +73,8 @@
 //!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
 //!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
+//!         | {"floatkey": <expr>}   (a float as PostgreSQL compares it: -0 as
+//!                                 0, NaN as the positive NaN; see pgfloat)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -98,7 +100,7 @@ use datafusion::arrow::ipc::reader::StreamDecoder;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
-use datafusion::common::ScalarValue;
+use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
@@ -106,7 +108,9 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-use datafusion::logical_expr::{binary_expr, when, Expr, LogicalPlanBuilder, Operator};
+use datafusion::logical_expr::{
+    binary_expr, when, Expr, ExprSchemable, LogicalPlanBuilder, Operator,
+};
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
@@ -120,6 +124,7 @@ use tokio::task::JoinHandle;
 
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
+use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
 use crate::pgnum::{NumOp, NumericFn, PgNumeric};
 use crate::pgstr::{PgLike, PgStrFn, StrFn};
@@ -405,6 +410,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
     if let Some(l) = v.get("lit") {
         return literal(l);
     }
+    if let Some(e) = v.get("floatkey") {
+        return Ok(FloatFn::Key.apply(expr(e)?));
+    }
     if let Some(op) = v.get("op") {
         let name = op.as_str().unwrap_or("");
         let args = field(v, "args")?.as_array().ok_or("plan spec: bad args")?;
@@ -597,11 +605,18 @@ fn may_fail(v: &Value) -> bool {
     }
 }
 
-fn aggregate(v: &Value) -> Result<Expr, String> {
+fn aggregate(v: &Value, input: &DFSchema) -> Result<Expr, String> {
     let name = field(v, "fn")?.as_str().unwrap_or("");
     let arg = match v.get("arg") {
         Some(a) if !a.is_null() => Some(expr(a)?),
         _ => None,
+    };
+    // PostgreSQL's NaN is the largest float, whatever its sign bit.
+    let arg = match arg {
+        Some(a) if matches!(name, "min" | "max") && is_float_expr(&a, input) => {
+            Some(FloatFn::Nan.apply(a))
+        }
+        a => a,
     };
     let need = |a: Option<Expr>| a.ok_or_else(|| format!("aggregate {name} needs an argument"));
     Ok(match name {
@@ -630,6 +645,11 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
 
 /// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
 /// counts, sum_decimal's "some value is NaN".
+/// Is `e`, over `input`, of type float4 or float8?
+fn is_float_expr(e: &Expr, input: &DFSchema) -> bool {
+    e.get_type(input).is_ok_and(|t| is_float(&t))
+}
+
 fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
     match field(v, "fn")?.as_str() {
         Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
@@ -1013,14 +1033,24 @@ fn build_node(
         let mut b = build_node(field(a, "input")?, tables)?;
         let groups = field(a, "group")?.as_array().cloned().unwrap_or_default();
         let aggs = field(a, "aggs")?.as_array().cloned().unwrap_or_default();
-        let group_exprs = groups
-            .iter()
-            .enumerate()
-            .map(|(i, g)| expr(g).map(|e| e.alias(format!("g{i}"))))
-            .collect::<Result<Vec<_>, _>>()?;
+        // A float key groups by its PostgreSQL value (pgfloat); the group's
+        // value is the smallest of its members, so that a group of -0 alone
+        // shows -0.
+        let mut group_exprs = Vec::with_capacity(groups.len());
+        let mut float_groups = Vec::new();
         let mut agg_exprs = Vec::with_capacity(aggs.len());
+        for (i, g) in groups.iter().enumerate() {
+            let e = expr(g)?;
+            if is_float_expr(&e, b.schema()) {
+                group_exprs.push(FloatFn::Key.apply(e.clone()).alias(format!("g{i}")));
+                agg_exprs.push(min(e).alias(format!("g{i}_v")));
+                float_groups.push(i);
+            } else {
+                group_exprs.push(e.alias(format!("g{i}")));
+            }
+        }
         for (i, g) in aggs.iter().enumerate() {
-            agg_exprs.push(aggregate(g)?.alias(format!("a{i}")));
+            agg_exprs.push(aggregate(g, b.schema())?.alias(format!("a{i}")));
             if let Some(e) = aggregate_extra(g)? {
                 agg_exprs.push(e.alias(format!("a{i}_n")));
             }
@@ -1031,13 +1061,23 @@ fn build_node(
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
         let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
-        if aggs.iter().any(|a| {
-            matches!(
-                kind(a).as_deref(),
-                Some("count_merge" | "avg_merge" | "sum_decimal")
-            )
-        }) {
-            let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
+        if !float_groups.is_empty()
+            || aggs.iter().any(|a| {
+                matches!(
+                    kind(a).as_deref(),
+                    Some("count_merge" | "avg_merge" | "sum_decimal")
+                )
+            })
+        {
+            let mut cols: Vec<Expr> = (0..ngroups)
+                .map(|i| {
+                    if float_groups.contains(&i) {
+                        col(format!("g{i}_v")).alias(format!("g{i}"))
+                    } else {
+                        col(format!("g{i}"))
+                    }
+                })
+                .collect();
             for (i, a) in aggs.iter().enumerate() {
                 let c = col(format!("a{i}"));
                 cols.push(match kind(a).as_deref() {
@@ -1099,8 +1139,15 @@ fn build_node(
                 .as_array()
                 .filter(|p| p.len() == 2)
                 .ok_or("plan spec: bad join key")?;
-            lkeys.push(expr(&pair[0])?);
-            rkeys.push(expr(&pair[1])?);
+            let (l, r) = (expr(&pair[0])?, expr(&pair[1])?);
+            // Float keys match by their PostgreSQL value (pgfloat).
+            if is_float_expr(&l, left.schema()) {
+                lkeys.push(FloatFn::Key.apply(l));
+                rkeys.push(FloatFn::Key.apply(r));
+            } else {
+                lkeys.push(l);
+                rkeys.push(r);
+            }
         }
         let filter = match j.get("filter").filter(|v| !v.is_null()) {
             Some(f) => Some(expr(f)?),

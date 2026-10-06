@@ -353,6 +353,25 @@ df_common_scale(Plan *ctx, Node *l, Node *r)
 	return Max(df_scale_of(ctx, l), df_scale_of(ctx, r));
 }
 
+/*
+ * An operand of a comparison: a float as PostgreSQL compares it, -0 as 0
+ * and every NaN as one, above all numbers (df_core::pgfloat).
+ */
+static void
+df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
+{
+	Oid			type = exprType(e);
+
+	if (type != FLOAT4OID && type != FLOAT8OID)
+	{
+		df_emit(b, out, e, level);
+		return;
+	}
+	appendStringInfoString(out, "{\"floatkey\":");
+	df_emit(b, out, e, level);
+	appendStringInfoChar(out, '}');
+}
+
 /* "[l, r]", numeric operands at their common scale (E1). */
 static void
 df_emit_operands(DfBuilder *b, StringInfo out, Node *l, Node *r, DfLevel level)
@@ -369,9 +388,9 @@ df_emit_operands(DfBuilder *b, StringInfo out, Node *l, Node *r, DfLevel level)
 	}
 	else
 	{
-		df_emit(b, out, l, level);
+		df_emit_compared(b, out, l, level);
 		appendStringInfoChar(out, ',');
-		df_emit(b, out, r, level);
+		df_emit_compared(b, out, r, level);
 	}
 	appendStringInfoChar(out, ']');
 }
@@ -642,6 +661,13 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					appendStringInfoString(out, "]}");
 					return;
 				}
+				if (op->opresulttype == BOOLOID && list_length(op->args) == 2)
+				{
+					/* a comparison */
+					df_emit_operands(b, out, linitial(op->args), lsecond(op->args), level);
+					appendStringInfoChar(out, '}');
+					return;
+				}
 				df_emit_list(b, out, op->args, level);
 				appendStringInfoChar(out, '}');
 				return;
@@ -804,7 +830,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (elemtype == NUMERICOID)
 					df_emit_numeric_at(b, out, left, scale, level, ctx);
 				else
-					df_emit(b, out, left, level);
+					df_emit_compared(b, out, left, level);
 				appendStringInfoString(out, ",\"values\":[");
 				for (i = 0; i < nelems; i++)
 				{
@@ -816,7 +842,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (elemtype == NUMERICOID)
 						df_emit_numeric_const(b, out, c, scale);
 					else
-						df_emit_const(b, out, c);
+						df_emit_compared(b, out, (Node *) c, level);
 				}
 				appendStringInfo(out, "],\"negated\":%s}", sa->useOr ? "false" : "true");
 				return;

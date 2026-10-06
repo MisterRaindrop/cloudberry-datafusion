@@ -114,6 +114,43 @@ SELECT count(n::int4) FROM df_cs WHERE id = -1;
 SELECT count(n::numeric(5,2)) FROM df_cs;
 \set VERBOSITY default
 
-DROP TABLE df_ex, df_cs;
+-- Floats compare as in PostgreSQL: -0 equals 0, '-NaN' is NaN, and NaN
+-- equals NaN and sorts above every number (df_core::pgfloat).  Values keep
+-- their sign: a group of -0 alone shows -0.  f mixes -0 and 0, g has -0 only.
+CREATE TABLE df_fl (k int, f float8, g float4) DISTRIBUTED BY (k);
+INSERT INTO df_fl SELECT i,
+  CASE i % 6 WHEN 0 THEN '-0'::float8 WHEN 1 THEN 0 WHEN 2 THEN 'NaN' WHEN 3 THEN '-NaN'
+    WHEN 4 THEN '-Infinity' END,
+  CASE i % 4 WHEN 0 THEN '-0'::float4 WHEN 1 THEN 'NaN' WHEN 2 THEN '-NaN' END
+FROM generate_series(1, 1200) i;
+ANALYZE df_fl;
+SET datafusion.mode = off;
+SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END) AS z, sum(CASE WHEN f < 0 THEN 1 ELSE 0 END) AS neg,
+  sum(CASE WHEN f > 1e308 THEN 1 ELSE 0 END) AS big, sum(CASE WHEN f = 'NaN' THEN 1 ELSE 0 END) AS nan,
+  sum(CASE WHEN g = 'NaN' THEN 1 ELSE 0 END) AS gnan, sum(CASE WHEN f IN (0, 'NaN') THEN 1 ELSE 0 END) AS inl,
+  sum(CASE WHEN f IS DISTINCT FROM 0 THEN 1 ELSE 0 END) AS dist, sum(CASE f WHEN 0 THEN 1 ELSE 0 END) AS cs,
+  count(nullif(f, 'NaN')) AS nif
+FROM df_fl;
+SELECT g, count(*) FROM df_fl GROUP BY g ORDER BY 2, 1;
+SELECT count(*) FROM (SELECT f FROM df_fl GROUP BY f) s;
+SELECT max(f), max(g), min(g) FROM df_fl WHERE k % 6 <> 1;
+SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
+SET datafusion.mode = on;
+SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END) AS z, sum(CASE WHEN f < 0 THEN 1 ELSE 0 END) AS neg,
+  sum(CASE WHEN f > 1e308 THEN 1 ELSE 0 END) AS big, sum(CASE WHEN f = 'NaN' THEN 1 ELSE 0 END) AS nan,
+  sum(CASE WHEN g = 'NaN' THEN 1 ELSE 0 END) AS gnan, sum(CASE WHEN f IN (0, 'NaN') THEN 1 ELSE 0 END) AS inl,
+  sum(CASE WHEN f IS DISTINCT FROM 0 THEN 1 ELSE 0 END) AS dist, sum(CASE f WHEN 0 THEN 1 ELSE 0 END) AS cs,
+  count(nullif(f, 'NaN')) AS nif
+FROM df_fl;
+SELECT g, count(*) FROM df_fl GROUP BY g ORDER BY 2, 1;
+SELECT count(*) FROM (SELECT f FROM df_fl GROUP BY f) s;
+SELECT max(f), max(g), min(g) FROM df_fl WHERE k % 6 <> 1;
+SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END), count(nullif(f, 'NaN')) FROM df_fl;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
+
+DROP TABLE df_ex, df_cs, df_fl;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

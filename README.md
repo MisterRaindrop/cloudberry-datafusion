@@ -645,6 +645,18 @@ Casts (E2), known by the cast function's pg_proc OID:
 Casts that can fail run behind the AND/OR guards.  Casts involving
 time zones (timestamptz), text and float to numeric stay on PostgreSQL.
 
+Floats compare as in PostgreSQL (F0).  Arrow compares, hashes and sorts
+float4 and float8 in IEEE total order, where -0 is below 0 and a NaN with
+its sign bit set (`'-NaN'`, or what `inf - inf` gives on x86) is below
+-Infinity; PostgreSQL has -0 equal to 0 and every NaN equal to every other
+and above all numbers.  Comparison operands, IN lists, join and grouping
+keys therefore go through `pg_float_key`, which makes -0 0 and every NaN
+the positive one; on those values total order is PostgreSQL's.  Values
+keep their bits: a float grouping key shows the smallest member of its
+group, so a group of -0 alone shows `-0`, and min/max only make NaN
+positive, returning either of -0 and 0 when both are present, as
+PostgreSQL does depending on row order.
+
 ## Build
 
 Requires a Cloudberry installation (for `pg_config` and server headers; the
