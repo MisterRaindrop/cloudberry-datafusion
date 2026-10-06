@@ -1,0 +1,320 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Subtrees of a slice below PostgreSQL's nodes (T2).  When a slice as a
+-- whole cannot run, DataFusion runs its highest subtrees that can, in
+-- children their parents run once, and PostgreSQL's nodes above pull their
+-- rows.  Each query runs with datafusion.mode off, then on; the two
+-- results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+CREATE TABLE df_pt (id int, k int, v int8, t text) DISTRIBUTED BY (id);
+INSERT INTO df_pt SELECT i, i % 13, i * 7, 'k' || (i % 31) FROM generate_series(1, 30000) i;
+CREATE TABLE df_pt2 (id int, w int) DISTRIBUTED BY (id);
+INSERT INTO df_pt2 SELECT i, i % 5 FROM generate_series(1, 40) i;
+ANALYZE df_pt;
+ANALYZE df_pt2;
+SET datafusion.mode = explain;
+-- a Limit WITH TIES stays, the Sort and aggregate below run
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC FETCH FIRST 2 ROWS WITH TIES;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: (count(*))
+         ->  Limit
+               ->  Sort
+                     Sort Key: (count(*)) DESC
+                     ->  Finalize HashAggregate
+                           Group Key: k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: k
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: k
+                                       ->  Seq Scan on df_pt
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: LIMIT WITH TIES
+ DataFusion: slice 1 eligible below the top: Sort (above: LIMIT WITH TIES)
+ DataFusion: slice 2 eligible, sends Arrow batches
+(17 rows)
+
+-- each child of an Append
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k
+UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Append
+         ->  Finalize HashAggregate
+               Group Key: df_pt.k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: df_pt.k
+                     ->  Streaming Partial HashAggregate
+                           Group Key: df_pt.k
+                           ->  Seq Scan on df_pt
+                                 Filter: (v > 100)
+         ->  Finalize HashAggregate
+               Group Key: df_pt2.w
+               ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                     Hash Key: df_pt2.w
+                     ->  Streaming Partial HashAggregate
+                           Group Key: df_pt2.w
+                           ->  Seq Scan on df_pt2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Aggregate, Aggregate (above: Append is not supported)
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(22 rows)
+
+-- Below a Nested Loop only its outer side may run, never the inner side,
+-- which it rescans per row.  With sorts the GroupAggregates read their
+-- input's order, which DataFusion running the outer aggregate hashed would
+-- not keep; without, the outer side only receives rows: nothing runs there.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
+JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  GroupAggregate
+         Group Key: df_pt.k
+         ->  Nested Loop
+               Join Filter: ((count(*)) > (b.w * 500))
+               ->  Finalize GroupAggregate
+                     Group Key: df_pt.k
+                     ->  Sort
+                           Sort Key: df_pt.k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: df_pt.k
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: df_pt.k
+                                       ->  Seq Scan on df_pt
+               ->  Materialize
+                     ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                           ->  Seq Scan on df_pt2 b
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: sorted or mixed aggregation
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(22 rows)
+
+SET enable_sort = off;
+EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
+JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: df_pt.k
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Streaming Partial HashAggregate
+               Group Key: df_pt.k
+               ->  Nested Loop
+                     Join Filter: ((count(*)) > (b.w * 500))
+                     ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                           ->  Finalize HashAggregate
+                                 Group Key: df_pt.k
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: df_pt.k
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_pt.k
+                                             ->  Seq Scan on df_pt
+                     ->  Materialize
+                           ->  Seq Scan on df_pt2 b
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: Nested Loop is not supported
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+(22 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_sort;
+-- ORCA's Result on top
+SET optimizer = on;
+EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: k
+         ->  Sort
+               Sort Key: k
+               ->  Result
+                     Filter: ((count(*)) > 10)
+                     ->  Finalize HashAggregate
+                           Group Key: k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: k
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: k
+                                       ->  Seq Scan on df_pt
+                                             Filter: (v > 100)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Aggregate (above: Result is not supported)
+ DataFusion: slice 2 eligible, sends Arrow batches
+(19 rows)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC, 1 FETCH FIRST 2 ROWS WITH TIES;
+ k | count 
+---+-------
+ 1 |  2308
+ 2 |  2308
+(2 rows)
+
+SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w ORDER BY 1, 2;
+ k  | count 
+----+-------
+  0 |     8
+  0 |  2306
+  1 |     8
+  1 |  2306
+  2 |     8
+  2 |  2307
+  3 |     8
+  3 |  2307
+  4 |     8
+  4 |  2307
+  5 |  2307
+  6 |  2307
+  7 |  2307
+  8 |  2307
+  9 |  2307
+ 10 |  2306
+ 11 |  2306
+ 12 |  2306
+(18 rows)
+
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_sort = off;
+SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
+JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k ORDER BY 1;
+ k  | count 
+----+-------
+  0 |    40
+  1 |    40
+  2 |    40
+  3 |    40
+  4 |    40
+  5 |    40
+  6 |    40
+  7 |    40
+  8 |    40
+  9 |    40
+ 10 |    40
+ 11 |    40
+ 12 |    40
+(13 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_sort;
+SET optimizer = on;
+SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
+ k | count 
+---+-------
+ 0 |  2306
+ 1 |  2306
+ 2 |  2307
+ 3 |  2307
+ 4 |  2307
+(5 rows)
+
+SET optimizer = off;
+SET datafusion.mode = on;
+SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC, 1 FETCH FIRST 2 ROWS WITH TIES;
+ k | count 
+---+-------
+ 1 |  2308
+ 2 |  2308
+(2 rows)
+
+SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w ORDER BY 1, 2;
+ k  | count 
+----+-------
+  0 |     8
+  0 |  2306
+  1 |     8
+  1 |  2306
+  2 |     8
+  2 |  2307
+  3 |     8
+  3 |  2307
+  4 |     8
+  4 |  2307
+  5 |  2307
+  6 |  2307
+  7 |  2307
+  8 |  2307
+  9 |  2307
+ 10 |  2306
+ 11 |  2306
+ 12 |  2306
+(18 rows)
+
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_sort = off;
+SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
+JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k ORDER BY 1;
+ k  | count 
+----+-------
+  0 |    40
+  1 |    40
+  2 |    40
+  3 |    40
+  4 |    40
+  5 |    40
+  6 |    40
+  7 |    40
+  8 |    40
+  9 |    40
+ 10 |    40
+ 11 |    40
+ 12 |    40
+(13 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_sort;
+SET optimizer = on;
+SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
+ k | count 
+---+-------
+ 0 |  2306
+ 1 |  2306
+ 2 |  2307
+ 3 |  2307
+ 4 |  2307
+(5 rows)
+
+SET optimizer = off;
+DROP TABLE df_pt, df_pt2;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;
