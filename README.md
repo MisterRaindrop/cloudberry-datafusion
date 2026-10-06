@@ -461,6 +461,17 @@ which gives the same answer for every date, infinities and dates past the
 timestamp range included, as each lies on the same side of the rounded
 constant as of the timestamp.
 
+`extract(year | quarter | month | day from date)` returns `numeric` of
+scale 0, computed as PostgreSQL's `extract_date` (its `j2date`, no year 0).
+The year of an infinite date is `±Infinity`, which `numeric(p, s)` columns
+cannot hold: DataFusion holds them as two values beyond 76 digits that
+sort below and above every number (and below NaN), so grouping, sorting,
+`min`/`max` and comparisons at scale 0 on such a year agree with
+PostgreSQL, and they come back as `±Infinity`.  Arithmetic, `sum`/`avg`,
+casts and comparisons that rescale such a year (`> 1995.5`) would take an
+infinity for a number and stay on PostgreSQL; the other fields of an
+infinite date are NULL and have no such limits.
+
 Over 20 million heap rows on 3 segments, counting one year by a `date`
 range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s
 in PostgreSQL; grouping by `date` with a `timestamp` filter took 0.17 s and

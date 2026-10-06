@@ -95,6 +95,7 @@ df_numeric_parts(struct varlena *v, DfNumericParts *parts)
 	{
 		parts->special = true;
 		parts->nan = (h == NUMERIC_NAN);
+		parts->neg = (h == NUMERIC_NINF);
 		return;
 	}
 	if (h & 0x8000)
@@ -152,8 +153,8 @@ df_numeric_value(Datum d, int scale, int128 *out)
 	df_numeric_parts(v, &parts);
 	if (parts.special)
 	{
-		if (parts.nan)
-			*out = DF_NUMERIC_NAN;
+		/* an infinity as its value only where the caller allows one */
+		*out = parts.nan ? DF_NUMERIC_NAN : parts.neg ? DF_NUMERIC_NINF : DF_NUMERIC_PINF;
 		fit = parts.nan ? DF_NUMERIC_FITS : DF_NUMERIC_INFINITE;
 	}
 	else if (parts.dscale > scale ||
@@ -204,7 +205,8 @@ df_numeric_const_ps(Datum d, int *precision, int *scale)
 
 /*
  * 'v' as a Decimal256 value: little-endian two's complement, the upper half
- * extending the sign.  DF_NUMERIC_NAN becomes Decimal256's NaN, i256::MAX.
+ * extending the sign.  DF_NUMERIC_NAN becomes Decimal256's NaN, i256::MAX,
+ * and the infinities i256::MAX - 1 and i256::MIN (pgnum.rs).
  */
 void
 df_numeric_store(int128 v, uint8 *dst)
@@ -212,10 +214,15 @@ df_numeric_store(int128 v, uint8 *dst)
 	uint128		lo = (uint128) v;
 	uint128		hi = v < 0 ? ~(uint128) 0 : 0;
 
-	if (v == DF_NUMERIC_NAN)
+	if (v == DF_NUMERIC_NAN || v == DF_NUMERIC_PINF)
 	{
-		lo = ~(uint128) 0;
+		lo = v == DF_NUMERIC_NAN ? ~(uint128) 0 : ~(uint128) 0 - 1;
 		hi = ~(uint128) 0 >> 1;
+	}
+	else if (v == DF_NUMERIC_NINF)
+	{
+		lo = 0;
+		hi = (uint128) 1 << 127;
 	}
 	memcpy(dst, &lo, sizeof(lo));
 	memcpy(dst + sizeof(lo), &hi, sizeof(hi));
@@ -240,8 +247,12 @@ df_numeric_datum(const uint8 *src, int scale)
 
 	memcpy(w, src, sizeof(w));
 	if (w[3] == (~(uint64) 0 >> 1) && w[2] == ~(uint64) 0 &&
-		w[1] == ~(uint64) 0 && w[0] == ~(uint64) 0)
-		return DirectFunctionCall3(numeric_in, CStringGetDatum("NaN"),
+		w[1] == ~(uint64) 0 && (w[0] == ~(uint64) 0 || w[0] == ~(uint64) 0 - 1))
+		return DirectFunctionCall3(numeric_in,
+								   CStringGetDatum(w[0] == ~(uint64) 0 ? "NaN" : "Infinity"),
+								   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	if (w[3] == (uint64) 1 << 63 && w[2] == 0 && w[1] == 0 && w[0] == 0)
+		return DirectFunctionCall3(numeric_in, CStringGetDatum("-Infinity"),
 								   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
 	neg = (w[3] >> 63) != 0;
 	if (neg)

@@ -39,6 +39,13 @@ use datafusion::logical_expr::{
 /// NaN of a numeric value (i256::MAX, beyond 10^76).
 pub const NUMERIC_NAN: i256 = i256::MAX;
 
+/// The infinities of a numeric value (DT2), also beyond 10^76: below every
+/// value, and above every one but NaN, as PostgreSQL sorts them.  Only
+/// extract(year) of an infinite date makes them, and the planner hook keeps
+/// them out of arithmetic, rescaling, casts and sums.
+pub const NUMERIC_PINF: i256 = i256::from_parts(u128::MAX - 1, i128::MAX);
+pub const NUMERIC_NINF: i256 = i256::MIN;
+
 /// Digits a numeric value of this representation may have.
 pub const NUMERIC_PRECISION: u8 = 76;
 

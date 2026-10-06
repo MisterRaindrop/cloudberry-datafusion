@@ -107,6 +107,33 @@ SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-1
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
 DROP TABLE df_ty3;
 
+-- extract(year | quarter | month | day from date) as numeric of scale 0
+-- (DT2).  The year of an infinite date is ±Infinity, which DataFusion
+-- groups, sorts, compares at scale 0 and returns, but arithmetic, sums,
+-- casts and rescaling comparisons on it stay on PostgreSQL.
+CREATE TABLE df_ty4 (id int4, d date) DISTRIBUTED BY (id);
+INSERT INTO df_ty4 SELECT i, date '1992-01-01' + (i * 7919) % 2600 FROM generate_series(1, 3000) i;
+INSERT INTO df_ty4 VALUES (-1, '-infinity'), (-2, 'infinity'), (-3, '4714-11-24 BC'),
+  (-4, '0001-12-31 BC'), (-5, '0001-01-01'), (-6, '5874897-12-31'), (-7, '2000-02-29'),
+  (-8, NULL), (-9, 'infinity');
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 1995.5;
+SET datafusion.mode = off;
+SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
+SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
+SELECT min(extract(year from d)), max(extract(year from d)), count(*) FROM df_ty4;
+SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
+SET datafusion.mode = on;
+SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
+SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
+SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
+SELECT min(extract(year from d)), max(extract(year from d)), count(*) FROM df_ty4;
+SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
+DROP TABLE df_ty4;
+
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.
 SET datafusion.motion_batches = on;

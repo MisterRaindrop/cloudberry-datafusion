@@ -82,6 +82,8 @@
 //!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
 //!         | {"floatkey": <expr>}   (a float as PostgreSQL compares it: -0 as
 //!                                 0, NaN as the positive NaN; see pgfloat)
+//!         | {"extract": <expr>, "field": "year"}   (of a date, as numeric
+//!                                 of scale 0; see pgdate)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -555,6 +557,13 @@ fn expr(v: &Value) -> Result<Expr, String> {
         let args = field(v, "args")?.as_array().ok_or("plan spec: bad args")?;
         let args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
         return Ok(PgStrFn::udf(f).call(args));
+    }
+    if let Some(e) = v.get("extract") {
+        let f = field(v, "field")?
+            .as_str()
+            .and_then(crate::pgdate::DateField::parse)
+            .ok_or("plan spec: bad extract field")?;
+        return Ok(crate::pgdate::PgExtractDate::udf(f).call(vec![expr(e)?]));
     }
     if let Some(e) = v.get("rescale") {
         let by = field(v, "by")?.as_i64().ok_or("plan spec: bad rescale")? as i8;

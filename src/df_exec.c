@@ -808,8 +808,12 @@ df_exec_fill(DfExec *x, DfInput *in)
 					{
 						int128		v = 0;
 
+						/*
+						 * An infinity can only be a year of an infinite date
+						 * (DT2), which the planner hook allows
+						 */
 						if (!isnull &&
-							df_numeric_value(d, in->spec->scales[c], &v) != DF_NUMERIC_FITS)
+							df_numeric_value(d, in->spec->scales[c], &v) == DF_NUMERIC_TOO_LONG)
 							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
 								 DF_NUMERIC_MAX_PRECISION, in->spec->scales[c]);
 						df_numeric_store(v, (uint8 *) dst + (size_t) n * DF_NUMERIC_BYTES);

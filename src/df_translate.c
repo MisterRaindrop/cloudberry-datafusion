@@ -947,6 +947,14 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 										   strcmp(fn, "char_length") == 0 ? "}]}" : "]}");
 					return;
 				}
+				if (df_extract_field(fe) != NULL)
+				{
+					/* DT2: df_core::pgdate */
+					appendStringInfoString(out, "{\"extract\":");
+					df_emit(b, out, lsecond(fe->args), level);
+					appendStringInfo(out, ",\"field\":\"%s\"}", df_extract_field(fe));
+					return;
+				}
 				if (df_cast_kind(fe->funcid) != NULL && strcmp(df_cast_kind(fe->funcid), "widen") == 0)
 				{
 					/* exact, or rounding as C does (E2) */

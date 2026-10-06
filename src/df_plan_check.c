@@ -59,6 +59,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
+#include "parser/scansup.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
@@ -400,6 +401,112 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 }
 
 /*
+ * The field of extract(field from date) that DataFusion computes (DT2:
+ * df_core::pgdate), or NULL: year, quarter, month or day, each a numeric
+ * of scale 0.
+ */
+const char *
+df_extract_field(FuncExpr *fe)
+{
+	static const char *const fields[] = {"year", "quarter", "month", "day", NULL};
+	Const	   *c;
+	char	   *lower;
+	int			i;
+
+	if (fe->funcid != F_EXTRACT_TEXT_DATE || list_length(fe->args) != 2 ||
+		!IsA(linitial(fe->args), Const))
+		return NULL;
+	c = linitial_node(Const, fe->args);
+	if (c->constisnull)
+		return NULL;
+	lower = downcase_truncate_identifier(VARDATA_ANY(DatumGetTextPP(c->constvalue)),
+										 VARSIZE_ANY_EXHDR(DatumGetTextPP(c->constvalue)),
+										 false);
+	for (i = 0; fields[i] != NULL; i++)
+		if (strcmp(lower, fields[i]) == 0)
+			return fields[i];
+	return NULL;
+}
+
+/*
+ * Can numeric expression 'expr' of plan node 'ctx' be infinite (DT2)?  The
+ * year of an infinite date is, and so are min/max, CASE and COALESCE of
+ * one, through references.  DataFusion holds an infinity as a value beyond
+ * 76 digits that sorts and groups as PostgreSQL does, but arithmetic,
+ * rescaling, casts and sums would take it for a number.
+ */
+static bool
+df_numeric_may_be_infinite(Plan *ctx, Node *expr)
+{
+	ListCell   *lc;
+
+	if (expr == NULL || exprType(expr) != NUMERICOID)
+		return false;
+	switch (nodeTag(expr))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) expr;
+				Plan	   *child;
+				TargetEntry *tle;
+
+				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
+					return false;
+				child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+				tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+				return tle != NULL && df_numeric_may_be_infinite(child, (Node *) tle->expr);
+			}
+		case T_FuncExpr:
+			{
+				const char *f = df_extract_field((FuncExpr *) expr);
+
+				return f != NULL && strcmp(f, "year") == 0;
+			}
+		case T_CaseExpr:
+			foreach(lc, ((CaseExpr *) expr)->args)
+				if (df_numeric_may_be_infinite(ctx, (Node *) lfirst_node(CaseWhen, lc)->result))
+					return true;
+			return df_numeric_may_be_infinite(ctx, (Node *) ((CaseExpr *) expr)->defresult);
+		case T_CoalesceExpr:
+			foreach(lc, ((CoalesceExpr *) expr)->args)
+				if (df_numeric_may_be_infinite(ctx, lfirst(lc)))
+					return true;
+			return false;
+		case T_NullIfExpr:
+			return df_numeric_may_be_infinite(ctx, linitial(((NullIfExpr *) expr)->args));
+		case T_Aggref:
+			{
+				Aggref	   *agg = (Aggref *) expr;
+				char	   *name = get_func_name(agg->aggfnoid);
+
+				return name != NULL && list_length(agg->args) == 1 &&
+					(strcmp(name, "min") == 0 || strcmp(name, "max") == 0) &&
+					df_numeric_may_be_infinite(ctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
+			}
+		default:
+			return false;
+	}
+}
+
+/*
+ * Would comparing numeric 'l' and 'r' at their common scale rescale one
+ * that may be infinite (DT2)?
+ */
+static bool
+df_rescales_infinity(Plan *ctx, Node *l, Node *r)
+{
+	int			lp,
+				ls,
+				rp,
+				rs;
+
+	if (!df_numeric_ps(ctx, l, &lp, &ls) || !df_numeric_ps(ctx, r, &rp, &rs))
+		return false;
+	return (ls < rs && df_numeric_may_be_infinite(ctx, l)) ||
+		(rs < ls && df_numeric_may_be_infinite(ctx, r));
+}
+
+/*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
  * numeric(p, s) with p <= 38, found through the references of the nodes
@@ -516,6 +623,12 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 
 				/* integers made numeric, scale 0 */
 				*scale = 0;
+				if (df_extract_field(fe) != NULL)
+				{
+					/* DT2: years run from -4714 to 5874897 */
+					*precision = strcmp(df_extract_field(fe), "year") == 0 ? 7 : 2;
+					return true;
+				}
 				switch (fe->funcid)
 				{
 					case F_NUMERIC_INT2:
@@ -715,6 +828,8 @@ df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid c
 				 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
 			df_reject(cxt, "%s on numeric beyond %d digits at a common scale",
 					  what, DF_NUMERIC_MAX_EXPR_PRECISION);
+		else if (df_rescales_infinity(cxt->node, l, r))
+			df_reject(cxt, "%s rescaling a numeric that may be infinite", what);
 	}
 	else if (df_type_is_string(lt) &&
 			 (problem = df_string_compare_problem(cxt, "=", collation)) != NULL)
@@ -1014,7 +1129,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 									  format_type_be(ltype), format_type_be(rtype));
 						else if (op->opresulttype != BOOLOID)
 						{
-							if (!df_numeric_ps(cxt->node, node, &lp, &ls))
+							if (df_numeric_may_be_infinite(cxt->node, linitial(op->args)) ||
+								df_numeric_may_be_infinite(cxt->node, lsecond(op->args)))
+								df_reject(cxt, "operator %s on a numeric that may be infinite", name);
+							else if (!df_numeric_ps(cxt->node, node, &lp, &ls))
 								df_reject(cxt, "operator %s on numeric: %s", name,
 										  strcmp(name, "/") == 0 || strcmp(name, "%") == 0 ?
 										  "its scale depends on the values" :
@@ -1027,6 +1145,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 								 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
 							df_reject(cxt, "operator %s on numeric beyond %d digits at a common scale",
 									  name, DF_NUMERIC_MAX_EXPR_PRECISION);
+						else if (df_rescales_infinity(cxt->node, linitial(op->args), lsecond(op->args)))
+							df_reject(cxt, "operator %s rescaling a numeric that may be infinite", name);
 					}
 					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
 					{
@@ -1095,6 +1215,12 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					/* the sum must stay within Decimal128's 38 digits */
 					df_reject(cxt, "aggregate %s of numeric of unknown precision or more than %d digits",
 							  name, DF_NUMERIC_MAX_SUM_PRECISION);
+				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
+						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
+						 df_numeric_may_be_infinite(cxt->node,
+													(Node *) linitial_node(TargetEntry, agg->args)->expr))
+					/* DT2: the sum would take an infinity for a number */
+					df_reject(cxt, "aggregate %s of a numeric that may be infinite", name);
 				else if (agg->aggtype == NUMERICOID && df_agg_state(agg) == DF_AGG_PLAIN &&
 						 !df_numeric_ps(cxt->node, node, &np, &ns))
 					df_reject(cxt, "aggregate %s returning numeric of unknown precision", name);
@@ -1172,6 +1298,21 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				int			np,
 							ns;
 
+				foreach(lc, fe->args)
+				{
+					if (df_numeric_may_be_infinite(cxt->node, lfirst(lc)))
+					{
+						df_reject(cxt, "function %s() of a numeric that may be infinite",
+								  name ? name : "?");
+						return true;
+					}
+				}
+				if (df_extract_field(fe) != NULL)
+				{
+					/* DT2: the date (the field is a constant) */
+					df_check_expr(lsecond(fe->args), cxt);
+					return cxt->failed;
+				}
 				if (fe->funcresulttype == NUMERICOID && df_numeric_ps(cxt->node, node, &np, &ns))
 				{
 					/* an integer made numeric (N3), numeric(p, s) (E2) */

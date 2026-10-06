@@ -145,6 +145,9 @@ extern int	df_agg_state_ncols(DfAggState state);
 #define DF_NUMERIC_MAX_PRECISION 38
 #define DF_NUMERIC_MAX_EXPR_PRECISION 76
 #define DF_NUMERIC_NAN	((int128) (~(uint128) 0 >> 1))	/* above 10^38 */
+/* the infinities (DT2): below every value, above every one but NaN */
+#define DF_NUMERIC_PINF	(DF_NUMERIC_NAN - 1)
+#define DF_NUMERIC_NINF	(-DF_NUMERIC_NAN - 1)
 #define DF_NUMERIC_BYTES 32		/* a Decimal256 value, little-endian */
 
 typedef enum DfNumericFit
@@ -187,6 +190,7 @@ typedef struct DfStringFunc
 extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
+extern const char *df_extract_field(FuncExpr *fe);
 
 /*
  * Casts DataFusion runs (E2), by pg_proc OID: "widen" ones are exact or
