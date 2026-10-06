@@ -120,6 +120,7 @@ use tokio::task::JoinHandle;
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
+use crate::pgnum::{NumericFn, PgNumeric};
 use crate::pgstr::{PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
@@ -327,7 +328,16 @@ fn literal(v: &Value) -> Result<Expr, String> {
         } else {
             Some(val.and_then(Value::as_str).ok_or("bad text literal")?.to_string())
         }),
-        PgType::Numeric(_) => return Err("numeric literals are not supported".to_string()),
+        PgType::Numeric(s) => ScalarValue::Decimal128(
+            if null {
+                None
+            } else {
+                // the integer times 10^-s, as a string (beyond JSON numbers)
+                Some(val.and_then(Value::as_str).and_then(|v| v.parse::<i128>().ok()).ok_or("bad numeric literal")?)
+            },
+            38,
+            s,
+        ),
         _ => unreachable!(),
     };
     Ok(lit(sv))
@@ -442,6 +452,14 @@ fn expr(v: &Value) -> Result<Expr, String> {
         let args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
         return Ok(PgStrFn::udf(f).call(args));
     }
+    if let Some(e) = v.get("rescale") {
+        let by = field(v, "by")?.as_i64().ok_or("plan spec: bad rescale")? as i8;
+        let to = match PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+            PgType::Numeric(s) => s,
+            _ => return Err("plan spec: rescale to a non-numeric type".into()),
+        };
+        return Ok(PgNumeric::udf(NumericFn::Rescale { by, to }).call(vec![expr(e)?]));
+    }
     if let Some(e) = v.get("cast") {
         let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
         return Ok(Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(expr(e)?), ty)));
@@ -498,6 +516,10 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
             Box::new(need(arg)?),
             DataType::Decimal128(38, 0),
         ))),
+        // sum of numeric(p, s), NaN aside; the second aggregate notes NaNs
+        // (`aggregate_extra`) and the projection after the aggregate makes
+        // the sum NaN then.
+        "sum_decimal" => sum(PgNumeric::udf(NumericFn::NanToZero).call(vec![need(arg)?])),
         "min" => min(need(arg)?),
         "max" => max(need(arg)?),
         "avg" => avg(need(arg)?),
@@ -506,12 +528,13 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
 }
 
 /// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
-/// counts.
+/// counts, sum_decimal's "some value is NaN".
 fn aggregate_extra(v: &Value) -> Result<Option<Expr>, String> {
-    if field(v, "fn")?.as_str() != Some("avg_merge") {
-        return Ok(None);
+    match field(v, "fn")?.as_str() {
+        Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
+        Some("sum_decimal") => Ok(Some(max(PgNumeric::udf(NumericFn::IsNan).call(vec![expr(field(v, "arg")?)?])))),
+        _ => Ok(None),
     }
-    Ok(Some(sum(expr(field(v, "arg2")?)?)))
 }
 
 /// DataFusion's default session, minus expression simplification.
@@ -866,7 +889,7 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
         let kind = |a: &Value| a.get("fn").and_then(Value::as_str).map(str::to_owned);
-        if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge"))) {
+        if aggs.iter().any(|a| matches!(kind(a).as_deref(), Some("count_merge" | "avg_merge" | "sum_decimal"))) {
             let mut cols: Vec<Expr> = (0..ngroups).map(|i| col(format!("g{i}"))).collect();
             for (i, a) in aggs.iter().enumerate() {
                 let c = col(format!("a{i}"));
@@ -874,6 +897,9 @@ fn build_node(node: &Value, tables: &mut Vec<Option<StreamingTable>>) -> Result<
                     Some("count_merge") => {
                         when(c.clone().is_null(), lit(0i64)).otherwise(c).map_err(df)?.alias(format!("a{i}"))
                     }
+                    Some("sum_decimal") => PgNumeric::udf(NumericFn::NanIf)
+                        .call(vec![c, col(format!("a{i}_n"))])
+                        .alias(format!("a{i}")),
                     Some("avg_merge") => {
                         let n = col(format!("a{i}_n"));
                         let nf = Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(n.clone()), DataType::Float64));

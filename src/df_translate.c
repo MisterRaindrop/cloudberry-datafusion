@@ -73,6 +73,7 @@ typedef struct DfInputDesc
 	List	   *attnos;			/* int: table column, or Motion stream
 								 * position + 1, of each input column */
 	List	   *types;			/* oid: type of each */
+	List	   *scales;			/* int: scale of each numeric one */
 } DfInputDesc;
 
 typedef struct DfBuilder
@@ -90,6 +91,7 @@ typedef struct DfBuilder
 } DfBuilder;
 
 static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
+static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 
 static void
 df_fail(DfBuilder *b, const char *what)
@@ -128,11 +130,36 @@ df_type_tag(Oid type)
 		case VARCHAROID:
 			return "text";
 		case NUMERICOID:
-			/* only results of aggregates over integers so far: scale 0 */
+			/* of scale 0; see df_tag for others */
 			return "numeric";
 		default:
 			return NULL;
 	}
+}
+
+/* The type tag of 'type', for numeric of scale 'scale'. */
+static const char *
+df_tag(Oid type, int scale)
+{
+	if (type == NUMERICOID && scale != 0)
+		return psprintf("numeric:%d", scale);
+	return df_type_tag(type);
+}
+
+/*
+ * The scale of numeric expression 'expr' of node 'ctx' (0 if none), also
+ * of a reference to a partial sum or avg below, whose type is PostgreSQL's
+ * state (bytea) but whose stream column is DataFusion's numeric sum.
+ */
+static int
+df_scale_of(Plan *ctx, Node *expr)
+{
+	int			p,
+				s;
+
+	if (!df_numeric_ps(ctx, expr, &p, &s))
+		return 0;
+	return s;
 }
 
 static void
@@ -174,7 +201,21 @@ static void
 df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 {
 	const char *tag = df_type_tag(c->consttype);
+	int			p,
+				s;
 
+	if (c->consttype == NUMERICOID)
+	{
+		if (c->constisnull)
+			s = 0;
+		else if (!df_numeric_const_ps(c->constvalue, &p, &s))
+		{
+			df_fail(b, "a numeric constant");
+			return;
+		}
+		df_emit_numeric_const(b, out, c, s);
+		return;
+	}
 	if (tag == NULL)
 	{
 		df_fail(b, "a constant");
@@ -223,6 +264,71 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 	}
 }
 
+/* numeric constant 'c' as a literal of scale 'scale' (it fits: checked). */
+static void
+df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
+{
+	int128		v;
+	char		digits[48];
+	int			n = 0;
+	bool		neg;
+
+	appendStringInfo(out, "{\"lit\":{\"type\":\"%s\"", df_tag(NUMERICOID, scale));
+	if (c->constisnull)
+	{
+		appendStringInfoString(out, ",\"null\":true}}");
+		return;
+	}
+	if (df_numeric_value(c->constvalue, scale, &v) != DF_NUMERIC_FITS)
+	{
+		df_fail(b, "a numeric constant");
+		return;
+	}
+	/* the integer, as a JSON string (beyond what JSON numbers carry) */
+	neg = v < 0;
+	do
+	{
+		int			d = (int) (v % 10);
+
+		digits[n++] = (char) ('0' + (d < 0 ? -d : d));
+		v /= 10;
+	} while (v != 0);
+	appendStringInfoString(out, ",\"value\":\"");
+	if (neg)
+		appendStringInfoChar(out, '-');
+	while (n > 0)
+		appendStringInfoChar(out, digits[--n]);
+	appendStringInfoString(out, "\"}}");
+}
+
+static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
+
+/*
+ * numeric expression 'e' of node 'ctx' at scale 'scale' (not below its
+ * own): constants as literals of that scale, others multiplied by a power
+ * of ten.
+ */
+static void
+df_emit_numeric_at(DfBuilder *b, StringInfo out, Node *e, int scale, DfLevel level, Plan *ctx)
+{
+	int			own;
+
+	if (IsA(e, Const))
+	{
+		df_emit_numeric_const(b, out, (Const *) e, scale);
+		return;
+	}
+	own = df_scale_of(ctx, e);
+	if (own == scale)
+	{
+		df_emit(b, out, e, level);
+		return;
+	}
+	appendStringInfoString(out, "{\"rescale\":");
+	df_emit(b, out, e, level);
+	appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}", scale - own, df_tag(NUMERICOID, scale));
+}
+
 /* Add an input reading 'leaf'; returns its index. */
 static int
 df_add_input(DfBuilder *b, Plan *leaf)
@@ -236,7 +342,7 @@ df_add_input(DfBuilder *b, Plan *leaf)
 
 /* Column of input 'j' for 'attno', adding it if new; its index there. */
 static int
-df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type)
+df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 {
 	DfInputDesc *in = list_nth(b->inputs, j);
 	ListCell   *lc;
@@ -250,14 +356,15 @@ df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type)
 	}
 	in->attnos = lappend_int(in->attnos, attno);
 	in->types = lappend_oid(in->types, type);
+	in->scales = lappend_int(in->scales, scale);
 	return i;
 }
 
 /* Append a reference to that column of input 'j'. */
 static void
-df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type)
+df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, int scale)
 {
-	int			k = df_input_column(b, j, attno, type);
+	int			k = df_input_column(b, j, attno, type, scale);
 
 	if (j == 0)
 		appendStringInfo(out, "{\"col\":%d}", k);
@@ -297,7 +404,8 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 	else if (IsA(child, Motion))
 		df_emit_column(b, out, df_input_of(b, child),
 					   df_motion_stream_column((Motion *) child, resno) + 1,
-					   exprType((Node *) tle->expr));
+					   exprType((Node *) tle->expr),
+					   df_scale_of(child, (Node *) tle->expr));
 	else
 	{
 		b->ctx = child;
@@ -390,7 +498,8 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 						 ((Scan *) b->ctx)->scanrelid == var->varno &&
 						 df_input_of(b, b->ctx) >= 0)
 					df_emit_column(b, out, df_input_of(b, b->ctx),
-								   var->varattno, var->vartype);
+								   var->varattno, var->vartype,
+								   df_scale_of(b->ctx, (Node *) var));
 				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
 				{
 					int			k;
@@ -424,6 +533,34 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					return;
 				}
 				appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"%s\",\"args\":", name, tag);
+				if (exprType(linitial(op->args)) == NUMERICOID)
+				{
+					/* compared at the larger scale (N2) */
+					Plan	   *ctx = level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+					Node	   *l = linitial(op->args);
+					Node	   *r = lsecond(op->args);
+					int			t;
+					int			lp,
+								ls = 0,
+								rp,
+								rs = 0;
+
+					if (IsA(l, Const))
+						(void) df_numeric_const_ps(((Const *) l)->constvalue, &lp, &ls);
+					else
+						ls = df_scale_of(ctx, l);
+					if (IsA(r, Const))
+						(void) df_numeric_const_ps(((Const *) r)->constvalue, &rp, &rs);
+					else
+						rs = df_scale_of(ctx, r);
+					t = Max(ls, rs);
+					appendStringInfoChar(out, '[');
+					df_emit_numeric_at(b, out, l, t, level, ctx);
+					appendStringInfoChar(out, ',');
+					df_emit_numeric_at(b, out, r, t, level, ctx);
+					appendStringInfoString(out, "]}");
+					return;
+				}
 				df_emit_list(b, out, op->args, level);
 				appendStringInfoChar(out, '}');
 				return;
@@ -501,15 +638,20 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 	}
 }
 
-/* A join key, cast to 'type' if it has another. */
+/* A join key, cast to 'type' if it has another (numeric: to 'scale'). */
 static void
-df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type)
+df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
 {
 	const char *tag = df_type_tag(type);
 
 	if (tag == NULL)
 	{
 		df_fail(b, "a join key");
+		return;
+	}
+	if (type == NUMERICOID)
+	{
+		df_emit_numeric_at(b, out, key, scale, DF_LEVEL_SCAN, b->ctx);
 		return;
 	}
 	if (exprType(key) == type)
@@ -609,13 +751,15 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 					Node	   *inner = lsecond(op->args);
 					Node	   *outer = linitial(op->args);
 					Oid			type = df_join_key_type(exprType(inner), exprType(outer));
+					int			scale = type != NUMERICOID ? 0 :
+						Max(df_scale_of(b->ctx, inner), df_scale_of(b->ctx, outer));
 
 					/* Keys of two types are compared in the wider one. */
 					appendStringInfoString(out, first ? "[" : ",[");
 					first = false;
-					df_emit_key(b, out, inner, type);
+					df_emit_key(b, out, inner, type, scale);
 					appendStringInfoChar(out, ',');
-					df_emit_key(b, out, outer, type);
+					df_emit_key(b, out, outer, type, scale);
 					appendStringInfoChar(out, ']');
 				}
 				appendStringInfoString(out, "],\"filter\":");
@@ -640,7 +784,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 
 static void
 df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
-				DfSliceSpec *spec)
+				DfSliceSpec *spec, Plan *ctx)
 {
 	ListCell   *lc;
 	int			i = 0;
@@ -653,13 +797,15 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		if (level == DF_LEVEL_AGG && df_partial_state(expr) != DF_AGG_PLAIN)
 			spec->nout += df_agg_state_ncols(df_partial_state(expr));
 		else if (level == DF_LEVEL_AGG && IsA(expr, Aggref) &&
-				 df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT)
+				 (df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT ||
+				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC))
 			spec->nout += 2;	/* numeric sum and count */
 		else
 			spec->nout++;
 	}
 	spec->out_types = palloc(sizeof(Oid) * Max(spec->nout, 1));
 	spec->out_kinds = palloc0(sizeof(uint8) * Max(spec->nout, 1));
+	spec->out_scales = palloc0(sizeof(int16) * Max(spec->nout, 1));
 	appendStringInfoChar(out, '[');
 	foreach(lc, tlist)
 	{
@@ -671,15 +817,18 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 
 		if (state != DF_AGG_PLAIN)
 		{
-			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1) */
+			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1, N2) */
 			Aggref	   *agg = (Aggref *) tle->expr;
 			bool		fsum = state == DF_AGG_AVG_FLOAT;
+			bool		dsum = state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC;
+			int			scale = df_scale_of(ctx, (Node *) agg);
 
+			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = fsum ? FLOAT8OID : NUMERICOID;
 			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
 							 i > 1 ? "," : "",
-							 df_agg_ref(b, agg, fsum ? "sum" : "sum_numeric"),
-							 fsum ? "float8" : "numeric");
+							 df_agg_ref(b, agg, fsum ? "sum" : dsum ? "sum_decimal" : "sum_numeric"),
+							 fsum ? "float8" : df_tag(NUMERICOID, scale));
 			if (df_agg_state_ncols(state) == 2)
 			{
 				spec->out_types[i++] = INT8OID;
@@ -689,20 +838,26 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 			continue;
 		}
 		if (level == DF_LEVEL_AGG && IsA(tle->expr, Aggref) &&
-			df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT)
+			(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
+			 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
 		{
-			/* avg = numeric sum / count, divided on the C side (N1) */
+			/* avg = numeric sum / count, divided on the C side (N1, N2) */
 			Aggref	   *agg = (Aggref *) tle->expr;
 			bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+			bool		dsum = df_agg_state(agg) == DF_AGG_AVG_NUMERIC;
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+			int			scale = df_scale_of(ctx, arg);	/* arguments refer to the Agg's child */
 
 			spec->out_kinds[i] = DF_OUT_NUMERIC_AVG;
+			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = NUMERICOID;
 			spec->out_kinds[i] = DF_OUT_PART;
 			spec->out_types[i++] = INT8OID;
-			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"numeric\"},"
+			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"},"
 							 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
 							 i > 2 ? "," : "",
-							 df_agg_ref(b, agg, combine ? "merge_sum" : "sum_numeric"),
+							 df_agg_ref(b, agg, combine ? "merge_sum" : dsum ? "sum_decimal" : "sum_numeric"),
+							 df_tag(NUMERICOID, scale),
 							 df_agg_ref(b, agg, combine ? "merge_count" : "count"));
 			continue;
 		}
@@ -710,6 +865,11 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		{
 			df_fail(b, "an output column");
 			return;
+		}
+		if (type == NUMERICOID)
+		{
+			spec->out_scales[i] = (int16) df_scale_of(ctx, (Node *) tle->expr);
+			tag = df_tag(type, spec->out_scales[i]);
 		}
 		spec->out_types[i++] = type;
 		if (i > 1)
@@ -719,6 +879,9 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		appendStringInfo(out, ",\"type\":\"%s\"}", tag);
 	}
 	appendStringInfoChar(out, ']');
+	/* the arrays above were sized by the first loop */
+	if (!b->failed && i != spec->nout)
+		elog(ERROR, "datafusion: %d output columns where %d were counted", i, spec->nout);
 }
 
 /*
@@ -782,13 +945,13 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		}
 		appendStringInfoChar(&group, ']');
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
-		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_AGG, spec);
+		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_AGG, spec, root);
 	}
 	else
 	{
 		df_emit_node(&b, &node, root);
 		b.ctx = root;
-		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_SCAN, spec);
+		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_SCAN, spec, root);
 	}
 	if (b.failed)
 		return false;
@@ -828,14 +991,17 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 					break;
 				}
 				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
-				appendStringInfoString(&aggs, "{\"fn\":\"sum\",\"arg\":");
+				appendStringInfo(&aggs, "{\"fn\":\"%s\",\"arg\":", count ? "sum" : "sum_decimal");
 				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + (count ? 2 : 1),
-							   count ? INT8OID : NUMERICOID);
+							   count ? INT8OID : NUMERICOID,
+							   count ? 0 : df_scale_of((Plan *) b.agg, arg));
 				appendStringInfoChar(&aggs, '}');
 				continue;
 			}
 			if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
 				fn = "sum_numeric";	/* exact, and numeric as PostgreSQL's */
+			if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_NUMERIC)
+				fn = "sum_decimal";	/* exact, NaN if any is */
 			if (combine && strcmp(name, "avg") == 0)
 			{
 				/* DataFusion's avg state: the stream's sum and count columns */
@@ -851,9 +1017,9 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 				}
 				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
 				appendStringInfoString(&aggs, "{\"fn\":\"avg_merge\",\"arg\":");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 1, FLOAT8OID);
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 1, FLOAT8OID, 0);
 				appendStringInfoString(&aggs, ",\"arg2\":");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 2, INT8OID);
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 2, INT8OID, 0);
 				appendStringInfoChar(&aggs, '}');
 				continue;
 			}
@@ -886,13 +1052,14 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		foreach(lc, b.inputs)
 		{
 			DfInputDesc *in = lfirst(lc);
-			ListCell   *lt;
+			ListCell   *lt,
+					   *ls;
 			int			k = 0;
 
 			appendStringInfoString(&json, i++ > 0 ? ",{\"columns\":[" : "{\"columns\":[");
-			foreach(lt, in->types)
+			forboth(lt, in->types, ls, in->scales)
 				appendStringInfo(&json, "%s{\"type\":\"%s\"}", k++ > 0 ? "," : "",
-								 df_type_tag(lfirst_oid(lt)));
+								 df_tag(lfirst_oid(lt), lfirst_int(ls)));
 			appendStringInfoChar(&json, ']');
 			if (IsA(in->leaf, Motion))
 			{
@@ -939,10 +1106,12 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		si->ncols = list_length(in->attnos);
 		si->attnos = palloc(sizeof(AttrNumber) * Max(si->ncols, 1));
 		si->types = palloc(sizeof(Oid) * Max(si->ncols, 1));
+		si->scales = palloc(sizeof(int16) * Max(si->ncols, 1));
 		forboth(la, in->attnos, lt, in->types)
 		{
 			si->attnos[k] = (AttrNumber) lfirst_int(la);
 			si->types[k] = lfirst_oid(lt);
+			si->scales[k] = (int16) list_nth_int(in->scales, k);
 			k++;
 		}
 	}

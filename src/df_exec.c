@@ -217,6 +217,8 @@ df_type_width(Oid type)
 		case FLOAT4OID:
 		case DATEOID:
 			return 4;
+		case NUMERICOID:
+			return 16;			/* Decimal128 */
 		default:
 			return 8;
 	}
@@ -631,9 +633,9 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 		if (amname == NULL || strcmp(amname, "pax") != 0)
 			return false;
 	}
-	/* The reader hands out fixed-width values only. */
+	/* The reader hands out fixed-width values only (not strings, not numeric). */
 	for (c = 0; c < in->spec->ncols; c++)
-		if (df_type_is_string(in->spec->types[c]))
+		if (df_type_is_string(in->spec->types[c]) || in->spec->types[c] == NUMERICOID)
 			return false;
 	reader = df_pax_reader_get();
 	if (reader == NULL)
@@ -796,6 +798,17 @@ df_exec_fill(DfExec *x, DfInput *in)
 				case FLOAT8OID:
 					((float8 *) dst)[n] = isnull ? 0 : DatumGetFloat8(d);
 					break;
+				case NUMERICOID:
+					{
+						int128		v = 0;
+
+						if (!isnull &&
+							df_numeric_value(d, in->spec->scales[c], &v) != DF_NUMERIC_FITS)
+							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
+								 DF_NUMERIC_MAX_PRECISION, in->spec->scales[c]);
+						memcpy(dst + (size_t) n * sizeof(int128), &v, sizeof(int128));
+					}
+					break;
 				case TEXTOID:
 				case VARCHAROID:
 					{
@@ -877,43 +890,6 @@ df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		df_raise_query(status, sqlstate, buf);
 }
 
-/*
- * A numeric of 'v' * 10^-scale, through numeric_in so that its display
- * scale is 'scale', as PostgreSQL's own would be.
- */
-static Datum
-df_numeric_datum(int128 v, int scale)
-{
-	char		digits[48];
-	char		buf[64];
-	int			n = 0,
-				len = 0,
-				i;
-	bool		neg = v < 0;
-
-	/* the digits, least significant first (|INT128_MIN| has 39) */
-	do
-	{
-		int			d = (int) (v % 10);
-
-		digits[n++] = (char) ('0' + (d < 0 ? -d : d));
-		v /= 10;
-	} while (v != 0);
-	while (n <= scale)
-		digits[n++] = '0';		/* at least one digit before the point */
-	if (neg)
-		buf[len++] = '-';
-	for (i = n - 1; i >= 0; i--)
-	{
-		buf[len++] = digits[i];
-		if (i == scale && scale > 0)
-			buf[len++] = '.';
-	}
-	buf[len] = '\0';
-	return DirectFunctionCall3(numeric_in, CStringGetDatum(buf),
-							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
-}
-
 static int128
 df_read_int128(const void *values, uint32 r)
 {
@@ -956,7 +932,8 @@ df_exec_emit(DfExec *x)
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
 				slot->tts_values[k] =
 					DirectFunctionCall2(numeric_div,
-										df_numeric_datum(df_read_int128(v, r), 0),
+										df_numeric_datum(df_read_int128(v, r),
+														 x->spec.out_scales[c]),
 										NumericGetDatum(int64_to_numeric(count)));
 				MemoryContextSwitchTo(oldcxt);
 			}
@@ -1007,7 +984,8 @@ df_exec_emit(DfExec *x)
 				break;
 			case NUMERICOID:
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
-				slot->tts_values[k] = df_numeric_datum(df_read_int128(v, r), 0);
+				slot->tts_values[k] = df_numeric_datum(df_read_int128(v, r),
+													   x->spec.out_scales[c]);
 				MemoryContextSwitchTo(oldcxt);
 				break;
 		}

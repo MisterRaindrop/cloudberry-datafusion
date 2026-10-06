@@ -83,6 +83,7 @@ typedef struct DfCheckContext
 	bool		final_states;	/* this Agg may read DataFusion avg states */
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
+	Plan	   *node;			/* the node whose expressions are checked */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -92,6 +93,8 @@ static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_pri
 static bool df_check_expr(Node *node, DfCheckContext *cxt);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
+static void df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+							   bool root_is_sender);
 
 /* Record the first reason a slice does not qualify. */
 static void
@@ -127,6 +130,9 @@ df_type_supported(Oid type)
 		case VARCHAROID:
 			/* Arrow's strings are UTF-8. */
 			return GetDatabaseEncoding() == PG_UTF8;
+		case NUMERICOID:
+			/* of a known precision and scale: df_numeric_ps */
+			return true;
 		default:
 			return false;
 	}
@@ -244,6 +250,101 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 			return NULL;
 	}
 	return NULL;
+}
+
+/*
+ * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
+ * DataFusion can carry it as Decimal128(38, scale): a column of a declared
+ * numeric(p, s) with p <= 38, found through the references of the nodes
+ * above it; a constant; min/max of such, and sum of such or of int8 (at
+ * most 38 digits, the scale of its argument).  A partial avg's sum counts
+ * as such a sum.  Anything else (an avg's result, arithmetic) has none.
+ */
+bool
+df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
+{
+	if (expr == NULL || exprType(expr) == InvalidOid)
+		return false;
+	switch (nodeTag(expr))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) expr;
+				Plan	   *child;
+				TargetEntry *tle;
+
+				/*
+				 * A reference is followed whatever its type: one to a partial
+				 * sum or avg has PostgreSQL's state type (bytea).
+				 */
+				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
+					return var->vartype == NUMERICOID &&
+						df_numeric_typmod(var->vartypmod, precision, scale);
+				child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+				if (child == NULL)
+					return false;
+				tle = get_tle_by_resno(child->targetlist, var->varattno);
+				return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
+			}
+		case T_Const:
+			if (((Const *) expr)->consttype != NUMERICOID)
+				return false;
+			if (((Const *) expr)->constisnull)
+			{
+				*precision = 1;
+				*scale = 0;
+				return true;
+			}
+			return df_numeric_const_ps(((Const *) expr)->constvalue, precision, scale);
+		case T_Aggref:
+			{
+				Aggref	   *agg = (Aggref *) expr;
+				char	   *name = get_func_name(agg->aggfnoid);
+				Node	   *arg;
+				int			p,
+							s;
+
+				if (name == NULL || agg->aggfnoid >= FirstGenbkiObjectId ||
+					list_length(agg->args) != 1)
+					return false;
+				arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+				/* arguments refer to the Agg's child (OUTER_VAR): 'ctx' is the Agg */
+				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+				{
+					/* the argument is the partial result below, of the same scale */
+					if (!df_numeric_ps(ctx, arg, &p, &s))
+						return false;
+				}
+				else if (exprType(arg) == INT8OID && strcmp(name, "sum") == 0)
+					p = 19, s = 0;
+				else if (exprType(arg) == INT8OID || exprType(arg) == INT4OID ||
+						 exprType(arg) == INT2OID)
+				{
+					/* a partial avg of integers: its numeric sum */
+					if (strcmp(name, "avg") != 0 || agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+						return false;
+					p = 19, s = 0;
+				}
+				else if (!df_numeric_ps(ctx, arg, &p, &s))
+					return false;
+				if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
+				{
+					*precision = p;
+					*scale = s;
+					return true;
+				}
+				if (strcmp(name, "sum") == 0 ||
+					(strcmp(name, "avg") == 0 && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL))
+				{
+					*precision = DF_NUMERIC_MAX_PRECISION;
+					*scale = s;
+					return true;
+				}
+				return false;
+			}
+		default:
+			return false;
+	}
 }
 
 /* Is 'node' a constant LIKE pattern whose last backslash escapes nothing? */
@@ -424,6 +525,15 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				}
 				else if (!df_type_supported(var->vartype))
 					df_reject(cxt, "column of type %s", format_type_be(var->vartype));
+				else if (var->vartype == NUMERICOID)
+				{
+					int			p,
+								s;
+
+					if (!df_numeric_ps(cxt->node, node, &p, &s))
+						df_reject(cxt, "numeric column without a precision of at most %d",
+								  DF_NUMERIC_MAX_PRECISION);
+				}
 				return cxt->failed;
 			}
 
@@ -431,8 +541,14 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			{
 				Const	   *c = (Const *) node;
 
+				int			p,
+							s;
+
 				if (!df_type_supported(c->consttype))
 					df_reject(cxt, "constant of type %s", format_type_be(c->consttype));
+				else if (c->consttype == NUMERICOID && !df_numeric_ps(cxt->node, node, &p, &s))
+					df_reject(cxt, "numeric constant of more than %d digits or infinite",
+							  DF_NUMERIC_MAX_PRECISION);
 				return cxt->failed;
 			}
 
@@ -479,6 +595,26 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							 (op->opresulttype != BOOLOID || ltype != rtype))
 						df_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
+					else if (ltype == NUMERICOID || rtype == NUMERICOID)
+					{
+						int			lp,
+									ls,
+									rp,
+									rs,
+									t;
+
+						/* comparisons, at the larger scale (N2) */
+						if (op->opresulttype != BOOLOID || ltype != rtype)
+							df_reject(cxt, "operator %s on %s and %s", name,
+									  format_type_be(ltype), format_type_be(rtype));
+						else if (!df_numeric_ps(cxt->node, linitial(op->args), &lp, &ls) ||
+								 !df_numeric_ps(cxt->node, lsecond(op->args), &rp, &rs))
+							df_reject(cxt, "operator %s on numeric of unknown precision", name);
+						else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_PRECISION ||
+								 rp - rs + t > DF_NUMERIC_MAX_PRECISION)
+							df_reject(cxt, "operator %s on numeric beyond %d digits at a common scale",
+									  name, DF_NUMERIC_MAX_PRECISION);
+					}
 					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
 					{
 						const char *problem;
@@ -512,6 +648,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			{
 				Aggref	   *agg = (Aggref *) node;
 				char	   *name = get_func_name(agg->aggfnoid);
+				int			np,
+							ns;
 
 				if (!cxt->allow_aggref)
 					df_reject(cxt, "aggregate outside an Aggregate node");
@@ -527,7 +665,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
-				else if (df_agg_state(agg) == DF_AGG_AVG_INT &&
+				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
+						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
+						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
+						 !(df_numeric_ps(cxt->node,
+										 (Node *) linitial_node(TargetEntry, agg->args)->expr,
+										 &np, &ns) && np <= DF_NUMERIC_MAX_SUM_PRECISION))
+					/* the sum must stay within Decimal128's 38 digits */
+					df_reject(cxt, "aggregate %s of numeric of unknown precision or more than %d digits",
+							  name, DF_NUMERIC_MAX_SUM_PRECISION);
+				else if (agg->aggtype == NUMERICOID && df_agg_state(agg) == DF_AGG_PLAIN &&
+						 !df_numeric_ps(cxt->node, node, &np, &ns))
+					df_reject(cxt, "aggregate %s returning numeric of unknown precision", name);
+				else if ((df_agg_state(agg) == DF_AGG_AVG_INT ||
+						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL && cxt->agg_to_batches)
 					/* avg = sum / count is computed where tuples are made */
 					df_reject(cxt, "aggregate avg returning numeric into a batch Motion");
@@ -853,6 +1004,17 @@ static void
 df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			  bool root_is_sender)
 {
+	Plan	   *saved = cxt->node;
+
+	cxt->node = plan;
+	df_check_plan_node(plan, cxt, needed, root_is_sender);
+	cxt->node = saved;
+}
+
+static void
+df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+				   bool root_is_sender)
+{
 	if (plan == NULL || cxt->failed)
 		return;
 
@@ -945,6 +1107,17 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						df_reject(cxt, "GROUP BY key of type %s",
 								  format_type_be(exprType((Node *) tle->expr)));
 						return;
+					}
+					if (tle && exprType((Node *) tle->expr) == NUMERICOID)
+					{
+						int			p,
+									s;
+
+						if (!df_numeric_ps(child, (Node *) tle->expr, &p, &s))
+						{
+							df_reject(cxt, "GROUP BY key of numeric of unknown precision");
+							return;
+						}
 					}
 					if (tle && df_type_is_string(exprType((Node *) tle->expr)) &&
 						df_string_compare_problem(cxt, "=", agg->grpCollations[i]) != NULL)
@@ -1165,9 +1338,15 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						TargetEntry *tle = lfirst_node(TargetEntry, lc);
 						Oid			type = exprType((Node *) tle->expr);
 
-						if (bms_is_member(tle->resno, needed) && !df_type_supported(type) &&
-							!(bms_is_member(motion->motionID, cxt->batches) &&
-							  df_motion_state_columns(motion, tle->resno) > 0))
+						bool		state = bms_is_member(motion->motionID, cxt->batches) &&
+							df_motion_state_columns(motion, tle->resno) > 0;
+						int			p,
+									s;
+
+						if (bms_is_member(tle->resno, needed) && !state &&
+							(!df_type_supported(type) ||
+							 (type == NUMERICOID &&
+							  !df_numeric_ps(plan, (Node *) tle->expr, &p, &s))))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;
@@ -1502,6 +1681,10 @@ df_agg_state(Aggref *agg)
 	}
 	if (strcmp(name, "sum") == 0 && argtype == INT8OID)
 		return DF_AGG_SUM_INT8;
+	if (argtype == NUMERICOID && strcmp(name, "sum") == 0)
+		return DF_AGG_SUM_NUMERIC;
+	if (argtype == NUMERICOID && strcmp(name, "avg") == 0)
+		return DF_AGG_AVG_NUMERIC;
 	return DF_AGG_PLAIN;
 }
 
@@ -1513,8 +1696,10 @@ df_agg_state_ncols(DfAggState state)
 	{
 		case DF_AGG_AVG_FLOAT:
 		case DF_AGG_AVG_INT:
+		case DF_AGG_AVG_NUMERIC:
 			return 2;
 		case DF_AGG_SUM_INT8:
+		case DF_AGG_SUM_NUMERIC:
 			return 1;
 		default:
 			return 0;

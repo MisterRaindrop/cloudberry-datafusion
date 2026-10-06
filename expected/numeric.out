@@ -87,7 +87,7 @@ EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
          ->  Seq Scan on df_nm
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: operator + returning numeric
+ DataFusion: slice 1 not eligible: operator + on numeric and numeric
 (7 rows)
 
 RESET datafusion.motion_batches;
@@ -177,6 +177,232 @@ SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
     |                       |                     
 (9 rows)
 
-DROP TABLE df_nm, df_nm_empty;
+-- numeric(p, s) columns with p <= 38 (N2): Decimal128(38, s), NaN above
+-- every value; sum and avg need p <= 28 to stay within 38 digits.
+CREATE TABLE df_nc (id int, g int, a numeric(10,2), b numeric(15,4), c numeric(38,0),
+  d numeric(28,10), u numeric) DISTRIBUTED BY (id);
+INSERT INTO df_nc SELECT i, i % 7, ((i::bigint * 7919) % 2000000 - 1000000) / 100.0,
+  ((i::bigint * 104729) % 20000000 - 10000000) / 10000.0,
+  i::numeric * 99999999999999999999999, ((i * 31) % 1000) / 1234567.0, i / 3.0
+FROM generate_series(1, 50000) i;
+INSERT INTO df_nc VALUES (-1, 90, 'NaN', 'NaN', 'NaN', 'NaN', 'NaN'),
+  (-2, 90, 1.5, 2.25, 3, 0.0000000001, 1), (-3, 91, NULL, NULL, NULL, NULL, NULL),
+  (-4, 92, 99999999.99, 99999999999.9999, 99999999999999999999999999999999999999,
+   999999999999999999.9999999999, 0),
+  (-5, 92, -99999999.99, -99999999999.9999, -99999999999999999999999999999999999999,
+   -999999999999999999.9999999999, 0),
+  (-6, 93, 0, -0.0001, 0, 0, 0), (-7, 93, 1.50, 1.5, 1, 1.5, 1.5);
+CREATE TABLE df_nc2 AS SELECT id, b AS a2, a AS b2 FROM df_nc WHERE id % 3 = 0 OR id < 0
+DISTRIBUTED BY (id);
+ANALYZE df_nc;
+ANALYZE df_nc2;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(a), avg(b), min(c), max(d) FROM df_nc WHERE b < a AND a > 100.5 GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g
+               ->  Streaming Partial HashAggregate
+                     Group Key: g
+                     ->  Seq Scan on df_nc
+                           Filter: ((b < a) AND (a > 100.5))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(c) FROM df_nc;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 1 not eligible: aggregate sum of numeric of unknown precision or more than 28 digits
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT min(u) FROM df_nc;
+                                       QUERY PLAN                                       
+----------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: aggregate min returning numeric of unknown precision
+ DataFusion: slice 1 not eligible: aggregate min returning numeric of unknown precision
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT a + 1 FROM df_nc;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: operator + on numeric and numeric
+(5 rows)
+
+SET datafusion.mode = off;
+SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
+     min      | max |        min        | max |                   min                   | max |              min               | max | count 
+--------------+-----+-------------------+-----+-----------------------------------------+-----+--------------------------------+-----+-------
+ -99999999.99 | NaN | -99999999999.9999 | NaN | -99999999999999999999999999999999999999 | NaN | -999999999999999999.9999999999 | NaN | 50006
+(1 row)
+
+SELECT g, sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), min(c), count(*) FROM df_nc GROUP BY g ORDER BY g;
+ g  |    sum    |           avg           |    sum     |           avg           |     sum      |          avg           |                   min                   | count 
+----+-----------+-------------------------+------------+-------------------------+--------------+------------------------+-----------------------------------------+-------
+  0 |  17287.49 |      2.4205390646877625 |  1693.7259 |  0.23715008401008120975 | 2.8898399195 | 0.00040462614386726407 |                699999999999999999999993 |  7142
+  1 |  -7058.34 | -0.98814783704325913482 | -6498.3494 | -0.90975072098558028839 | 2.8901906492 | 0.00040461859851602968 |                 99999999999999999999999 |  7143
+  2 |  -1404.17 | -0.19657986840263194736 | -1690.4247 | -0.23665472490550188996 | 2.8897313790 | 0.00040455430197396052 |                199999999999999999999998 |  7143
+  3 | -15750.00 |     -2.2049559008819824 | -4882.5000 | -0.68353632927341453171 | 2.8900821096 | 0.00040460340327593448 |                299999999999999999999997 |  7143
+  4 | -30095.83 |     -4.2133319333613328 | -6074.5753 | -0.85042353352932941341 | 2.8904328397 | 0.00040465250450790984 |                399999999999999999999996 |  7143
+  5 | -24441.66 |     -3.4217639647207056 | -1266.6506 | -0.17732753744925101498 | 2.8899735690 | 0.00040458820789584208 |                499999999999999999999995 |  7143
+  6 |   1212.51 |  0.16974800503989920202 | -8458.7259 |     -1.1841979420411592 | 2.8895142990 | 0.00040452391138177236 |                599999999999999999999994 |  7143
+ 90 |       NaN |                     NaN |        NaN |                     NaN |          NaN |                    NaN |                                       3 |     2
+ 91 |           |                         |            |                         |              |                        |                                         |     1
+ 92 |      0.00 |  0.00000000000000000000 |     0.0000 |  0.00000000000000000000 | 0.0000000000 | 0.00000000000000000000 | -99999999999999999999999999999999999999 |     2
+ 93 |      1.50 |  0.75000000000000000000 |     1.4999 |  0.74995000000000000000 | 1.5000000000 | 0.75000000000000000000 |                                       0 |     2
+(11 rows)
+
+SELECT count(*) FROM df_nc WHERE a > 100.5 AND b <= 2.25 AND c > 1e30;
+ count 
+-------
+     0
+(1 row)
+
+SELECT id, a, b FROM df_nc WHERE a = 1.5 OR b = 1.5000 OR a = 'NaN' OR a > 99999999 ORDER BY id;
+ id |      a      |        b         
+----+-------------+------------------
+ -7 |        1.50 |           1.5000
+ -4 | 99999999.99 | 99999999999.9999
+ -2 |        1.50 |           2.2500
+ -1 |         NaN |              NaN
+(4 rows)
+
+SELECT count(*) FROM df_nc WHERE b < a;
+ count 
+-------
+ 24979
+(1 row)
+
+SELECT count(*), sum(x.a) FROM df_nc x JOIN df_nc2 y ON x.a = y.a2;
+ count | sum 
+-------+-----
+     7 | NaN
+(1 row)
+
+SELECT id, a, b, c, d FROM df_nc WHERE id < 0 ORDER BY id;
+ id |      a       |         b         |                    c                    |               d                
+----+--------------+-------------------+-----------------------------------------+--------------------------------
+ -7 |         1.50 |            1.5000 |                                       1 |                   1.5000000000
+ -6 |         0.00 |           -0.0001 |                                       0 |                   0.0000000000
+ -5 | -99999999.99 | -99999999999.9999 | -99999999999999999999999999999999999999 | -999999999999999999.9999999999
+ -4 |  99999999.99 |  99999999999.9999 |  99999999999999999999999999999999999999 |  999999999999999999.9999999999
+ -3 |              |                   |                                         |                               
+ -2 |         1.50 |            2.2500 |                                       3 |                   0.0000000001
+ -1 |          NaN |               NaN |                                     NaN |                            NaN
+(7 rows)
+
+SET datafusion.mode = on;
+SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
+     min      | max |        min        | max |                   min                   | max |              min               | max | count 
+--------------+-----+-------------------+-----+-----------------------------------------+-----+--------------------------------+-----+-------
+ -99999999.99 | NaN | -99999999999.9999 | NaN | -99999999999999999999999999999999999999 | NaN | -999999999999999999.9999999999 | NaN | 50006
+(1 row)
+
+SELECT g, sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), min(c), count(*) FROM df_nc GROUP BY g ORDER BY g;
+ g  |    sum    |           avg           |    sum     |           avg           |     sum      |          avg           |                   min                   | count 
+----+-----------+-------------------------+------------+-------------------------+--------------+------------------------+-----------------------------------------+-------
+  0 |  17287.49 |      2.4205390646877625 |  1693.7259 |  0.23715008401008120975 | 2.8898399195 | 0.00040462614386726407 |                699999999999999999999993 |  7142
+  1 |  -7058.34 | -0.98814783704325913482 | -6498.3494 | -0.90975072098558028839 | 2.8901906492 | 0.00040461859851602968 |                 99999999999999999999999 |  7143
+  2 |  -1404.17 | -0.19657986840263194736 | -1690.4247 | -0.23665472490550188996 | 2.8897313790 | 0.00040455430197396052 |                199999999999999999999998 |  7143
+  3 | -15750.00 |     -2.2049559008819824 | -4882.5000 | -0.68353632927341453171 | 2.8900821096 | 0.00040460340327593448 |                299999999999999999999997 |  7143
+  4 | -30095.83 |     -4.2133319333613328 | -6074.5753 | -0.85042353352932941341 | 2.8904328397 | 0.00040465250450790984 |                399999999999999999999996 |  7143
+  5 | -24441.66 |     -3.4217639647207056 | -1266.6506 | -0.17732753744925101498 | 2.8899735690 | 0.00040458820789584208 |                499999999999999999999995 |  7143
+  6 |   1212.51 |  0.16974800503989920202 | -8458.7259 |     -1.1841979420411592 | 2.8895142990 | 0.00040452391138177236 |                599999999999999999999994 |  7143
+ 90 |       NaN |                     NaN |        NaN |                     NaN |          NaN |                    NaN |                                       3 |     2
+ 91 |           |                         |            |                         |              |                        |                                         |     1
+ 92 |      0.00 |  0.00000000000000000000 |     0.0000 |  0.00000000000000000000 | 0.0000000000 | 0.00000000000000000000 | -99999999999999999999999999999999999999 |     2
+ 93 |      1.50 |  0.75000000000000000000 |     1.4999 |  0.74995000000000000000 | 1.5000000000 | 0.75000000000000000000 |                                       0 |     2
+(11 rows)
+
+SELECT count(*) FROM df_nc WHERE a > 100.5 AND b <= 2.25 AND c > 1e30;
+ count 
+-------
+     0
+(1 row)
+
+SELECT id, a, b FROM df_nc WHERE a = 1.5 OR b = 1.5000 OR a = 'NaN' OR a > 99999999 ORDER BY id;
+ id |      a      |        b         
+----+-------------+------------------
+ -7 |        1.50 |           1.5000
+ -4 | 99999999.99 | 99999999999.9999
+ -2 |        1.50 |           2.2500
+ -1 |         NaN |              NaN
+(4 rows)
+
+SELECT count(*) FROM df_nc WHERE b < a;
+ count 
+-------
+ 24979
+(1 row)
+
+SELECT count(*), sum(x.a) FROM df_nc x JOIN df_nc2 y ON x.a = y.a2;
+ count | sum 
+-------+-----
+     7 | NaN
+(1 row)
+
+SELECT id, a, b, c, d FROM df_nc WHERE id < 0 ORDER BY id;
+ id |      a       |         b         |                    c                    |               d                
+----+--------------+-------------------+-----------------------------------------+--------------------------------
+ -7 |         1.50 |            1.5000 |                                       1 |                   1.5000000000
+ -6 |         0.00 |           -0.0001 |                                       0 |                   0.0000000000
+ -5 | -99999999.99 | -99999999999.9999 | -99999999999999999999999999999999999999 | -999999999999999999.9999999999
+ -4 |  99999999.99 |  99999999999.9999 |  99999999999999999999999999999999999999 |  999999999999999999.9999999999
+ -3 |              |                   |                                         |                               
+ -2 |         1.50 |            2.2500 |                                       3 |                   0.0000000001
+ -1 |          NaN |               NaN |                                     NaN |                            NaN
+(7 rows)
+
+-- split through batch Motions: DataFusion's sums, NaN included
+SET datafusion.motion_batches = on;
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
+ sum | avg | sum | avg | sum | avg 
+-----+-----+-----+-----+-----+-----
+ NaN | NaN | NaN | NaN | NaN | NaN
+(1 row)
+
+SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
+    sum    |           avg           |   max   |    min    
+-----------+-------------------------+---------+-----------
+ -60250.00 | -0.54355000000000000000 | 9998.89 | -999.8931
+(1 row)
+
+SET datafusion.mode = off;
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
+ sum | avg | sum | avg | sum | avg 
+-----+-----+-----+-----+-----+-----
+ NaN | NaN | NaN | NaN | NaN | NaN
+(1 row)
+
+SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
+    sum    |           avg           |   max   |    min    
+-----------+-------------------------+---------+-----------
+ -60250.00 | -0.54355000000000000000 | 9998.89 | -999.8931
+(1 row)
+
+RESET datafusion.motion_batches;
+DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

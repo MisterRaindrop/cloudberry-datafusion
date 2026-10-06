@@ -34,7 +34,7 @@
 MODULE_big = datafusion_executor
 OBJS = src/df_init.o src/df_runtime.o src/df_debug.o \
 	src/df_hooks.o src/df_plan_check.o src/df_translate.o src/df_exec.o \
-	src/df_paxload.o
+	src/df_paxload.o src/df_numeric.o
 
 EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql

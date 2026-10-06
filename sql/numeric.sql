@@ -63,6 +63,59 @@ SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
 SET datafusion.mode = off;
 SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
 
-DROP TABLE df_nm, df_nm_empty;
+-- numeric(p, s) columns with p <= 38 (N2): Decimal128(38, s), NaN above
+-- every value; sum and avg need p <= 28 to stay within 38 digits.
+CREATE TABLE df_nc (id int, g int, a numeric(10,2), b numeric(15,4), c numeric(38,0),
+  d numeric(28,10), u numeric) DISTRIBUTED BY (id);
+INSERT INTO df_nc SELECT i, i % 7, ((i::bigint * 7919) % 2000000 - 1000000) / 100.0,
+  ((i::bigint * 104729) % 20000000 - 10000000) / 10000.0,
+  i::numeric * 99999999999999999999999, ((i * 31) % 1000) / 1234567.0, i / 3.0
+FROM generate_series(1, 50000) i;
+INSERT INTO df_nc VALUES (-1, 90, 'NaN', 'NaN', 'NaN', 'NaN', 'NaN'),
+  (-2, 90, 1.5, 2.25, 3, 0.0000000001, 1), (-3, 91, NULL, NULL, NULL, NULL, NULL),
+  (-4, 92, 99999999.99, 99999999999.9999, 99999999999999999999999999999999999999,
+   999999999999999999.9999999999, 0),
+  (-5, 92, -99999999.99, -99999999999.9999, -99999999999999999999999999999999999999,
+   -999999999999999999.9999999999, 0),
+  (-6, 93, 0, -0.0001, 0, 0, 0), (-7, 93, 1.50, 1.5, 1, 1.5, 1.5);
+CREATE TABLE df_nc2 AS SELECT id, b AS a2, a AS b2 FROM df_nc WHERE id % 3 = 0 OR id < 0
+DISTRIBUTED BY (id);
+ANALYZE df_nc;
+ANALYZE df_nc2;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(a), avg(b), min(c), max(d) FROM df_nc WHERE b < a AND a > 100.5 GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT sum(c) FROM df_nc;
+EXPLAIN (COSTS OFF) SELECT min(u) FROM df_nc;
+EXPLAIN (COSTS OFF) SELECT a + 1 FROM df_nc;
+
+SET datafusion.mode = off;
+SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
+SELECT g, sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), min(c), count(*) FROM df_nc GROUP BY g ORDER BY g;
+SELECT count(*) FROM df_nc WHERE a > 100.5 AND b <= 2.25 AND c > 1e30;
+SELECT id, a, b FROM df_nc WHERE a = 1.5 OR b = 1.5000 OR a = 'NaN' OR a > 99999999 ORDER BY id;
+SELECT count(*) FROM df_nc WHERE b < a;
+SELECT count(*), sum(x.a) FROM df_nc x JOIN df_nc2 y ON x.a = y.a2;
+SELECT id, a, b, c, d FROM df_nc WHERE id < 0 ORDER BY id;
+SET datafusion.mode = on;
+SELECT min(a), max(a), min(b), max(b), min(c), max(c), min(d), max(d), count(a) FROM df_nc;
+SELECT g, sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), min(c), count(*) FROM df_nc GROUP BY g ORDER BY g;
+SELECT count(*) FROM df_nc WHERE a > 100.5 AND b <= 2.25 AND c > 1e30;
+SELECT id, a, b FROM df_nc WHERE a = 1.5 OR b = 1.5000 OR a = 'NaN' OR a > 99999999 ORDER BY id;
+SELECT count(*) FROM df_nc WHERE b < a;
+SELECT count(*), sum(x.a) FROM df_nc x JOIN df_nc2 y ON x.a = y.a2;
+SELECT id, a, b, c, d FROM df_nc WHERE id < 0 ORDER BY id;
+-- split through batch Motions: DataFusion's sums, NaN included
+SET datafusion.motion_batches = on;
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
+SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
+SET datafusion.mode = off;
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
+SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
+RESET datafusion.motion_batches;
+
+DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

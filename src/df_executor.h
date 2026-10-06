@@ -59,6 +59,7 @@ typedef struct DfSliceInput
 	AttrNumber *attnos;			/* table columns, or Motion stream
 								 * positions + 1 */
 	Oid		   *types;
+	int16	   *scales;			/* of numeric columns (Decimal128) */
 } DfSliceInput;
 
 /* What df_translate_slice produces for one slice. */
@@ -70,6 +71,7 @@ typedef struct DfSliceSpec
 	int			nout;			/* output columns, in targetlist order */
 	Oid		   *out_types;
 	uint8	   *out_kinds;		/* DfOutKind of each */
+	int16	   *out_scales;		/* of numeric ones */
 	int			batch_rows;		/* rows per batch, from the widest row */
 } DfSliceSpec;
 
@@ -84,11 +86,32 @@ typedef enum DfAggState
 	DF_AGG_PLAIN,				/* the result type is the state */
 	DF_AGG_AVG_FLOAT,			/* avg(float4/8): float8 sum, int8 count */
 	DF_AGG_AVG_INT,				/* avg(int2/4/8): numeric sum, int8 count */
-	DF_AGG_SUM_INT8				/* sum(int8): numeric sum */
+	DF_AGG_SUM_INT8,			/* sum(int8): numeric sum */
+	DF_AGG_SUM_NUMERIC,			/* sum(numeric(p <= 28, s)): numeric sum */
+	DF_AGG_AVG_NUMERIC			/* avg(numeric(p <= 28, s)): numeric sum, count */
 } DfAggState;
+
+/* sum and avg of numeric(p, s): p digits added up must stay within 38 */
+#define DF_NUMERIC_MAX_SUM_PRECISION 28
 
 extern DfAggState df_agg_state(Aggref *agg);
 extern int	df_agg_state_ncols(DfAggState state);
+
+/* df_numeric.c: numeric(p, s) values as 128-bit integers (N2) */
+#define DF_NUMERIC_MAX_PRECISION 38
+#define DF_NUMERIC_NAN	((int128) (~(uint128) 0 >> 1))	/* above 10^38 */
+
+typedef enum DfNumericFit
+{
+	DF_NUMERIC_FITS,
+	DF_NUMERIC_INFINITE,
+	DF_NUMERIC_TOO_LONG			/* more digits than 38 at that scale */
+} DfNumericFit;
+
+extern bool df_numeric_typmod(int32 typmod, int *precision, int *scale);
+extern DfNumericFit df_numeric_value(Datum d, int scale, int128 *out);
+extern bool df_numeric_const_ps(Datum d, int *precision, int *scale);
+extern Datum df_numeric_datum(int128 v, int scale);
 
 /* How an output column of the slice becomes a value of its tuple. */
 typedef enum DfOutKind
@@ -115,6 +138,7 @@ typedef struct DfStringFunc
 } DfStringFunc;
 
 extern const DfStringFunc *df_string_func(Oid funcid);
+extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 
 /* df_exec.c */
 extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
