@@ -91,15 +91,21 @@ typedef enum DfAggState
 	DF_AGG_AVG_NUMERIC			/* avg(numeric(p <= 28, s)): numeric sum, count */
 } DfAggState;
 
-/* sum and avg of numeric(p, s): p digits added up must stay within 38 */
-#define DF_NUMERIC_MAX_SUM_PRECISION 28
+/* sum and avg of numeric(p, s): p digits added up must stay within 76 */
+#define DF_NUMERIC_MAX_SUM_PRECISION 66
 
 extern DfAggState df_agg_state(Aggref *agg);
 extern int	df_agg_state_ncols(DfAggState state);
 
-/* df_numeric.c: numeric(p, s) values as 128-bit integers (N2) */
+/*
+ * df_numeric.c: numeric values of a fixed scale as Decimal256 (N2, N3).
+ * Columns and constants are read with up to 38 digits (as int128), and
+ * expressions keep up to 76; a sum adds up values of up to 66.
+ */
 #define DF_NUMERIC_MAX_PRECISION 38
+#define DF_NUMERIC_MAX_EXPR_PRECISION 76
 #define DF_NUMERIC_NAN	((int128) (~(uint128) 0 >> 1))	/* above 10^38 */
+#define DF_NUMERIC_BYTES 32		/* a Decimal256 value, little-endian */
 
 typedef enum DfNumericFit
 {
@@ -111,7 +117,8 @@ typedef enum DfNumericFit
 extern bool df_numeric_typmod(int32 typmod, int *precision, int *scale);
 extern DfNumericFit df_numeric_value(Datum d, int scale, int128 *out);
 extern bool df_numeric_const_ps(Datum d, int *precision, int *scale);
-extern Datum df_numeric_datum(int128 v, int scale);
+extern void df_numeric_store(int128 v, uint8 *dst);
+extern Datum df_numeric_datum(const uint8 *src, int scale);
 
 /* How an output column of the slice becomes a value of its tuple. */
 typedef enum DfOutKind

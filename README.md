@@ -429,6 +429,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | L2 | Common string functions and `\|\|` |
 | N1 | numeric results of `sum(int8)` and `avg` of integers |
 | N2 | `numeric(p, s)` columns with p <= 38 |
+| N3 | numeric `+`, `-`, `*`; Decimal256 |
 
 ### Date and time types
 
@@ -552,7 +553,8 @@ in both and took 2.16 s in DataFusion against 1.42 s.
 ### numeric results of integer aggregates
 
 `sum(int8)` and `avg` of `int2`, `int4` and `int8` return numeric (N1).
-DataFusion adds the values exactly as `Decimal128(38, 0)`; the C side
+DataFusion adds the values exactly as numeric of scale 0 (Decimal256 since
+N3); the C side
 builds the numeric values with `numeric_in`, and avg as `numeric_div(sum,
 count)`, which is what `int8_avg` and `numeric_poly_avg` compute, so
 values and display scales are PostgreSQL's (`1.5000000000000000`, sums
@@ -562,7 +564,8 @@ serialized state, so it stays on PostgreSQL unless batch Motions carry
 DataFusion's state instead (the exact sum, and the count for avg, as for
 avg of floats in M7d).  An avg returning numeric is divided where tuples
 are made, so it does not go into a batch Motion itself.  Computing on
-numeric values (`avg(a) + 1`) stays on PostgreSQL for now.  Over 30 million heap rows, `sum(b), avg(a),
+an avg's result (`avg(a) + 1`), whose scale depends on the values, stays
+on PostgreSQL.  Over 30 million heap rows, `sum(b), avg(a),
 avg(b)` took 0.26 s with batch Motions against 1.04 s in PostgreSQL, and
 grouped by a column 0.31 s against 1.46 s.
 
@@ -570,28 +573,36 @@ grouped by a column 0.31 s against 1.46 s.
 
 A column declared `numeric(p, s)` with p <= 38 (N2) holds values whose
 display scale is s, so each is an integer times 10^-s: it travels as
-`Decimal128(38, s)`, read on the main thread from PostgreSQL's
-representation (`df_numeric.c`, without a copy for short headers) and
-written back through `numeric_in`.  NaN, which such a column may hold, is
-`i128::MAX`, above every 38-digit value: PostgreSQL sorts NaN above all
+`Decimal256(76, s)` (Decimal128 in N2), read on the main thread from
+PostgreSQL's representation (`df_numeric.c`, without a copy for short
+headers) and written back through `numeric_in`.  NaN, which such a column
+may hold, is `i256::MAX`, above every 76-digit value: PostgreSQL sorts NaN above all
 numbers and NaN equals NaN, so comparisons, min/max, grouping and join keys
 need nothing more, and `sum`/`avg` add the other values and return NaN if
 any was NaN.
 
 | Operation | Condition |
 |---|---|
-| comparisons with columns and constants, join keys | both sides within 38 digits at the larger of their scales (they are rescaled to it) |
-| `min`, `max`, GROUP BY keys | p <= 38 |
-| `sum`, `avg` | p <= 28, so that sums stay within 38 digits; avg is `numeric_div(sum, count)` on the C side, as `numeric_avg` |
+| comparisons with columns and constants, join keys | both sides within 76 digits at the larger of their scales (they are rescaled to it) |
+| `+`, `-` (N3) | scale max(s1, s2), at most 76 digits: max(p1 - s1, p2 - s2) + scale + 1 |
+| `*` (N3) | scale s1 + s2 (`mul_var`'s rscale), at most 76 digits: p1 + p2 |
+| integers made numeric (`a + id`) | scale 0 |
+| `min`, `max`, GROUP BY keys | a column of p <= 38 or such an expression |
+| `sum`, `avg` | of at most 66 digits, so that sums stay within 76; avg is `numeric_div(sum, count)` on the C side, as `numeric_avg` |
 
 The planner hook finds precision and scale from the column's declared type
 through every reference above it (`df_numeric_ps`), including a partial
-aggregate's result below a Motion.  Columns of plain `numeric`, arithmetic,
-`sum` of wider columns and Redistribute Motions by a numeric key (whose
-`hash_numeric` is not transcribed) stay on PostgreSQL; the direct PAX
-reader leaves numeric columns to the table AM.  Over 20 million rows of
-`numeric(15,2)` columns, `sum`, `avg` and `count` grouped by a column with
-a filter took 0.40 s with batch Motions against 1.39 s in PostgreSQL.
+aggregate's result below a Motion, and bounds arithmetic by the digits its
+operands may have, not by their values, so nothing can overflow at run
+time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
++ tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
+`numeric`, `/` and `%` (whose result scale depends on the values), unary
+minus, and Redistribute Motions by a numeric key (whose `hash_numeric` is
+not transcribed) stay on PostgreSQL; the direct PAX reader leaves numeric
+columns to the table AM.  Over 20 million rows of `numeric(15,2)` columns,
+a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
+six more aggregates grouped by a flag) took 0.55 s with batch Motions
+against 2.31 s in PostgreSQL.
 
 ## Build
 

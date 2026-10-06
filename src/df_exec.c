@@ -218,7 +218,7 @@ df_type_width(Oid type)
 		case DATEOID:
 			return 4;
 		case NUMERICOID:
-			return 16;			/* Decimal128 */
+			return DF_NUMERIC_BYTES;	/* Decimal256 */
 		default:
 			return 8;
 	}
@@ -806,7 +806,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 							df_numeric_value(d, in->spec->scales[c], &v) != DF_NUMERIC_FITS)
 							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
 								 DF_NUMERIC_MAX_PRECISION, in->spec->scales[c]);
-						memcpy(dst + (size_t) n * sizeof(int128), &v, sizeof(int128));
+						df_numeric_store(v, (uint8 *) dst + (size_t) n * DF_NUMERIC_BYTES);
 					}
 					break;
 				case TEXTOID:
@@ -890,14 +890,11 @@ df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		df_raise_query(status, sqlstate, buf);
 }
 
-static int128
-df_read_int128(const void *values, uint32 r)
+/* Row 'r' of a Decimal256 column. */
+static const uint8 *
+df_numeric_at(const void *values, uint32 r)
 {
-	int128		v;
-
-	/* Arrow aligns its buffers, but do not rely on it */
-	memcpy(&v, (const char *) values + (size_t) r * sizeof(int128), sizeof(int128));
-	return v;
+	return (const uint8 *) values + (size_t) r * DF_NUMERIC_BYTES;
 }
 
 static TupleTableSlot *
@@ -932,7 +929,7 @@ df_exec_emit(DfExec *x)
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
 				slot->tts_values[k] =
 					DirectFunctionCall2(numeric_div,
-										df_numeric_datum(df_read_int128(v, r),
+										df_numeric_datum(df_numeric_at(v, r),
 														 x->spec.out_scales[c]),
 										NumericGetDatum(int64_to_numeric(count)));
 				MemoryContextSwitchTo(oldcxt);
@@ -984,7 +981,7 @@ df_exec_emit(DfExec *x)
 				break;
 			case NUMERICOID:
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
-				slot->tts_values[k] = df_numeric_datum(df_read_int128(v, r),
+				slot->tts_values[k] = df_numeric_datum(df_numeric_at(v, r),
 													   x->spec.out_scales[c]);
 				MemoryContextSwitchTo(oldcxt);
 				break;

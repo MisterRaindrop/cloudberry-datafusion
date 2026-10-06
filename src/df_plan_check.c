@@ -296,6 +296,58 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				return true;
 			}
 			return df_numeric_const_ps(((Const *) expr)->constvalue, precision, scale);
+		case T_OpExpr:
+			{
+				/* numeric + - * (N3): the result scale and digits of numeric.c */
+				OpExpr	   *op = (OpExpr *) expr;
+				char	   *name = get_opname(op->opno);
+				int			lp,
+							ls,
+							rp,
+							rs;
+
+				if (op->opresulttype != NUMERICOID || list_length(op->args) != 2 ||
+					name == NULL || op->opno >= FirstGenbkiObjectId ||
+					exprType(linitial(op->args)) != NUMERICOID ||
+					exprType(lsecond(op->args)) != NUMERICOID ||
+					!df_numeric_ps(ctx, linitial(op->args), &lp, &ls) ||
+					!df_numeric_ps(ctx, lsecond(op->args), &rp, &rs))
+					return false;
+				if (strcmp(name, "+") == 0 || strcmp(name, "-") == 0)
+				{
+					*scale = Max(ls, rs);
+					*precision = Max(lp - ls, rp - rs) + *scale + 1;
+				}
+				else if (strcmp(name, "*") == 0)
+				{
+					*scale = ls + rs;	/* mul_var's rscale */
+					*precision = lp + rp;
+				}
+				else
+					return false;	/* / and %: the scale depends on the values */
+				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+			}
+		case T_FuncExpr:
+			{
+				FuncExpr   *fe = (FuncExpr *) expr;
+
+				/* integers made numeric, scale 0 */
+				*scale = 0;
+				switch (fe->funcid)
+				{
+					case F_NUMERIC_INT2:
+						*precision = 5;
+						return true;
+					case F_NUMERIC_INT4:
+						*precision = 10;
+						return true;
+					case F_NUMERIC_INT8:
+						*precision = 19;
+						return true;
+					default:
+						return false;
+				}
+			}
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) expr;
@@ -603,17 +655,25 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 									rs,
 									t;
 
-						/* comparisons, at the larger scale (N2) */
-						if (op->opresulttype != BOOLOID || ltype != rtype)
+						/* comparisons at the larger scale (N2), + - * (N3) */
+						if (ltype != rtype)
 							df_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
+						else if (op->opresulttype != BOOLOID)
+						{
+							if (!df_numeric_ps(cxt->node, node, &lp, &ls))
+								df_reject(cxt, "operator %s on numeric: %s", name,
+										  strcmp(name, "/") == 0 || strcmp(name, "%") == 0 ?
+										  "its scale depends on the values" :
+										  "of unknown precision or more than 76 digits");
+						}
 						else if (!df_numeric_ps(cxt->node, linitial(op->args), &lp, &ls) ||
 								 !df_numeric_ps(cxt->node, lsecond(op->args), &rp, &rs))
 							df_reject(cxt, "operator %s on numeric of unknown precision", name);
-						else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_PRECISION ||
-								 rp - rs + t > DF_NUMERIC_MAX_PRECISION)
+						else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
+								 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
 							df_reject(cxt, "operator %s on numeric beyond %d digits at a common scale",
-									  name, DF_NUMERIC_MAX_PRECISION);
+									  name, DF_NUMERIC_MAX_EXPR_PRECISION);
 					}
 					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
 					{
@@ -744,7 +804,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				char	   *name = get_func_name(fe->funcid);
 				const char *problem;
 				ListCell   *lc;
+				int			np,
+							ns;
 
+				if (fe->funcresulttype == NUMERICOID && df_numeric_ps(cxt->node, node, &np, &ns))
+					break;		/* an integer made numeric (N3) */
 				if (f == NULL || fe->funcretset || fe->funcvariadic)
 				{
 					df_reject(cxt, "function %s()", name ? name : "?");

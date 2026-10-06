@@ -202,27 +202,81 @@ df_numeric_const_ps(Datum d, int *precision, int *scale)
 	return *precision <= DF_NUMERIC_MAX_PRECISION;
 }
 
-Datum
-df_numeric_datum(int128 v, int scale)
+/*
+ * 'v' as a Decimal256 value: little-endian two's complement, the upper half
+ * extending the sign.  DF_NUMERIC_NAN becomes Decimal256's NaN, i256::MAX.
+ */
+void
+df_numeric_store(int128 v, uint8 *dst)
 {
-	char		digits[48];
-	char		buf[64];
+	uint128		lo = (uint128) v;
+	uint128		hi = v < 0 ? ~(uint128) 0 : 0;
+
+	if (v == DF_NUMERIC_NAN)
+	{
+		lo = ~(uint128) 0;
+		hi = ~(uint128) 0 >> 1;
+	}
+	memcpy(dst, &lo, sizeof(lo));
+	memcpy(dst + sizeof(lo), &hi, sizeof(hi));
+}
+
+/*
+ * A numeric of the Decimal256 value at 'src' times 10^-scale, through
+ * numeric_in so that its display scale is 'scale', as PostgreSQL's own
+ * would be.
+ */
+Datum
+df_numeric_datum(const uint8 *src, int scale)
+{
+	uint64		w[4];			/* little-endian 64-bit words */
+	char		digits[96];
+	char		buf[112];
 	int			n = 0,
 				len = 0,
 				i;
-	bool		neg = v < 0;
+	bool		neg;
+	bool		zero;
 
-	if (v == DF_NUMERIC_NAN)
+	memcpy(w, src, sizeof(w));
+	if (w[3] == (~(uint64) 0 >> 1) && w[2] == ~(uint64) 0 &&
+		w[1] == ~(uint64) 0 && w[0] == ~(uint64) 0)
 		return DirectFunctionCall3(numeric_in, CStringGetDatum("NaN"),
 								   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
-	/* the digits, least significant first (|INT128_MIN| has 39) */
+	neg = (w[3] >> 63) != 0;
+	if (neg)
+	{
+		/* two's complement: invert and add one */
+		uint64		carry = 1;
+
+		for (i = 0; i < 4; i++)
+		{
+			w[i] = ~w[i] + carry;
+			carry = (carry && w[i] == 0) ? 1 : 0;
+		}
+	}
+	/* the digits, least significant first, 18 at a time */
 	do
 	{
-		int			dig = (int) (v % 10);
+		uint128		rem = 0;
+		uint64		chunk;
+		int			k;
 
-		digits[n++] = (char) ('0' + (dig < 0 ? -dig : dig));
-		v /= 10;
-	} while (v != 0);
+		for (i = 3; i >= 0; i--)
+		{
+			uint128		cur = (rem << 64) | w[i];
+
+			w[i] = (uint64) (cur / UINT64CONST(1000000000000000000));
+			rem = cur % UINT64CONST(1000000000000000000);
+		}
+		chunk = (uint64) rem;
+		zero = (w[0] | w[1] | w[2] | w[3]) == 0;
+		for (k = 0; k < 18 && (!zero || chunk != 0 || k == 0); k++)
+		{
+			digits[n++] = (char) ('0' + chunk % 10);
+			chunk /= 10;
+		}
+	} while (!zero);
 	while (n <= scale)
 		digits[n++] = '0';		/* at least one digit before the point */
 	if (neg)

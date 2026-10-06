@@ -56,6 +56,7 @@
 #include "nodes/plannodes.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 
 #include "df_executor.h"
@@ -532,6 +533,30 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_fail(b, "an operator");
 					return;
 				}
+				if (op->opresulttype == NUMERICOID)
+				{
+					/*
+					 * numeric + - * (N3): operands of + and - at the result
+					 * scale, those of * at their own (whose sum it is).
+					 */
+					Plan	   *ctx = level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+					int			rs = df_scale_of(ctx, node);
+					ListCell   *la;
+
+					appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"%s\",\"args\":[",
+									 name, df_tag(NUMERICOID, rs));
+					foreach(la, op->args)
+					{
+						if (foreach_current_index(la) > 0)
+							appendStringInfoChar(out, ',');
+						if (strcmp(name, "*") == 0)
+							df_emit(b, out, lfirst(la), level);
+						else
+							df_emit_numeric_at(b, out, lfirst(la), rs, level, ctx);
+					}
+					appendStringInfoString(out, "]}");
+					return;
+				}
 				appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"%s\",\"args\":", name, tag);
 				if (exprType(linitial(op->args)) == NUMERICOID)
 				{
@@ -600,6 +625,16 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				FuncExpr   *fe = (FuncExpr *) node;
 				const DfStringFunc *f = df_string_func(fe->funcid);
 				const char *tag = df_type_tag(fe->funcresulttype);
+
+				if (fe->funcid == F_NUMERIC_INT2 || fe->funcid == F_NUMERIC_INT4 ||
+					fe->funcid == F_NUMERIC_INT8)
+				{
+					/* an integer made numeric, exactly (N3) */
+					appendStringInfoString(out, "{\"cast\":");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfoString(out, ",\"type\":\"numeric\"}");
+					return;
+				}
 
 				if (f == NULL || tag == NULL)
 				{

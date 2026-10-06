@@ -90,7 +90,7 @@ use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer,
 use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Decimal128Type, Field, Float32Type, Float64Type, Int16Type, Int32Type,
+    ArrowPrimitiveType, DataType, Decimal256Type, Field, Float32Type, Float64Type, Int16Type, Int32Type,
     Int64Type, Schema, SchemaRef,
 };
 use datafusion::arrow::ipc::reader::StreamDecoder;
@@ -120,7 +120,7 @@ use tokio::task::JoinHandle;
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
-use crate::pgnum::{NumericFn, PgNumeric};
+use crate::pgnum::{NumOp, NumericFn, PgNumeric};
 use crate::pgstr::{PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
@@ -164,8 +164,8 @@ pub enum PgType {
     Timestamptz,
     // text and varchar: UTF-8 bytes, compared byte by byte.
     Text,
-    // numeric of a fixed scale, as Decimal128(38, scale): the C side builds
-    // PostgreSQL's numeric values from the integers.
+    // numeric of a fixed scale, as Decimal256(76, scale): the C side builds
+    // PostgreSQL's numeric values from the integers (pgnum).
     Numeric(i8),
 }
 
@@ -185,7 +185,7 @@ impl PgType {
             "text" => PgType::Text,
             "numeric" => PgType::Numeric(0),
             other if other.starts_with("numeric:") => match other["numeric:".len()..].parse::<i8>() {
-                Ok(s) if (0..=38).contains(&s) => PgType::Numeric(s),
+                Ok(s) if (0..=76).contains(&s) => PgType::Numeric(s),
                 _ => return Err(format!("unsupported type {other}")),
             },
             other => return Err(format!("unsupported type {other}")),
@@ -225,7 +225,7 @@ impl PgType {
             PgType::Float4 => DataType::Float32,
             PgType::Float8 => DataType::Float64,
             PgType::Text => DataType::Utf8,
-            PgType::Numeric(s) => DataType::Decimal128(38, s),
+            PgType::Numeric(s) => crate::pgnum::numeric_type(s),
             _ => unreachable!(),
         }
     }
@@ -328,14 +328,18 @@ fn literal(v: &Value) -> Result<Expr, String> {
         } else {
             Some(val.and_then(Value::as_str).ok_or("bad text literal")?.to_string())
         }),
-        PgType::Numeric(s) => ScalarValue::Decimal128(
+        PgType::Numeric(s) => ScalarValue::Decimal256(
             if null {
                 None
             } else {
                 // the integer times 10^-s, as a string (beyond JSON numbers)
-                Some(val.and_then(Value::as_str).and_then(|v| v.parse::<i128>().ok()).ok_or("bad numeric literal")?)
+                Some(
+                    val.and_then(Value::as_str)
+                        .and_then(datafusion::arrow::datatypes::i256::from_string)
+                        .ok_or("bad numeric literal")?,
+                )
             },
-            38,
+            crate::pgnum::NUMERIC_PRECISION,
             s,
         ),
         _ => unreachable!(),
@@ -398,6 +402,16 @@ fn expr(v: &Value) -> Result<Expr, String> {
             return Ok(binary_expr(a, cmp, b));
         }
         if let Some(arith) = ArithOp::from_pg(name) {
+            if let PgType::Numeric(to) = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+                // the C side passes + and - operands rescaled to `to`
+                let op = match arith {
+                    ArithOp::Add => NumOp::Add,
+                    ArithOp::Sub => NumOp::Sub,
+                    ArithOp::Mul => NumOp::Mul,
+                    _ => return Err(format!("numeric operator {name}")),
+                };
+                return Ok(PgNumeric::udf(NumericFn::Arith { op, to }).call(vec![a, b]));
+            }
             // PostgreSQL computes a cross-type operator in its result type.
             let ty = PgType::parse(field(v, "type")?.as_str().unwrap_or(""))?.arrow();
             return Ok(PgArith::udf(arith).call(vec![
@@ -514,7 +528,7 @@ fn aggregate(v: &Value) -> Result<Expr, String> {
         // PostgreSQL's sum(int8) and avg(int)'s sum: exact, as numeric.
         "sum_numeric" => sum(Expr::Cast(datafusion::logical_expr::Cast::new(
             Box::new(need(arg)?),
-            DataType::Decimal128(38, 0),
+            crate::pgnum::numeric_type(0),
         ))),
         // sum of numeric(p, s), NaN aside; the second aggregate notes NaNs
         // (`aggregate_extra`) and the projection after the aggregate makes
@@ -1507,7 +1521,7 @@ impl Query {
                     offsets = a.value_offsets().as_ptr();
                     (None, a.values().as_ptr())
                 }
-                PgType::Numeric(_) => (None, array.as_primitive::<Decimal128Type>().values().as_ptr() as *const u8),
+                PgType::Numeric(_) => (None, array.as_primitive::<Decimal256Type>().values().as_ptr() as *const u8),
                 _ => unreachable!(),
             };
             self.current.push(OutColumn { _array: array, offsets, bools, nulls, values });
@@ -1627,12 +1641,14 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
         PgType::Numeric(s) => {
-            // palloc aligns to 8 bytes, i128 wants 16.
-            let p = c.values as *const i128;
-            let values: Vec<i128> = (0..n).map(|r| std::ptr::read_unaligned(p.add(r))).collect();
+            // 32 little-endian bytes each; palloc aligns to 8 only.
+            let p = c.values as *const [u8; 32];
+            let values: Vec<datafusion::arrow::datatypes::i256> = (0..n)
+                .map(|r| datafusion::arrow::datatypes::i256::from_le_bytes(std::ptr::read_unaligned(p.add(r))))
+                .collect();
             Arc::new(
-                PrimitiveArray::<Decimal128Type>::new(ScalarBuffer::from(values), nulls)
-                    .with_data_type(DataType::Decimal128(38, s)),
+                PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
+                    .with_data_type(crate::pgnum::numeric_type(s)),
             )
         }
         _ => unreachable!(),

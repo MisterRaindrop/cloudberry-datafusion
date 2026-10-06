@@ -77,7 +77,7 @@ EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
  DataFusion: slice 1 eligible, sends Arrow batches
 (7 rows)
 
--- numeric results are not computed on further yet
+-- an avg's numeric result has no fixed scale: not computed on further
 EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -87,7 +87,7 @@ EXPLAIN (COSTS OFF) SELECT g, avg(a) + 1 FROM df_nm GROUP BY g;
          ->  Seq Scan on df_nm
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: operator + on numeric and numeric
+ DataFusion: slice 1 not eligible: operator + on numeric: of unknown precision or more than 76 digits
 (7 rows)
 
 RESET datafusion.motion_batches;
@@ -177,8 +177,8 @@ SELECT a % 7 AS k, sum(b), avg(e) FROM df_nm GROUP BY a % 7 ORDER BY k;
     |                       |                     
 (9 rows)
 
--- numeric(p, s) columns with p <= 38 (N2): Decimal128(38, s), NaN above
--- every value; sum and avg need p <= 28 to stay within 38 digits.
+-- numeric(p, s) columns with p <= 38 (N2): Decimal256(76, s), NaN above
+-- every value; sum and avg need p <= 66 to stay within 76 digits.
 CREATE TABLE df_nc (id int, g int, a numeric(10,2), b numeric(15,4), c numeric(38,0),
   d numeric(28,10), u numeric) DISTRIBUTED BY (id);
 INSERT INTO df_nc SELECT i, i % 7, ((i::bigint * 7919) % 2000000 - 1000000) / 100.0,
@@ -217,7 +217,7 @@ EXPLAIN (COSTS OFF) SELECT g, sum(a), avg(b), min(c), max(d) FROM df_nc WHERE b 
  DataFusion: slice 2 eligible, sends Arrow batches
 (13 rows)
 
-EXPLAIN (COSTS OFF) SELECT sum(c) FROM df_nc;
+EXPLAIN (COSTS OFF) SELECT sum(c * c) FROM df_nc;
                                                QUERY PLAN                                               
 --------------------------------------------------------------------------------------------------------
  Finalize Aggregate
@@ -226,7 +226,7 @@ EXPLAIN (COSTS OFF) SELECT sum(c) FROM df_nc;
                ->  Seq Scan on df_nc
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
- DataFusion: slice 1 not eligible: aggregate sum of numeric of unknown precision or more than 28 digits
+ DataFusion: slice 1 not eligible: aggregate sum of numeric of unknown precision or more than 66 digits
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT min(u) FROM df_nc;
@@ -241,14 +241,25 @@ EXPLAIN (COSTS OFF) SELECT min(u) FROM df_nc;
  DataFusion: slice 1 not eligible: aggregate min returning numeric of unknown precision
 (7 rows)
 
-EXPLAIN (COSTS OFF) SELECT a + 1 FROM df_nc;
+-- + - * (N3) have a fixed scale, / and % one that depends on the values
+EXPLAIN (COSTS OFF) SELECT a + 1, a * b, a - id FROM df_nc;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Seq Scan on df_nc
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: operator + on numeric and numeric
+ DataFusion: slice 1 eligible
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT a / b FROM df_nc;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: operator / on numeric: its scale depends on the values
 (5 rows)
 
 SET datafusion.mode = off;
@@ -377,10 +388,10 @@ SELECT id, a, b, c, d FROM df_nc WHERE id < 0 ORDER BY id;
 
 -- split through batch Motions: DataFusion's sums, NaN included
 SET datafusion.motion_batches = on;
-SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
- sum | avg | sum | avg | sum | avg 
------+-----+-----+-----+-----+-----
- NaN | NaN | NaN | NaN | NaN | NaN
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), sum(c) FROM df_nc;
+ sum | avg | sum | avg | sum | avg | sum 
+-----+-----+-----+-----+-----+-----+-----
+ NaN | NaN | NaN | NaN | NaN | NaN | NaN
 (1 row)
 
 SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
@@ -390,16 +401,98 @@ SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
 (1 row)
 
 SET datafusion.mode = off;
-SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d) FROM df_nc;
- sum | avg | sum | avg | sum | avg 
------+-----+-----+-----+-----+-----
- NaN | NaN | NaN | NaN | NaN | NaN
+SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), sum(c) FROM df_nc;
+ sum | avg | sum | avg | sum | avg | sum 
+-----+-----+-----+-----+-----+-----+-----
+ NaN | NaN | NaN | NaN | NaN | NaN | NaN
 (1 row)
 
 SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
     sum    |           avg           |   max   |    min    
 -----------+-------------------------+---------+-----------
  -60250.00 | -0.54355000000000000000 | 9998.89 | -999.8931
+(1 row)
+
+-- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
+SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+  id   |      ?column?      |     ?column?      |          ?column?          |   ?column?    |   ?column?   |   ?column?    |                                   ?column?                                   |                         ?column?                          |   ?column?    
+-------+--------------------+-------------------+----------------------------+---------------+--------------+---------------+------------------------------------------------------------------------------+-----------------------------------------------------------+---------------
+    -7 |             3.0000 |            0.0000 |                   2.250000 |          3.00 |        -0.50 |         0.750 |                                                                            1 |                                    2.25000000000000000000 |         -5.50
+    -6 |            -0.0001 |            0.0001 |                   0.000000 |          0.00 |         1.00 |         0.000 |                                                                            0 |                                    0.00000000000000000000 |         -6.00
+    -5 | -100099999999.9899 |  99900000000.0099 | 9999999998999990000.000001 | -199999999.98 | 100000000.99 | -49999999.995 | 9999999999999999999999999999999999999800000000000000000000000000000000000001 | 999999999999999999999999999800000000.00000000000000000001 | -100000004.99
+    -4 |  100099999999.9899 | -99900000000.0099 | 9999999998999990000.000001 |  199999999.98 | -99999998.99 |  49999999.995 | 9999999999999999999999999999999999999800000000000000000000000000000000000001 | 999999999999999999999999999800000000.00000000000000000001 |   99999995.99
+    -3 |                    |                   |                            |               |              |               |                                                                              |                                                           |              
+    -2 |             3.7500 |           -0.7500 |                   3.375000 |          3.00 |        -0.50 |         0.750 |                                                                            9 |                                    0.00000000000000000001 |         -0.50
+    -1 |                NaN |               NaN |                        NaN |           NaN |          NaN |           NaN |                                                                          NaN |                                                       NaN |           NaN
+  9973 |          -791.8983 |          315.6383 |              131868.845279 |       -476.26 |       239.13 |      -119.065 |                       994607289999999999999980107854200000000000000099460729 |                                    0.00000001743194730601 |       9734.87
+ 19946 |          9416.2034 |         9631.2766 |            -1024150.618884 |      19047.48 |     -9522.74 |      4761.870 |                      3978429159999999999999920431416800000000000000397842916 |                                    0.00000006972778922404 |      29469.74
+ 29919 |          -375.6949 |        -1053.0851 |             -241960.392489 |      -1428.78 |       715.39 |      -357.195 |                      8951465609999999999999820970687800000000000000895146561 |                                    0.00000015688752575409 |      29204.61
+ 39892 |          9832.4068 |         8262.5532 |             7101609.524464 |      18094.96 |     -9046.48 |      4523.740 |                     15913716639999999999999681725667200000000000001591371664 |                                    0.00000027891115689616 |      48939.48
+ 49865 |         -1959.4915 |         -421.8085 |              915421.131975 |      -2381.30 |      1191.65 |      -595.325 |                     24865182249999999999999502696355000000000000002486518225 |                                    0.00000043579868265025 |      48674.35
+(12 rows)
+
+SELECT g, sum(a * (1 - b)), sum(a * (1 - b) * (1 + a)), avg(a - 1) FROM df_nc GROUP BY g ORDER BY g;
+ g  |             sum              |              sum               |           avg           
+----+------------------------------+--------------------------------+-------------------------
+  0 |              25020333.380035 |          238754146044.05605397 |      1.4205390646877625
+  1 |              18542770.685000 |          533734517414.64608928 |     -1.9881478370432591
+  2 |             -54982981.124021 |          540097921601.79554663 |     -1.1965798684026319
+  3 |              10787529.952972 |          615497693953.83477200 |     -3.2049559008819824
+  4 |             -10084360.084021 |          668548535765.77411137 |     -5.2133319333613328
+  5 |             -28767865.235000 |          557984350812.10391072 |     -4.4217639647207056
+  6 |              14538982.500035 |          628225122065.11451603 | -0.83025199496010079798
+ 90 |                          NaN |                            NaN |                     NaN
+ 91 |                              |                                |                        
+ 92 | -19999999997999980000.000002 | -19979999998003979999.99980200 | -1.00000000000000000000
+ 93 |                    -0.750000 |                    -1.87500000 | -0.25000000000000000000
+(11 rows)
+
+SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
+ count 
+-------
+   452
+(1 row)
+
+SET datafusion.mode = on;
+SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
+FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
+  id   |      ?column?      |     ?column?      |          ?column?          |   ?column?    |   ?column?   |   ?column?    |                                   ?column?                                   |                         ?column?                          |   ?column?    
+-------+--------------------+-------------------+----------------------------+---------------+--------------+---------------+------------------------------------------------------------------------------+-----------------------------------------------------------+---------------
+    -7 |             3.0000 |            0.0000 |                   2.250000 |          3.00 |        -0.50 |         0.750 |                                                                            1 |                                    2.25000000000000000000 |         -5.50
+    -6 |            -0.0001 |            0.0001 |                   0.000000 |          0.00 |         1.00 |         0.000 |                                                                            0 |                                    0.00000000000000000000 |         -6.00
+    -5 | -100099999999.9899 |  99900000000.0099 | 9999999998999990000.000001 | -199999999.98 | 100000000.99 | -49999999.995 | 9999999999999999999999999999999999999800000000000000000000000000000000000001 | 999999999999999999999999999800000000.00000000000000000001 | -100000004.99
+    -4 |  100099999999.9899 | -99900000000.0099 | 9999999998999990000.000001 |  199999999.98 | -99999998.99 |  49999999.995 | 9999999999999999999999999999999999999800000000000000000000000000000000000001 | 999999999999999999999999999800000000.00000000000000000001 |   99999995.99
+    -3 |                    |                   |                            |               |              |               |                                                                              |                                                           |              
+    -2 |             3.7500 |           -0.7500 |                   3.375000 |          3.00 |        -0.50 |         0.750 |                                                                            9 |                                    0.00000000000000000001 |         -0.50
+    -1 |                NaN |               NaN |                        NaN |           NaN |          NaN |           NaN |                                                                          NaN |                                                       NaN |           NaN
+  9973 |          -791.8983 |          315.6383 |              131868.845279 |       -476.26 |       239.13 |      -119.065 |                       994607289999999999999980107854200000000000000099460729 |                                    0.00000001743194730601 |       9734.87
+ 19946 |          9416.2034 |         9631.2766 |            -1024150.618884 |      19047.48 |     -9522.74 |      4761.870 |                      3978429159999999999999920431416800000000000000397842916 |                                    0.00000006972778922404 |      29469.74
+ 29919 |          -375.6949 |        -1053.0851 |             -241960.392489 |      -1428.78 |       715.39 |      -357.195 |                      8951465609999999999999820970687800000000000000895146561 |                                    0.00000015688752575409 |      29204.61
+ 39892 |          9832.4068 |         8262.5532 |             7101609.524464 |      18094.96 |     -9046.48 |      4523.740 |                     15913716639999999999999681725667200000000000001591371664 |                                    0.00000027891115689616 |      48939.48
+ 49865 |         -1959.4915 |         -421.8085 |              915421.131975 |      -2381.30 |      1191.65 |      -595.325 |                     24865182249999999999999502696355000000000000002486518225 |                                    0.00000043579868265025 |      48674.35
+(12 rows)
+
+SELECT g, sum(a * (1 - b)), sum(a * (1 - b) * (1 + a)), avg(a - 1) FROM df_nc GROUP BY g ORDER BY g;
+ g  |             sum              |              sum               |           avg           
+----+------------------------------+--------------------------------+-------------------------
+  0 |              25020333.380035 |          238754146044.05605397 |      1.4205390646877625
+  1 |              18542770.685000 |          533734517414.64608928 |     -1.9881478370432591
+  2 |             -54982981.124021 |          540097921601.79554663 |     -1.1965798684026319
+  3 |              10787529.952972 |          615497693953.83477200 |     -3.2049559008819824
+  4 |             -10084360.084021 |          668548535765.77411137 |     -5.2133319333613328
+  5 |             -28767865.235000 |          557984350812.10391072 |     -4.4217639647207056
+  6 |              14538982.500035 |          628225122065.11451603 | -0.83025199496010079798
+ 90 |                          NaN |                            NaN |                     NaN
+ 91 |                              |                                |                        
+ 92 | -19999999997999980000.000002 | -19979999998003979999.99980200 | -1.00000000000000000000
+ 93 |                    -0.750000 |                    -1.87500000 | -0.25000000000000000000
+(11 rows)
+
+SELECT count(*) FROM df_nc WHERE a * 2 > b + 1.5 AND a - b < 100;
+ count 
+-------
+   452
 (1 row)
 
 RESET datafusion.motion_batches;
