@@ -32,6 +32,11 @@
 //!                input from a Motion, the stream column behind each column)
 //!   "plan":    <node>,
 //!   "output":  [ {"expr": <expr>, "type": "int8"}, ... ],
+//!   "sort":    [ {"col": c, "desc": b, "nulls_first": b}, ... ],  (optional:
+//!                the order of the output, by output columns; floats as
+//!                PostgreSQL orders them, see pgfloat)
+//!   "limit":   {"skip": n, "fetch": m},   (optional, after the sort; no
+//!                "fetch": all rows)
 //!   "route":   ... }                                   (as below)
 //!
 //! <node> := {"input": j}
@@ -996,6 +1001,17 @@ fn normalize_spec(mut spec: Value) -> Result<Value, String> {
     Ok(spec)
 }
 
+/// Does the slice sort all its rows (no Limit to keep only the top ones)?
+/// Each partition's sort then needs its share of the memory budget.
+fn has_full_sort(spec: &Value) -> bool {
+    spec.get("sort").is_some_and(|s| !s.is_null())
+        && spec
+            .get("limit")
+            .and_then(|l| l.get("fetch"))
+            .and_then(Value::as_u64)
+            .is_none()
+}
+
 /// Does the plan group rows in an aggregate (which caps the partitions)?
 fn has_grouped_aggregate(node: &Value) -> bool {
     if let Some(a) = node.get("aggregate") {
@@ -1379,7 +1395,7 @@ impl Query {
         }
 
         let plan_node = field(&spec, "plan").map_err(internal)?.clone();
-        let partitions = if has_grouped_aggregate(&plan_node) {
+        let partitions = if has_grouped_aggregate(&plan_node) || has_full_sort(&spec) {
             partitions
                 .max(1)
                 .min((memory_limit / MIN_PARTITION_MEMORY).max(1))
@@ -1477,7 +1493,34 @@ impl Query {
             );
             out_types.push(ty);
         }
-        let plan = b.project(out_exprs).map_err(df)?.build().map_err(df)?;
+        let mut b = b.project(out_exprs).map_err(df)?;
+        // S1: the slice's Sort, by output columns, then its Limit.
+        if let Some(keys) = spec.get("sort").filter(|v| !v.is_null()) {
+            let mut sorts = Vec::new();
+            for k in keys
+                .as_array()
+                .ok_or_else(|| internal("bad sort keys".into()))?
+            {
+                let c = index(field(k, "col").map_err(internal)?).map_err(internal)?;
+                let ty = out_types
+                    .get(c)
+                    .ok_or_else(|| internal(format!("sort key {c} is not an output")))?;
+                let flag = |name: &str| k.get(name).and_then(Value::as_bool).unwrap_or(false);
+                let e = col(format!("o{c}"));
+                let e = if is_float(&ty.arrow()) {
+                    FloatFn::Key.apply(e)
+                } else {
+                    e
+                };
+                sorts.push(e.sort(!flag("desc"), flag("nulls_first")));
+            }
+            b = b.sort(sorts).map_err(df)?;
+        }
+        if let Some(l) = spec.get("limit").filter(|v| !v.is_null()) {
+            let n = |name: &str| l.get(name).and_then(Value::as_u64).map(|n| n as usize);
+            b = b.limit(n("skip").unwrap_or(0), n("fetch")).map_err(df)?;
+        }
+        let plan = b.build().map_err(df)?;
         let route = match spec.get("route").filter(|v| !v.is_null()) {
             Some(r) if ipc_output => Some(HashRoute::parse(r).map_err(internal)?),
             Some(_) => return Err(internal("a route needs IPC output".into())),

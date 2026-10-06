@@ -56,6 +56,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "nodes/bitmapset.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
 #include "utils/array.h"
@@ -86,6 +87,8 @@ typedef struct DfCheckContext
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
 	Plan	   *node;			/* the node whose expressions are checked */
+	Plan	   *top;			/* where a Limit or Sort may be: the top of
+								 * the slice, or below its Limit (S1) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -1343,6 +1346,115 @@ df_relation_am(Oid relid)
 	return relam;
 }
 
+/* ---------------------------------------------------------------------
+ * S1: Sort and Limit at the top of a slice
+ * ---------------------------------------------------------------------
+ */
+
+/*
+ * The value of a Limit's OFFSET or COUNT 'expr', if it is a constant (or
+ * folds to one) and not negative: -1 for none (no expression, or NULL as
+ * in LIMIT ALL).  A negative value is PostgreSQL's error to raise.
+ */
+bool
+df_limit_value(Node *expr, int64 *value)
+{
+	Node	   *folded;
+	Const	   *c;
+
+	*value = -1;
+	if (expr == NULL)
+		return true;
+	folded = eval_const_expressions(NULL, copyObject(expr));
+	if (!IsA(folded, Const) || ((Const *) folded)->consttype != INT8OID)
+		return false;
+	c = (Const *) folded;
+	if (c->constisnull)
+		return true;
+	*value = DatumGetInt64(c->constvalue);
+	return *value >= 0;
+}
+
+/*
+ * Does 'sortop' order values of 'type' as its default btree operator class
+ * does, ascending (<) or descending (>)?  Those orders are what DataFusion
+ * sorts by (strings under a C collation, floats through pg_float_key).
+ */
+bool
+df_sort_direction(Oid sortop, Oid type, bool *desc)
+{
+	Oid			opfamily;
+	Oid			opcintype;
+	int16		strategy;
+	Oid			opclass = GetDefaultOpClass(type, BTREE_AM_OID);
+
+	if (!OidIsValid(opclass) ||
+		!get_ordering_op_properties(sortop, &opfamily, &opcintype, &strategy) ||
+		opfamily != get_opclass_family(opclass))
+		return false;
+	*desc = strategy == BTGreaterStrategyNumber;
+	return true;
+}
+
+/*
+ * Does 'plan' pass its child's rows through unchanged: no filter, and
+ * output column i is the child's column i, as Sort and Limit build them?
+ * set_dummy_tlist_references keeps a constant output of the child as the
+ * constant itself.
+ */
+bool
+df_passes_through(Plan *plan)
+{
+	ListCell   *lc;
+	Plan	   *child = outerPlan(plan);
+
+	if (plan->qual != NIL || child == NULL ||
+		list_length(plan->targetlist) != list_length(child->targetlist))
+		return false;
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		Var		   *var = (Var *) tle->expr;
+
+		if (IsA(var, Const) &&
+			equal(var, get_tle_by_resno(child->targetlist, tle->resno)->expr))
+			continue;
+		if (!IsA(var, Var) || var->varno != OUTER_VAR || var->varattno != tle->resno)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Is the output of the slice part 'top' (a Sort, or a Limit over one) in
+ * the order a sorted Motion's receiver merges by?  The planner builds
+ * them so; this guards the assumption.
+ */
+static bool
+df_sorted_for(Plan *top, Motion *motion)
+{
+	Sort	   *sort;
+	int			i;
+
+	if (IsA(top, Limit))
+		top = outerPlan(top);
+	if (!IsA(top, Sort) || motion->numSortCols > ((Sort *) top)->numCols)
+		return false;
+	sort = (Sort *) top;
+	for (i = 0; i < motion->numSortCols; i++)
+	{
+		TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
+		Var		   *var = tle ? (Var *) tle->expr : NULL;
+
+		if (var == NULL || !IsA(var, Var) || var->varno != OUTER_VAR ||
+			var->varattno != sort->sortColIdx[i] ||
+			motion->sortOperators[i] != sort->sortOperators[i] ||
+			motion->nullsFirst[i] != sort->nullsFirst[i])
+			return false;
+	}
+	return true;
+}
+
 static void
 df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			  bool root_is_sender)
@@ -1645,6 +1757,101 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_Limit:
+			{
+				Limit	   *limit = (Limit *) plan;
+				int64		v;
+
+				if (plan != cxt->top)
+				{
+					df_reject(cxt, "Limit below the top of the slice");
+					return;
+				}
+				if (limit->limitOption != LIMIT_OPTION_COUNT)
+				{
+					df_reject(cxt, "LIMIT WITH TIES");
+					return;
+				}
+				if (!df_limit_value(limit->limitCount, &v) ||
+					!df_limit_value(limit->limitOffset, &v))
+				{
+					df_reject(cxt, "LIMIT or OFFSET that is not a constant of at least 0");
+					return;
+				}
+				if (!df_passes_through(plan))
+				{
+					df_reject(cxt, "Limit that computes columns");
+					return;
+				}
+				/* a Sort may be below it */
+				cxt->top = outerPlan(plan);
+				df_check_plan(outerPlan(plan), cxt, needed, false);
+				return;
+			}
+
+		case T_Sort:
+			{
+				Sort	   *sort = (Sort *) plan;
+				Plan	   *child = outerPlan(plan);
+				Bitmapset  *child_needed = needed ? bms_copy(needed) : NULL;
+				int			i;
+
+				if (plan != cxt->top)
+				{
+					df_reject(cxt, "Sort below the top of the slice");
+					return;
+				}
+				cxt->top = NULL;
+				if (!df_passes_through(plan))
+				{
+					df_reject(cxt, "Sort that computes columns");
+					return;
+				}
+				for (i = 0; i < sort->numCols; i++)
+				{
+					TargetEntry *tle = get_tle_by_resno(child->targetlist, sort->sortColIdx[i]);
+					Oid			type;
+					bool		desc;
+
+					if (tle == NULL)
+					{
+						df_reject(cxt, "sort key outside the target list");
+						return;
+					}
+					type = exprType((Node *) tle->expr);
+					if (!df_type_supported(type))
+					{
+						df_reject(cxt, "sort key of type %s", format_type_be(type));
+						return;
+					}
+					if (!df_sort_direction(sort->sortOperators[i], type, &desc))
+					{
+						df_reject(cxt, "sort key ordered by operator %s",
+								  get_opname(sort->sortOperators[i]));
+						return;
+					}
+					if (df_type_is_string(type) &&
+						df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
+					{
+						df_reject(cxt, "sort key of type %s %s", format_type_be(type),
+								  df_string_compare_problem(cxt, "<", sort->collations[i]));
+						return;
+					}
+					if (IsA(tle->expr, Aggref) &&
+						(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
+						 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
+					{
+						/* the C side divides it, after DataFusion */
+						df_reject(cxt, "sort key avg returning numeric");
+						return;
+					}
+					if (child_needed)
+						child_needed = bms_add_member(child_needed, sort->sortColIdx[i]);
+				}
+				df_check_plan(child, cxt, child_needed, false);
+				return;
+			}
+
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
@@ -1700,12 +1907,14 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				/*
 				 * The sending Motion stays on PostgreSQL and pulls DataFusion's
-				 * rows.  A sorted send needs sorted input, and the remaining
-				 * types belong to parallel or DML plans.
+				 * rows.  A sorted send needs them sorted: a Sort at the top of
+				 * the slice (S1).  The remaining types belong to parallel or
+				 * DML plans.
 				 */
-				if (motion->sendSorted)
+				if (motion->sendSorted &&
+					(outerPlan(plan) == NULL || !df_sorted_for(outerPlan(plan), motion)))
 				{
-					df_reject(cxt, "sorted %s", df_plan_name(plan));
+					df_reject(cxt, "sorted %s without a Sort below it", df_plan_name(plan));
 					return;
 				}
 				if (motion->motionType != MOTIONTYPE_GATHER &&
@@ -1759,7 +1968,10 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	else if (stmt->hasModifyingCTE)
 		df_reject(&cxt, "data-modifying WITH is not supported");
 	else
+	{
+		cxt.top = root_is_sender ? outerPlan(root) : root;
 		df_check_plan(root, &cxt, NULL, root_is_sender);
+	}
 
 	if (locale_dependent)
 		*locale_dependent = cxt.locale_dependent;

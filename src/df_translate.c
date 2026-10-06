@@ -39,6 +39,10 @@
  * ("avg_merge").  Input columns from a Motion are therefore numbered by
  * their position in the stream (df_motion_stream_column).
  *
+ * A Sort and a Limit at the top of the slice (S1) pass the rows of the
+ * rest through: they become the spec's "sort", by output column, and
+ * "limit".
+ *
  * df_check_slice has already rejected anything this file cannot express,
  * so the translator reports a failure only as a safety net, and the slice
  * then stays on the PostgreSQL executor.
@@ -89,6 +93,8 @@ typedef struct DfBuilder
 								 * Aggref's own, or "sum" / "count" for the
 								 * parts of a partial avg's state */
 	Node	   *case_arg;		/* the value of the CASE being emitted (E1) */
+	int		   *out_col;		/* output column of each targetlist entry, by
+								 * resno (df_emit_outputs) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -1104,6 +1110,7 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		else
 			spec->nout++;
 	}
+	b->out_col = palloc0(sizeof(int) * (list_length(tlist) + 1));
 	spec->out_types = palloc(sizeof(Oid) * Max(spec->nout, 1));
 	spec->out_kinds = palloc0(sizeof(uint8) * Max(spec->nout, 1));
 	spec->out_scales = palloc0(sizeof(int16) * Max(spec->nout, 1));
@@ -1116,6 +1123,7 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *tlist, DfLevel level,
 		DfAggState	state = level == DF_LEVEL_AGG ?
 			df_partial_state((Node *) tle->expr) : DF_AGG_PLAIN;
 
+		b->out_col[tle->resno] = i;
 		if (state != DF_AGG_PLAIN)
 		{
 			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1, N2) */
@@ -1209,6 +1217,64 @@ df_slice_width(Plan *plan)
 }
 
 /*
+ * S1: the slice's Sort keys, as output columns of the spec, and its Limit:
+ * ,"sort":[{"col": c, "desc": b, "nulls_first": b}, ...],"limit":{...}
+ */
+static void
+df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
+				   Plan *body, DfSliceSpec *spec)
+{
+	int			i;
+
+	if (sort != NULL)
+	{
+		appendStringInfoString(out, ",\"sort\":[");
+		for (i = 0; i < sort->numCols; i++)
+		{
+			AttrNumber	k = sort->sortColIdx[i];
+			TargetEntry *tle = get_tle_by_resno(body->targetlist, k);
+			bool		desc;
+			int			c;
+
+			if (tle == NULL || k > list_length(body->targetlist) ||
+				!df_sort_direction(sort->sortOperators[i], exprType((Node *) tle->expr), &desc))
+			{
+				df_fail(b, "a sort key");
+				return;
+			}
+			c = b->out_col[k];
+			if (spec->out_kinds[c] != DF_OUT_PLAIN ||
+				spec->out_types[c] != exprType((Node *) tle->expr))
+			{
+				/* e.g. avg returning numeric, divided after DataFusion */
+				df_fail(b, "a sort key computed outside DataFusion");
+				return;
+			}
+			appendStringInfo(out, "%s{\"col\":%d,\"desc\":%s,\"nulls_first\":%s}",
+							 i > 0 ? "," : "", c, desc ? "true" : "false",
+							 sort->nullsFirst[i] ? "true" : "false");
+		}
+		appendStringInfoChar(out, ']');
+	}
+	if (limit != NULL)
+	{
+		int64		count,
+					offset;
+
+		if (!df_limit_value(limit->limitCount, &count) ||
+			!df_limit_value(limit->limitOffset, &offset))
+		{
+			df_fail(b, "a LIMIT or OFFSET");
+			return;
+		}
+		appendStringInfo(out, ",\"limit\":{\"skip\":" INT64_FORMAT, Max(offset, 0));
+		if (count >= 0)
+			appendStringInfo(out, ",\"fetch\":" INT64_FORMAT, count);
+		appendStringInfoChar(out, '}');
+	}
+}
+
+/*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
  */
@@ -1220,9 +1286,30 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 				group,
 				having,
 				outputs,
+				sortlimit,
 				json;
 	ListCell   *lc;
 	int			i;
+	Limit	   *limit = NULL;
+	Sort	   *sort = NULL;
+
+	/* S1: a Limit and a Sort at the top, over the rows of the rest */
+	if (IsA(root, Limit))
+	{
+		limit = (Limit *) root;
+		root = outerPlan(root);
+	}
+	if (root != NULL && IsA(root, Sort))
+	{
+		sort = (Sort *) root;
+		root = outerPlan(root);
+	}
+	if (root == NULL || (limit && !df_passes_through((Plan *) limit)) ||
+		(sort && !df_passes_through((Plan *) sort)))
+	{
+		snprintf(reason, reasonlen, "cannot translate a Limit or Sort");
+		return false;
+	}
 
 	memset(&b, 0, sizeof(b));
 	b.reason = reason;
@@ -1254,6 +1341,9 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		b.ctx = root;
 		df_emit_outputs(&b, &outputs, root->targetlist, DF_LEVEL_SCAN, spec, root);
 	}
+	initStringInfo(&sortlimit);
+	if (!b.failed)
+		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
 	if (b.failed)
 		return false;
 
@@ -1387,8 +1477,8 @@ df_translate_slice(Plan *root, DfSliceSpec *spec, char *reason, size_t reasonlen
 		}
 		spec->batch_rows = Min(DF_BATCH_MAX_ROWS,
 							   Max(DF_BATCH_MIN_ROWS, DF_BATCH_BYTES / Max(df_slice_width(root), 1)));
-		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s,\"batch_rows\":%d}",
-						 node.data, outputs.data, spec->batch_rows);
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d}",
+						 node.data, outputs.data, sortlimit.data, spec->batch_rows);
 	}
 
 	spec->json = json.data;

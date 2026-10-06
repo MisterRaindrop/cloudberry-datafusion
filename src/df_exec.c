@@ -300,6 +300,8 @@ df_hash_memory(PlanState *ps)
 	}
 	else if (IsA(ps, HashState))
 		bytes += df_hash_budget(ps->plan);
+	else if (IsA(ps, SortState))
+		bytes += PlanStateOperatorMemKB(ps) * 1024.0;	/* as nodeSort.c (S1) */
 	return bytes + df_hash_memory(outerPlanState(ps)) + df_hash_memory(innerPlanState(ps));
 }
 
@@ -309,8 +311,8 @@ df_slice_memory(PlanState *root)
 	double		bytes = df_hash_memory(root);
 
 	/*
-	 * Only hashed aggregates and Hash Join tables are limited by the
-	 * executor; their budgets add up.  Without them, as for a plain
+	 * Only hashed aggregates, Hash Join tables and sorts are limited by
+	 * the executor; their budgets add up.  Without them, as for a plain
 	 * aggregate or a scan, only the batches in flight need room: the
 	 * resource queue rates a plain Agg a light operator (100 kB), far too
 	 * little for those, and DataFusion's repartitioning would spill them.

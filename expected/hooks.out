@@ -88,7 +88,7 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT relnatts) FROM pg_class;
  DataFusion: slice 0 not eligible: DISTINCT or ORDER BY inside aggregate count
 (4 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0 LIMIT 1;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES;
                         QUERY PLAN                        
 ----------------------------------------------------------
  Limit
@@ -96,7 +96,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0 LIMIT 1;
          ->  Seq Scan on pg_class
                Filter: (relpages > 0)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: Limit is not supported
+ DataFusion: slice 0 not eligible: LIMIT WITH TIES
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE abs(relpages) > 0;
@@ -223,7 +223,7 @@ SELECT datafusion_debug_takeovers();
                           1
 (1 row)
 
-SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0 LIMIT 1;
+SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0 ORDER BY 1 FETCH FIRST 1 ROW WITH TIES;
  ok 
 ----
  t

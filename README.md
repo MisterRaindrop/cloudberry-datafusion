@@ -663,6 +663,39 @@ a float, NaN made positive, to an integer of its width in total order,
 and the result is mapped back.  Of -0 and 0, min returns -0 and max 0;
 PostgreSQL returns either, depending on row order.
 
+### Sort and LIMIT
+
+S1 runs a Sort and a Limit at the top of a slice: ORDER BY with LIMIT and
+OFFSET of constants (or expressions folding to one).  Below a sorted
+Gather Motion, each segment's slice sorts in DataFusion, with a Limit only
+its top rows (DataFusion's TopK), and PostgreSQL's receiver on the
+coordinator merges the sorted streams as it would PostgreSQL's.  The
+coordinator's own Limit over that merge stays on PostgreSQL: it computes
+nothing.  A slice without a Motion (catalog queries) runs its Sort and
+Limit itself.
+
+| Sort key | Order |
+|---|---|
+| integers, bool, date, time, timestamp, timestamptz | as stored; date and timestamp infinities at the ends |
+| float4, float8 | through `pg_float_key`: -0 equals 0, NaN above all numbers |
+| numeric(p, s) | Decimal256; NaN, stored above every number, last |
+| text, varchar | bytes, under a C collation only |
+
+NULLS FIRST/LAST and DESC are DataFusion's.  A sort key ordered by
+another operator (`USING ~<~`), a sort by an avg returning numeric
+(divided on the C side, after DataFusion), LIMIT ... WITH TIES, a LIMIT
+from a parameter and a Sort or Limit further down the slice stay on
+PostgreSQL.  A Sort's memory budget is the node's operator memory, as for
+PostgreSQL's Sort; DataFusion spills sorted runs to the backend's
+temporary directory beyond it.  A slice that stops early (a LIMIT
+reached) ends its scan there.
+
+Over 30 million rows: the top 10 by one column took 0.39 s against
+1.0-1.35 s, the top 100 of a filtered scan 0.27 s against 1.0-1.1 s, the
+top 5 groups by sum 0.27 s against 1.2-1.4 s, and sorting 30,000
+filtered rows 0.25 s against 0.84-1.09 s; a full sort of all 30 million
+under a 64 MB statement_mem spilled and returned PostgreSQL's rows.
+
 ## Build
 
 Requires a Cloudberry installation (for `pg_config` and server headers; the
