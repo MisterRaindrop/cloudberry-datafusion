@@ -450,7 +450,16 @@ blocks by their min/max.
 
 Arithmetic (`d - 1`, `d1 - d2`, anything returning `interval`) checks for
 overflow and infinities and stays on PostgreSQL, as do comparisons between
-two of these types (`ts > date`, `tz > ts`), which convert one side first.
+two of these types (`ts > date`, `tz > ts`), which convert one side first,
+but for a `date` against a `timestamp` constant: the planner folds
+`d < date '1994-01-01' + interval '1' year` into one, as in most TPC-H
+queries.  PostgreSQL compares the date's midnight with the timestamp,
+dates past the timestamp range after every finite one; DataFusion compares
+the date with the constant rounded to a date (up for `<` and `>=`, down
+for `<=` and `>`; `=` and `<>` on a constant within a day are constant),
+which gives the same answer for every date, infinities and dates past the
+timestamp range included, as each lies on the same side of the rounded
+constant as of the timestamp.
 
 Over 20 million heap rows on 3 segments, counting one year by a `date`
 range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s

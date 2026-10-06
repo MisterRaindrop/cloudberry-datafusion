@@ -657,10 +657,21 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				OpExpr	   *op = (OpExpr *) node;
 				char	   *name = get_opname(op->opno);
 				const char *tag = df_type_tag(op->opresulttype);
+				Node	   *date_arg;
+				const char *date_cmp;
+				int32		date_value;
 
 				if (name == NULL || tag == NULL)
 				{
 					df_fail(b, "an operator");
+					return;
+				}
+				if (df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
+				{
+					/* a date against a timestamp constant, as dates (DT1) */
+					appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[", date_cmp);
+					df_emit(b, out, date_arg, level);
+					appendStringInfo(out, ",{\"lit\":{\"type\":\"date\",\"value\":%d}}]}", date_value);
 					return;
 				}
 				if (op->opresulttype == NUMERICOID)

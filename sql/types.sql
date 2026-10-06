@@ -19,7 +19,9 @@
 -- PostgreSQL stores them (days or microseconds from 2000-01-01, time from
 -- midnight), infinities included.  Comparing two values of one type and
 -- min/max are integer comparisons; arithmetic, which checks for overflow
--- and infinities, and comparisons across types stay on PostgreSQL.  Each
+-- and infinities, and comparisons across types stay on PostgreSQL, but for
+-- a date against a timestamp constant (DT1), such as the folded
+-- "d < date '1994-01-01' + interval '1' year", which compares dates.  Each
 -- query runs with datafusion.mode off, then on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -70,6 +72,40 @@ WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER 
 SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
 -- Arithmetic stays on PostgreSQL, and fails there as it should.
 SELECT max(d - date '2000-01-01') FROM df_ty WHERE id >= -1;
+
+-- A date against a timestamp constant compares dates (DT1): the constant
+-- rounded up for < and >=, down for <= and >; = and <> on a constant
+-- within a day are constant.  Dates past the timestamp range sort after
+-- every finite timestamp, before infinity.
+CREATE TABLE df_ty3 (id int4, d date) DISTRIBUTED BY (id);
+INSERT INTO df_ty3 VALUES (1, '-infinity'), (2, 'infinity'), (3, '4713-01-01 BC'),
+  (4, '0044-03-15 BC'), (5, '1993-12-31'), (6, '1994-01-01'), (7, '1994-01-02'),
+  (8, '294276-12-31'), (9, '294277-01-01'), (10, '5874897-12-31'), (11, NULL);
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + interval '1' year;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+SET datafusion.mode = off;
+SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '1994-01-01 12:00' < d;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '0044-03-15 12:00 BC' >= d;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d = timestamp '1994-01-01' OR d = timestamp '1994-01-02 01:00';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-12-31 23:59:59.999999';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
+SET datafusion.mode = on;
+SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '1994-01-01 12:00' < d;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '0044-03-15 12:00 BC' >= d;
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d = timestamp '1994-01-01' OR d = timestamp '1994-01-02 01:00';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-12-31 23:59:59.999999';
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
+DROP TABLE df_ty3;
 
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.

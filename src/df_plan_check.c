@@ -61,6 +61,8 @@
 #include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
+#include "utils/timestamp.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -165,6 +167,76 @@ df_type_is_datetime(Oid type)
 {
 	return type == DATEOID || type == TIMEOID ||
 		type == TIMESTAMPOID || type == TIMESTAMPTZOID;
+}
+
+/*
+ * Is 'op' a date compared with a timestamp constant (DT1), such as the
+ * folded "d < date '1994-01-01' + interval '1' year"?  Sets 'date_arg'
+ * and the date comparison that answers it: 'cmp' on the date integers
+ * with 'value'.  PostgreSQL compares d * USECS_PER_DAY with the timestamp,
+ * dates past the timestamp range after every finite timestamp
+ * (date_cmp_timestamp_internal).  Those and the infinities lie on either
+ * side of the finite date the constant maps to, so comparing integers
+ * answers the same.  An = or <> on a constant within a day comes out
+ * constant (< or >= the earliest date).
+ */
+bool
+df_date_timestamp_cmp(OpExpr *op, Node **date_arg, const char **cmp, int32 *value)
+{
+	static const char *const names[][2] = {
+		{"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}, {"=", "="}, {"<>", "<>"}
+	};
+	Node	   *l,
+			   *r;
+	Const	   *c;
+	char	   *name;
+	Timestamp	t;
+	int64		floor_day;
+	bool		exact;
+	int			i;
+
+	if (list_length(op->args) != 2 || op->opresulttype != BOOLOID)
+		return false;
+	l = linitial(op->args);
+	r = lsecond(op->args);
+	if (exprType(l) == DATEOID && exprType(r) == TIMESTAMPOID && IsA(r, Const))
+		c = (Const *) r;
+	else if (exprType(l) == TIMESTAMPOID && exprType(r) == DATEOID && IsA(l, Const))
+	{
+		c = (Const *) l;
+		l = r;
+	}
+	else
+		return false;
+	if (c->constisnull || (name = get_opname(op->opno)) == NULL)
+		return false;
+	for (i = 0; i < lengthof(names) && strcmp(names[i][0], name) != 0; i++)
+		;
+	if (i == lengthof(names))
+		return false;
+	/* the constant on the left: t < d is d > t */
+	*cmp = names[i][(Node *) c == linitial(op->args) ? 1 : 0];
+	*date_arg = l;
+
+	t = DatumGetTimestamp(c->constvalue);
+	if (TIMESTAMP_IS_NOBEGIN(t) || TIMESTAMP_IS_NOEND(t))
+	{
+		*value = TIMESTAMP_IS_NOBEGIN(t) ? DATEVAL_NOBEGIN : DATEVAL_NOEND;
+		return true;
+	}
+	floor_day = t / USECS_PER_DAY - (t % USECS_PER_DAY < 0 ? 1 : 0);
+	exact = t % USECS_PER_DAY == 0;
+	if (strcmp(*cmp, "<") == 0 || strcmp(*cmp, ">=") == 0)
+		*value = (int32) (floor_day + (exact ? 0 : 1));
+	else if (strcmp(*cmp, "<=") == 0 || strcmp(*cmp, ">") == 0 || exact)
+		*value = (int32) floor_day;
+	else
+	{
+		/* = within a day: never; <> always (NULL on NULL) */
+		*cmp = strcmp(*cmp, "=") == 0 ? "<" : ">=";
+		*value = DATEVAL_NOBEGIN;
+	}
+	return true;
 }
 
 /*
@@ -908,6 +980,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				{
 					Oid			ltype = exprType(linitial(op->args));
 					Oid			rtype = exprType(lsecond(op->args));
+					Node	   *date_arg;
+					const char *date_cmp;
+					int32		date_value;
 
 					/*
 					 * Arithmetic on dates and times checks for overflow and
@@ -921,7 +996,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 									  format_type_be(ltype), format_type_be(rtype));
 					}
 					else if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
-							 (op->opresulttype != BOOLOID || ltype != rtype))
+							 (op->opresulttype != BOOLOID || ltype != rtype) &&
+							 !df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
 						df_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
 					else if (ltype == NUMERICOID || rtype == NUMERICOID)
