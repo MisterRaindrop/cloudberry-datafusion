@@ -22,5 +22,6 @@ pub mod cdbhash;
 pub mod debug;
 pub mod memory;
 pub mod pgfunc;
+pub mod pgstr;
 pub mod query;
 pub mod runtime;

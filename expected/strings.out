@@ -114,17 +114,31 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
  DataFusion: slice 1 not eligible: operator = on text under a nondeterministic collation
 (8 rows)
 
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%';
-                   QUERY PLAN                   
-------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_st
-                     Filter: (t ~~ 'k1%'::text)
+                     Filter: ((t ~~ 'k1%'::text) AND ((v)::text !~~ '%9'::text))
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator ~~
+ DataFusion: slice 1 eligible, sends Arrow batches
+(8 rows)
+
+-- PostgreSQL raises an error only on rows that reach the dangling escape.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE E'k1\\';
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_st
+                     Filter: (t ~~ 'k1\'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: LIKE pattern ending with an escape character
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
@@ -288,6 +302,32 @@ SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
  666664 | 100000
 (1 row)
 
+SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+ count 
+-------
+ 20001
+(1 row)
+
+SELECT count(*) FROM df_st WHERE t LIKE '%2_3' OR t LIKE '中_字%' OR v LIKE E'tab\t%';
+ count 
+-------
+  1002
+(1 row)
+
+SELECT id FROM df_st WHERE t LIKE E'%\\\\%' OR t LIKE E'%quo"te%line' OR t LIKE '' ORDER BY id;
+ id 
+----
+ -4
+ -1
+(2 rows)
+
+-- a pattern from a column
+SELECT count(*) FROM df_st WHERE (t LIKE v) IS NOT NULL AND t NOT LIKE u;
+ count  
+--------
+ 100002
+(1 row)
+
 SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
   count  |     sum      |     sum      
 ---------+--------------+--------------
@@ -408,6 +448,32 @@ SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
  count  |  max   
 --------+--------
  666664 | 100000
+(1 row)
+
+SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+ count 
+-------
+ 20001
+(1 row)
+
+SELECT count(*) FROM df_st WHERE t LIKE '%2_3' OR t LIKE '中_字%' OR v LIKE E'tab\t%';
+ count 
+-------
+  1002
+(1 row)
+
+SELECT id FROM df_st WHERE t LIKE E'%\\\\%' OR t LIKE E'%quo"te%line' OR t LIKE '' ORDER BY id;
+ id 
+----
+ -4
+ -1
+(2 rows)
+
+-- a pattern from a column
+SELECT count(*) FROM df_st WHERE (t LIKE v) IS NOT NULL AND t NOT LIKE u;
+ count  
+--------
+ 100002
 (1 row)
 
 SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;

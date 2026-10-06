@@ -57,7 +57,9 @@ EXPLAIN (COSTS OFF) SELECT min(t COLLATE "C"), max(v COLLATE "C") FROM df_st WHE
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE u < 'b';
 EXPLAIN (COSTS OFF) SELECT min(u) FROM df_st;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
-EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+-- PostgreSQL raises an error only on rows that reach the dangling escape.
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE E'k1\\';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
 EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
@@ -79,6 +81,11 @@ SELECT v, count(*), max(id) FROM df_st
 WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
 SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
 SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+SELECT count(*) FROM df_st WHERE t LIKE '%2_3' OR t LIKE '中_字%' OR v LIKE E'tab\t%';
+SELECT id FROM df_st WHERE t LIKE E'%\\\\%' OR t LIKE E'%quo"te%line' OR t LIKE '' ORDER BY id;
+-- a pattern from a column
+SELECT count(*) FROM df_st WHERE (t LIKE v) IS NOT NULL AND t NOT LIKE u;
 SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
 SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;
@@ -101,6 +108,11 @@ SELECT v, count(*), max(id) FROM df_st
 WHERE v = 'v1' OR v = 'v1 ' OR v = 'ünïcödé' OR v = '' OR v IS NULL GROUP BY v ORDER BY v;
 SELECT u, count(*) FROM df_st GROUP BY u ORDER BY u COLLATE "C" LIMIT 5;
 SELECT count(*), max(a.id) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
+SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
+SELECT count(*) FROM df_st WHERE t LIKE '%2_3' OR t LIKE '中_字%' OR v LIKE E'tab\t%';
+SELECT id FROM df_st WHERE t LIKE E'%\\\\%' OR t LIKE E'%quo"te%line' OR t LIKE '' ORDER BY id;
+-- a pattern from a column
+SELECT count(*) FROM df_st WHERE (t LIKE v) IS NOT NULL AND t NOT LIKE u;
 SELECT count(*), sum(a.id), sum(b.id) FROM df_st a JOIN df_st b ON a.t = b.t;
 SELECT count(*), sum(n) FROM (SELECT v, count(*) AS n FROM df_st GROUP BY v) s;
 SELECT count(*), count(b.id) FROM df_st a LEFT JOIN df_st2 b ON a.v = b.tv AND b.id < 3000;

@@ -120,6 +120,7 @@ use tokio::task::JoinHandle;
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
+use crate::pgstr::PgLike;
 use crate::runtime;
 
 /// Rows per input batch the main thread pushes.
@@ -367,6 +368,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
             return Err(format!("operator {name} with {} arguments", args.len()));
         }
         let (a, b) = (expr(&args[0])?, expr(&args[1])?);
+        if name == "~~" || name == "!~~" {
+            return Ok(PgLike::udf(name == "!~~").call(vec![a, b]));
+        }
         if let Some(cmp) = comparison(name) {
             return Ok(binary_expr(a, cmp, b));
         }
@@ -425,13 +429,19 @@ fn expr(v: &Value) -> Result<Expr, String> {
     Err(format!("plan spec: unknown expression {v}"))
 }
 
-/// Can evaluating this expression raise an error?  Only the PostgreSQL
-/// arithmetic operators can (overflow, division by zero).
+/// Can evaluating this expression raise an error?  The PostgreSQL
+/// arithmetic operators can (overflow, division by zero), and LIKE with a
+/// pattern that is not a constant (one ending in an escape character).
 fn may_fail(v: &Value) -> bool {
     match v {
         Value::Object(map) => {
             if let Some(op) = map.get("op").and_then(Value::as_str) {
                 if ArithOp::from_pg(op).is_some() {
+                    return true;
+                }
+                if (op == "~~" || op == "!~~")
+                    && map.get("args").and_then(|a| a.get(1)).map_or(true, |p| p.get("lit").is_none())
+                {
                     return true;
                 }
             }

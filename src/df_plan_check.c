@@ -161,7 +161,9 @@ df_type_is_string(Oid type)
 static const char *
 df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 {
-	bool		equality = strcmp(name, "=") == 0 || strcmp(name, "<>") == 0;
+	/* LIKE compares bytes too, and PostgreSQL rejects it otherwise */
+	bool		equality = strcmp(name, "=") == 0 || strcmp(name, "<>") == 0 ||
+		strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0;
 
 	if (!equality && collation == DEFAULT_COLLATION_OID)
 		cxt->locale_dependent = true;
@@ -170,6 +172,32 @@ df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 	if (equality ? !get_collation_isdeterministic(collation) : !lc_collate_is_c(collation))
 		return equality ? "under a nondeterministic collation" : "under a collation other than C";
 	return NULL;
+}
+
+/* Is 'node' a constant LIKE pattern whose last backslash escapes nothing? */
+static bool
+df_like_pattern_ends_in_escape(Node *node)
+{
+	text	   *t;
+	const char *p;
+	int			len,
+				i;
+
+	if (!IsA(node, Const) || ((Const *) node)->constisnull)
+		return false;
+	t = DatumGetTextPP(((Const *) node)->constvalue);
+	p = VARDATA_ANY(t);
+	len = VARSIZE_ANY_EXHDR(t);
+	for (i = 0; i < len; i++)
+	{
+		if (p[i] == '\\')
+		{
+			if (i + 1 == len)
+				return true;
+			i++;				/* the escaped byte */
+		}
+	}
+	return false;
 }
 
 static bool
@@ -287,7 +315,7 @@ static bool
 df_check_expr(Node *node, DfCheckContext *cxt)
 {
 	static const char *const operators[] =
-	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", NULL};
+	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "~~", "!~~", NULL};
 	static const char *const aggregates[] =
 	{"count", "sum", "min", "max", "avg", NULL};
 
@@ -382,6 +410,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						else if ((problem = df_string_compare_problem(cxt, name, op->inputcollid)) != NULL)
 							df_reject(cxt, "operator %s on %s %s", name,
 									  format_type_be(ltype), problem);
+						else if ((strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0) &&
+								 df_like_pattern_ends_in_escape(lsecond(op->args)))
+							/* PostgreSQL may raise an error, depending on the rows */
+							df_reject(cxt, "LIKE pattern ending with an escape character");
 					}
 				}
 				if (cxt->failed)

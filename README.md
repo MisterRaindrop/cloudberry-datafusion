@@ -425,6 +425,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | T1 | `date`, `time`, `timestamp` and `timestamptz` |
 | X1 | `text` and `varchar`; batch size from the row width |
 | X2 | Redistribute batches by `text` and `varchar` keys (`hashtext`) |
+| L1 | `LIKE` and `NOT LIKE` |
 
 ### Date and time types
 
@@ -472,10 +473,25 @@ verdict, a segment may run the same slice on PostgreSQL, and the Motions
 of a slice whose verdict depends on the default collation carry tuples
 rather than batches, so that every node agrees on which Motions carry
 batches.  An explicit `COLLATE "C"` is the same everywhere and keeps the
-batches.  Functions and operators on strings (`LIKE`, `||`, `length`)
+batches.  Functions and operators on strings (`||`, `length`, `ILIKE`)
 stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out fixed-width values only;
 a PAX table with a string column is read through the table AM.
+
+`LIKE` and `NOT LIKE` (L1) run through `df_core::pgstr`, a transcription
+of PostgreSQL's matcher for UTF-8 (`UTF8_MatchText`): `%`, `_` as one
+character, backslash escapes, newlines matched by `%`.  In a UTF-8
+database it does not depend on the locale, so any deterministic collation
+qualifies (PostgreSQL rejects LIKE under a nondeterministic one).  A
+constant pattern is prepared once: without `_` it becomes literal pieces
+between `%`'s, checked with prefix, suffix and substring searches.  A
+pattern ending in an unescaped backslash raises an error in PostgreSQL
+only on rows whose matching reaches it, so such a constant pattern stays
+on PostgreSQL; a pattern from a column goes through the same matcher and
+raises the same error (22025) on the same rows, and runs behind the
+guards of AND and OR like arithmetic does.  Over 20 million rows, `LIKE
+'%00042%'` took 0.24 s against 1.04 s in PostgreSQL, `LIKE 'city-4%'`
+0.23 s against 0.72 s.
 
 Redistribute Motions by a `text` or `varchar` key carry batches too (X2):
 cdbhash calls `hashtext` with the default collation, which is always
