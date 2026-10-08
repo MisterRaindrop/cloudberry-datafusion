@@ -1199,6 +1199,124 @@ SET optimizer = off;
 SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_av;
+-- Numeric values received as tuples (WT1, TPC-H Q22 under ORCA, whose avg
+-- is broadcast from the coordinator) are read into all 76 digits of
+-- Decimal256: an avg at scale 40, a product of 40 digits at scale 3,
+-- whose last NBASE digit reaches past the scale.
+CREATE TABLE df_wv (id int, g int, x numeric(36,2)) DISTRIBUTED BY (id);
+INSERT INTO df_wv SELECT k, k % 7,
+  (CASE WHEN k % 5 = 0 THEN -1 ELSE 1 END) *
+  (k::numeric * 1000000000000000000000000000000 + k * 0.37 + (k % 3) * 0.01)
+FROM generate_series(1, 300) k;
+INSERT INTO df_wv VALUES (-1, 10, 1.00), (-2, 10, 3.00), (-3, 10, 2.00), (-4, 10, 2.01),
+  (-7, 12, 999999999999999999999999999999999.99),
+  (-8, 12, 999999999999999999999999999999999.98),
+  (-9, 12, 999999999999999999999999999999999.97);
+ANALYZE df_wv;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Nested Loop
+                     Join Filter: (df_wv.x > (avg(df_wv_1.x)))
+                     ->  Broadcast Motion 1:3  (slice2)
+                           ->  Finalize Aggregate
+                                 ->  Gather Motion 3:1  (slice3; segments: 3)
+                                       ->  Partial Aggregate
+                                             ->  Seq Scan on df_wv df_wv_1
+                     ->  Seq Scan on df_wv
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 not eligible: combining aggregate avg without batch Motions
+ DataFusion: slice 3 not eligible: partial aggregate avg without batch Motions
+(16 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+ count |  sum  
+-------+-------
+   165 | 32173
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x < (SELECT avg(x) FROM df_wv WHERE g = 3);
+ count |  sum  
+-------+-------
+   134 | 12203
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x >= (SELECT avg(x) FROM df_wv WHERE g = 10);
+ count |  sum  
+-------+-------
+   245 | 35970
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x <= (SELECT avg(x) FROM df_wv WHERE g = 12);
+ count |  sum  
+-------+-------
+   306 | 45123
+(1 row)
+
+SELECT g, max(y), min(y), count(*) FROM (SELECT g, x * 1000.5 AS y FROM df_wv) s GROUP BY g ORDER BY g;
+ g  |                    max                    |                    min                    | count 
+----+-------------------------------------------+-------------------------------------------+-------
+  0 |  294147000000000000000000000000108834.390 | -280140000000000000000000000000103661.805 |    42
+  1 |  288144000000000000000000000000106613.280 | -295147500000000000000000000000109214.580 |    43
+  2 |  296148000000000000000000000000109594.770 | -275137500000000000000000000000101820.885 |    43
+  3 |  297148500000000000000000000000109944.945 | -290145000000000000000000000000107373.660 |    43
+  4 |  298149000000000000000000000000110325.135 | -270135000000000000000000000000099949.950 |    43
+  5 |  299149500000000000000000000000110705.325 | -285142500000000000000000000000105502.725 |    43
+  6 |  293146500000000000000000000000108484.215 | -300150000000000000000000000000111055.500 |    43
+ 10 |                                  3001.500 |                                  1000.500 |     4
+ 12 | 1000499999999999999999999999999999989.995 | 1000499999999999999999999999999999969.985 |     3
+(9 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+ count |  sum  
+-------+-------
+   165 | 32173
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x < (SELECT avg(x) FROM df_wv WHERE g = 3);
+ count |  sum  
+-------+-------
+   134 | 12203
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x >= (SELECT avg(x) FROM df_wv WHERE g = 10);
+ count |  sum  
+-------+-------
+   245 | 35970
+(1 row)
+
+SELECT count(*), sum(id) FROM df_wv WHERE x <= (SELECT avg(x) FROM df_wv WHERE g = 12);
+ count |  sum  
+-------+-------
+   306 | 45123
+(1 row)
+
+SELECT g, max(y), min(y), count(*) FROM (SELECT g, x * 1000.5 AS y FROM df_wv) s GROUP BY g ORDER BY g;
+ g  |                    max                    |                    min                    | count 
+----+-------------------------------------------+-------------------------------------------+-------
+  0 |  294147000000000000000000000000108834.390 | -280140000000000000000000000000103661.805 |    42
+  1 |  288144000000000000000000000000106613.280 | -295147500000000000000000000000109214.580 |    43
+  2 |  296148000000000000000000000000109594.770 | -275137500000000000000000000000101820.885 |    43
+  3 |  297148500000000000000000000000109944.945 | -290145000000000000000000000000107373.660 |    43
+  4 |  298149000000000000000000000000110325.135 | -270135000000000000000000000000099949.950 |    43
+  5 |  299149500000000000000000000000110705.325 | -285142500000000000000000000000105502.725 |    43
+  6 |  293146500000000000000000000000108484.215 | -300150000000000000000000000000111055.500 |    43
+ 10 |                                  3001.500 |                                  1000.500 |     4
+ 12 | 1000499999999999999999999999999999989.995 | 1000499999999999999999999999999999969.985 |     3
+(9 rows)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_wv;
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -3258,14 +3258,14 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 									s;
 
 						/*
-						 * Tuples' numeric values are read into 38 digits;
-						 * batches carry Decimal256 (an avg, AVG1)
+						 * Tuples' numeric values are read into Decimal256's
+						 * 76 digits, as batches carry them (an avg, AVG1)
 						 */
 						if (bms_is_member(tle->resno, needed) && !state &&
 							(!df_type_supported(type) ||
 							 (type == NUMERICOID &&
 							  (!df_numeric_ps(plan, (Node *) tle->expr, &p, &s) ||
-							   (!batch && p > DF_NUMERIC_MAX_PRECISION)))))
+							   p > DF_NUMERIC_MAX_EXPR_PRECISION))))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;

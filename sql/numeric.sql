@@ -279,6 +279,39 @@ SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_av;
 
+-- Numeric values received as tuples (WT1, TPC-H Q22 under ORCA, whose avg
+-- is broadcast from the coordinator) are read into all 76 digits of
+-- Decimal256: an avg at scale 40, a product of 40 digits at scale 3,
+-- whose last NBASE digit reaches past the scale.
+CREATE TABLE df_wv (id int, g int, x numeric(36,2)) DISTRIBUTED BY (id);
+INSERT INTO df_wv SELECT k, k % 7,
+  (CASE WHEN k % 5 = 0 THEN -1 ELSE 1 END) *
+  (k::numeric * 1000000000000000000000000000000 + k * 0.37 + (k % 3) * 0.01)
+FROM generate_series(1, 300) k;
+INSERT INTO df_wv VALUES (-1, 10, 1.00), (-2, 10, 3.00), (-3, 10, 2.00), (-4, 10, 2.01),
+  (-7, 12, 999999999999999999999999999999999.99),
+  (-8, 12, 999999999999999999999999999999999.98),
+  (-9, 12, 999999999999999999999999999999999.97);
+ANALYZE df_wv;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+SELECT count(*), sum(id) FROM df_wv WHERE x < (SELECT avg(x) FROM df_wv WHERE g = 3);
+SELECT count(*), sum(id) FROM df_wv WHERE x >= (SELECT avg(x) FROM df_wv WHERE g = 10);
+SELECT count(*), sum(id) FROM df_wv WHERE x <= (SELECT avg(x) FROM df_wv WHERE g = 12);
+SELECT g, max(y), min(y), count(*) FROM (SELECT g, x * 1000.5 AS y FROM df_wv) s GROUP BY g ORDER BY g;
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x) FROM df_wv);
+SELECT count(*), sum(id) FROM df_wv WHERE x < (SELECT avg(x) FROM df_wv WHERE g = 3);
+SELECT count(*), sum(id) FROM df_wv WHERE x >= (SELECT avg(x) FROM df_wv WHERE g = 10);
+SELECT count(*), sum(id) FROM df_wv WHERE x <= (SELECT avg(x) FROM df_wv WHERE g = 12);
+SELECT g, max(y), min(y), count(*) FROM (SELECT g, x * 1000.5 AS y FROM df_wv) s GROUP BY g ORDER BY g;
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_wv;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

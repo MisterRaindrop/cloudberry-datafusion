@@ -148,8 +148,9 @@ extern int	df_agg_state_ncols(DfAggState state);
 
 /*
  * df_numeric.c: numeric values of a fixed scale as Decimal256 (N2, N3).
- * Columns and constants are read with up to 38 digits (as int128), and
- * expressions keep up to 76; a sum adds up values of up to 66.
+ * Columns and constants are read with up to 38 digits (as int128), values
+ * received as tuples with up to 76, and expressions keep up to 76; a sum
+ * adds up values of up to 66.
  */
 #define DF_NUMERIC_MAX_PRECISION 38
 #define DF_NUMERIC_MAX_EXPR_PRECISION 76
@@ -168,6 +169,7 @@ typedef enum DfNumericFit
 
 extern bool df_numeric_typmod(int32 typmod, int *precision, int *scale);
 extern DfNumericFit df_numeric_value(Datum d, int scale, int128 *out);
+extern DfNumericFit df_numeric_value_wide(Datum d, int scale, uint8 *dst);
 extern bool df_numeric_const_ps(Datum d, int *precision, int *scale);
 extern void df_numeric_store(int128 v, uint8 *dst);
 extern Datum df_numeric_datum(const uint8 *src, int scale);

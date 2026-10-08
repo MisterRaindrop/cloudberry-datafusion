@@ -445,6 +445,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
+| WT1 | Numeric values received as tuples with up to 76 digits |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -717,9 +718,14 @@ a sum of scale s (a dividend of at least 10^-s, a count below 10^20).
 Comparing, grouping and hashing by it read the value only.  Its display
 scale is not PostgreSQL's, so it leaves DataFusion only through a batch
 Motion: as an output column PostgreSQL finishes the expression over the
-avg the C side divides, or the slice stays on PostgreSQL, and a tuple
-Motion's numeric columns stay within 38 digits.  A numeric constant
-compared with it may have up to 76 digits.
+avg the C side divides, or the slice stays on PostgreSQL.  A numeric
+constant compared with it may have up to 76 digits.
+
+WT1: a numeric value received through a tuple Motion is read into all 76
+digits of Decimal256 (df_numeric_value_wide), not only the 38 of int128:
+TPC-H Q22 under GPORCA broadcasts an avg PostgreSQL computes on the
+coordinator, held at scale 40 by the slices receiving it.  Values within
+38 digits keep the int128 path.
 
 ### numeric(p, s) columns
 

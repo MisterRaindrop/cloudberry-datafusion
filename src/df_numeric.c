@@ -185,6 +185,108 @@ df_numeric_value(Datum d, int scale, int128 *out)
 	return fit;
 }
 
+/* w = w * m + a, on four little-endian 64-bit words */
+static void
+df_wide_muladd(uint64 *w, uint64 m, uint64 a)
+{
+	uint128		carry = a;
+	int			i;
+
+	for (i = 0; i < 4; i++)
+	{
+		uint128		cur = (uint128) w[i] * m + carry;
+
+		w[i] = (uint64) cur;
+		carry = cur >> 64;
+	}
+}
+
+/*
+ * As df_numeric_value, into the Decimal256 value at 'dst', for values of up
+ * to 76 digits at 'scale' (N3's expressions): a tuple read into a column of
+ * such a type, an avg (AVG1) received from PostgreSQL.  The value is built
+ * digit by digit, NBASE at a time, then shifted to the scale.
+ */
+DfNumericFit
+df_numeric_value_wide(Datum d, int scale, uint8 *dst)
+{
+	struct varlena *v;
+	DfNumericParts parts;
+	uint64		w[4] = {0, 0, 0, 0};
+	int128		narrow;
+	int			exp10 = 0;
+	int			i;
+	DfNumericFit fit;
+
+	fit = df_numeric_value(d, scale, &narrow);
+	if (fit != DF_NUMERIC_TOO_LONG)
+	{
+		df_numeric_store(narrow, dst);
+		return fit;
+	}
+	v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d));
+	df_numeric_parts(v, &parts);
+	if (parts.dscale > scale ||
+		df_numeric_int_digits(&parts) + scale > DF_NUMERIC_MAX_EXPR_PRECISION)
+		fit = DF_NUMERIC_TOO_LONG;
+	else
+	{
+		bool		started = false;
+
+		fit = DF_NUMERIC_FITS;
+		for (i = 0; i < parts.ndigits; i++)
+		{
+			NumericDigit dig;
+			int			e = (parts.weight - i) * DEC_DIGITS + scale;
+
+			memcpy(&dig, parts.digits + i * sizeof(NumericDigit), sizeof(dig));
+			if (e >= 0)
+			{
+				/* Horner: the digits so far are then worth 10^e each */
+				df_wide_muladd(w, started ? NBASE : 1, dig);
+				started = true;
+				exp10 = e;
+			}
+			else
+			{
+				/* past the scale: dropped digits are 0 */
+				while (exp10 > 0)
+				{
+					int			k = Min(exp10, 18);
+
+					df_wide_muladd(w, (uint64) df_pow10(k), 0);
+					exp10 -= k;
+				}
+				if (e > -DEC_DIGITS)
+					df_wide_muladd(w, 1, dig / (int) df_pow10(-e));
+				break;
+			}
+		}
+		while (exp10 > 0)
+		{
+			int			k = Min(exp10, 18);
+
+			df_wide_muladd(w, (uint64) df_pow10(k), 0);
+			exp10 -= k;
+		}
+		if (parts.neg)
+		{
+			/* two's complement: invert and add one */
+			uint64		carry = 1;
+
+			for (i = 0; i < 4; i++)
+			{
+				w[i] = ~w[i] + carry;
+				carry = (carry && w[i] == 0) ? 1 : 0;
+			}
+		}
+		memcpy(dst, w, sizeof(w));
+	}
+	if ((Pointer) v != DatumGetPointer(d))
+		pfree(v);
+	return fit;
+}
+
 bool
 df_numeric_const_ps(Datum d, int *precision, int *scale)
 {
