@@ -353,8 +353,10 @@ on PostgreSQL.  Reading the Hash side to its
 end before the other, also from the interconnect, keeps the deadlock
 properties of PostgreSQL's plans.  With `datafusion.motion_batches` the
 Motions feeding a join carry batches too, Broadcast included (its one
-stream goes to every receiver).  NOT IN anti joins (with their NULL rule)
-and IS NOT DISTINCT FROM joins stay on PostgreSQL.
+stream goes to every receiver).  A NOT IN anti join reads its outer side
+first (NJ1, below): each Motion's sending slice sends to that join's slice
+alone, so the inner side's senders only wait for room meanwhile.  IS NOT
+DISTINCT FROM joins stay on PostgreSQL.
 
 DataFusion's hash join does not spill.  A slice qualifies only if the Hash
 node's estimated size (planner rows times width plus a per-row allowance)
