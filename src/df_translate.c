@@ -893,6 +893,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
 				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
 					df_emit_output_of(b, out, innerPlan(b->ctx), var->varattno);
+				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
+						 ((Scan *) b->ctx)->scanrelid == var->varno)
+					/* SQ1: a column of the subquery's plan */
+					df_emit_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan, var->varattno);
 				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SeqScan) &&
 						 ((Scan *) b->ctx)->scanrelid == var->varno &&
 						 df_input_of(b, b->ctx) >= 0)
@@ -1390,6 +1394,21 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 
 		case T_Hash:
 			df_emit_node(b, out, outerPlan(plan));
+			return;
+
+		case T_SubqueryScan:
+			/* SQ1: its plan's rows, its filter over them */
+			if (plan->qual == NIL)
+			{
+				df_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
+				return;
+			}
+			appendStringInfoString(out, "{\"filter\":{\"input\":");
+			df_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
+			appendStringInfoString(out, ",\"pred\":");
+			b->ctx = plan;
+			df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+			appendStringInfoString(out, "}}");
 			return;
 
 		case T_Sort:

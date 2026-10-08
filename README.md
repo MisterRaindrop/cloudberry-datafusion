@@ -434,6 +434,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | E1 | `IN`/`NOT IN` lists, `CASE`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM` |
 | E2 | Casts between integers, floats, date/timestamp and numeric |
 | A1 | Aggregates below a join or another aggregate |
+| SQ1 | Subquery Scan; batch Motions below Subquery Scan and Append |
 
 ### Aggregates below a join or another aggregate
 
@@ -449,6 +450,15 @@ is NULL above an unmatched row, not -1).  An aggregate whose value
 PostgreSQL finishes where tuples are made (avg returning numeric, a sum of
 branches of different scales) stays on PostgreSQL there, and so does a
 partial stage, whose state only a batch Motion carries.
+
+SQ1: a Subquery Scan passes its plan's rows on, as the Postgres planner
+leaves one over a view or a subquery in FROM (TPC-H Q15): its columns
+read its plan's, and its own filter runs over them.  An aggregate below it
+is not the slice's top one, so it runs as A1 has it.  The Motions below a
+Subquery Scan or an Append now count when choosing batch Motions; before,
+they always carried tuples, so a partial sum below one stayed on
+PostgreSQL.  Those of init plans still do: an init plan's top slice has
+no sending Motion to find its plan by.
 
 ### Date and time types
 

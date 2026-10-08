@@ -85,6 +85,7 @@ typedef struct DfCheckContext
 	bool		join_input;		/* checking an input of a join */
 	bool		inner_agg;		/* checking an Agg below a join or another
 								 * Agg, whose values others read (A1) */
+	bool		subquery_input; /* checking the plan of a Subquery Scan */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
@@ -1782,6 +1783,26 @@ df_collect_outer_refs(Node *node, Bitmapset **refs)
 	return expression_tree_walker(node, df_collect_outer_refs, refs);
 }
 
+/* Columns of scan relation 'relid' that an expression reads. */
+typedef struct DfScanRefs
+{
+	Index		relid;
+	Bitmapset  *refs;
+} DfScanRefs;
+
+static bool
+df_collect_scan_refs(Node *node, DfScanRefs *c)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var) && ((Var *) node)->varno == c->relid)
+	{
+		c->refs = bms_add_member(c->refs, ((Var *) node)->varattno);
+		return false;
+	}
+	return expression_tree_walker(node, df_collect_scan_refs, c);
+}
+
 /* The same for a join's inner child (INNER_VAR). */
 static bool
 df_collect_inner_refs(Node *node, Bitmapset **refs)
@@ -1847,6 +1868,24 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 		return false;
 	if (IsA(plan, Motion))
 		return true;
+	if (IsA(plan, SubqueryScan))
+	{
+		/* SQ1: its plan's columns */
+		Bitmapset  *sub = NULL;
+
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!bms_is_member(tle->resno, attnos))
+				continue;
+			if (!IsA(tle->expr, Var) ||
+				((Var *) tle->expr)->varno != ((Scan *) plan)->scanrelid)
+				return false;
+			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
+		}
+		return df_plain_outputs(((SubqueryScan *) plan)->subplan, sub);
+	}
 	if (IsA(plan, Agg))
 	{
 		/* A1: its groups and calls are columns of its node, below the join */
@@ -2316,7 +2355,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * the plan, which those above read by name: not a partial
 				 * stage, whose state only a batch Motion carries.
 				 */
-				inner = cxt->join_input || cxt->agg_input;
+				inner = cxt->join_input || cxt->agg_input || cxt->subquery_input;
 				if (inner && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "partial aggregate below a join or another aggregate");
@@ -2403,6 +2442,40 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->order_free = true; /* hashed: the order of its input is not read */
 				df_check_plan(child, cxt, child_needed, false);
 				cxt->agg_input = false;
+				return;
+			}
+
+		case T_SubqueryScan:
+			{
+				/*
+				 * SQ1: a subquery's rows, as its plan makes them.  Its
+				 * columns and filter read its plan's columns (Vars of its
+				 * scanrelid).  An Agg below it is not the slice's top one,
+				 * which those above read by name (A1).
+				 */
+				SubqueryScan *sq = (SubqueryScan *) plan;
+				DfScanRefs	refs = {sq->scan.scanrelid, NULL};
+				bool		saved = cxt->subquery_input;
+				ListCell   *lc;
+
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				df_check_expr_list(plan->qual, cxt);
+				if (cxt->failed)
+					return;
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+						df_collect_scan_refs((Node *) tle->expr, &refs);
+				}
+				df_collect_scan_refs((Node *) plan->qual, &refs);
+				refs.refs = bms_add_member(refs.refs, 0);
+				cxt->order_free = cxt->node_order_free; /* its plan's order */
+				cxt->subquery_input = true;
+				df_check_plan(sq->subplan, cxt, refs.refs, false);
+				cxt->subquery_input = saved;
 				return;
 			}
 
@@ -3170,15 +3243,27 @@ df_motion_batchable(Motion *motion)
 		motion->motionType == MOTIONTYPE_BROADCAST;
 }
 
+/*
+ * The Motions of the plan tree 'plan', also below a Subquery Scan and an
+ * Append.  Those of init plans are not listed: their top slice has no
+ * sending Motion to find it by (df_slice_runs_in_datafusion).
+ */
 static void
 df_list_motions(Plan *plan, List **motions)
 {
+	ListCell   *lc;
+
 	if (plan == NULL)
 		return;
 	if (IsA(plan, Motion))
 		*motions = lappend(*motions, plan);
 	df_list_motions(outerPlan(plan), motions);
 	df_list_motions(innerPlan(plan), motions);
+	if (IsA(plan, SubqueryScan))
+		df_list_motions(((SubqueryScan *) plan)->subplan, motions);
+	if (IsA(plan, Append))
+		foreach(lc, ((Append *) plan)->appendplans)
+			df_list_motions(lfirst(lc), motions);
 }
 
 /*

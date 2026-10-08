@@ -246,6 +246,36 @@ SET optimizer = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_ag1, df_ag2;
 
+-- A Subquery Scan (SQ1) passes its plan's rows on, filtered by its own
+-- quals; the Motions below it carry batches too.
+CREATE TABLE df_sq (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
+INSERT INTO df_sq SELECT i, i % 37, (i % 1000) * 1.25 FROM generate_series(1, 10000) i;
+ANALYZE df_sq;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
+EXPLAIN (COSTS OFF) SELECT b.k, x.s FROM df_sq b
+  LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
+WHERE b.k < 12 ORDER BY 1;
+SET datafusion.mode = off;
+SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
+SELECT b.k, x.s2 FROM df_sq b
+  JOIN (SELECT g, sum(n) * 2 s2, count(*) + 1 c FROM df_sq GROUP BY g) x ON x.g = b.g
+WHERE b.k < 8 AND x.c > 270 ORDER BY 1;
+SELECT b.k, x.s FROM df_sq b
+  LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
+WHERE b.k < 12 ORDER BY 1;
+SET datafusion.mode = on;
+SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
+SELECT b.k, x.s2 FROM df_sq b
+  JOIN (SELECT g, sum(n) * 2 s2, count(*) + 1 c FROM df_sq GROUP BY g) x ON x.g = b.g
+WHERE b.k < 8 AND x.c > 270 ORDER BY 1;
+SELECT b.k, x.s FROM df_sq b
+  LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
+WHERE b.k < 12 ORDER BY 1;
+RESET datafusion.motion_batches;
+DROP TABLE df_sq;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
