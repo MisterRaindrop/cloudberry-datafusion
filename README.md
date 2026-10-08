@@ -653,6 +653,19 @@ a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
 against 2.31 s in PostgreSQL.
 
+A CASE or COALESCE whose branches have different scales (`CASE WHEN
+p_type LIKE 'PROMO%' THEN price * (1 - disc) ELSE 0 END` in TPC-H Q8 and
+Q14) returns values of different display scales, row by row, so it has no
+one Decimal256 scale; DataFusion runs it only as the argument of `sum`.
+PostgreSQL's sum shows the largest display scale of the values it adds
+up: DataFusion adds the values at the largest scale of the branches and
+keeps, beside the sum, the largest scale of the branches the values came
+from (NULL values left out, as `sum` leaves them), split through batch
+Motions as a second state column; the C side rounds the sum to that scale,
+which only drops zeros.  A group whose rows all took `ELSE 0` shows `0`,
+as in PostgreSQL, not `0.0000`.  `avg` of such an argument stays on
+PostgreSQL.
+
 ### Expressions
 
 E1 adds the expressions found most in filters and select lists:

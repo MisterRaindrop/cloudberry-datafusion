@@ -172,7 +172,8 @@ df_scale_of(Plan *ctx, Node *expr)
 	int			p,
 				s;
 
-	if (!df_numeric_ps(ctx, expr, &p, &s))
+	if (!df_numeric_ps(ctx, expr, &p, &s) && !df_numeric_mixed(ctx, expr, &p, &s) &&
+		!df_mixed_sum_scale(ctx, expr, &s))
 		return 0;
 	return s;
 }
@@ -558,13 +559,125 @@ df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
 	return i;
 }
 
-/* The DataFusion state a partial aggregate sends instead of its own. */
+/* The DataFusion state a partial aggregate of Agg 'ctx' sends instead of its own. */
 static DfAggState
-df_partial_state(Node *node)
+df_partial_state(Plan *ctx, Node *node)
 {
 	if (!IsA(node, Aggref) || ((Aggref *) node)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 		return DF_AGG_PLAIN;
-	return df_agg_state((Aggref *) node);
+	return df_agg_state_at(ctx, (Aggref *) node);
+}
+
+/* Is 'node' a sum of Agg 'ctx' that keeps its display scale (MS1)? */
+static bool
+df_is_mixed_sum(Plan *ctx, Node *node)
+{
+	return IsA(node, Aggref) && IsA(ctx, Agg) &&
+		df_agg_state_at(ctx, (Aggref *) node) == DF_AGG_SUM_NUMERIC_MIXED;
+}
+
+/* 'when' result 'then' */
+static CaseWhen *
+df_case_when(Expr *when, Expr *then)
+{
+	CaseWhen   *w = makeNode(CaseWhen);
+
+	w->expr = when;
+	w->result = then;
+	w->location = -1;
+	return w;
+}
+
+/* 'e' IS [NOT] NULL */
+static Expr *
+df_null_test(Expr *e, NullTestType type)
+{
+	NullTest   *nt = makeNode(NullTest);
+
+	nt->arg = e;
+	nt->nulltesttype = type;
+	nt->argisrow = false;
+	nt->location = -1;
+	return (Expr *) nt;
+}
+
+/* An int4 constant, or NULL. */
+static Expr *
+df_int4_const(int v, bool isnull)
+{
+	return (Expr *) makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+							  Int32GetDatum(v), isnull, true);
+}
+
+/*
+ * The display scale of each row of MS1's CASE or COALESCE 'arg' of node
+ * 'ctx': its branch's scale, NULL where the value is NULL, which sum
+ * leaves out.  The same branches are taken: the CASE keeps its tests.
+ */
+static Expr *
+df_mixed_scale_expr(Plan *ctx, Node *arg)
+{
+	CaseExpr   *out = makeNode(CaseExpr);
+	ListCell   *lc;
+	int			p,
+				s;
+
+	out->casetype = INT4OID;
+	out->casecollid = InvalidOid;
+	out->location = -1;
+	if (IsA(arg, CaseExpr))
+	{
+		CaseExpr   *ce = (CaseExpr *) arg;
+		List	   *results = NIL;
+
+		out->arg = ce->arg;
+		foreach(lc, ce->args)
+			results = lappend(results, lfirst_node(CaseWhen, lc)->result);
+		results = lappend(results, ce->defresult);
+		foreach(lc, results)
+		{
+			Expr	   *r = lfirst(lc);
+			Expr	   *scale;
+
+			if (r == NULL || (IsA(r, Const) && ((Const *) r)->constisnull))
+				scale = df_int4_const(0, true);
+			else
+			{
+				CaseExpr   *sc = makeNode(CaseExpr);
+
+				(void) df_numeric_ps(ctx, (Node *) r, &p, &s);
+				sc->casetype = INT4OID;
+				sc->args = list_make1(df_case_when(df_null_test(r, IS_NULL),
+												   df_int4_const(0, true)));
+				sc->defresult = df_int4_const(s, false);
+				sc->location = -1;
+				scale = (Expr *) sc;
+			}
+			if (foreach_current_index(lc) < list_length(ce->args))
+				out->args = lappend(out->args,
+									df_case_when(list_nth_node(CaseWhen, ce->args,
+															   foreach_current_index(lc))->expr,
+												 scale));
+			else
+				out->defresult = scale;
+		}
+	}
+	else
+	{
+		/* COALESCE: the scale of the first argument that is not NULL */
+		foreach(lc, ((CoalesceExpr *) arg)->args)
+		{
+			Expr	   *a = lfirst(lc);
+
+			if (IsA(a, Const) && ((Const *) a)->constisnull)
+				continue;
+			(void) df_numeric_ps(ctx, (Node *) a, &p, &s);
+			out->args = lappend(out->args, df_case_when(df_null_test(a, IS_NOT_NULL),
+														df_int4_const(s, false)));
+		}
+		out->defresult = df_int4_const(0, true);
+	}
+	return (Expr *) out;
 }
 
 static void
@@ -1219,12 +1332,13 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 	{
 		Node	   *expr = (Node *) lfirst(lc);
 
-		if (level == DF_LEVEL_AGG && df_partial_state(expr) != DF_AGG_PLAIN)
-			spec->nout += df_agg_state_ncols(df_partial_state(expr));
+		if (level == DF_LEVEL_AGG && df_partial_state(ctx, expr) != DF_AGG_PLAIN)
+			spec->nout += df_agg_state_ncols(df_partial_state(ctx, expr));
 		else if (level == DF_LEVEL_AGG && IsA(expr, Aggref) &&
 				 (df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT ||
-				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC))
-			spec->nout += 2;	/* numeric sum and count */
+				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
+				  df_is_mixed_sum(ctx, expr)))
+			spec->nout += 2;	/* numeric sum and count, or display scale */
 		else
 			spec->nout++;
 	}
@@ -1239,7 +1353,7 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 		Oid			type = exprType((Node *) value);
 		const char *tag = df_type_tag(type);
 		DfAggState	state = level == DF_LEVEL_AGG ?
-			df_partial_state((Node *) value) : DF_AGG_PLAIN;
+			df_partial_state(ctx, (Node *) value) : DF_AGG_PLAIN;
 
 		b->out_col[foreach_current_index(lc)] = i;
 		if (state != DF_AGG_PLAIN)
@@ -1247,7 +1361,8 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1, N2) */
 			Aggref	   *agg = (Aggref *) value;
 			bool		fsum = state == DF_AGG_AVG_FLOAT;
-			bool		dsum = state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC;
+			bool		dsum = state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
+				state == DF_AGG_SUM_NUMERIC_MIXED;
 			int			scale = df_scale_of(ctx, (Node *) agg);
 
 			spec->out_scales[i] = (int16) scale;
@@ -1256,12 +1371,41 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 							 i > 1 ? "," : "",
 							 df_agg_ref(b, agg, fsum ? "sum" : dsum ? "sum_decimal" : "sum_numeric"),
 							 fsum ? "float8" : df_tag(NUMERICOID, scale));
-			if (df_agg_state_ncols(state) == 2)
+			if (state == DF_AGG_SUM_NUMERIC_MIXED)
+			{
+				/* MS1: the largest display scale added up */
+				spec->out_types[i++] = INT4OID;
+				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int4\"}",
+								 df_agg_ref(b, agg, "mixed_scale"));
+			}
+			else if (df_agg_state_ncols(state) == 2)
 			{
 				spec->out_types[i++] = INT8OID;
 				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
 								 df_agg_ref(b, agg, "count"));
 			}
+			continue;
+		}
+		if (level == DF_LEVEL_AGG && df_is_mixed_sum(ctx, (Node *) value))
+		{
+			/*
+			 * MS1: the sum at the largest scale of its argument, and the
+			 * largest display scale of the values added up, which the C side
+			 * gives the result as PostgreSQL's sum does
+			 */
+			Aggref	   *agg = (Aggref *) value;
+			int			scale = df_scale_of(ctx, (Node *) agg);
+
+			spec->out_kinds[i] = DF_OUT_NUMERIC_MIXED;
+			spec->out_scales[i] = (int16) scale;
+			spec->out_types[i++] = NUMERICOID;
+			spec->out_kinds[i] = DF_OUT_PART;
+			spec->out_types[i++] = INT4OID;
+			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"},"
+							 "{\"expr\":{\"agg\":%d},\"type\":\"int4\"}",
+							 i > 2 ? "," : "",
+							 df_agg_ref(b, agg, "sum_decimal"), df_tag(NUMERICOID, scale),
+							 df_agg_ref(b, agg, "mixed_scale"));
 			continue;
 		}
 		if (level == DF_LEVEL_AGG && IsA(value, Aggref) &&
@@ -1603,6 +1747,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 				Plan	   *child = df_below_sort(outerPlan(b.agg));
 				bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
+				bool		mixed = fn != NULL && strcmp(fn, "mixed_scale") == 0;
 				int			pos;
 
 				if (!IsA(child, Motion) || !IsA(arg, Var))
@@ -1611,10 +1756,23 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 					break;
 				}
 				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
-				appendStringInfo(&aggs, "{\"fn\":\"%s\",\"arg\":", count ? "sum" : "sum_decimal");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + (count ? 2 : 1),
-							   count ? INT8OID : NUMERICOID,
-							   count ? 0 : df_scale_of((Plan *) b.agg, arg));
+				appendStringInfo(&aggs, "{\"fn\":\"%s\",\"arg\":",
+								 count ? "sum" : mixed ? "max" : "sum_decimal");
+				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + (count || mixed ? 2 : 1),
+							   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
+							   count || mixed ? 0 : df_scale_of((Plan *) b.agg, arg));
+				appendStringInfoChar(&aggs, '}');
+				continue;
+			}
+			if (!combine && fn != NULL && strcmp(fn, "mixed_scale") == 0)
+			{
+				/* MS1: the largest display scale of the values added up */
+				b.ctx = (Plan *) b.agg;
+				appendStringInfoString(&aggs, "{\"fn\":\"max\",\"arg\":");
+				df_emit(&b, &aggs,
+						(Node *) df_mixed_scale_expr((Plan *) b.agg,
+													 (Node *) linitial_node(TargetEntry, agg->args)->expr),
+						DF_LEVEL_SCAN);
 				appendStringInfoChar(&aggs, '}');
 				continue;
 			}

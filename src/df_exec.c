@@ -927,6 +927,31 @@ df_exec_emit(DfExec *x)
 
 		if (kind == DF_OUT_PART)
 			continue;
+		if (kind == DF_OUT_NUMERIC_MIXED)
+		{
+			/*
+			 * MS1: a sum at the largest scale of its argument's branches,
+			 * shown at the largest scale of the values added up, as
+			 * PostgreSQL's sum does; the digits past it are 0
+			 */
+			int			scale = x->spec.out_scales[c];
+			int			shown = x->outcols[c + 1].nulls[r] ? scale :
+				((const int32 *) x->outcols[c + 1].values)[r];
+
+			slot->tts_isnull[k] = isnull;
+			slot->tts_values[k] = (Datum) 0;
+			if (!isnull)
+			{
+				oldcxt = MemoryContextSwitchTo(x->rowcxt);
+				slot->tts_values[k] = df_numeric_datum(df_numeric_at(v, r), scale);
+				if (shown < scale)
+					slot->tts_values[k] = DirectFunctionCall2(numeric_round, slot->tts_values[k],
+															  Int32GetDatum(shown));
+				MemoryContextSwitchTo(oldcxt);
+			}
+			k++;
+			continue;
+		}
 		if (kind == DF_OUT_NUMERIC_AVG)
 		{
 			/* avg(int) = numeric_div(sum, count), as int8_avg and numeric_poly_avg */

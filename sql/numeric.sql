@@ -141,6 +141,28 @@ SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT b, d, count(*) AS n FROM
 SELECT c, count(*) FROM df_nc GROUP BY c HAVING c < 0 OR c > 1e38 OR c = 'NaN' ORDER BY c;
 SET datafusion.mode = off;
 
+-- sum of a CASE or COALESCE whose branches differ in scale (MS1, TPC-H Q8
+-- and Q14): PostgreSQL's sum shows the largest display scale of the values
+-- it adds up, so DataFusion keeps that beside the sum, and a group whose
+-- rows all took the ELSE 0 shows 0, not 0.0000.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc;
+EXPLAIN (COSTS OFF) SELECT avg(CASE WHEN g = 1 THEN a ELSE 0 END) FROM df_nc;
+SET datafusion.mode = off;
+SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc WHERE id > 0;
+SELECT g, sum(CASE WHEN id % 2 = 0 OR g = 93 THEN a * b ELSE 0 END), sum(COALESCE(b, a, 0))
+FROM df_nc GROUP BY g ORDER BY g;
+SELECT g, sum(CASE WHEN id < 0 AND g <> 93 THEN b END), sum(CASE g WHEN 90 THEN d WHEN 92 THEN c ELSE 1 END)
+FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
+SET datafusion.mode = on;
+SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc WHERE id > 0;
+SELECT g, sum(CASE WHEN id % 2 = 0 OR g = 93 THEN a * b ELSE 0 END), sum(COALESCE(b, a, 0))
+FROM df_nc GROUP BY g ORDER BY g;
+SELECT g, sum(CASE WHEN id < 0 AND g <> 93 THEN b END), sum(CASE g WHEN 90 THEN d WHEN 92 THEN c ELSE 1 END)
+FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
+SET datafusion.mode = off;
+
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

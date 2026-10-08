@@ -89,6 +89,8 @@ typedef struct DfCheckContext
 	bool		final_states;	/* this Agg may read DataFusion avg states */
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
+	Node	   *mixed_scales_ok;	/* a sum's argument whose branches may have
+									 * different scales (MS1) */
 	Plan	   *node;			/* the node whose expressions are checked */
 	Plan	   *top;			/* where a Limit or Sort may be: the top of
 								 * the slice, or below its Limit (S1) */
@@ -504,6 +506,141 @@ df_rescales_infinity(Plan *ctx, Node *l, Node *r)
 		return false;
 	return (ls < rs && df_numeric_may_be_infinite(ctx, l)) ||
 		(rs < ls && df_numeric_may_be_infinite(ctx, r));
+}
+
+/*
+ * Is numeric 'expr' of plan node 'ctx' a CASE or COALESCE whose results
+ * have scales of their own, not all the same (MS1)?  Each row's value then
+ * has the display scale of its branch.  Sets the largest scale and the
+ * precision at it.
+ */
+bool
+df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale)
+{
+	List	   *results = NIL;
+	ListCell   *lc;
+	int			first = -1,
+				digits = 0;
+	bool		mixed = false;
+
+	if (expr == NULL || exprType(expr) != NUMERICOID)
+		return false;
+	if (IsA(expr, CaseExpr))
+	{
+		foreach(lc, ((CaseExpr *) expr)->args)
+			results = lappend(results, lfirst_node(CaseWhen, lc)->result);
+		results = lappend(results, ((CaseExpr *) expr)->defresult);
+	}
+	else if (IsA(expr, CoalesceExpr))
+		results = ((CoalesceExpr *) expr)->args;
+	else
+		return false;
+	*scale = 0;
+	foreach(lc, results)
+	{
+		Node	   *e = lfirst(lc);
+		int			p,
+					s;
+
+		if (e == NULL || (IsA(e, Const) && ((Const *) e)->constisnull))
+			continue;
+		if (!df_numeric_ps(ctx, e, &p, &s) || df_numeric_may_be_infinite(ctx, e))
+			return false;
+		if (first >= 0 && s != first)
+			mixed = true;
+		if (first < 0)
+			first = s;
+		*scale = Max(*scale, s);
+		digits = Max(digits, p - s);
+	}
+	*precision = digits + *scale;
+	return mixed && *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+}
+
+/*
+ * Is 'agg', of Agg node 'ctx', a sum of such a CASE or COALESCE (MS1)?  A
+ * combining sum is if the partial sum below it is.  PostgreSQL's sum takes
+ * the largest display scale of the values it adds up, which DataFusion
+ * keeps beside the sum.
+ */
+static bool
+df_sum_mixed(Plan *ctx, Aggref *agg)
+{
+	char	   *name = get_func_name(agg->aggfnoid);
+	Node	   *arg;
+
+	if (name == NULL || strcmp(name, "sum") != 0 || agg->aggfnoid >= FirstGenbkiObjectId ||
+		list_length(agg->args) != 1 || list_length(agg->aggargtypes) != 1 ||
+		linitial_oid(agg->aggargtypes) != NUMERICOID || agg->aggdistinct != NIL)
+		return false;
+	arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+	if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+	{
+		/* the partial sum, through the Motion and any Sort between */
+		Plan	   *child = ctx;
+
+		while (IsA(arg, Var) && ((Var *) arg)->varno == OUTER_VAR &&
+			   (child = outerPlan(child)) != NULL)
+		{
+			TargetEntry *tle = get_tle_by_resno(child->targetlist, ((Var *) arg)->varattno);
+
+			if (tle == NULL)
+				return false;
+			arg = (Node *) tle->expr;
+		}
+		return child != NULL && IsA(arg, Aggref) &&
+			((Aggref *) arg)->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
+			df_sum_mixed(child, (Aggref *) arg);
+	}
+	{
+		int			p,
+					s;
+
+		return df_numeric_mixed(ctx, arg, &p, &s);
+	}
+}
+
+/*
+ * The scale of MS1's sum that numeric 'expr' of node 'ctx' is, or refers
+ * to through the nodes below: the largest of its argument's branches.
+ */
+bool
+df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale)
+{
+	int			p;
+
+	while (IsA(expr, Var) &&
+		   (((Var *) expr)->varno == OUTER_VAR || ((Var *) expr)->varno == INNER_VAR))
+	{
+		Plan	   *child = ((Var *) expr)->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+		TargetEntry *tle = child ? get_tle_by_resno(child->targetlist,
+													((Var *) expr)->varattno) : NULL;
+
+		if (tle == NULL)
+			return false;
+		ctx = child;
+		expr = (Node *) tle->expr;
+	}
+	if (!IsA(expr, Aggref) || df_agg_state_at(ctx, (Aggref *) expr) != DF_AGG_SUM_NUMERIC_MIXED)
+		return false;
+	if (((Aggref *) expr)->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+		/* its argument is the partial sum below */
+		return df_mixed_sum_scale(ctx, (Node *) linitial_node(TargetEntry,
+															  ((Aggref *) expr)->args)->expr,
+								  scale);
+	return df_numeric_mixed(ctx, (Node *) linitial_node(TargetEntry, ((Aggref *) expr)->args)->expr,
+							&p, scale);
+}
+
+/* df_agg_state of 'agg' of Agg node 'ctx', telling apart MS1's sums. */
+DfAggState
+df_agg_state_at(Plan *ctx, Aggref *agg)
+{
+	DfAggState	state = df_agg_state(agg);
+
+	if (state == DF_AGG_SUM_NUMERIC && df_sum_mixed(ctx, agg))
+		return DF_AGG_SUM_NUMERIC_MIXED;
+	return state;
 }
 
 /*
@@ -1209,9 +1346,14 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
 						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
-						 !(df_numeric_ps(cxt->node,
-										 (Node *) linitial_node(TargetEntry, agg->args)->expr,
-										 &np, &ns) && np <= DF_NUMERIC_MAX_SUM_PRECISION))
+						 !((df_numeric_ps(cxt->node,
+										  (Node *) linitial_node(TargetEntry, agg->args)->expr,
+										  &np, &ns) ||
+							(df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED &&
+							 df_numeric_mixed(cxt->node,
+											  (Node *) linitial_node(TargetEntry, agg->args)->expr,
+											  &np, &ns))) &&
+						   np <= DF_NUMERIC_MAX_SUM_PRECISION))
 					/* the sum must stay within Decimal128's 38 digits */
 					df_reject(cxt, "aggregate %s of numeric of unknown precision or more than %d digits",
 							  name, DF_NUMERIC_MAX_SUM_PRECISION);
@@ -1284,6 +1426,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							  df_string_compare_problem(cxt, name, agg->inputcollid));
 				if (cxt->failed)
 					return true;
+				/* MS1: the branches of a sum's argument may differ in scale */
+				if (df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED)
+					cxt->mixed_scales_ok = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 				/* the arguments; aggdistinct holds sort clauses, checked above */
 				return df_check_expr((Node *) agg->args, cxt);
 			}
@@ -1390,7 +1535,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				foreach(lc, ce->args)
 					results = lappend(results, lfirst_node(CaseWhen, lc)->result);
 				results = lappend(results, ce->defresult);
-				if (ce->casetype == NUMERICOID && !df_numeric_same_scale(cxt->node, results, -1))
+				if (ce->casetype == NUMERICOID && node != cxt->mixed_scales_ok &&
+					!df_numeric_same_scale(cxt->node, results, -1))
 				{
 					df_reject(cxt, "CASE returning numeric of different scales");
 					return true;
@@ -1411,7 +1557,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "COALESCE of %s", format_type_be(co->coalescetype));
 					return true;
 				}
-				if (co->coalescetype == NUMERICOID &&
+				if (co->coalescetype == NUMERICOID && node != cxt->mixed_scales_ok &&
 					!df_numeric_same_scale(cxt->node, co->args, -1))
 				{
 					df_reject(cxt, "COALESCE of numeric of different scales");
@@ -3012,7 +3158,7 @@ df_motion_state_columns(Motion *motion, AttrNumber resno)
 	}
 	if (!IsA(expr, Aggref) || ((Aggref *) expr)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 		return 0;
-	return df_agg_state_ncols(df_agg_state((Aggref *) expr));
+	return df_agg_state_ncols(df_agg_state_at(child, (Aggref *) expr));
 }
 
 /* Which state DataFusion keeps for 'agg'. */
@@ -3050,6 +3196,7 @@ df_agg_state_ncols(DfAggState state)
 		case DF_AGG_AVG_FLOAT:
 		case DF_AGG_AVG_INT:
 		case DF_AGG_AVG_NUMERIC:
+		case DF_AGG_SUM_NUMERIC_MIXED:
 			return 2;
 		case DF_AGG_SUM_INT8:
 		case DF_AGG_SUM_NUMERIC:

@@ -514,6 +514,119 @@ SELECT c, count(*) FROM df_nc GROUP BY c HAVING c < 0 OR c > 1e38 OR c = 'NaN' O
 (2 rows)
 
 SET datafusion.mode = off;
+-- sum of a CASE or COALESCE whose branches differ in scale (MS1, TPC-H Q8
+-- and Q14): PostgreSQL's sum shows the largest display scale of the values
+-- it adds up, so DataFusion keeps that beside the sum, and a group whose
+-- rows all took the ELSE 0 shows 0, not 0.0000.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT avg(CASE WHEN g = 1 THEN a ELSE 0 END) FROM df_nc;
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: combining aggregate avg without batch Motions
+ DataFusion: slice 1 not eligible: aggregate avg of numeric of unknown precision or more than 66 digits
+(7 rows)
+
+SET datafusion.mode = off;
+SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc WHERE id > 0;
+       ?column?       
+----------------------
+ -74.3328610016826451
+(1 row)
+
+SELECT g, sum(CASE WHEN id % 2 = 0 OR g = 93 THEN a * b ELSE 0 END), sum(COALESCE(b, a, 0))
+FROM df_nc GROUP BY g ORDER BY g;
+ g  |            sum             |    sum     
+----+----------------------------+------------
+  0 |            -1066317.905944 |  1693.7259
+  1 |           -17396095.454196 | -6498.3494
+  2 |            12609799.670280 | -1690.4247
+  3 |           -34770211.770280 | -4882.5000
+  4 |            53154028.870280 | -6074.5753
+  5 |           -30322679.254196 | -1266.6506
+  6 |           -27824574.305944 | -8458.7259
+ 90 |                   3.375000 |        NaN
+ 91 |                          0 |          0
+ 92 | 9999999998999990000.000001 |     0.0000
+ 93 |                   2.250000 |     1.4999
+(11 rows)
+
+SELECT g, sum(CASE WHEN id < 0 AND g <> 93 THEN b END), sum(CASE g WHEN 90 THEN d WHEN 92 THEN c ELSE 1 END)
+FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
+ g  |  sum   | sum 
+----+--------+-----
+  0 |        |   7
+  1 |        |   7
+  2 |        |   7
+  3 |        |   7
+  4 |        |   7
+  5 |        |   7
+  6 |        |   8
+ 90 |    NaN | NaN
+ 91 |        |   1
+ 92 | 0.0000 |   0
+ 93 |        |   2
+(11 rows)
+
+SET datafusion.mode = on;
+SELECT 100.00 * sum(CASE WHEN g = 1 THEN a * (1 - b) ELSE 0 END) / sum(a * (1 - b)) FROM df_nc WHERE id > 0;
+       ?column?       
+----------------------
+ -74.3328610016826451
+(1 row)
+
+SELECT g, sum(CASE WHEN id % 2 = 0 OR g = 93 THEN a * b ELSE 0 END), sum(COALESCE(b, a, 0))
+FROM df_nc GROUP BY g ORDER BY g;
+ g  |            sum             |    sum     
+----+----------------------------+------------
+  0 |            -1066317.905944 |  1693.7259
+  1 |           -17396095.454196 | -6498.3494
+  2 |            12609799.670280 | -1690.4247
+  3 |           -34770211.770280 | -4882.5000
+  4 |            53154028.870280 | -6074.5753
+  5 |           -30322679.254196 | -1266.6506
+  6 |           -27824574.305944 | -8458.7259
+ 90 |                   3.375000 |        NaN
+ 91 |                          0 |          0
+ 92 | 9999999998999990000.000001 |     0.0000
+ 93 |                   2.250000 |     1.4999
+(11 rows)
+
+SELECT g, sum(CASE WHEN id < 0 AND g <> 93 THEN b END), sum(CASE g WHEN 90 THEN d WHEN 92 THEN c ELSE 1 END)
+FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
+ g  |  sum   | sum 
+----+--------+-----
+  0 |        |   7
+  1 |        |   7
+  2 |        |   7
+  3 |        |   7
+  4 |        |   7
+  5 |        |   7
+  6 |        |   8
+ 90 |    NaN | NaN
+ 91 |        |   1
+ 92 | 0.0000 |   0
+ 93 |        |   2
+(11 rows)
+
+SET datafusion.mode = off;
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

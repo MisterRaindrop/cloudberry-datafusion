@@ -103,10 +103,10 @@ typedef struct DfSliceSpec
 
 	/*
 	 * The tuple's columns (P1).  The output columns above are values: one
-	 * per value, two for DF_OUT_NUMERIC_AVG.  Column k of the tuple is value
-	 * col_value[k], or, if that is -1, col_tail[k] evaluated over the values
-	 * (Vars of OUTER_VAR, attno = value + 1).  col_tail is NULL without
-	 * such columns.
+	 * per value, two for DF_OUT_NUMERIC_AVG and DF_OUT_NUMERIC_MIXED.
+	 * Column k of the tuple is value col_value[k], or, if that is -1,
+	 * col_tail[k] evaluated over the values (Vars of OUTER_VAR, attno =
+	 * value + 1).  col_tail is NULL without such columns.
 	 */
 	int			ncols;
 	int		   *col_value;
@@ -128,13 +128,17 @@ typedef enum DfAggState
 	DF_AGG_AVG_INT,				/* avg(int2/4/8): numeric sum, int8 count */
 	DF_AGG_SUM_INT8,			/* sum(int8): numeric sum */
 	DF_AGG_SUM_NUMERIC,			/* sum(numeric(p <= 28, s)): numeric sum */
-	DF_AGG_AVG_NUMERIC			/* avg(numeric(p <= 28, s)): numeric sum, count */
+	DF_AGG_AVG_NUMERIC,			/* avg(numeric(p <= 28, s)): numeric sum, count */
+	DF_AGG_SUM_NUMERIC_MIXED	/* sum of a CASE or COALESCE whose branches
+								 * differ in scale (MS1): numeric sum at the
+								 * largest, int4 largest scale added up */
 } DfAggState;
 
 /* sum and avg of numeric(p, s): p digits added up must stay within 76 */
 #define DF_NUMERIC_MAX_SUM_PRECISION 66
 
 extern DfAggState df_agg_state(Aggref *agg);
+extern DfAggState df_agg_state_at(Plan *ctx, Aggref *agg);
 extern int	df_agg_state_ncols(DfAggState state);
 
 /*
@@ -169,6 +173,8 @@ typedef enum DfOutKind
 	DF_OUT_PLAIN,				/* one column, one value */
 	DF_OUT_NUMERIC_AVG,			/* numeric sum and the next column's count:
 								 * avg = sum / count (numeric_div) */
+	DF_OUT_NUMERIC_MIXED,		/* numeric sum and the next column's display
+								 * scale (MS1) */
 	DF_OUT_PART					/* consumed with the column before */
 } DfOutKind;
 
@@ -190,6 +196,8 @@ typedef struct DfStringFunc
 extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
+extern bool df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale);
+extern bool df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale);
 extern const char *df_extract_field(FuncExpr *fe);
 
 /*
