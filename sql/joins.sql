@@ -276,6 +276,33 @@ WHERE b.k < 12 ORDER BY 1;
 RESET datafusion.motion_batches;
 DROP TABLE df_sq;
 
+-- A semi join deduplicated by RowIdExpr (RI1, TPC-H Q4 and Q21): the
+-- planner numbers the rows of one side, joins, and groups by the numbers
+-- to drop the copies the join made, keeping the other columns as they are.
+-- DataFusion numbers them as a column of the node whose output has the
+-- RowIdExpr.  df_ri_o has rows twice over, which only their numbers tell
+-- apart.
+CREATE TABLE df_ri_o (id int, k int, c char(4), n numeric(10,2)) DISTRIBUTED BY (id);
+INSERT INTO df_ri_o SELECT i, i % 300, 'c' || (i % 7), (i % 300) * 0.25 FROM generate_series(1, 1000) i;
+INSERT INTO df_ri_o SELECT id, k, c, n FROM df_ri_o WHERE id % 5 = 0;
+CREATE TABLE df_ri_i (k int, s int, v int) DISTRIBUTED BY (v);
+INSERT INTO df_ri_i SELECT i % 500, i % 37, i FROM generate_series(1, 60000) i;
+ANALYZE df_ri_o;
+ANALYZE df_ri_i;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+SET datafusion.mode = off;
+SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
+SET datafusion.mode = on;
+SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
+RESET datafusion.motion_batches;
+DROP TABLE df_ri_o, df_ri_i;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

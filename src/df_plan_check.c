@@ -86,6 +86,8 @@ typedef struct DfCheckContext
 	bool		inner_agg;		/* checking an Agg below a join or another
 								 * Agg, whose values others read (A1) */
 	bool		subquery_input; /* checking the plan of a Subquery Scan */
+	bool		rowid_ok;		/* checking a scan's or join's targetlist,
+								 * where a RowIdExpr may be (RI1) */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
@@ -1262,6 +1264,16 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				return cxt->failed;
 			}
 
+		case T_RowIdExpr:
+			/*
+			 * RI1: a number unique to each row of the node whose targetlist
+			 * it is in, which DataFusion adds as a column of that node's
+			 * rows (df_core::rowid)
+			 */
+			if (!cxt->rowid_ok)
+				df_reject(cxt, "RowIdExpr outside a scan's or join's output");
+			return cxt->failed;
+
 		case T_Const:
 			{
 				Const	   *c = (Const *) node;
@@ -2322,7 +2334,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				cxt->allow_aggref = false;
+				cxt->rowid_ok = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
+				cxt->rowid_ok = false;
 				df_check_expr_list(plan->qual, cxt);
 				return;
 			}
@@ -2541,7 +2555,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				cxt->allow_aggref = false;
+				cxt->rowid_ok = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
+				cxt->rowid_ok = false;
 				df_check_expr_list(hj->hashclauses, cxt);
 				df_check_expr_list(join->joinqual, cxt);
 				df_check_expr_list(plan->qual, cxt);

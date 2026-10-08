@@ -1225,6 +1225,170 @@ WHERE b.k < 12 ORDER BY 1;
 
 RESET datafusion.motion_batches;
 DROP TABLE df_sq;
+-- A semi join deduplicated by RowIdExpr (RI1, TPC-H Q4 and Q21): the
+-- planner numbers the rows of one side, joins, and groups by the numbers
+-- to drop the copies the join made, keeping the other columns as they are.
+-- DataFusion numbers them as a column of the node whose output has the
+-- RowIdExpr.  df_ri_o has rows twice over, which only their numbers tell
+-- apart.
+CREATE TABLE df_ri_o (id int, k int, c char(4), n numeric(10,2)) DISTRIBUTED BY (id);
+INSERT INTO df_ri_o SELECT i, i % 300, 'c' || (i % 7), (i % 300) * 0.25 FROM generate_series(1, 1000) i;
+INSERT INTO df_ri_o SELECT id, k, c, n FROM df_ri_o WHERE id % 5 = 0;
+CREATE TABLE df_ri_i (k int, s int, v int) DISTRIBUTED BY (v);
+INSERT INTO df_ri_i SELECT i % 500, i % 37, i FROM generate_series(1, 60000) i;
+ANALYZE df_ri_o;
+ANALYZE df_ri_i;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: o.c
+   ->  Sort
+         Sort Key: o.c
+         ->  Finalize HashAggregate
+               Group Key: o.c
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: o.c
+                     ->  Streaming Partial HashAggregate
+                           Group Key: o.c
+                           ->  HashAggregate
+                                 Group Key: (RowIdExpr)
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: (RowIdExpr)
+                                       ->  Hash Join
+                                             Hash Cond: (i.k = o.k)
+                                             ->  Seq Scan on df_ri_i i
+                                             ->  Hash
+                                                   ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                                                         ->  Seq Scan on df_ri_o o
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+(26 rows)
+
+SET datafusion.mode = off;
+SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+  c   | count |   sum   
+------+-------+---------
+ c0   |   170 | 5945.25
+ c1   |   172 | 6014.75
+ c2   |   171 | 5981.75
+ c3   |   172 | 6050.00
+ c4   |   171 | 5943.25
+ c5   |   172 | 5935.25
+ c6   |   172 | 5929.75
+(7 rows)
+
+SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
+ count |  sum   
+-------+--------
+  1200 | 601000
+(1 row)
+
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
+ id | k  |  c   |  n   
+----+----+------+------
+  1 |  1 | c1   | 0.25
+  2 |  2 | c2   | 0.50
+  3 |  3 | c3   | 0.75
+  4 |  4 | c4   | 1.00
+  5 |  5 | c5   | 1.25
+  5 |  5 | c5   | 1.25
+  6 |  6 | c6   | 1.50
+  7 |  7 | c0   | 1.75
+  8 |  8 | c1   | 2.00
+  9 |  9 | c2   | 2.25
+ 10 | 10 | c3   | 2.50
+ 10 | 10 | c3   | 2.50
+ 11 | 11 | c4   | 2.75
+ 12 | 12 | c5   | 3.00
+ 13 | 13 | c6   | 3.25
+ 14 | 14 | c0   | 3.50
+ 15 | 15 | c1   | 3.75
+ 15 | 15 | c1   | 3.75
+ 16 | 16 | c2   | 4.00
+ 17 | 17 | c3   | 4.25
+ 18 | 18 | c4   | 4.50
+ 19 | 19 | c5   | 4.75
+ 20 | 20 | c6   | 5.00
+ 20 | 20 | c6   | 5.00
+ 21 | 21 | c0   | 5.25
+ 22 | 22 | c1   | 5.50
+ 23 | 23 | c2   | 5.75
+ 24 | 24 | c3   | 6.00
+ 25 | 25 | c4   | 6.25
+ 25 | 25 | c4   | 6.25
+ 26 | 26 | c5   | 6.50
+ 27 | 27 | c6   | 6.75
+ 28 | 28 | c0   | 7.00
+ 29 | 29 | c1   | 7.25
+(34 rows)
+
+SET datafusion.mode = on;
+SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
+  c   | count |   sum   
+------+-------+---------
+ c0   |   170 | 5945.25
+ c1   |   172 | 6014.75
+ c2   |   171 | 5981.75
+ c3   |   172 | 6050.00
+ c4   |   171 | 5943.25
+ c5   |   172 | 5935.25
+ c6   |   172 | 5929.75
+(7 rows)
+
+SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
+ count |  sum   
+-------+--------
+  1200 | 601000
+(1 row)
+
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
+ id | k  |  c   |  n   
+----+----+------+------
+  1 |  1 | c1   | 0.25
+  2 |  2 | c2   | 0.50
+  3 |  3 | c3   | 0.75
+  4 |  4 | c4   | 1.00
+  5 |  5 | c5   | 1.25
+  5 |  5 | c5   | 1.25
+  6 |  6 | c6   | 1.50
+  7 |  7 | c0   | 1.75
+  8 |  8 | c1   | 2.00
+  9 |  9 | c2   | 2.25
+ 10 | 10 | c3   | 2.50
+ 10 | 10 | c3   | 2.50
+ 11 | 11 | c4   | 2.75
+ 12 | 12 | c5   | 3.00
+ 13 | 13 | c6   | 3.25
+ 14 | 14 | c0   | 3.50
+ 15 | 15 | c1   | 3.75
+ 15 | 15 | c1   | 3.75
+ 16 | 16 | c2   | 4.00
+ 17 | 17 | c3   | 4.25
+ 18 | 18 | c4   | 4.50
+ 19 | 19 | c5   | 4.75
+ 20 | 20 | c6   | 5.00
+ 20 | 20 | c6   | 5.00
+ 21 | 21 | c0   | 5.25
+ 22 | 22 | c1   | 5.50
+ 23 | 23 | c2   | 5.75
+ 24 | 24 | c3   | 6.00
+ 25 | 25 | c4   | 6.25
+ 25 | 25 | c4   | 6.25
+ 26 | 26 | c5   | 6.50
+ 27 | 27 | c6   | 6.75
+ 28 | 28 | c0   | 7.00
+ 29 | 29 | c1   | 7.25
+(34 rows)
+
+RESET datafusion.motion_batches;
+DROP TABLE df_ri_o, df_ri_i;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

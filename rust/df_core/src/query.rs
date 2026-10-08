@@ -46,6 +46,9 @@
 //!                          "name": s}}   (name: an aggregate below a join
 //!                          or another aggregate, its columns s_g<i> and
 //!                          s_a<i>)
+//!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
+//!                with a column s of numbers unique to each, above n: Cloudberry's
+//!                RowIdExpr)
 //!         | {"join": {"type": "inner" | "left" | "right" | "full" | "leftsemi"
 //!                           | "rightsemi" | "leftanti" | "rightanti",
 //!                     "left": <node>, "right": <node>,
@@ -694,6 +697,9 @@ fn aggregate_of(name: &str, a: Expr) -> Result<Expr, String> {
         "min" => min(a),
         "max" => max(a),
         "avg" => avg(a),
+        // a column every row of the group has alike (one the groups
+        // determine, as RowIdExpr's do): any of them
+        "any" => datafusion::functions_aggregate::expr_fn::first_value(a, vec![]),
         other => return Err(format!("unsupported aggregate {other}")),
     })
 }
@@ -1133,7 +1139,7 @@ fn memory_consumers(node: &Value) -> usize {
             + usize::from(distinct)
             + a.get("input").map_or(0, memory_consumers);
     }
-    if let Some(f) = node.get("filter") {
+    if let Some(f) = node.get("filter").or_else(|| node.get("rowid")) {
         return f.get("input").map_or(0, memory_consumers);
     }
     if let Some(j) = node.get("join") {
@@ -1166,6 +1172,15 @@ fn build_node(
     if let Some(f) = node.get("filter") {
         let b = build_node(field(f, "input")?, tables)?;
         return b.filter(expr(field(f, "pred")?)?).map_err(df);
+    }
+    if let Some(r) = node.get("rowid") {
+        // RowIdExpr, as a column of its node's rows (see rowid)
+        let b = build_node(field(r, "input")?, tables)?;
+        let name = field(r, "name")?.as_str().ok_or("plan spec: rowid name")?;
+        let base = field(r, "base")?.as_i64().ok_or("plan spec: rowid base")?;
+        let mut cols: Vec<Expr> = b.schema().columns().into_iter().map(Expr::Column).collect();
+        cols.push(crate::rowid::RowId::udf(base).call(vec![]).alias(name));
+        return b.project(cols).map_err(df);
     }
     if let Some(a) = node.get("aggregate") {
         let mut b = build_node(field(a, "input")?, tables)?;
@@ -1287,7 +1302,7 @@ fn build_node(
                             inner_aggs.push(filtered(count(x))?.alias(format!("{p}_n")));
                             post[i] = Post::AvgDivide;
                         }
-                        "sum" | "sum_numeric" | "sum_decimal" | "min" | "max" => {
+                        "sum" | "sum_numeric" | "sum_decimal" | "min" | "max" | "any" => {
                             inner_aggs
                                 .push(filtered(aggregate(a, &input_schema, None)?)?.alias(&p));
                             if let Some(e) = aggregate_extra(a, None)? {
@@ -1317,6 +1332,9 @@ fn build_node(
                 match field(g, "fn")?.as_str().unwrap_or("") {
                     "min" => agg_exprs.push(min(p).alias(&a)),
                     "max" => agg_exprs.push(max(p).alias(&a)),
+                    "any" => agg_exprs.push(
+                        datafusion::functions_aggregate::expr_fn::first_value(p, vec![]).alias(&a),
+                    ),
                     "avg" => {
                         agg_exprs.push(sum(p).alias(&a));
                         agg_exprs.push(sum(pn).alias(format!("{a}_n")));

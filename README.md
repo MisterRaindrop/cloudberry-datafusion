@@ -435,6 +435,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | E2 | Casts between integers, floats, date/timestamp and numeric |
 | A1 | Aggregates below a join or another aggregate |
 | SQ1 | Subquery Scan; batch Motions below Subquery Scan and Append |
+| RI1 | RowIdExpr: semi joins deduplicated after the join |
 
 ### Aggregates below a join or another aggregate
 
@@ -459,6 +460,18 @@ Subquery Scan or an Append now count when choosing batch Motions; before,
 they always carried tuples, so a partial sum below one stayed on
 PostgreSQL.  Those of init plans still do: an init plan's top slice has
 no sending Motion to find its plan by.
+
+RI1: for a semi join whose outer side is small, Cloudberry's planner
+joins first and drops the copies afterwards (JOIN_DEDUP_SEMI, TPC-H Q4 and
+Q21): RowIdExpr numbers the rows of one side, unique within the query, and
+an aggregate grouped by those numbers keeps one row of each, its other
+columns as they are.  DataFusion numbers the rows of the scan or join whose
+output has the RowIdExpr as a column of that node (`df_core::rowid`: the
+segment's dbid shifted left by 48 bits, as PostgreSQL's, plus a counter
+the partitions share), so the copies the join makes share a number.  An
+aggregate's column it does not group by, which the planner puts there
+only where the groups determine it, is any value of its group
+(`first_value`).
 
 ### Date and time types
 

@@ -55,7 +55,9 @@
 
 #include <math.h>
 
+#include "access/parallel.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbvars.h"
 #include "executor/nodeSubplan.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -90,6 +92,7 @@ typedef struct DfNamedAgg
 {
 	Agg		   *agg;
 	List	   *aggrefs;		/* its distinct aggregate calls */
+	List	   *aggfns;			/* the function of each (df_emit_agg_calls) */
 } DfNamedAgg;
 
 typedef struct DfBuilder
@@ -117,9 +120,14 @@ static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
 static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
+static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
 static void df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
 							  List *aggfns);
 static DfNamedAgg *df_named_of(DfBuilder *b, Agg *agg);
+static void df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call);
+static void df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var);
+static int	df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn);
+static bool df_numbers_rows(Plan *plan);
 
 static void
 df_fail(DfBuilder *b, const char *what)
@@ -649,6 +657,87 @@ df_named_of(DfBuilder *b, Agg *agg)
 }
 
 /*
+ * A1: call 'call' of b->agg, an Agg below the top: by its name from above,
+ * by its index in its own HAVING.
+ */
+static void
+df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call)
+{
+	List	   *calls = df_named_of(b, b->agg)->aggrefs;
+	int			k = list_length(calls);
+	ListCell   *lc;
+
+	foreach(lc, calls)
+		if (equal(lfirst(lc), call))
+			k = foreach_current_index(lc);
+	if (k == list_length(calls))
+		df_fail(b, "an aggregate call");
+	else if (b->agg_named)
+		appendStringInfo(out, "{\"name\":\"q%d_a%d\"}", b->agg->plan.plan_node_id, k);
+	else
+		appendStringInfo(out, "{\"agg\":%d}", k);
+}
+
+/*
+ * RI1: column 'var' of an Agg's child, as the call any(var) of the Agg
+ * (df_emit_agg_calls).
+ */
+static Aggref *
+df_any_call(Var *var)
+{
+	Aggref	   *call = makeNode(Aggref);
+
+	call->aggfnoid = InvalidOid;
+	call->aggtype = var->vartype;
+	call->aggsplit = AGGSPLIT_SIMPLE;
+	call->aggargtypes = list_make1_oid(var->vartype);
+	call->args = list_make1(makeTargetEntry((Expr *) copyObject(var), 1, NULL, false));
+	call->location = -1;
+	return call;
+}
+
+/*
+ * RI1: a column of b->agg's child it does not group by.  The planner puts
+ * one there only where the groups determine it: a column of a table
+ * grouped by its key, or of a row whose copies a grouping by RowIdExpr
+ * drops.  Any value of the group is it.
+ */
+static void
+df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var)
+{
+	if (df_named_of(b, b->agg) != NULL)
+		df_emit_named_call(b, out, df_any_call(var));
+	else
+		appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, df_any_call(var), "any"));
+}
+
+/* RI1: the columns of an Agg's child it does not group by, outside calls. */
+typedef struct DfUngrouped
+{
+	Agg		   *agg;
+	List	   *vars;
+} DfUngrouped;
+
+static bool
+df_collect_ungrouped(Node *node, DfUngrouped *c)
+{
+	if (node == NULL || IsA(node, Aggref))
+		return false;
+	if (IsA(node, Var) && ((Var *) node)->varno == OUTER_VAR)
+	{
+		int			k;
+
+		for (k = 0; k < c->agg->numCols; k++)
+			if (c->agg->grpColIdx[k] == ((Var *) node)->varattno)
+				return false;
+		c->vars = lappend(c->vars, node);
+		return false;
+	}
+	return expression_tree_walker(node, df_collect_ungrouped, c);
+}
+
+
+/*
  * Output column 'resno' of plan node 'child', as an expression over the
  * inputs: the Motion's column itself, or the child's targetlist entry
  * emitted in the child's own terms, down to the scanned columns.
@@ -916,12 +1005,22 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					else if (k < b->agg->numCols)
 						appendStringInfo(out, "{\"group\":%d}", k);
 					else
-						df_fail(b, "an ungrouped column above an aggregate");
+						df_emit_ungrouped(b, out, var);
 				}
 				else
 					df_fail(b, "a column reference");
 				return;
 			}
+
+		case T_RowIdExpr:
+			/* RI1: the column its node's rows were numbered in */
+			if (level != DF_LEVEL_SCAN || !df_numbers_rows(b->ctx))
+			{
+				df_fail(b, "a RowIdExpr");
+				return;
+			}
+			appendStringInfo(out, "{\"name\":\"rowid%d\"}", b->ctx->plan_node_id);
+			return;
 
 		case T_Param:
 			/* IP1: an init plan's value (numeric only compared: above) */
@@ -1313,19 +1412,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			if (df_named_of(b, b->agg) != NULL)
 			{
 				/* A1: a call of an Agg below the top (df_emit_node) */
-				List	   *calls = df_named_of(b, b->agg)->aggrefs;
-				int			k = list_length(calls);
-				ListCell   *lc;
-
-				foreach(lc, calls)
-					if (equal(lfirst(lc), node))
-						k = foreach_current_index(lc);
-				if (k == list_length(calls))
-					df_fail(b, "an aggregate call");
-				else if (b->agg_named)
-					appendStringInfo(out, "{\"name\":\"q%d_a%d\"}", b->agg->plan.plan_node_id, k);
-				else
-					appendStringInfo(out, "{\"agg\":%d}", k);
+				df_emit_named_call(b, out, (Aggref *) node);
 				return;
 			}
 			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
@@ -1369,7 +1456,7 @@ df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
  * first, which is the order they are fed in.
  */
 static void
-df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
+df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 {
 	if (b->failed)
 		return;
@@ -1426,6 +1513,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				Agg		   *agg = (Agg *) plan;
 				DfNamedAgg *na = palloc0(sizeof(DfNamedAgg));
 				List	   *calls = NIL;
+				DfUngrouped ungrouped;
 				Agg		   *saved = b->agg;
 				bool		named = b->agg_named;
 				ListCell   *lc;
@@ -1436,7 +1524,25 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 				df_collect_aggrefs((Node *) plan->qual, &calls);
 				foreach(lc, calls)
 					if (!list_member(na->aggrefs, lfirst(lc)))
+					{
 						na->aggrefs = lappend(na->aggrefs, lfirst(lc));
+						na->aggfns = lappend(na->aggfns, NULL);
+					}
+				/* RI1: the columns it does not group by, as any() */
+				ungrouped.agg = agg;
+				ungrouped.vars = NIL;
+				df_collect_ungrouped((Node *) plan->targetlist, &ungrouped);
+				df_collect_ungrouped((Node *) plan->qual, &ungrouped);
+				foreach(lc, ungrouped.vars)
+				{
+					Aggref	   *call = df_any_call(lfirst(lc));
+
+					if (!list_member(na->aggrefs, call))
+					{
+						na->aggrefs = lappend(na->aggrefs, call);
+						na->aggfns = lappend(na->aggfns, "any");
+					}
+				}
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
 				df_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"group\":[");
@@ -1447,7 +1553,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 					df_emit_grouped(b, out, outerPlan(plan), agg->grpColIdx[i]);
 				}
 				appendStringInfoString(out, "],\"aggs\":[");
-				df_emit_agg_calls(b, out, agg, na->aggrefs, NIL);
+				df_emit_agg_calls(b, out, agg, na->aggrefs, na->aggfns);
 				b->named = lappend(b->named, na);
 				appendStringInfoString(out, "],\"having\":");
 				b->agg = agg;
@@ -1546,6 +1652,66 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 	}
 }
 
+/* Is there a RowIdExpr in 'node'? */
+static bool
+df_has_rowid_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RowIdExpr))
+		return true;
+	return expression_tree_walker(node, df_has_rowid_walker, context);
+}
+
+/*
+ * RI1: does plan node 'plan' number its rows (a RowIdExpr in its
+ * targetlist, of a scan or join: df_check_slice)?  Its rows get a column
+ * rowid<plan_node_id>.
+ */
+static bool
+df_numbers_rows(Plan *plan)
+{
+	return (IsA(plan, SeqScan) || IsA(plan, HashJoin)) &&
+		df_has_rowid_walker((Node *) plan->targetlist, NULL);
+}
+
+/*
+ * RI1: the number RowIdExpr counts up from in this process, as
+ * execExpr.c has it: unique to the segment (and parallel worker).
+ */
+static int64
+df_rowid_base(void)
+{
+	if (TotalParallelWorkerNumberOfSlice > 0)
+	{
+		int			bits = pg_leftmost_one_pos32(TotalParallelWorkerNumberOfSlice) + 1;
+		int64		base = ((int64) GpIdentity.dbid) << (48 + bits);
+
+		if (IsParallelWorkerOfSlice())
+			base |= ((int64) ParallelWorkerNumberOfSlice) << 48;
+		return base;
+	}
+	return ((int64) GpIdentity.dbid) << 48;
+}
+
+/*
+ * The plan node 'plan' of the slice, below its aggregate, as a node of the
+ * spec, its rows numbered if it has a RowIdExpr (RI1).
+ */
+static void
+df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
+{
+	if (b->failed || !df_numbers_rows(plan))
+	{
+		df_emit_plan_node(b, out, plan);
+		return;
+	}
+	appendStringInfoString(out, "{\"rowid\":{\"input\":");
+	df_emit_plan_node(b, out, plan);
+	appendStringInfo(out, ",\"name\":\"rowid%d\",\"base\":" INT64_FORMAT "}}",
+					 plan->plan_node_id, df_rowid_base());
+}
+
 /*
  * The aggregate calls 'aggrefs' of Agg 'aggnode', with the function of
  * each in 'aggfns' (NULL for the call's own; NIL: all NULL), as the "aggs"
@@ -1565,6 +1731,15 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 
 		if (foreach_current_index(lc) > 0)
 			appendStringInfoChar(aggs, ',');
+		if (fn != NULL && strcmp(fn, "any") == 0)
+		{
+			/* RI1: a column the groups determine (df_emit_ungrouped) */
+			b->ctx = (Plan *) aggnode;
+			appendStringInfoString(aggs, "{\"fn\":\"any\",\"arg\":");
+			df_emit(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr, DF_LEVEL_SCAN);
+			appendStringInfoChar(aggs, '}');
+			continue;
+		}
 		if (combine && df_agg_state(agg) != DF_AGG_AVG_FLOAT &&
 			df_agg_state(agg) != DF_AGG_PLAIN)
 		{

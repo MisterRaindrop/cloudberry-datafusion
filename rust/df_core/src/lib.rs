@@ -28,4 +28,5 @@ pub mod pgfunc;
 pub mod pgnum;
 pub mod pgstr;
 pub mod query;
+pub mod rowid;
 pub mod runtime;
