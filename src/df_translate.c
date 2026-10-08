@@ -1480,8 +1480,60 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			}
 
 		case T_Hash:
+		case T_Material:
 			df_emit_node(b, out, outerPlan(plan));
 			return;
+
+		case T_NestLoop:
+			{
+				/*
+				 * NL1: DataFusion's nested loop join collects its left side,
+				 * PostgreSQL's inner one, fed first, and streams the other;
+				 * the join types turn around as for a Hash Join.  No keys,
+				 * the join filter decides.
+				 */
+				Join	   *join = (Join *) plan;
+				const char *type;
+
+				switch (join->jointype)
+				{
+					case JOIN_INNER:
+						type = "inner";
+						break;
+					case JOIN_LEFT:
+						type = "right";
+						break;
+					case JOIN_SEMI:
+						type = "rightsemi";
+						break;
+					case JOIN_ANTI:
+						type = "rightanti";
+						break;
+					default:
+						df_fail(b, "this kind of Nested Loop");
+						return;
+				}
+				if (plan->qual != NIL)
+					appendStringInfoString(out, "{\"filter\":{\"input\":");
+				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
+				df_emit_node(b, out, innerPlan(plan));
+				appendStringInfoString(out, ",\"right\":");
+				df_emit_node(b, out, outerPlan(plan));
+				appendStringInfoString(out, ",\"on\":[],\"filter\":");
+				b->ctx = plan;
+				b->join_sides = true;
+				df_emit_qual(b, out, join->joinqual, DF_LEVEL_SCAN);
+				b->join_sides = false;
+				appendStringInfoString(out, "}}");
+				if (plan->qual != NIL)
+				{
+					appendStringInfoString(out, ",\"pred\":");
+					b->ctx = plan;
+					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					appendStringInfoString(out, "}}");
+				}
+				return;
+			}
 
 		case T_Result:
 			/* R1: its child's rows, its filter over them */

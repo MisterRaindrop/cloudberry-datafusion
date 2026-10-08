@@ -353,6 +353,36 @@ SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHER
 RESET datafusion.motion_batches;
 DROP TABLE df_ni_o, df_ni_i;
 
+-- A Nested Loop without parameters (NL1, GPORCA's TPC-H Q11): DataFusion's
+-- nested loop join, which collects PostgreSQL's inner side and streams the
+-- outer one; the join filter decides.
+CREATE TABLE df_nl_o (id int, k int) DISTRIBUTED BY (id);
+INSERT INTO df_nl_o SELECT i, CASE WHEN i % 41 = 0 THEN NULL ELSE i % 500 END
+FROM generate_series(1, 3000) i;
+CREATE TABLE df_nl_i (v int, k int) DISTRIBUTED BY (v);
+INSERT INTO df_nl_i SELECT i, i * 3 % 450 FROM generate_series(1, 300) i;
+ANALYZE df_nl_o;
+ANALYZE df_nl_i;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
+SET datafusion.mode = off;
+SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
+SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
+SELECT count(*), sum(id) FROM df_nl_o a WHERE EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
+SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
+SET datafusion.mode = on;
+SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
+SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
+SELECT count(*), sum(id) FROM df_nl_o a WHERE EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
+SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
+RESET datafusion.motion_batches;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+DROP TABLE df_nl_o, df_nl_i;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

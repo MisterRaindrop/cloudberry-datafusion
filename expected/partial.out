@@ -89,7 +89,7 @@ UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w;
 -- Below a Nested Loop only its outer side may run, never the inner side,
 -- which it rescans per row.  With sorts the GroupAggregates read their
 -- input's order, which DataFusion running the outer aggregate hashed would
--- not keep; without, the outer side only receives rows: nothing runs there.
+-- not keep; without, the Nested Loop runs in DataFusion (NL1).
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
@@ -144,8 +144,8 @@ JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k;
                            ->  Seq Scan on df_pt2 b
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: Nested Loop is not supported
- DataFusion: slice 2 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible, sends Arrow batches
 (22 rows)
 

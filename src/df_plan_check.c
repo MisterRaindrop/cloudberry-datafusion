@@ -1948,9 +1948,9 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	}
 	if (IsA(plan, SeqScan))
 		return true;
-	if (IsA(plan, Hash))
+	if (IsA(plan, Hash) || IsA(plan, Material))
 		return inner == NULL && df_plain_outputs(outerPlan(plan), outer);
-	if (IsA(plan, HashJoin))
+	if (IsA(plan, HashJoin) || IsA(plan, NestLoop))
 		return (outer == NULL || df_plain_outputs(outerPlan(plan), outer)) &&
 			(inner == NULL || df_plain_outputs(innerPlan(plan), inner));
 	return false;
@@ -2650,14 +2650,43 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			}
 
 		case T_HashJoin:
+		case T_NestLoop:
 			{
-				HashJoin   *hj = (HashJoin *) plan;
-				Join	   *join = &hj->join;
+				HashJoin   *hj = IsA(plan, HashJoin) ? (HashJoin *) plan : NULL;
+				Join	   *join = (Join *) plan;
+				List	   *hashclauses = hj ? hj->hashclauses : NIL;
 				Plan	   *outer = outerPlan(plan);
 				Plan	   *inner = innerPlan(plan);
 				Bitmapset  *outer_needed = NULL;
 				Bitmapset  *inner_needed = NULL;
 				ListCell   *lc;
+
+				if (hj == NULL)
+				{
+					/*
+					 * NL1: a Nested Loop, as DataFusion's nested loop join,
+					 * which collects its left side, PostgreSQL's inner one
+					 * (often a Materialize), and streams the outer one.  Not a
+					 * parameterized one, whose inner side is scanned again for
+					 * each outer row.
+					 */
+					if (((NestLoop *) plan)->nestParams != NIL)
+					{
+						df_reject(cxt, "Nested Loop with parameters");
+						return;
+					}
+					if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
+						join->jointype != JOIN_SEMI && join->jointype != JOIN_ANTI)
+					{
+						df_reject(cxt, "this kind of Nested Loop");
+						return;
+					}
+					if (inner == NULL || outer == NULL)
+					{
+						df_reject(cxt, "Nested Loop without two children");
+						return;
+					}
+				}
 
 				/*
 				 * An equi-join, DataFusion's hash table on PostgreSQL's Hash
@@ -2673,24 +2702,24 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "this kind of join");
 					return;
 				}
-				if (join->jointype == JOIN_LASJ_NOTIN &&
+				if (hj != NULL && join->jointype == JOIN_LASJ_NOTIN &&
 					(list_length(hj->hashclauses) != 1 || join->joinqual != NIL))
 				{
 					/* NJ1: DataFusion's null-aware anti join takes one key */
 					df_reject(cxt, "NOT IN anti join on several columns or with a join filter");
 					return;
 				}
-				if (hj->hashqualclauses != NIL)
+				if (hj != NULL && hj->hashqualclauses != NIL)
 				{
 					df_reject(cxt, "IS NOT DISTINCT FROM join");
 					return;
 				}
-				if (inner == NULL || !IsA(inner, Hash) || outer == NULL)
+				if (hj != NULL && (inner == NULL || !IsA(inner, Hash) || outer == NULL))
 				{
 					df_reject(cxt, "Hash Join without a Hash node");
 					return;
 				}
-				foreach(lc, hj->hashclauses)
+				foreach(lc, hashclauses)
 				{
 					OpExpr	   *op = lfirst(lc);
 					char	   *name;
@@ -2712,8 +2741,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				if (df_hash_estimate(inner) > df_hash_budget(inner))
 				{
-					df_reject(cxt, "Hash Join build side of about %.0f kB exceeds its %.0f kB",
-							  df_hash_estimate(inner) / 1024, df_hash_budget(inner) / 1024);
+					df_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
+							  df_plan_name(plan), df_hash_estimate(inner) / 1024,
+							  df_hash_budget(inner) / 1024);
 					return;
 				}
 				if (join->jointype == JOIN_LASJ_NOTIN &&
@@ -2728,7 +2758,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->rowid_ok = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
 				cxt->rowid_ok = false;
-				df_check_expr_list(hj->hashclauses, cxt);
+				df_check_expr_list(hashclauses, cxt);
 				df_check_expr_list(join->joinqual, cxt);
 				df_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
@@ -2760,7 +2790,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						Var		   *var = lfirst_node(Var, lc);
 
 						if (var->varno == dropped &&
-							(join->jointype != JOIN_SEMI || df_semi_key_for(hj, var) == NULL))
+							(join->jointype != JOIN_SEMI || hj == NULL ||
+							 df_semi_key_for(hj, var) == NULL))
 						{
 							df_reject(cxt, "column of the side a semi or anti join drops");
 							return;
@@ -2779,8 +2810,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						df_collect_inner_refs((Node *) tle->expr, &inner_needed);
 					}
 				}
-				df_collect_outer_refs((Node *) hj->hashclauses, &outer_needed);
-				df_collect_inner_refs((Node *) hj->hashclauses, &inner_needed);
+				df_collect_outer_refs((Node *) hashclauses, &outer_needed);
+				df_collect_inner_refs((Node *) hashclauses, &inner_needed);
 				df_collect_outer_refs((Node *) join->joinqual, &outer_needed);
 				df_collect_inner_refs((Node *) join->joinqual, &inner_needed);
 				df_collect_outer_refs((Node *) plan->qual, &outer_needed);
@@ -2824,13 +2855,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			}
 
 		case T_Hash:
+		case T_Material:
 			{
 				Bitmapset  *child_needed = NULL;
 				ListCell   *lc;
 
+				/* NL1: a Materialize passes its child's rows on, as a Hash */
 				if (plan->qual != NIL)
 				{
-					df_reject(cxt, "filter on a Hash node");
+					df_reject(cxt, "filter on a %s node", df_plan_name(plan));
 					return;
 				}
 				df_check_targetlist(plan->targetlist, needed, cxt);

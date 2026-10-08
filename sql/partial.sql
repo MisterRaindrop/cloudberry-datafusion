@@ -44,7 +44,7 @@ UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w;
 -- Below a Nested Loop only its outer side may run, never the inner side,
 -- which it rescans per row.  With sorts the GroupAggregates read their
 -- input's order, which DataFusion running the outer aggregate hashed would
--- not keep; without, the outer side only receives rows: nothing runs there.
+-- not keep; without, the Nested Loop runs in DataFusion (NL1).
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 EXPLAIN (COSTS OFF) SELECT a.k, count(*) FROM (SELECT k, count(*) AS c FROM df_pt GROUP BY k) a
