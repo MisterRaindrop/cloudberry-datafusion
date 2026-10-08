@@ -2140,6 +2140,46 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 }
 
 /*
+ * D4: the order of Sort 'sort' below 'body', a GroupAggregate run hashed
+ * under a Limit, as the spec's "sort" by output columns (the Limit applies
+ * after it).
+ */
+static void
+df_emit_resort_by(DfBuilder *b, StringInfo out, Sort *sort, Plan *body, DfSliceSpec *spec)
+{
+	int			i;
+
+	appendStringInfoString(out, ",\"sort\":[");
+	for (i = 0; i < sort->numCols; i++)
+	{
+		TargetEntry *tle = NULL;
+		ListCell   *lc;
+		bool		desc;
+		int			c;
+
+		foreach(lc, body->targetlist)
+		{
+			TargetEntry *t = lfirst_node(TargetEntry, lc);
+
+			if (IsA(t->expr, Var) && ((Var *) t->expr)->varno == OUTER_VAR &&
+				((Var *) t->expr)->varattno == sort->sortColIdx[i])
+				tle = t;
+		}
+		if (tle == NULL || spec->col_value[tle->resno - 1] < 0 ||
+			!df_sort_direction(sort->sortOperators[i], exprType((Node *) tle->expr), &desc))
+		{
+			df_fail(b, "a sort key of the GroupAggregate");
+			return;
+		}
+		c = b->out_col[spec->col_value[tle->resno - 1]];
+		appendStringInfo(out, "%s{\"col\":%d,\"desc\":%s,\"nulls_first\":%s}",
+						 i > 0 ? "," : "", c, desc ? "true" : "false",
+						 sort->nullsFirst[i] ? "true" : "false");
+	}
+	appendStringInfoChar(out, ']');
+}
+
+/*
  * D3: the order of sorted Motion 'motion' above 'body', a GroupAggregate
  * run hashed, as the spec's "sort" by output columns.
  */
@@ -2247,8 +2287,10 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
 	if (!b.failed && tails != NULL && tails->resort != NULL)
 	{
-		if (sort != NULL || limit != NULL)
+		if (sort != NULL || (limit != NULL && tails->resort_by == NULL))
 			df_fail(&b, "a Sort below a sorted Motion's GroupAggregate");
+		else if (tails->resort_by != NULL)
+			df_emit_resort_by(&b, &sortlimit, tails->resort_by, root, spec);
 		else
 			df_emit_resort(&b, &sortlimit, tails->resort, root, spec);
 	}

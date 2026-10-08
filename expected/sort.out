@@ -768,6 +768,84 @@ SELECT id FROM df_so ORDER BY b, id OFFSET 30000;
 
 RESET plan_cache_mode;
 DEALLOCATE df_top;
+-- A LIMIT pushed below a sorted Motion over a GroupAggregate (D4, TPC-H
+-- Q18): DataFusion groups hashed, sorts by the GroupAggregate's Sort keys,
+-- every grouping column among them, and then limits.
+CREATE TABLE df_lk (k int, a int, n numeric(10,2), d date) DISTRIBUTED BY (k);
+INSERT INTO df_lk SELECT i % 500, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 7 END,
+  (i % 211) * 0.75, date '2000-01-01' + i % 3 FROM generate_series(1, 20000) i;
+ANALYZE df_lk;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: a, k
+         ->  Limit
+               ->  GroupAggregate
+                     Group Key: a, k
+                     ->  Sort
+                           Sort Key: a DESC NULLS LAST, k
+                           ->  Seq Scan on df_lk
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+ k | a |  sum   
+---+---+--------
+ 0 | 6 | 514.50
+ 1 | 6 | 429.75
+ 2 | 6 | 477.00
+ 3 | 6 | 405.00
+ 4 | 6 | 408.75
+ 5 | 6 | 354.00
+ 6 | 6 | 472.50
+ 7 | 6 | 546.00
+(8 rows)
+
+SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
+  k  |     d      | count 
+-----+------------+-------
+ 497 | 01-01-2000 |    13
+ 496 | 01-01-2000 |    13
+ 495 | 01-01-2000 |    14
+ 494 | 01-01-2000 |    13
+ 493 | 01-01-2000 |    13
+ 492 | 01-01-2000 |    14
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+ k | a |  sum   
+---+---+--------
+ 0 | 6 | 514.50
+ 1 | 6 | 429.75
+ 2 | 6 | 477.00
+ 3 | 6 | 405.00
+ 4 | 6 | 408.75
+ 5 | 6 | 354.00
+ 6 | 6 | 472.50
+ 7 | 6 | 546.00
+(8 rows)
+
+SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
+  k  |     d      | count 
+-----+------------+-------
+ 497 | 01-01-2000 |    13
+ 496 | 01-01-2000 |    13
+ 495 | 01-01-2000 |    14
+ 494 | 01-01-2000 |    13
+ 493 | 01-01-2000 |    13
+ 492 | 01-01-2000 |    14
+(6 rows)
+
+RESET enable_hashagg;
+DROP TABLE df_lk;
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

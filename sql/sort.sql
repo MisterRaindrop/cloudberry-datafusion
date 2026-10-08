@@ -123,6 +123,25 @@ SELECT id FROM df_so ORDER BY b, id OFFSET 30000;
 RESET plan_cache_mode;
 DEALLOCATE df_top;
 
+-- A LIMIT pushed below a sorted Motion over a GroupAggregate (D4, TPC-H
+-- Q18): DataFusion groups hashed, sorts by the GroupAggregate's Sort keys,
+-- every grouping column among them, and then limits.
+CREATE TABLE df_lk (k int, a int, n numeric(10,2), d date) DISTRIBUTED BY (k);
+INSERT INTO df_lk SELECT i % 500, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 7 END,
+  (i % 211) * 0.75, date '2000-01-01' + i % 3 FROM generate_series(1, 20000) i;
+ANALYZE df_lk;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+SET datafusion.mode = off;
+SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
+SET datafusion.mode = on;
+SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
+SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
+RESET enable_hashagg;
+DROP TABLE df_lk;
+
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

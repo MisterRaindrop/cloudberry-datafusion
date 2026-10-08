@@ -122,6 +122,7 @@ typedef struct DfCheckContext
 
 static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
 static bool df_check_expr(Node *node, DfCheckContext *cxt);
+static bool df_check_resort_limit(DfCheckContext *cxt, Motion *motion, Limit *limit);
 static bool df_name_in(const char *name, const char *const *list);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
@@ -2259,6 +2260,93 @@ df_sorted_for(Plan *top, Motion *motion)
 	return true;
 }
 
+/* Column of Agg 'agg' that outputs its child's column 'attno', or 0. */
+static AttrNumber
+df_agg_output_of(Agg *agg, AttrNumber attno)
+{
+	ListCell   *lc;
+
+	foreach(lc, agg->plan.targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (IsA(tle->expr, Var) && ((Var *) tle->expr)->varno == OUTER_VAR &&
+			((Var *) tle->expr)->varattno == attno)
+			return tle->resno;
+	}
+	return 0;
+}
+
+/*
+ * D4: below sorted Motion 'motion', a Limit over a GroupAggregate over a
+ * Sort, as the planner pushes a LIMIT down (TPC-H Q18): the Limit keeps
+ * the first rows in the GroupAggregate's order, the Sort's.  May the slice
+ * run it hashed, sort its output by the Sort's keys and then limit it?
+ * That order is the GroupAggregate's when the Sort's keys are grouping
+ * columns covering all of them (one row per group, so no ties), each an
+ * output column; the Motion merges by a prefix of them.  Records it.
+ */
+static bool
+df_check_resort_limit(DfCheckContext *cxt, Motion *motion, Limit *limit)
+{
+	Agg		   *agg = (Agg *) outerPlan(limit);
+	Sort	   *sort;
+	Bitmapset  *groups = NULL;
+	Bitmapset  *keys = NULL;
+	int			i,
+				k;
+
+	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
+		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) ||
+		!df_passes_through((Plan *) limit) || motion->numSortCols == 0)
+		return false;
+	sort = (Sort *) outerPlan(agg);
+	if (sort->numCols < motion->numSortCols)
+		return false;
+	for (i = 0; i < sort->numCols; i++)
+	{
+		AttrNumber	col = df_agg_output_of(agg, sort->sortColIdx[i]);
+		TargetEntry *tle = col > 0 ? get_tle_by_resno(agg->plan.targetlist, col) : NULL;
+		Oid			type;
+		bool		desc;
+
+		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != sort->sortColIdx[i]; k++)
+			;
+		if (tle == NULL || k == agg->numCols)
+			return false;
+		groups = bms_add_member(groups, k);
+		type = exprType((Node *) tle->expr);
+		if (!df_type_supported(type) || !df_sort_direction(sort->sortOperators[i], type, &desc))
+			return false;
+		if (df_type_is_string(type) &&
+			df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
+		{
+			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  df_string_compare_problem(cxt, "<", sort->collations[i]));
+			return false;
+		}
+		if (i < motion->numSortCols)
+		{
+			/* the Motion's key i is the same column, the same way */
+			TargetEntry *mtle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
+
+			if (mtle == NULL || !IsA(mtle->expr, Var) ||
+				((Var *) mtle->expr)->varno != OUTER_VAR ||
+				((Var *) mtle->expr)->varattno != col ||
+				motion->sortOperators[i] != sort->sortOperators[i] ||
+				motion->nullsFirst[i] != sort->nullsFirst[i])
+				return false;
+		}
+		keys = bms_add_member(keys, col);
+	}
+	if (bms_num_members(groups) != agg->numCols)
+		return false;
+	cxt->sort_keys = bms_union(cxt->sort_keys, keys);
+	cxt->tails.resort = motion;
+	cxt->tails.resort_by = sort;
+	return true;
+}
+
 /*
  * D3: may the slice below sorted Motion 'motion' run its GroupAggregate
  * hashed and sort the result by the Motion's keys?  The keys must be the
@@ -2271,6 +2359,8 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 	int			i,
 				k;
 
+	if (agg != NULL && IsA(agg, Limit))
+		return df_check_resort_limit(cxt, motion, (Limit *) agg);
 	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
 		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) || motion->numSortCols == 0)
 		return false;
@@ -2762,6 +2852,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				/* a Sort may be below it */
 				cxt->top = outerPlan(plan);
 				cxt->output = outerPlan(plan);
+				/* D4: the GroupAggregate below, in the order the slice sorts by */
+				cxt->order_free = cxt->node_order_free && cxt->tails.resort_by != NULL;
 				df_check_plan(outerPlan(plan), cxt, needed, false);
 				return;
 			}

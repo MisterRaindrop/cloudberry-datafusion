@@ -437,6 +437,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | SQ1 | Subquery Scan; batch Motions below Subquery Scan and Append |
 | RI1 | RowIdExpr: semi joins deduplicated after the join |
 | R1 | GPORCA's Result: a projection and filter over its child |
+| D4 | A Limit over a GroupAggregate below a sorted Motion |
 
 ### Aggregates below a join or another aggregate
 
@@ -849,6 +850,13 @@ keys: the groups are unique, so the order is the same.  One below a Limit
 or at the top of the coordinator's slice stays on PostgreSQL, since the
 query's ORDER BY may rest on its order.  `count(DISTINCT a % 100000)`
 over 30 million rows took 0.65 s against 3.29 s.
+
+D4: the planner also pushes a LIMIT below the sorted Motion, over the
+GroupAggregate (TPC-H Q18), where it keeps the first groups in the order of
+the Sort below.  The slice runs the GroupAggregate hashed, sorts its output
+by that Sort's keys and then limits it.  The order is the GroupAggregate's
+only when every grouping column is among those keys (one row per group, no
+ties) and output; the Motion merges by a prefix of them.
 
 ### Subtrees below PostgreSQL's nodes
 
