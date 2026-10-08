@@ -2847,6 +2847,8 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 		{TEXTOID, "hashtext"}, {VARCHAROID, "hashtext"},
 		/* the bytes without trailing blanks */
 		{BPCHAROID, "hashbpchar"},
+		/* NBASE digits in memory order; of a known scale (below) */
+		{NUMERICOID, "hash_numeric"},
 #endif
 	};
 	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);
@@ -2868,6 +2870,19 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 		{
 			*column = var->varattno - 1;
 			*tag = df_type_tag(var->vartype);
+			if (var->vartype == NUMERICOID)
+			{
+				/* the column's scale places the digits (df_core::cdbhash) */
+				Plan	   *child = outerPlan(motion);
+				TargetEntry *tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+				int			p,
+							sc;
+
+				if (tle == NULL || !df_numeric_ps(child, (Node *) tle->expr, &p, &sc))
+					return false;
+				if (sc != 0)
+					*tag = psprintf("numeric:%d", sc);
+			}
 			return true;
 		}
 	}

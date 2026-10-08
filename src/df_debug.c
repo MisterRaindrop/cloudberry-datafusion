@@ -329,6 +329,9 @@ static const DfKeyType df_key_types[] = {
 	{0, F_HASHCHAR, 1}, {1, F_HASHINT2, 2}, {2, F_HASHINT4, 4},
 	{3, F_HASHINT8, 8}, {4, F_HASHFLOAT4, 4}, {5, F_HASHFLOAT8, 8},
 	{6, F_HASHTEXT, 0}, {7, F_HASHBPCHAR, 0},
+	/* numeric of scale kind - 8 */
+	{8, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {10, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
+	{13, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {23, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
 };
 
 /*
@@ -386,6 +389,29 @@ df_random_key(pg_prng_state *rng, int32 kind, void *dst)
 		case 5:
 			*(float8 *) dst = special ? fspecial[s] : (pg_prng_double(rng) - 0.5) * 1e12;
 			break;
+		default:
+			{
+				/* numeric: up to 38 digits, zero digits around the point */
+				static const int128 nspecial[] = {0, DF_NUMERIC_NAN, DF_NUMERIC_PINF,
+				DF_NUMERIC_NINF, 1, -10000, 100000000, 1};
+				int128		v = 0;
+				int			ndig = pg_prng_uint64(rng) % 39;
+				int			i;
+
+				for (i = 0; i < ndig; i++)
+					v = v * 10 + (pg_prng_uint64(rng) % 3 == 0 ? 0 : pg_prng_uint64(rng) % 10);
+				if (special)
+				{
+					v = nspecial[s];
+					if (s == 7)
+						for (i = 0; i < 37; i++)
+							v *= 10;
+				}
+				if (!special && (r & 1))
+					v = -v;
+				df_numeric_store(v, dst);
+			}
+			break;
 	}
 }
 
@@ -404,8 +430,10 @@ df_key_datum(int32 kind, const void *v)
 			return Int64GetDatum(*(const int64 *) v);
 		case 4:
 			return Float4GetDatum(*(const float4 *) v);
-		default:
+		case 5:
 			return Float8GetDatum(*(const float8 *) v);
+		default:
+			return df_numeric_datum((const uint8 *) v, kind - 8);
 	}
 }
 
@@ -512,6 +540,7 @@ datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
 		/* nkeys, key types (indexes into df_key_types) */
 		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7},
 		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3}, {2, 7, 2},
+		{1, 8}, {1, 9}, {1, 10}, {1, 11}, {2, 9, 7},
 	};
 	int32		nrows = PG_GETARG_INT32(0);
 	int32		segments = PG_GETARG_INT32(1);

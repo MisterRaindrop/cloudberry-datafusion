@@ -30,19 +30,24 @@
 //! against cdbhash() value by value (datafusion_debug_cdbhash_check).
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
-use datafusion::arrow::datatypes::{Float32Type, Float64Type, Int16Type, Int32Type, Int64Type};
+use datafusion::arrow::datatypes::{
+    i256, Decimal256Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+};
+
+use crate::pgnum::{NUMERIC_NAN, NUMERIC_NINF, NUMERIC_PINF};
 
 /// The hash function of a distribution key, named after the column type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyHash {
-    Bool,   // hashchar
-    Int2,   // hashint2
-    Int4,   // hashint4
-    Int8,   // hashint8
-    Float4, // hashfloat4
-    Float8, // hashfloat8
-    Text,   // hashtext (cdbhash passes the default collation: deterministic)
-    Bpchar, // hashbpchar: hashtext of the value without trailing blanks
+    Bool,        // hashchar
+    Int2,        // hashint2
+    Int4,        // hashint4
+    Int8,        // hashint8
+    Float4,      // hashfloat4
+    Float8,      // hashfloat8
+    Text,        // hashtext (cdbhash passes the default collation: deterministic)
+    Bpchar,      // hashbpchar: hashtext of the value without trailing blanks
+    Numeric(i8), // hash_numeric, of a column of this scale
 }
 
 impl KeyHash {
@@ -58,7 +63,11 @@ impl KeyHash {
             "time" | "timestamp" | "timestamptz" => KeyHash::Int8,
             "text" => KeyHash::Text,
             "bpchar" => KeyHash::Bpchar,
-            _ => return None,
+            "numeric" => KeyHash::Numeric(0),
+            other => match other.strip_prefix("numeric:").map(str::parse::<i8>) {
+                Some(Ok(s)) if (0..=76).contains(&s) => KeyHash::Numeric(s),
+                _ => return None,
+            },
         })
     }
 }
@@ -215,6 +224,62 @@ pub fn jump_consistent_hash(mut key: u64, num_segments: i32) -> i32 {
     b as i32
 }
 
+/// hash_numeric (numeric.c) of `v` times 10^-`scale`: hash_any of the
+/// NBASE (10000) digits without leading and trailing zero digits, as int16
+/// in memory order, xor-ed with the weight of the first.  The digits are
+/// aligned on the decimal point.  0 hashes to -1, NaN and the infinities to
+/// 0.  The sign does not count.
+pub fn hash_numeric(v: i256, scale: i8) -> u32 {
+    if v == NUMERIC_NAN || v == NUMERIC_PINF || v == NUMERIC_NINF {
+        return 0;
+    }
+    if v == i256::ZERO {
+        return u32::MAX;
+    }
+    let scale = scale as u32;
+    let pad = (4 - scale % 4) % 4;
+    let nfrac = ((scale + pad) / 4) as i32;
+    // NBASE digits of |v| * 10^pad, least significant first
+    let mut digits: Vec<u16> = Vec::with_capacity(20);
+    let x = v.wrapping_abs();
+    match x
+        .to_i128()
+        .and_then(|x| (x as u128).checked_mul(10u128.pow(pad)))
+    {
+        Some(mut x) => {
+            while x > 0 {
+                let mut chunk = (x % 10_000_000_000_000_000) as u64;
+                x /= 10_000_000_000_000_000;
+                for _ in 0..4 {
+                    digits.push((chunk % 10000) as u16);
+                    chunk /= 10000;
+                }
+            }
+        }
+        None => {
+            let base = i256::from_i128(10000);
+            let mut x = x
+                .checked_mul(i256::from_i128(10i128.pow(pad)))
+                .expect("a numeric distribution key within 76 digits");
+            while x > i256::ZERO {
+                digits.push((x % base).as_i128() as u16);
+                x /= base;
+            }
+        }
+    }
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    let weight = digits.len() as i32 - 1 - nfrac;
+    let low = digits.iter().position(|&d| d != 0).unwrap_or(0);
+    let bytes: Vec<u8> = digits[low..]
+        .iter()
+        .rev()
+        .flat_map(|&d| (d as i16).to_ne_bytes())
+        .collect();
+    hash_bytes(&bytes) ^ weight as u32
+}
+
 /// The hash of row `r` of a key column.  None for NULL.
 #[inline]
 fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
@@ -232,6 +297,7 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
         KeyHash::Bpchar => {
             hash_bytes(crate::pgstr::bpchar_trim(a.as_string::<i32>().value(r)).as_bytes())
         }
+        KeyHash::Numeric(s) => hash_numeric(a.as_primitive::<Decimal256Type>().value(r), s),
     })
 }
 

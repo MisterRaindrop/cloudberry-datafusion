@@ -117,6 +117,30 @@ SET datafusion.mode = off;
 SELECT sum(a), avg(a), sum(b), avg(b), sum(d), avg(d), sum(c) FROM df_nc;
 SELECT sum(a), avg(b), max(a), min(b) FROM df_nc WHERE id > 0;
 
+-- Redistributed by numeric keys as batches: hash_numeric of the NBASE
+-- digits, placed by the column's scale (df_core::cdbhash).  df_nc3 is
+-- distributed by PostgreSQL's hash, which the rows redistributed to join
+-- it must meet.
+CREATE TABLE df_nc3 AS SELECT b AS k, id FROM df_nc, generate_series(1, 3)
+DISTRIBUTED BY (k);
+ANALYZE df_nc3;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT b, count(*) FROM df_nc GROUP BY b;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x.id) FROM df_nc x JOIN df_nc3 y ON x.b = y.k;
+SET datafusion.mode = off;
+SELECT count(*), sum(x.id) FROM df_nc x JOIN df_nc3 y ON x.b = y.k;
+SET datafusion.mode = on;
+SELECT count(*), sum(x.id) FROM df_nc x JOIN df_nc3 y ON x.b = y.k;
+SET datafusion.mode = off;
+SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT a, count(*) AS n FROM df_nc GROUP BY a) s;
+SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT b, d, count(*) AS n FROM df_nc GROUP BY b, d) s;
+SELECT c, count(*) FROM df_nc GROUP BY c HAVING c < 0 OR c > 1e38 OR c = 'NaN' ORDER BY c;
+SET datafusion.mode = on;
+SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT a, count(*) AS n FROM df_nc GROUP BY a) s;
+SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT b, d, count(*) AS n FROM df_nc GROUP BY b, d) s;
+SELECT c, count(*) FROM df_nc GROUP BY c HAVING c < 0 OR c > 1e38 OR c = 'NaN' ORDER BY c;
+SET datafusion.mode = off;
+
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;
@@ -161,6 +185,6 @@ SELECT id, b / a FROM df_nc WHERE id = -6;
 \set VERBOSITY default
 RESET datafusion.motion_batches;
 
-DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2;
+DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

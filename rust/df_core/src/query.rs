@@ -236,6 +236,7 @@ impl PgType {
             PgType::Int8 => KeyHash::Int8,
             PgType::Float4 => KeyHash::Float4,
             PgType::Float8 => KeyHash::Float8,
+            PgType::Numeric(s) => KeyHash::Numeric(s),
             _ => unreachable!(),
         }
     }

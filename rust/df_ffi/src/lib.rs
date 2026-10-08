@@ -504,7 +504,7 @@ pub extern "C" fn df_ffi_query_bytes(
 /// Routes of `nrows` rows by Cloudberry's distribution hash, for checking
 /// the Rust transcription against cdbhash(): `kinds[i]` names the hash of
 /// key column `cols[i]` (0 bool, 1 int2, 2 int4, 3 int8, 4 float4,
-/// 5 float8).  Writes `nrows` routes to `out`.  DF_OK, or DF_ERROR for an
+/// 5 float8, 6 text, 7 character, 8 + s numeric of scale s).  Writes `nrows` routes to `out`.  DF_OK, or DF_ERROR for an
 /// unknown kind.
 #[no_mangle]
 pub extern "C" fn df_ffi_cdbhash_routes(
@@ -531,6 +531,7 @@ pub extern "C" fn df_ffi_cdbhash_routes(
                 5 => PgType::Float8,
                 6 => PgType::Text,
                 7 => PgType::Bpchar,
+                8..=84 => PgType::Numeric((kind - 8) as i8),
                 _ => return None,
             };
             let raw = df_core::query::RawColumn {

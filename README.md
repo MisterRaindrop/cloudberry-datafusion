@@ -288,8 +288,9 @@ would: `df_core::cdbhash` transcribes Cloudberry's distribution hash (key
 hashes rotated and combined, Jump Consistent Hash over the segments, and in
 parallel mode the receiving worker from a second jump) and the hash
 functions of the supported types (`hashchar` for bool, `hashint2/4/8`,
-`hashfloat4/8` with their handling of -0 and NaN, and since X2
-`hashtext`).  Each receiver gets its
+`hashfloat4/8` with their handling of -0 and NaN, since X2 `hashtext`,
+since B1 `hashbpchar`, and `hash_numeric`, whose NBASE digits a Decimal256
+value at its column's scale gives).  Each receiver gets its
 own stream.  Keys must be plain columns hashed by their type's own
 non-legacy function; random distribution, legacy and cross-type hashing
 stay on tuples.  `datafusion_debug_cdbhash_check(nrows, segments, workers)`
@@ -645,9 +646,8 @@ aggregate's result below a Motion, and bounds arithmetic by the digits its
 operands may have, not by their values, so nothing can overflow at run
 time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
 + tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
-`numeric`, `/` and `%` (whose result scale depends on the values), unary
-minus, and Redistribute Motions by a numeric key (whose `hash_numeric` is
-not transcribed) stay on PostgreSQL; the direct PAX reader leaves numeric
+`numeric`, `/` and `%` (whose result scale depends on the values) and
+unary minus stay on PostgreSQL; the direct PAX reader leaves numeric
 columns to the table AM.  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
