@@ -1616,12 +1616,54 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					case JOIN_RIGHT_ANTI:
 						type = "leftanti";
 						break;
+					case JOIN_LASJ_NOTIN:
+						/* NJ1: below */
+						type = "leftanti";
+						break;
 					default:
 						df_fail(b, "this kind of join");
 						return;
 				}
 				if (plan->qual != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
+				if (hj->join.jointype == JOIN_LASJ_NOTIN)
+				{
+					/*
+					 * NJ1: NOT IN.  PostgreSQL returns nothing if the inner
+					 * side has a NULL key, and drops an outer row with a NULL
+					 * key unless the inner side is empty: DataFusion's
+					 * null-aware anti join, which keeps its left side and
+					 * builds its table there.  So the outer side is the left
+					 * one, fed first, and the keys read outer, inner.
+					 */
+					OpExpr	   *op = linitial_node(OpExpr, hj->hashclauses);
+					Node	   *outer = linitial(op->args);
+					Node	   *inner = lsecond(op->args);
+					Oid			ktype = df_join_key_type(exprType(inner), exprType(outer));
+					int			scale = ktype != NUMERICOID ? 0 :
+						Max(df_scale_of(plan, inner), df_scale_of(plan, outer));
+
+					appendStringInfoString(out, "{\"join\":{\"type\":\"leftanti\",\"null_aware\":true,\"left\":");
+					df_emit_node(b, out, outerPlan(plan));
+					appendStringInfoString(out, ",\"right\":");
+					df_emit_node(b, out, innerPlan(plan));
+					appendStringInfoString(out, ",\"on\":[[");
+					b->ctx = plan;
+					b->join_sides = true;
+					df_emit_key(b, out, outer, ktype, scale);
+					appendStringInfoChar(out, ',');
+					df_emit_key(b, out, inner, ktype, scale);
+					b->join_sides = false;
+					appendStringInfoString(out, "]],\"filter\":null}}");
+					if (plan->qual != NIL)
+					{
+						appendStringInfoString(out, ",\"pred\":");
+						b->ctx = plan;
+						df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+						appendStringInfoString(out, "}}");
+					}
+					return;
+				}
 				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
 				df_emit_node(b, out, innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");

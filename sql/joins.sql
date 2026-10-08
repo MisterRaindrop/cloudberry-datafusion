@@ -326,6 +326,33 @@ RESET datafusion.motion_batches;
 SET optimizer = off;
 DROP TABLE df_rs;
 
+-- NOT IN (NJ1, TPC-H Q16): DataFusion's null-aware anti join, which keeps
+-- its left side, the outer one.  A NULL among the inner keys leaves no row;
+-- an outer row with a NULL key goes unless the inner side is empty.
+CREATE TABLE df_ni_o (id int, k int, t text) DISTRIBUTED BY (id);
+INSERT INTO df_ni_o SELECT i, CASE WHEN i % 41 = 0 THEN NULL ELSE i % 500 END,
+  CASE WHEN i % 43 = 0 THEN NULL ELSE 't' || (i % 300) END FROM generate_series(1, 5000) i;
+CREATE TABLE df_ni_i (v int, k int, t text) DISTRIBUTED BY (v);
+INSERT INTO df_ni_i SELECT i, i * 3 % 450, 't' || (i * 7 % 250) FROM generate_series(1, 1000) i;
+INSERT INTO df_ni_i VALUES (7, NULL, NULL);
+ANALYZE df_ni_o;
+ANALYZE df_ni_i;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
+SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
+SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
+RESET datafusion.motion_batches;
+DROP TABLE df_ni_o, df_ni_i;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

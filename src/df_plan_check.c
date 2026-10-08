@@ -2668,10 +2668,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 					join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL &&
 					join->jointype != JOIN_SEMI && join->jointype != JOIN_ANTI &&
-					join->jointype != JOIN_RIGHT_ANTI)
+					join->jointype != JOIN_RIGHT_ANTI && join->jointype != JOIN_LASJ_NOTIN)
 				{
-					df_reject(cxt, "%s", join->jointype == JOIN_LASJ_NOTIN ?
-							  "NOT IN anti join" : "this kind of join");
+					df_reject(cxt, "this kind of join");
+					return;
+				}
+				if (join->jointype == JOIN_LASJ_NOTIN &&
+					(list_length(hj->hashclauses) != 1 || join->joinqual != NIL))
+				{
+					/* NJ1: DataFusion's null-aware anti join takes one key */
+					df_reject(cxt, "NOT IN anti join on several columns or with a join filter");
 					return;
 				}
 				if (hj->hashqualclauses != NIL)
@@ -2710,6 +2716,14 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 							  df_hash_estimate(inner) / 1024, df_hash_budget(inner) / 1024);
 					return;
 				}
+				if (join->jointype == JOIN_LASJ_NOTIN &&
+					df_hash_estimate(outer) > df_hash_budget(inner))
+				{
+					/* NJ1: DataFusion builds its table on the outer side */
+					df_reject(cxt, "NOT IN anti join outer side of about %.0f kB exceeds its %.0f kB",
+							  df_hash_estimate(outer) / 1024, df_hash_budget(inner) / 1024);
+					return;
+				}
 				cxt->allow_aggref = false;
 				cxt->rowid_ok = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
@@ -2728,7 +2742,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * hash key by an exact equality reads that key instead.
 				 */
 				if (join->jointype == JOIN_SEMI || join->jointype == JOIN_ANTI ||
-					join->jointype == JOIN_RIGHT_ANTI)
+					join->jointype == JOIN_RIGHT_ANTI || join->jointype == JOIN_LASJ_NOTIN)
 				{
 					List	   *vars = NIL;
 					int			dropped = join->jointype == JOIN_RIGHT_ANTI ? OUTER_VAR : INNER_VAR;

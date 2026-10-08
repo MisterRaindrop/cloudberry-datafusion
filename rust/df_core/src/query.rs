@@ -55,7 +55,8 @@
 //!                     "on": [[<left expr>, <right expr>], ...],
 //!                     "filter": <expr> | null}}
 //!           (an equi-join; DataFusion builds its hash table on the left,
-//!           NULL keys match nothing)
+//!           NULL keys match nothing; "null_aware": true with "leftanti" and
+//!           one key is NOT IN)
 //! ```
 //!
 //! {"col": k, "input": j} is column k of input j ("input" defaults to 0);
@@ -1471,9 +1472,19 @@ fn build_node(
             Some(f) => Some(expr(f)?),
             None => None,
         };
-        return left
+        let joined = left
             .join_with_expr_keys(right, join_type, (lkeys, rkeys), filter)
-            .map_err(df);
+            .map_err(df)?;
+        if j.get("null_aware").and_then(Value::as_bool) == Some(true) {
+            // NOT IN: no row if the right side has a NULL key; a left row
+            // with a NULL key only if the right side is empty
+            let mut plan = joined.build().map_err(df)?;
+            if let datafusion::logical_expr::LogicalPlan::Join(ref mut join) = plan {
+                join.null_aware = true;
+            }
+            return Ok(LogicalPlanBuilder::from(plan));
+        }
+        return Ok(joined);
     }
     Err(format!("plan spec: unknown node {node}"))
 }

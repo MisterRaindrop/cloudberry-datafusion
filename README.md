@@ -439,6 +439,16 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | R1 | GPORCA's Result: a projection and filter over its child |
 | D4 | A Limit over a GroupAggregate below a sorted Motion |
 | D5 | Sorted Gathers carry batches where the order is not read |
+| NJ1 | NOT IN anti joins, null-aware |
+
+NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
+(Not-In) Join.  PostgreSQL's executor returns no row once the inner side
+has a NULL key, and drops an outer row with a NULL key unless the inner
+side is empty, each process over the inner rows it has.  DataFusion's
+null-aware anti join does the same, but only as a left anti join, which
+builds its table on the side it keeps: the outer one is the left side, fed
+first, and must fit the Hash node's budget.  One key and no join filter;
+NOT IN over several columns stays on PostgreSQL.
 
 ### Aggregates below a join or another aggregate
 

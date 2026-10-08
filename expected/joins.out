@@ -93,7 +93,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FR
                                  ->  Seq Scan on df_jb
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: NOT IN anti join
+ DataFusion: slice 1 eligible
  DataFusion: slice 2 eligible
 (13 rows)
 
@@ -1470,6 +1470,89 @@ WHERE coalesce(x.c, 0) = 0;
 RESET datafusion.motion_batches;
 SET optimizer = off;
 DROP TABLE df_rs;
+-- NOT IN (NJ1, TPC-H Q16): DataFusion's null-aware anti join, which keeps
+-- its left side, the outer one.  A NULL among the inner keys leaves no row;
+-- an outer row with a NULL key goes unless the inner side is empty.
+CREATE TABLE df_ni_o (id int, k int, t text) DISTRIBUTED BY (id);
+INSERT INTO df_ni_o SELECT i, CASE WHEN i % 41 = 0 THEN NULL ELSE i % 500 END,
+  CASE WHEN i % 43 = 0 THEN NULL ELSE 't' || (i % 300) END FROM generate_series(1, 5000) i;
+CREATE TABLE df_ni_i (v int, k int, t text) DISTRIBUTED BY (v);
+INSERT INTO df_ni_i SELECT i, i * 3 % 450, 't' || (i * 7 % 250) FROM generate_series(1, 1000) i;
+INSERT INTO df_ni_i VALUES (7, NULL, NULL);
+ANALYZE df_ni_o;
+ANALYZE df_ni_i;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Left Anti Semi (Not-In) Join
+                     Hash Cond: (df_ni_o.k = df_ni_i.k)
+                     ->  Seq Scan on df_ni_o
+                     ->  Hash
+                           ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                 ->  Seq Scan on df_ni_i
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
+ count |   sum    
+-------+----------
+  5000 | 12502500
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
+ count |   sum   
+-------+---------
+  3416 | 8578068
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
+ count |   sum   
+-------+---------
+   784 | 1979352
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
+ count |   sum    
+-------+----------
+  5000 | 12502500
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
+ count |   sum   
+-------+---------
+  3416 | 8578068
+(1 row)
+
+SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
+ count |   sum   
+-------+---------
+   784 | 1979352
+(1 row)
+
+RESET datafusion.motion_batches;
+DROP TABLE df_ni_o, df_ni_i;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
