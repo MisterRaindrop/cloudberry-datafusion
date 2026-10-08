@@ -48,6 +48,7 @@ pub enum KeyHash {
     Text,        // hashtext (cdbhash passes the default collation: deterministic)
     Bpchar,      // hashbpchar: hashtext of the value without trailing blanks
     Numeric(i8), // hash_numeric, of a column of this scale
+    Tid,         // hashtid: the block number's halves and the offset
 }
 
 impl KeyHash {
@@ -64,6 +65,7 @@ impl KeyHash {
             "text" => KeyHash::Text,
             "bpchar" => KeyHash::Bpchar,
             "numeric" => KeyHash::Numeric(0),
+            "tid" => KeyHash::Tid,
             other => match other.strip_prefix("numeric:").map(str::parse::<i8>) {
                 Some(Ok(s)) if (0..=76).contains(&s) => KeyHash::Numeric(s),
                 _ => return None,
@@ -281,6 +283,18 @@ pub fn hash_numeric(v: i256, scale: i8) -> u32 {
     hash_bytes(&bytes) ^ weight as u32
 }
 
+/// hashtid (tid.c) of tid `t` as block << 16 | offset: hash_any of
+/// ItemPointerData's 6 bytes, the block number's high and low halves and
+/// the offset, each uint16 in memory order.
+pub fn hash_tid(t: i64) -> u32 {
+    let block = (t >> 16) as u32;
+    let mut bytes = [0u8; 6];
+    bytes[0..2].copy_from_slice(&((block >> 16) as u16).to_ne_bytes());
+    bytes[2..4].copy_from_slice(&(block as u16).to_ne_bytes());
+    bytes[4..6].copy_from_slice(&((t & 0xFFFF) as u16).to_ne_bytes());
+    hash_bytes(&bytes)
+}
+
 /// The hash of row `r` of a key column.  None for NULL.
 #[inline]
 fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
@@ -299,6 +313,7 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
             hash_bytes(crate::pgstr::bpchar_trim(a.as_string::<i32>().value(r)).as_bytes())
         }
         KeyHash::Numeric(s) => hash_numeric(a.as_primitive::<Decimal256Type>().value(r), s),
+        KeyHash::Tid => hash_tid(a.as_primitive::<Int64Type>().value(r)),
     })
 }
 

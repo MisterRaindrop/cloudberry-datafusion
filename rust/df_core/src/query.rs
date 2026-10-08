@@ -190,6 +190,8 @@ pub enum PgType {
     // numeric of a fixed scale, as Decimal256(76, scale): the C side builds
     // PostgreSQL's numeric values from the integers (pgnum).
     Numeric(i8),
+    // tid (TID1): block << 16 | offset as int8, ordered as tids are.
+    Tid,
 }
 
 impl PgType {
@@ -207,6 +209,7 @@ impl PgType {
             "timestamptz" => PgType::Timestamptz,
             "text" => PgType::Text,
             "bpchar" => PgType::Bpchar,
+            "tid" => PgType::Tid,
             "numeric" => PgType::Numeric(0),
             other if other.starts_with("numeric:") => match other["numeric:".len()..].parse::<i8>()
             {
@@ -221,7 +224,7 @@ impl PgType {
     pub fn storage(self) -> PgType {
         match self {
             PgType::Date => PgType::Int4,
-            PgType::Time | PgType::Timestamp | PgType::Timestamptz => PgType::Int8,
+            PgType::Time | PgType::Timestamp | PgType::Timestamptz | PgType::Tid => PgType::Int8,
             PgType::Bpchar => PgType::Text,
             t => t,
         }
@@ -232,6 +235,9 @@ impl PgType {
     pub fn key_hash(self) -> KeyHash {
         if self == PgType::Bpchar {
             return KeyHash::Bpchar;
+        }
+        if self == PgType::Tid {
+            return KeyHash::Tid;
         }
         match self.storage() {
             PgType::Text => KeyHash::Text,

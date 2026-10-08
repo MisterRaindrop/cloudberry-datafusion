@@ -155,6 +155,26 @@ SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
 SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
 SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
 
+-- ctid and gp_segment_id of a scan (TID1: GPORCA dedupes a semi join's
+-- side by them, TPC-H Q21), ctid carried as block << 16 | offset; a tid
+-- constant stays on PostgreSQL.
+CREATE TABLE df_ct (a int, b text) DISTRIBUTED BY (a);
+INSERT INTO df_ct SELECT i, 'x' || i FROM generate_series(1, 3000) i;
+DELETE FROM df_ct WHERE a % 7 = 0;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+EXPLAIN (COSTS OFF) SELECT a FROM df_ct WHERE ctid > '(0,5)';
+SET datafusion.mode = off;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+SET datafusion.mode = on;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+SET datafusion.mode = off;
+DROP TABLE df_ct;
+
 DROP TABLE df_ty, df_ty2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

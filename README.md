@@ -443,6 +443,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | D5 | Sorted Gathers carry batches where the order is not read |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
+| TID1 | ctid and gp_segment_id of scans; tid columns |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -547,6 +548,19 @@ range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s
 in PostgreSQL; grouping by `date` with a `timestamp` filter took 0.17 s and
 0.89 s (only the segments' slice in DataFusion; the coordinator sorts and
 limits).
+
+### tid
+
+TID1: GPORCA turns a semi join into a join and drops the copies by the
+rows' ctid and gp_segment_id (TPC-H Q21), grouping by them and
+redistributing by them.  A scan now reads those two system columns
+(slot_getsysattr: tts_tid, and the segment's index), and a tid column is
+an int8, the block number shifted left by 16 bits with the offset below,
+ordered as tids are; the C side makes ItemPointerData of it again.  A
+Redistribute by tid hashes as hashtid does: hash_any of the block number's
+halves and the offset, in memory order, which datafusion_debug_cdbhash_check
+checks.  A tid constant, other system columns, and a statement that carries
+ctid to its result for WHERE CURRENT OF stay on PostgreSQL.
 
 ### Text and varchar
 

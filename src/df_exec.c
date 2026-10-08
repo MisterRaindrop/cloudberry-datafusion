@@ -639,9 +639,13 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 		if (amname == NULL || strcmp(amname, "pax") != 0)
 			return false;
 	}
-	/* The reader hands out fixed-width values only (not strings, not numeric). */
+	/*
+	 * The reader hands out fixed-width values only (not strings, not
+	 * numeric), of the table's own columns (not ctid).
+	 */
 	for (c = 0; c < in->spec->ncols; c++)
-		if (df_type_is_string(in->spec->types[c]) || in->spec->types[c] == NUMERICOID)
+		if (df_type_is_string(in->spec->types[c]) || in->spec->types[c] == NUMERICOID ||
+			in->spec->attnos[c] <= 0)
 			return false;
 	reader = df_pax_reader_get();
 	if (reader == NULL)
@@ -775,9 +779,18 @@ df_exec_fill(DfExec *x, DfInput *in)
 		for (c = 0; c < in->spec->ncols; c++)
 		{
 			int			att = in->spec->attnos[c] - 1;
-			bool		isnull = slot->tts_isnull[att];
-			Datum		d = slot->tts_values[att];
+			bool		isnull;
+			Datum		d;
 			char	   *dst = in->invalues[c];
+
+			if (att < 0)
+				/* TID1: ctid or gp_segment_id */
+				d = slot_getsysattr(slot, att + 1, &isnull);
+			else
+			{
+				isnull = slot->tts_isnull[att];
+				d = slot->tts_values[att];
+			}
 
 			in->innulls[c][n] = isnull ? 1 : 0;
 			switch (in->spec->types[c])
@@ -797,6 +810,12 @@ df_exec_fill(DfExec *x, DfInput *in)
 				case TIMESTAMPOID:
 				case TIMESTAMPTZOID:
 					((int64 *) dst)[n] = isnull ? 0 : DatumGetInt64(d);
+					break;
+				case TIDOID:
+					/* TID1: block << 16 | offset, ordered as tids are */
+					((int64 *) dst)[n] = isnull ? 0 :
+						((int64) ItemPointerGetBlockNumberNoCheck(DatumGetItemPointer(d)) << 16) |
+						ItemPointerGetOffsetNumberNoCheck(DatumGetItemPointer(d));
 					break;
 				case FLOAT4OID:
 					((float4 *) dst)[n] = isnull ? 0 : DatumGetFloat4(d);
@@ -996,6 +1015,19 @@ df_exec_emit(DfExec *x)
 			case TIMESTAMPOID:
 			case TIMESTAMPTZOID:
 				slot->tts_values[k] = Int64GetDatum(((const int64 *) v)[r]);
+				break;
+			case TIDOID:
+				{
+					/* TID1 */
+					int64		t = ((const int64 *) v)[r];
+					ItemPointer ip;
+
+					oldcxt = MemoryContextSwitchTo(x->rowcxt);
+					ip = palloc(sizeof(ItemPointerData));
+					MemoryContextSwitchTo(oldcxt);
+					ItemPointerSet(ip, (BlockNumber) (t >> 16), (OffsetNumber) (t & 0xFFFF));
+					slot->tts_values[k] = ItemPointerGetDatum(ip);
+				}
 				break;
 			case FLOAT4OID:
 				slot->tts_values[k] = Float4GetDatum(((const float4 *) v)[r]);

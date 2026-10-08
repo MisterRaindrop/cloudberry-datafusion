@@ -174,6 +174,26 @@ df_init_params(DfCheckContext *cxt)
 	return cxt->init_params;
 }
 
+/*
+ * TID1: does 'stmt' carry ctid or gp_segment_id up to its result, as an
+ * updatable cursor does for WHERE CURRENT OF?
+ */
+static bool
+df_cursor_sysattrs(PlannedStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->planTree->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk && tle->resname != NULL &&
+			(strcmp(tle->resname, "ctid") == 0 || strcmp(tle->resname, "gp_segment_id") == 0))
+			return true;
+	}
+	return false;
+}
+
 /* Record the first reason a slice does not qualify. */
 static void
 df_reject(DfCheckContext *cxt, const char *fmt,...)
@@ -203,6 +223,9 @@ df_type_supported(Oid type)
 		case TIMEOID:
 		case TIMESTAMPOID:
 		case TIMESTAMPTZOID:
+			return true;
+		case TIDOID:
+			/* TID1: a row's ctid, as an int8 (block << 16 | offset) */
 			return true;
 		case TEXTOID:
 		case VARCHAROID:
@@ -1239,11 +1262,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 
 				if (var->varattno == 0)
 					df_reject(cxt, "whole-row reference");
-				else if (var->varattno < 0)
+				else if (var->varattno < 0 &&
+						 (IS_SPECIAL_VARNO(var->varno) || df_cursor_sysattrs(cxt->stmt) ||
+						  (var->varattno != SelfItemPointerAttributeNumber &&
+						   var->varattno != GpSegmentIdAttributeNumber)))
 				{
 					/*
-					 * Cloudberry adds ctid and gp_segment_id to updatable
-					 * cursors so WHERE CURRENT OF can find the row.
+					 * TID1: GPORCA identifies the rows of a semi join's side
+					 * by ctid and gp_segment_id (TPC-H Q21), read from the
+					 * scan; other system columns stay on PostgreSQL.  So does
+					 * an updatable cursor, whose ctid and gp_segment_id let
+					 * WHERE CURRENT OF find the row PostgreSQL's scan is on.
 					 */
 					char	   *attname = NULL;
 
@@ -1283,7 +1312,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				int			p,
 							s;
 
-				if (!df_type_supported(c->consttype))
+				if (!df_type_supported(c->consttype) || c->consttype == TIDOID)
 					df_reject(cxt, "constant of type %s", format_type_be(c->consttype));
 				else if (c->consttype == NUMERICOID && !df_numeric_ps(cxt->node, node, &p, &s))
 					df_reject(cxt, "numeric constant of more than %d digits or infinite",
@@ -3398,6 +3427,8 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 		{BPCHAROID, "hashbpchar"},
 		/* NBASE digits in memory order; of a known scale (below) */
 		{NUMERICOID, "hash_numeric"},
+		/* the block number's halves and the offset, in memory order */
+		{TIDOID, "hashtid"},
 #endif
 	};
 	Node	   *expr = (Node *) list_nth(motion->hashExprs, i);

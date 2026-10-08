@@ -652,6 +652,107 @@ SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.
   2002
 (1 row)
 
+-- ctid and gp_segment_id of a scan (TID1: GPORCA dedupes a semi join's
+-- side by them, TPC-H Q21), ctid carried as block << 16 | offset; a tid
+-- constant stays on PostgreSQL.
+CREATE TABLE df_ct (a int, b text) DISTRIBUTED BY (a);
+INSERT INTO df_ct SELECT i, 'x' || i FROM generate_series(1, 3000) i;
+DELETE FROM df_ct WHERE a % 7 = 0;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: ctid
+                     ->  Seq Scan on df_ct
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(10 rows)
+
+EXPLAIN (COSTS OFF) SELECT a FROM df_ct WHERE ctid > '(0,5)';
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_ct
+         Filter: (ctid > '(0,5)'::tid)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: constant of type tid
+(6 rows)
+
+SET datafusion.mode = off;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+ gp_segment_id | ctid  | a  
+---------------+-------+----
+             0 | (0,1) |  2
+             0 | (0,2) |  3
+             0 | (0,3) |  4
+             0 | (0,5) |  8
+             1 | (0,1) |  1
+             2 | (0,1) |  5
+             2 | (0,2) |  6
+             2 | (0,3) |  9
+             2 | (0,4) | 10
+             2 | (0,5) | 11
+(10 rows)
+
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+ count | count |  min  
+-------+-------+-------
+  2572 |  1003 | (0,1)
+(1 row)
+
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+NOTICE:  SELECT uses system-defined column "y.ctid" without the necessary companion column "y.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+ count 
+-------
+  3474
+(1 row)
+
+SET datafusion.mode = on;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+ gp_segment_id | ctid  | a  
+---------------+-------+----
+             0 | (0,1) |  2
+             0 | (0,2) |  3
+             0 | (0,3) |  4
+             0 | (0,5) |  8
+             1 | (0,1) |  1
+             2 | (0,1) |  5
+             2 | (0,2) |  6
+             2 | (0,3) |  9
+             2 | (0,4) | 10
+             2 | (0,5) | 11
+(10 rows)
+
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+ count | count |  min  
+-------+-------+-------
+  2572 |  1003 | (0,1)
+(1 row)
+
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+NOTICE:  SELECT uses system-defined column "y.ctid" without the necessary companion column "y.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+ count 
+-------
+  3474
+(1 row)
+
+SET datafusion.mode = off;
+DROP TABLE df_ct;
 DROP TABLE df_ty, df_ty2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

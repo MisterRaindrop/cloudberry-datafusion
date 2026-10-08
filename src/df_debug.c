@@ -332,6 +332,8 @@ static const DfKeyType df_key_types[] = {
 	/* numeric of scale kind - 8 */
 	{8, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {10, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
 	{13, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {23, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
+	/* tid, as block << 16 | offset */
+	{85, F_HASHTID, 8},
 };
 
 /*
@@ -389,6 +391,14 @@ df_random_key(pg_prng_state *rng, int32 kind, void *dst)
 		case 5:
 			*(float8 *) dst = special ? fspecial[s] : (pg_prng_double(rng) - 0.5) * 1e12;
 			break;
+		case 85:
+			{
+				/* any block number, every half of it used, and offset */
+				uint32		block = special ? (s & 1 ? PG_UINT32_MAX : 65536) : (uint32) r;
+
+				*(int64 *) dst = ((int64) block << 16) | ((r >> 32) & 0xFFFF);
+			}
+			break;
 		default:
 			{
 				/* numeric: up to 38 digits, zero digits around the point */
@@ -432,6 +442,14 @@ df_key_datum(int32 kind, const void *v)
 			return Float4GetDatum(*(const float4 *) v);
 		case 5:
 			return Float8GetDatum(*(const float8 *) v);
+		case 85:
+			{
+				int64		t = *(const int64 *) v;
+				ItemPointer ip = palloc(sizeof(ItemPointerData));
+
+				ItemPointerSet(ip, (BlockNumber) (t >> 16), (OffsetNumber) (t & 0xFFFF));
+				return ItemPointerGetDatum(ip);
+			}
 		default:
 			return df_numeric_datum((const uint8 *) v, kind - 8);
 	}
@@ -541,6 +559,8 @@ datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
 		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7},
 		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3}, {2, 7, 2},
 		{1, 8}, {1, 9}, {1, 10}, {1, 11}, {2, 9, 7},
+		/* ctid and gp_segment_id */
+		{1, 12}, {2, 12, 2},
 	};
 	int32		nrows = PG_GETARG_INT32(0);
 	int32		segments = PG_GETARG_INT32(1);

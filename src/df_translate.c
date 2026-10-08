@@ -162,6 +162,8 @@ df_type_tag(Oid type)
 			return "timestamp";
 		case TIMESTAMPTZOID:
 			return "timestamptz";
+		case TIDOID:
+			return "tid";
 		case TEXTOID:
 		case VARCHAROID:
 			return "text";
