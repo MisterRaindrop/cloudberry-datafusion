@@ -83,6 +83,8 @@ typedef struct DfCheckContext
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
 	bool		agg_input;		/* checking the child of an Agg node */
 	bool		join_input;		/* checking an input of a join */
+	bool		inner_agg;		/* checking an Agg below a join or another
+								 * Agg, whose values others read (A1) */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
@@ -967,7 +969,8 @@ df_distinct_problem(DfCheckContext *cxt, Aggref *agg)
 	return NULL;
 }
 
-static bool
+/* Add the Aggrefs of 'node' to 'aggs'. */
+bool
 df_collect_aggrefs(Node *node, List **aggs)
 {
 	if (node == NULL)
@@ -1001,39 +1004,6 @@ df_semi_key_for(HashJoin *hj, Var *var)
 			(type == INT2OID || type == INT4OID || type == INT8OID || type == BOOLOID ||
 			 df_type_is_datetime(type)))
 			return outer;
-	}
-	return NULL;
-}
-
-/*
- * D2: can DataFusion run Agg 'agg' as a grouping below another aggregate:
- * no aggregates, no filter, and the output columns in 'needed' grouping
- * columns?  (The planner may carry other columns the aggregate above does
- * not read.)  What it is otherwise, or NULL.
- */
-static const char *
-df_grouping_problem(Agg *agg, Bitmapset *needed)
-{
-	List	   *aggs = NIL;
-	ListCell   *lc;
-
-	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
-	if (aggs != NIL || agg->plan.qual != NIL || agg->aggsplit != AGGSPLIT_SIMPLE)
-		return "another aggregate";
-	foreach(lc, agg->plan.targetlist)
-	{
-		TargetEntry *tle = lfirst_node(TargetEntry, lc);
-		Var		   *var = (Var *) tle->expr;
-		int			i;
-
-		if (IsA(var, Const) || !bms_is_member(tle->resno, needed))
-			continue;
-		if (!IsA(var, Var) || var->varno != OUTER_VAR)
-			return "a grouping that computes columns";
-		for (i = 0; i < agg->numCols && agg->grpColIdx[i] != var->varattno; i++)
-			;
-		if (i == agg->numCols)
-			return "a grouping that outputs an ungrouped column";
 	}
 	return NULL;
 }
@@ -1448,6 +1418,13 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
+				else if (cxt->inner_agg &&
+						 (df_agg_state(agg) == DF_AGG_AVG_INT ||
+						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC ||
+						  df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED))
+					/* A1: finished where tuples are made, which those above cannot read */
+					df_reject(cxt, "aggregate %s returning numeric below a join or another aggregate",
+							  name);
 				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
 						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
@@ -1870,6 +1847,19 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 		return false;
 	if (IsA(plan, Motion))
 		return true;
+	if (IsA(plan, Agg))
+	{
+		/* A1: its groups and calls are columns of its node, below the join */
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (bms_is_member(tle->resno, attnos) && !IsA(tle->expr, Aggref) &&
+				!(IsA(tle->expr, Var) && ((Var *) tle->expr)->varno == OUTER_VAR))
+				return false;
+		}
+		return true;
+	}
 	foreach(lc, plan->targetlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
@@ -2303,6 +2293,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Agg		   *agg = (Agg *) plan;
 				Plan	   *child = outerPlan(plan);
 				Bitmapset  *child_needed = NULL;
+				bool		inner;
 				int			i;
 
 				if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
@@ -2320,9 +2311,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "sorted or mixed aggregation");
 					return;
 				}
-				if (cxt->join_input)
+				/*
+				 * A1: an Agg below a join or another Agg runs as a node of
+				 * the plan, which those above read by name: not a partial
+				 * stage, whose state only a batch Motion carries.
+				 */
+				inner = cxt->join_input || cxt->agg_input;
+				if (inner && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 				{
-					df_reject(cxt, "aggregate below a join");
+					df_reject(cxt, "partial aggregate below a join or another aggregate");
 					return;
 				}
 				/*
@@ -2379,14 +2376,17 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					}
 				}
 				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
-				cxt->agg_to_batches = cxt->batch_sender;
+				cxt->agg_to_batches = cxt->batch_sender && !inner;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(df_below_sort(child), Motion) &&
 					bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches);
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
-				df_check_targetlist(plan->targetlist, needed, cxt);
+				cxt->inner_agg = inner;
+				/* A1: an Agg below computes all its calls (df_emit_node) */
+				df_check_targetlist(plan->targetlist, inner ? NULL : needed, cxt);
 				df_check_expr_list(plan->qual, cxt);
+				cxt->inner_agg = false;
 				cxt->allow_aggref = false;
 				cxt->partial_states = false;
 				cxt->final_states = false;
@@ -2399,14 +2399,6 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					child_needed = bms_add_member(child_needed, agg->grpColIdx[i]);
 				/* count(*) alone reads no column; keep the set non-NULL. */
 				child_needed = bms_add_member(child_needed, 0);
-				if (child != NULL && IsA(child, Agg) &&
-					df_grouping_problem((Agg *) child, child_needed) != NULL)
-				{
-					/* D2: an aggregate over a grouping, as DISTINCT aggregates are planned */
-					df_reject(cxt, "aggregate over %s",
-							  df_grouping_problem((Agg *) child, child_needed));
-					return;
-				}
 				cxt->agg_input = true;
 				cxt->order_free = true; /* hashed: the order of its input is not read */
 				df_check_plan(child, cxt, child_needed, false);

@@ -85,10 +85,19 @@ typedef struct DfInputDesc
 	List	   *scales;			/* int: scale of each numeric one */
 } DfInputDesc;
 
+/* A1: an Agg below a join or another Agg, a named node of the plan. */
+typedef struct DfNamedAgg
+{
+	Agg		   *agg;
+	List	   *aggrefs;		/* its distinct aggregate calls */
+} DfNamedAgg;
+
 typedef struct DfBuilder
 {
 	Plan	   *ctx;			/* the node whose expressions are emitted */
-	Agg		   *agg;
+	Agg		   *agg;			/* the Agg of DF_LEVEL_AGG */
+	bool		agg_named;		/* read from above: its columns by name */
+	List	   *named;			/* DfNamedAgg, of the Aggs below the top */
 	List	   *inputs;			/* DfInputDesc, in input order */
 	List	   *aggrefs;		/* distinct aggregate calls, in first-use order */
 	List	   *aggfns;			/* the function of each: NULL for the
@@ -108,6 +117,9 @@ static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
 static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
+static void df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
+							  List *aggfns);
+static DfNamedAgg *df_named_of(DfBuilder *b, Agg *agg);
 
 static void
 df_fail(DfBuilder *b, const char *what)
@@ -624,6 +636,18 @@ df_input_of(DfBuilder *b, Plan *leaf)
 	return -1;
 }
 
+/* A1: the named node of Agg 'agg', or NULL. */
+static DfNamedAgg *
+df_named_of(DfBuilder *b, Agg *agg)
+{
+	ListCell   *lc;
+
+	foreach(lc, b->named)
+		if (((DfNamedAgg *) lfirst(lc))->agg == agg)
+			return lfirst(lc);
+	return NULL;
+}
+
 /*
  * Output column 'resno' of plan node 'child', as an expression over the
  * inputs: the Motion's column itself, or the child's targetlist entry
@@ -637,19 +661,23 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
-	else if (IsA(child, Agg) && IsA(tle->expr, Var))
+	else if (IsA(child, Agg))
 	{
-		/* D2: a grouping below the aggregate, by its name (df_emit_node) */
-		Agg		   *agg = (Agg *) child;
-		int			i;
+		/*
+		 * A1, D2: an Agg below, its groups and calls by their names
+		 * (df_emit_node)
+		 */
+		Agg		   *agg = b->agg;
+		bool		named = b->agg_named;
 
-		for (i = 0; i < agg->numCols; i++)
-			if (agg->grpColIdx[i] == ((Var *) tle->expr)->varattno)
-				break;
-		if (i == agg->numCols)
-			df_fail(b, "a reference to an ungrouped column");
+		b->agg = (Agg *) child;
+		b->agg_named = true;
+		if (df_named_of(b, b->agg) == NULL)
+			df_fail(b, "a reference to an aggregate");
 		else
-			appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", child->plan_node_id, i);
+			df_emit(b, out, (Node *) tle->expr, DF_LEVEL_AGG);
+		b->agg = agg;
+		b->agg_named = named;
 	}
 	else if (IsA(child, Motion))
 		df_emit_column(b, out, df_input_of(b, child),
@@ -878,7 +906,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					for (k = 0; k < b->agg->numCols; k++)
 						if (b->agg->grpColIdx[k] == var->varattno)
 							break;
-					if (k < b->agg->numCols)
+					if (k < b->agg->numCols && b->agg_named)
+						appendStringInfo(out, "{\"name\":\"q%d_g%d\"}",
+										 b->agg->plan.plan_node_id, k);
+					else if (k < b->agg->numCols)
 						appendStringInfo(out, "{\"group\":%d}", k);
 					else
 						df_fail(b, "an ungrouped column above an aggregate");
@@ -1275,6 +1306,24 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				df_fail(b, "an avg returning numeric inside an expression");
 				return;
 			}
+			if (df_named_of(b, b->agg) != NULL)
+			{
+				/* A1: a call of an Agg below the top (df_emit_node) */
+				List	   *calls = df_named_of(b, b->agg)->aggrefs;
+				int			k = list_length(calls);
+				ListCell   *lc;
+
+				foreach(lc, calls)
+					if (equal(lfirst(lc), node))
+						k = foreach_current_index(lc);
+				if (k == list_length(calls))
+					df_fail(b, "an aggregate call");
+				else if (b->agg_named)
+					appendStringInfo(out, "{\"name\":\"q%d_a%d\"}", b->agg->plan.plan_node_id, k);
+				else
+					appendStringInfo(out, "{\"agg\":%d}", k);
+				return;
+			}
 			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
 			return;
 
@@ -1351,12 +1400,24 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 		case T_Agg:
 			{
 				/*
-				 * D2: a grouping below the aggregate, without aggregates
-				 * (df_check_slice), its columns named q<plan_node_id>_g<i>.
+				 * A1, D2: an Agg below a join or another Agg (df_check_slice),
+				 * its groups named q<plan_node_id>_g<i> and its calls
+				 * q<plan_node_id>_a<k>.
 				 */
 				Agg		   *agg = (Agg *) plan;
+				DfNamedAgg *na = palloc0(sizeof(DfNamedAgg));
+				List	   *calls = NIL;
+				Agg		   *saved = b->agg;
+				bool		named = b->agg_named;
+				ListCell   *lc;
 				int			i;
 
+				na->agg = agg;
+				df_collect_aggrefs((Node *) plan->targetlist, &calls);
+				df_collect_aggrefs((Node *) plan->qual, &calls);
+				foreach(lc, calls)
+					if (!list_member(na->aggrefs, lfirst(lc)))
+						na->aggrefs = lappend(na->aggrefs, lfirst(lc));
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
 				df_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"group\":[");
@@ -1366,8 +1427,16 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 						appendStringInfoChar(out, ',');
 					df_emit_grouped(b, out, outerPlan(plan), agg->grpColIdx[i]);
 				}
-				appendStringInfo(out, "],\"aggs\":[],\"having\":null,\"name\":\"q%d\"}}",
-								 plan->plan_node_id);
+				appendStringInfoString(out, "],\"aggs\":[");
+				df_emit_agg_calls(b, out, agg, na->aggrefs, NIL);
+				b->named = lappend(b->named, na);
+				appendStringInfoString(out, "],\"having\":");
+				b->agg = agg;
+				b->agg_named = false;
+				df_emit_qual(b, out, plan->qual, DF_LEVEL_AGG);
+				b->agg = saved;
+				b->agg_named = named;
+				appendStringInfo(out, ",\"name\":\"q%d\"}}", plan->plan_node_id);
 				return;
 			}
 
@@ -1455,6 +1524,121 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
 		default:
 			df_fail(b, "this plan node");
 			return;
+	}
+}
+
+/*
+ * The aggregate calls 'aggrefs' of Agg 'aggnode', with the function of
+ * each in 'aggfns' (NULL for the call's own; NIL: all NULL), as the "aggs"
+ * of its node.  Arguments are expressions of the Agg over its child.
+ */
+static void
+df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, List *aggfns)
+{
+	ListCell   *lc;
+
+	foreach(lc, aggrefs)
+	{
+		Aggref	   *agg = lfirst_node(Aggref, lc);
+		const char *fn = aggfns ? list_nth(aggfns, foreach_current_index(lc)) : NULL;
+		char	   *name = get_func_name(agg->aggfnoid);
+		bool		combine = (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL);
+
+		if (foreach_current_index(lc) > 0)
+			appendStringInfoChar(aggs, ',');
+		if (combine && df_agg_state(agg) != DF_AGG_AVG_FLOAT &&
+			df_agg_state(agg) != DF_AGG_PLAIN)
+		{
+			/* sum(int8), avg(int): the stream's numeric sum and count columns */
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+			Plan	   *child = df_below_sort(outerPlan(aggnode));
+			bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
+			bool		mixed = fn != NULL && strcmp(fn, "mixed_scale") == 0;
+			int			pos;
+
+			if (!IsA(child, Motion) || !IsA(arg, Var))
+			{
+				df_fail(b, "a combining aggregate");
+				return;
+			}
+			pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
+			appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":",
+							 count ? "sum" : mixed ? "max" : "sum_decimal");
+			df_emit_column(b, aggs, df_input_of(b, child), pos + (count || mixed ? 2 : 1),
+						   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
+						   count || mixed ? 0 : df_scale_of((Plan *) aggnode, arg));
+			appendStringInfoChar(aggs, '}');
+			continue;
+		}
+		if (!combine && fn != NULL && strcmp(fn, "mixed_scale") == 0)
+		{
+			/* MS1: the largest display scale of the values added up */
+			b->ctx = (Plan *) aggnode;
+			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":");
+			df_emit(b, aggs,
+					(Node *) df_mixed_scale_expr((Plan *) aggnode,
+												 (Node *) linitial_node(TargetEntry, agg->args)->expr),
+					DF_LEVEL_SCAN);
+			appendStringInfoChar(aggs, '}');
+			continue;
+		}
+		if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
+			fn = "sum_numeric";	/* exact, and numeric as PostgreSQL's */
+		if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_NUMERIC)
+			fn = "sum_decimal";	/* exact, NaN if any is */
+		if (combine && strcmp(name, "avg") == 0)
+		{
+			/* DataFusion's avg state: the stream's sum and count columns */
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+			int			pos;
+
+			Plan	   *child = df_below_sort(outerPlan(aggnode));
+
+			if (!IsA(child, Motion) || !IsA(arg, Var))
+			{
+				df_fail(b, "a combining avg");
+				return;
+			}
+			pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
+			appendStringInfoString(aggs, "{\"fn\":\"avg_merge\",\"arg\":");
+			df_emit_column(b, aggs, df_input_of(b, child), pos + 1, FLOAT8OID, 0);
+			appendStringInfoString(aggs, ",\"arg2\":");
+			df_emit_column(b, aggs, df_input_of(b, child), pos + 2, INT8OID, 0);
+			appendStringInfoChar(aggs, '}');
+			continue;
+		}
+		appendStringInfo(aggs, "{\"fn\":\"%s%s\",\"arg\":", fn ? fn : name,
+						 !fn && combine && strcmp(name, "count") == 0 ? "_merge" : "");
+
+		/*
+		 * A combining aggregate keeps aggstar from the original call
+		 * (count(*)), but its one argument is the partial state.
+		 */
+		if ((agg->aggstar && !combine) || agg->args == NIL)
+			appendStringInfoString(aggs, "null");
+		else
+		{
+			/* arguments are expressions of the aggregate over its child */
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+			bool		bp = agg->aggdistinct != NIL && !combine && exprType(arg) == BPCHAROID;
+
+			b->ctx = (Plan *) aggnode;
+			if (bp)
+				appendStringInfoString(aggs, "{\"bpchar\":");	/* told apart without blanks */
+			df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+			if (bp)
+				appendStringInfoChar(aggs, '}');
+		}
+		/*
+		 * D1: over distinct arguments (min and max are the same without).
+		 * A combining stage keeps the DISTINCT of the call, but adds up
+		 * the partial results: the planner splits it only where each
+		 * segment sees all of a value.
+		 */
+		if (agg->aggdistinct != NIL && !combine &&
+			strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
+			appendStringInfoString(aggs, ",\"distinct\":true");
+		appendStringInfoChar(aggs, '}');
 	}
 }
 
@@ -1870,112 +2054,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 		StringInfoData aggs;
 
 		initStringInfo(&aggs);
-		ListCell   *lf;
-
-		i = 0;
-		forboth(lc, b.aggrefs, lf, b.aggfns)
-		{
-			Aggref	   *agg = lfirst_node(Aggref, lc);
-			const char *fn = lfirst(lf);
-			char	   *name = get_func_name(agg->aggfnoid);
-			bool		combine = (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL);
-
-			if (i++ > 0)
-				appendStringInfoChar(&aggs, ',');
-			if (combine && df_agg_state(agg) != DF_AGG_AVG_FLOAT &&
-				df_agg_state(agg) != DF_AGG_PLAIN)
-			{
-				/* sum(int8), avg(int): the stream's numeric sum and count columns */
-				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				Plan	   *child = df_below_sort(outerPlan(b.agg));
-				bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
-				bool		mixed = fn != NULL && strcmp(fn, "mixed_scale") == 0;
-				int			pos;
-
-				if (!IsA(child, Motion) || !IsA(arg, Var))
-				{
-					df_fail(&b, "a combining aggregate");
-					break;
-				}
-				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
-				appendStringInfo(&aggs, "{\"fn\":\"%s\",\"arg\":",
-								 count ? "sum" : mixed ? "max" : "sum_decimal");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + (count || mixed ? 2 : 1),
-							   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
-							   count || mixed ? 0 : df_scale_of((Plan *) b.agg, arg));
-				appendStringInfoChar(&aggs, '}');
-				continue;
-			}
-			if (!combine && fn != NULL && strcmp(fn, "mixed_scale") == 0)
-			{
-				/* MS1: the largest display scale of the values added up */
-				b.ctx = (Plan *) b.agg;
-				appendStringInfoString(&aggs, "{\"fn\":\"max\",\"arg\":");
-				df_emit(&b, &aggs,
-						(Node *) df_mixed_scale_expr((Plan *) b.agg,
-													 (Node *) linitial_node(TargetEntry, agg->args)->expr),
-						DF_LEVEL_SCAN);
-				appendStringInfoChar(&aggs, '}');
-				continue;
-			}
-			if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
-				fn = "sum_numeric";	/* exact, and numeric as PostgreSQL's */
-			if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_NUMERIC)
-				fn = "sum_decimal";	/* exact, NaN if any is */
-			if (combine && strcmp(name, "avg") == 0)
-			{
-				/* DataFusion's avg state: the stream's sum and count columns */
-				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				int			pos;
-
-				Plan	   *child = df_below_sort(outerPlan(b.agg));
-
-				if (!IsA(child, Motion) || !IsA(arg, Var))
-				{
-					df_fail(&b, "a combining avg");
-					break;
-				}
-				pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
-				appendStringInfoString(&aggs, "{\"fn\":\"avg_merge\",\"arg\":");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 1, FLOAT8OID, 0);
-				appendStringInfoString(&aggs, ",\"arg2\":");
-				df_emit_column(&b, &aggs, df_input_of(&b, child), pos + 2, INT8OID, 0);
-				appendStringInfoChar(&aggs, '}');
-				continue;
-			}
-			appendStringInfo(&aggs, "{\"fn\":\"%s%s\",\"arg\":", fn ? fn : name,
-							 !fn && combine && strcmp(name, "count") == 0 ? "_merge" : "");
-
-			/*
-			 * A combining aggregate keeps aggstar from the original call
-			 * (count(*)), but its one argument is the partial state.
-			 */
-			if ((agg->aggstar && !combine) || agg->args == NIL)
-				appendStringInfoString(&aggs, "null");
-			else
-			{
-				/* arguments are expressions of the aggregate over its child */
-				Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				bool		bp = agg->aggdistinct != NIL && !combine && exprType(arg) == BPCHAROID;
-
-				b.ctx = (Plan *) b.agg;
-				if (bp)
-					appendStringInfoString(&aggs, "{\"bpchar\":");	/* told apart without blanks */
-				df_emit(&b, &aggs, arg, DF_LEVEL_SCAN);
-				if (bp)
-					appendStringInfoChar(&aggs, '}');
-			}
-			/*
-			 * D1: over distinct arguments (min and max are the same without).
-			 * A combining stage keeps the DISTINCT of the call, but adds up
-			 * the partial results: the planner splits it only where each
-			 * segment sees all of a value.
-			 */
-			if (agg->aggdistinct != NIL && !combine &&
-				strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
-				appendStringInfoString(&aggs, ",\"distinct\":true");
-			appendStringInfoChar(&aggs, '}');
-		}
+		df_emit_agg_calls(&b, &aggs, b.agg, b.aggrefs, b.aggfns);
 		if (b.failed)
 			return false;
 

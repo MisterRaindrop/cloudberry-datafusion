@@ -177,6 +177,75 @@ WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
 RESET datafusion.motion_batches;
 DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 
+-- Aggregates below a join or another aggregate (A1, TPC-H Q2, Q13, Q15
+-- and Q20): a node of the plan whose groups and calls the nodes above read
+-- by name, also on the side an outer join fills with NULLs.  One whose
+-- value is finished where tuples are made (avg returning numeric) stays on
+-- PostgreSQL.
+CREATE TABLE df_ag1 (k int, g int, f float8, c char(5), n numeric(12,2)) DISTRIBUTED BY (k);
+INSERT INTO df_ag1 SELECT i, i % 37,
+  CASE WHEN i % 101 = 0 THEN 'NaN' WHEN i % 103 = 0 THEN '-0' ELSE (i % 17) * 0.5 END,
+  CASE WHEN i % 2 = 0 THEN 'ab' ELSE 'ab  ' END,
+  CASE WHEN i % 97 = 0 THEN NULL ELSE (i % 1000) * 1.25 END
+FROM generate_series(1, 20000) i;
+CREATE TABLE df_ag2 (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
+INSERT INTO df_ag2 SELECT i, i % 41, (i % 300) * 2.5 FROM generate_series(1, 3000) i;
+ANALYZE df_ag1;
+ANALYZE df_ag2;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(b.k) FROM df_ag2 b
+  JOIN (SELECT g, 0.0001 * sum(n) h FROM df_ag1 GROUP BY g) a ON a.g = b.g AND b.n > a.h;
+EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM df_ag1 GROUP BY g) x ON x.g = b.g;
+SET optimizer = on;
+EXPLAIN (COSTS OFF) SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
+  LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;
+-- computed below the join, NULL above it where nothing matched
+EXPLAIN (COSTS OFF) SELECT b.k, x.m FROM df_ag2 b
+  LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
+WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
+  JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
+SELECT count(*), sum(b.k) FROM df_ag2 b
+  JOIN (SELECT g, 0.0001 * sum(n) h FROM df_ag1 GROUP BY g) a ON a.g = b.g AND b.n > a.h;
+SELECT sum(s), max(c), count(*) FROM (SELECT g, sum(n) s, count(*) c FROM df_ag1 GROUP BY g) x;
+SELECT x.f, x.c FROM (SELECT f, count(*) c FROM df_ag1 GROUP BY f) x JOIN df_ag2 b ON b.k = x.c ORDER BY 1;
+SELECT x.ch, x.cnt FROM (SELECT c ch, count(*) cnt FROM df_ag1 GROUP BY c) x JOIN df_ag2 b ON b.k = x.cnt / 10 ORDER BY 2;
+SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1 WHERE k < 0) x ON x.c + 3 = b.k;
+SET optimizer = on;
+SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
+  LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;
+SELECT b.k, x.c, x.s FROM df_ag2 b
+  LEFT JOIN (SELECT g, count(*) c, sum(n) s FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
+WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
+SELECT b.k, x.m FROM df_ag2 b
+  LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
+WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
+SET optimizer = off;
+SET datafusion.mode = on;
+SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
+  JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
+SELECT count(*), sum(b.k) FROM df_ag2 b
+  JOIN (SELECT g, 0.0001 * sum(n) h FROM df_ag1 GROUP BY g) a ON a.g = b.g AND b.n > a.h;
+SELECT sum(s), max(c), count(*) FROM (SELECT g, sum(n) s, count(*) c FROM df_ag1 GROUP BY g) x;
+SELECT x.f, x.c FROM (SELECT f, count(*) c FROM df_ag1 GROUP BY f) x JOIN df_ag2 b ON b.k = x.c ORDER BY 1;
+SELECT x.ch, x.cnt FROM (SELECT c ch, count(*) cnt FROM df_ag1 GROUP BY c) x JOIN df_ag2 b ON b.k = x.cnt / 10 ORDER BY 2;
+SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1 WHERE k < 0) x ON x.c + 3 = b.k;
+SET optimizer = on;
+SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
+  LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;
+SELECT b.k, x.c, x.s FROM df_ag2 b
+  LEFT JOIN (SELECT g, count(*) c, sum(n) s FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
+WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
+SELECT b.k, x.m FROM df_ag2 b
+  LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
+WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
+SET optimizer = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_ag1, df_ag2;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

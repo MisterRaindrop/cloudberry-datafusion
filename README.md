@@ -433,6 +433,22 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | N3 | numeric `+`, `-`, `*`; Decimal256 |
 | E1 | `IN`/`NOT IN` lists, `CASE`, `COALESCE`, `NULLIF`, `IS [NOT] DISTINCT FROM` |
 | E2 | Casts between integers, floats, date/timestamp and numeric |
+| A1 | Aggregates below a join or another aggregate |
+
+### Aggregates below a join or another aggregate
+
+A1: an aggregate below a join, or below another aggregate, runs as a node
+of the plan whose groups and calls the nodes above read by name
+(`q<plan node id>_g<i>`, `_a<k>`), as TPC-H Q2, Q13, Q15 and Q20 have
+them: a grouped sum compared with a column in a join filter, a count over
+counts, a combining aggregate over a batch Motion below a join.  It
+computes every call of its target list.  Its columns are made below the
+join, so they may be on the side an outer join fills with NULLs; an
+expression over them in its target list may not (`coalesce(max(k), -1)`
+is NULL above an unmatched row, not -1).  An aggregate whose value
+PostgreSQL finishes where tuples are made (avg returning numeric, a sum of
+branches of different scales) stays on PostgreSQL there, and so does a
+partial stage, whose state only a batch Motion carries.
 
 ### Date and time types
 

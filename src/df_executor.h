@@ -139,6 +139,7 @@ typedef enum DfAggState
 
 extern DfAggState df_agg_state(Aggref *agg);
 extern DfAggState df_agg_state_at(Plan *ctx, Aggref *agg);
+extern bool df_collect_aggrefs(Node *node, List **aggs);
 extern int	df_agg_state_ncols(DfAggState state);
 
 /*

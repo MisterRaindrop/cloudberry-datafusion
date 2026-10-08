@@ -43,8 +43,9 @@
 //!         | {"filter": {"input": <node>, "pred": <expr>}}
 //!         | {"aggregate": {"input": <node>, "group": [<expr>...],
 //!                          "aggs": [...], "having": <expr> | null,
-//!                          "name": s}}   (name: a grouping without aggs
-//!                          below another aggregate, its columns s_g<i>)
+//!                          "name": s}}   (name: an aggregate below a join
+//!                          or another aggregate, its columns s_g<i> and
+//!                          s_a<i>)
 //!         | {"join": {"type": "inner" | "left" | "right" | "full" | "leftsemi"
 //!                           | "rightsemi" | "leftanti" | "rightanti",
 //!                     "left": <node>, "right": <node>,
@@ -1394,15 +1395,20 @@ fn build_node(
         if let Some(h) = a.get("having").filter(|v| !v.is_null()) {
             b = b.filter(expr(h)?).map_err(df)?;
         }
-        // D2: a grouping below another aggregate names its columns
-        // <name>_g<i>, apart from that aggregate's own g<i>.
+        // D2, A1: an aggregate below a join or another aggregate names its
+        // columns <name>_g<i> and <name>_a<i>, apart from the top
+        // aggregate's own g<i> and a<i>.
         if let Some(name) = a.get("name").and_then(Value::as_str) {
-            if !aggs.is_empty() {
-                return Err("plan spec: a named aggregate with aggregates".into());
+            let mut cols: Vec<Expr> = (0..ngroups)
+                .map(|i| col(format!("g{i}")).alias(format!("{name}_g{i}")))
+                .collect();
+            cols.extend(
+                (0..aggs.len()).map(|i| col(format!("a{i}")).alias(format!("{name}_a{i}"))),
+            );
+            if cols.is_empty() {
+                cols.push(col("a_rows").alias(format!("{name}_rows")));
             }
-            b = b
-                .project((0..ngroups).map(|i| col(format!("g{i}")).alias(format!("{name}_g{i}"))))
-                .map_err(df)?;
+            b = b.project(cols).map_err(df)?;
         }
         return Ok(b);
     }
