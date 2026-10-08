@@ -140,6 +140,16 @@ SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT a, count(*) AS n FROM df
 SELECT count(*), count(DISTINCT n), sum(n) FROM (SELECT b, d, count(*) AS n FROM df_nc GROUP BY b, d) s;
 SELECT c, count(*) FROM df_nc GROUP BY c HAVING c < 0 OR c > 1e38 OR c = 'NaN' ORDER BY c;
 SET datafusion.mode = off;
+-- A key of 76 digits: the digits are placed without overflowing.
+CREATE TABLE df_nc4 (id int, x numeric(38, 1)) DISTRIBUTED BY (id);
+INSERT INTO df_nc4 SELECT i, 9999999999999999999999999999999999999.9 - i % 50
+FROM generate_series(1, 200) i;
+ANALYZE df_nc4;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x * x, count(*) FROM df_nc4 GROUP BY x * x;
+SET datafusion.mode = on;
+SELECT count(*), min(n), max(n) FROM (SELECT x * x, count(*) AS n FROM df_nc4 GROUP BY x * x) s;
+SET datafusion.mode = off;
 
 -- sum of a CASE or COALESCE whose branches differ in scale (MS1, TPC-H Q8
 -- and Q14): PostgreSQL's sum shows the largest display scale of the values
@@ -238,6 +248,6 @@ SELECT id, b / a FROM df_nc WHERE id = -6;
 \set VERBOSITY default
 RESET datafusion.motion_batches;
 
-DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3;
+DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

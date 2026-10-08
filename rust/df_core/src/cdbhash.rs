@@ -239,14 +239,18 @@ pub fn hash_numeric(v: i256, scale: i8) -> u32 {
     let scale = scale as u32;
     let pad = (4 - scale % 4) % 4;
     let nfrac = ((scale + pad) / 4) as i32;
-    // NBASE digits of |v| * 10^pad, least significant first
+    // NBASE digits of |v| * 10^pad, least significant first; the lowest
+    // takes the last 4 - pad decimal digits, so nothing overflows
     let mut digits: Vec<u16> = Vec::with_capacity(20);
-    let x = v.wrapping_abs();
-    match x
-        .to_i128()
-        .and_then(|x| (x as u128).checked_mul(10u128.pow(pad)))
-    {
-        Some(mut x) => {
+    let mut x = v.wrapping_abs();
+    if pad > 0 {
+        let low = i256::from_i128(10i128.pow(4 - pad));
+        digits.push(((x % low).as_i128() * 10i128.pow(pad)) as u16);
+        x /= low;
+    }
+    match x.to_i128() {
+        Some(x) => {
+            let mut x = x as u128;
             while x > 0 {
                 let mut chunk = (x % 10_000_000_000_000_000) as u64;
                 x /= 10_000_000_000_000_000;
@@ -258,9 +262,6 @@ pub fn hash_numeric(v: i256, scale: i8) -> u32 {
         }
         None => {
             let base = i256::from_i128(10000);
-            let mut x = x
-                .checked_mul(i256::from_i128(10i128.pow(pad)))
-                .expect("a numeric distribution key within 76 digits");
             while x > i256::ZERO {
                 digits.push((x % base).as_i128() as u16);
                 x /= base;
@@ -354,6 +355,20 @@ mod tests {
         assert_eq!(hash_bytes(b"hello world!"), 1400155871);
         assert_eq!(hash_bytes(b"hello world!!"), 2176858744);
         assert_eq!(hash_bytes("中文😀".as_bytes()), 3467869828);
+        // hash_numeric, of values of their own scale and wider ones, up to
+        // 76 digits: SELECT hash_numeric('1.5'), ...
+        let n = |s: &str| i256::from_string(s).unwrap();
+        assert_eq!(hash_numeric(n("15"), 1) as i32, 692967894);
+        assert_eq!(hash_numeric(n("1500"), 3) as i32, 692967894);
+        assert_eq!(hash_numeric(n("123456789"), 4) as i32, -2041232919);
+        assert_eq!(hash_numeric(n("-1"), 3) as i32, 1143929985);
+        assert_eq!(hash_numeric(n("1000000"), 0) as i32, 1186574834);
+        assert_eq!(
+            hash_numeric(n("1234567890123456789012345678901234567812"), 1) as i32,
+            -1704301524
+        );
+        assert_eq!(hash_numeric(n(&"9".repeat(76)), 2) as i32, -467109537);
+        assert_eq!(hash_numeric(i256::ZERO, 5), u32::MAX);
         // Jump hash stays in range and is stable.
         for k in 0..1000u64 {
             let s = jump_consistent_hash(k, 3);
