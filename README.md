@@ -436,6 +436,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | A1 | Aggregates below a join or another aggregate |
 | SQ1 | Subquery Scan; batch Motions below Subquery Scan and Append |
 | RI1 | RowIdExpr: semi joins deduplicated after the join |
+| R1 | GPORCA's Result: a projection and filter over its child |
 
 ### Aggregates below a join or another aggregate
 
@@ -472,6 +473,12 @@ the partitions share), so the copies the join makes share a number.  An
 aggregate's column it does not group by, which the planner puts there
 only where the groups determine it, is any value of its group
 (`first_value`).
+
+R1: GPORCA puts a Result over aggregates and joins to filter (a HAVING,
+a test of an outer join's NULLs) and compute columns.  It runs as a filter
+over its child's rows, its columns read the child's, and an aggregate
+below it is not the slice's top one (A1).  One without a child or with a
+one-time filter stays on PostgreSQL.
 
 ### Date and time types
 

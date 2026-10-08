@@ -1389,6 +1389,87 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
 
 RESET datafusion.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
+-- GPORCA's Result (R1): a projection and filter over its child's rows,
+-- here a HAVING and a test of an outer join's NULLs.
+CREATE TABLE df_rs (k int, g int) DISTRIBUTED BY (k);
+INSERT INTO df_rs SELECT i, i % 37 FROM generate_series(1, 10000) i;
+ANALYZE df_rs;
+SET optimizer = on;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g
+   ->  Sort
+         Sort Key: g
+         ->  Result
+               Filter: ((count(*)) > 270)
+               ->  Finalize HashAggregate
+                     Group Key: g
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: g
+                                 ->  Seq Scan on df_rs
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(17 rows)
+
+SET datafusion.mode = off;
+SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+ g  | count 
+----+-------
+  1 |   271
+  2 |   271
+  3 |   271
+  4 |   271
+  5 |   271
+  6 |   271
+  7 |   271
+  8 |   271
+  9 |   271
+ 10 |   271
+(10 rows)
+
+SELECT count(*), sum(a.k) FROM df_rs a
+  LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
+WHERE coalesce(x.c, 0) = 0;
+ count |   sum    
+-------+----------
+  4590 | 22970655
+(1 row)
+
+SET datafusion.mode = on;
+SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+ g  | count 
+----+-------
+  1 |   271
+  2 |   271
+  3 |   271
+  4 |   271
+  5 |   271
+  6 |   271
+  7 |   271
+  8 |   271
+  9 |   271
+ 10 |   271
+(10 rows)
+
+SELECT count(*), sum(a.k) FROM df_rs a
+  LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
+WHERE coalesce(x.c, 0) = 0;
+ count |   sum    
+-------+----------
+  4590 | 22970655
+(1 row)
+
+RESET datafusion.motion_batches;
+SET optimizer = off;
+DROP TABLE df_rs;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

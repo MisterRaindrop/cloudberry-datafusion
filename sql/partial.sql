@@ -55,7 +55,7 @@ JOIN df_pt2 b ON a.c > b.w * 500 GROUP BY a.k;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET enable_sort;
--- ORCA's Result on top
+-- ORCA's Result on top, which runs in DataFusion since R1
 SET optimizer = on;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
 SET optimizer = off;

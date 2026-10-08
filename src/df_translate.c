@@ -1483,6 +1483,21 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			df_emit_node(b, out, outerPlan(plan));
 			return;
 
+		case T_Result:
+			/* R1: its child's rows, its filter over them */
+			if (plan->qual == NIL)
+			{
+				df_emit_node(b, out, outerPlan(plan));
+				return;
+			}
+			appendStringInfoString(out, "{\"filter\":{\"input\":");
+			df_emit_node(b, out, outerPlan(plan));
+			appendStringInfoString(out, ",\"pred\":");
+			b->ctx = plan;
+			df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+			appendStringInfoString(out, "}}");
+			return;
+
 		case T_SubqueryScan:
 			/* SQ1: its plan's rows, its filter over them */
 			if (plan->qual == NIL)

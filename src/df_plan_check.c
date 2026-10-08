@@ -85,7 +85,8 @@ typedef struct DfCheckContext
 	bool		join_input;		/* checking an input of a join */
 	bool		inner_agg;		/* checking an Agg below a join or another
 								 * Agg, whose values others read (A1) */
-	bool		subquery_input; /* checking the plan of a Subquery Scan */
+	bool		projection_input;	/* checking the plan below a Subquery
+									 * Scan or a Result */
 	bool		rowid_ok;		/* checking a scan's or join's targetlist,
 								 * where a RowIdExpr may be (RI1) */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
@@ -1880,6 +1881,23 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 		return false;
 	if (IsA(plan, Motion))
 		return true;
+	if (IsA(plan, Result))
+	{
+		/* R1: its child's columns */
+		Bitmapset  *sub = NULL;
+
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!bms_is_member(tle->resno, attnos))
+				continue;
+			if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varno != OUTER_VAR)
+				return false;
+			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
+		}
+		return df_plain_outputs(outerPlan(plan), sub);
+	}
 	if (IsA(plan, SubqueryScan))
 	{
 		/* SQ1: its plan's columns */
@@ -2369,7 +2387,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * the plan, which those above read by name: not a partial
 				 * stage, whose state only a batch Motion carries.
 				 */
-				inner = cxt->join_input || cxt->agg_input || cxt->subquery_input;
+				inner = cxt->join_input || cxt->agg_input || cxt->projection_input;
 				if (inner && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "partial aggregate below a join or another aggregate");
@@ -2459,6 +2477,45 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_Result:
+			{
+				/*
+				 * R1: a projection and filter over its child's rows, as GPORCA
+				 * puts above aggregates and joins.  Not one without a child or
+				 * with a one-time filter.  An Agg below it is not the slice's
+				 * top one (A1).
+				 */
+				Bitmapset  *child_needed = NULL;
+				bool		saved = cxt->projection_input;
+				ListCell   *lc;
+
+				if (outerPlan(plan) == NULL || innerPlan(plan) != NULL ||
+					((Result *) plan)->resconstantqual != NULL)
+				{
+					df_reject(cxt, "Result without a child or with a one-time filter");
+					return;
+				}
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				df_check_expr_list(plan->qual, cxt);
+				if (cxt->failed)
+					return;
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+				}
+				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				child_needed = bms_add_member(child_needed, 0);
+				cxt->order_free = cxt->node_order_free; /* its child's order */
+				cxt->projection_input = true;
+				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				cxt->projection_input = saved;
+				return;
+			}
+
 		case T_SubqueryScan:
 			{
 				/*
@@ -2469,7 +2526,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				SubqueryScan *sq = (SubqueryScan *) plan;
 				DfScanRefs	refs = {sq->scan.scanrelid, NULL};
-				bool		saved = cxt->subquery_input;
+				bool		saved = cxt->projection_input;
 				ListCell   *lc;
 
 				cxt->allow_aggref = false;
@@ -2487,9 +2544,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				df_collect_scan_refs((Node *) plan->qual, &refs);
 				refs.refs = bms_add_member(refs.refs, 0);
 				cxt->order_free = cxt->node_order_free; /* its plan's order */
-				cxt->subquery_input = true;
+				cxt->projection_input = true;
 				df_check_plan(sq->subplan, cxt, refs.refs, false);
-				cxt->subquery_input = saved;
+				cxt->projection_input = saved;
 				return;
 			}
 

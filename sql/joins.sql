@@ -303,6 +303,29 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
 RESET datafusion.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
 
+-- GPORCA's Result (R1): a projection and filter over its child's rows,
+-- here a HAVING and a test of an outer join's NULLs.
+CREATE TABLE df_rs (k int, g int) DISTRIBUTED BY (k);
+INSERT INTO df_rs SELECT i, i % 37 FROM generate_series(1, 10000) i;
+ANALYZE df_rs;
+SET optimizer = on;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+SET datafusion.mode = off;
+SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+SELECT count(*), sum(a.k) FROM df_rs a
+  LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
+WHERE coalesce(x.c, 0) = 0;
+SET datafusion.mode = on;
+SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
+SELECT count(*), sum(a.k) FROM df_rs a
+  LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
+WHERE coalesce(x.c, 0) = 0;
+RESET datafusion.motion_batches;
+SET optimizer = off;
+DROP TABLE df_rs;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
