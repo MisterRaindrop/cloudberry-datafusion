@@ -722,7 +722,7 @@ WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
                                                    ->  Seq Scan on df_sj_l
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+ DataFusion: slice 1 not eligible: Subquery Scan is not supported
  DataFusion: slice 2 eligible
  DataFusion: slice 3 eligible, sends Arrow batches
  DataFusion: slice 4 not eligible: partial aggregate sum without batch Motions

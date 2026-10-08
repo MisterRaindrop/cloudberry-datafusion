@@ -163,6 +163,37 @@ SELECT g, sum(CASE WHEN id < 0 AND g <> 93 THEN b END), sum(CASE g WHEN 90 THEN 
 FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
 SET datafusion.mode = off;
 
+-- An init plan's value (IP1, TPC-H Q11, Q15 and Q22), computed before the
+-- slices start, is a constant; numeric ones only compared with a numeric
+-- of known scale, rounded to it: up for < and >=, down for <= and >, and
+-- a value beyond every row's becomes the infinity on its side.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc) > 0;
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+SELECT count(*), sum(id) FROM df_nc WHERE (SELECT avg(b) FROM df_nc WHERE id > 0) >= b;
+SELECT count(*), sum(id) FROM df_nc WHERE a = (SELECT max(a) FROM df_nc WHERE id > 0);
+SELECT count(*), sum(id) FROM df_nc WHERE a <> (SELECT 1.505::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE a < (SELECT 'NaN'::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE a <= (SELECT -1e40::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE c > (SELECT 'Infinity'::numeric);
+SELECT count(*) FROM df_nc WHERE a > (SELECT NULL::numeric);
+SELECT g, sum(a) FROM df_nc GROUP BY g HAVING sum(a) > (SELECT sum(a) / 8 FROM df_nc WHERE id > 0) ORDER BY g;
+SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+SELECT count(*), sum(id) FROM df_nc WHERE (SELECT avg(b) FROM df_nc WHERE id > 0) >= b;
+SELECT count(*), sum(id) FROM df_nc WHERE a = (SELECT max(a) FROM df_nc WHERE id > 0);
+SELECT count(*), sum(id) FROM df_nc WHERE a <> (SELECT 1.505::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE a < (SELECT 'NaN'::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE a <= (SELECT -1e40::numeric);
+SELECT count(*), sum(id) FROM df_nc WHERE c > (SELECT 'Infinity'::numeric);
+SELECT count(*) FROM df_nc WHERE a > (SELECT NULL::numeric);
+SELECT g, sum(a) FROM df_nc GROUP BY g HAVING sum(a) > (SELECT sum(a) / 8 FROM df_nc WHERE id > 0) ORDER BY g;
+SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
+SET datafusion.mode = off;
+
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

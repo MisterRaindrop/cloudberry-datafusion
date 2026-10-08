@@ -627,6 +627,183 @@ FROM df_nc WHERE id < 0 OR id % 1000 = 0 GROUP BY g ORDER BY g;
 (11 rows)
 
 SET datafusion.mode = off;
+-- An init plan's value (IP1, TPC-H Q11, Q15 and Q22), computed before the
+-- slices start, is a constant; numeric ones only compared with a numeric
+-- of known scale, rounded to it: up for < and >=, down for <= and >, and
+-- a value beyond every row's becomes the infinity on its side.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Finalize Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_1
+                             Filter: (id > 0)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+                     Filter: (a > $0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc) > 0;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_1
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+                     Filter: ((a + $0) > '0'::numeric)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+(13 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+ count |    sum    
+-------+-----------
+ 25005 | 626485076
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE (SELECT avg(b) FROM df_nc WHERE id > 0) >= b;
+ count |    sum    
+-------+-----------
+ 25003 | 624148222
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a = (SELECT max(a) FROM df_nc WHERE id > 0);
+ count |  sum  
+-------+-------
+     1 | 37631
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a <> (SELECT 1.505::numeric);
+ count |    sum     
+-------+------------
+ 50006 | 1250024975
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a < (SELECT 'NaN'::numeric);
+ count |    sum     
+-------+------------
+ 50005 | 1250024976
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a <= (SELECT -1e40::numeric);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE c > (SELECT 'Infinity'::numeric);
+ count | sum 
+-------+-----
+     1 |  -1
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE a > (SELECT NULL::numeric);
+ count 
+-------
+     0
+(1 row)
+
+SELECT g, sum(a) FROM df_nc GROUP BY g HAVING sum(a) > (SELECT sum(a) / 8 FROM df_nc WHERE id > 0) ORDER BY g;
+ g  |   sum    
+----+----------
+  0 | 17287.49
+  1 | -7058.34
+  2 | -1404.17
+  6 |  1212.51
+ 90 |      NaN
+ 92 |     0.00
+ 93 |     1.50
+(7 rows)
+
+SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
+ count 
+-------
+ 25000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
+ count |    sum    
+-------+-----------
+ 25005 | 626485076
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE (SELECT avg(b) FROM df_nc WHERE id > 0) >= b;
+ count |    sum    
+-------+-----------
+ 25003 | 624148222
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a = (SELECT max(a) FROM df_nc WHERE id > 0);
+ count |  sum  
+-------+-------
+     1 | 37631
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a <> (SELECT 1.505::numeric);
+ count |    sum     
+-------+------------
+ 50006 | 1250024975
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a < (SELECT 'NaN'::numeric);
+ count |    sum     
+-------+------------
+ 50005 | 1250024976
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a <= (SELECT -1e40::numeric);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_nc WHERE c > (SELECT 'Infinity'::numeric);
+ count | sum 
+-------+-----
+     1 |  -1
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE a > (SELECT NULL::numeric);
+ count 
+-------
+     0
+(1 row)
+
+SELECT g, sum(a) FROM df_nc GROUP BY g HAVING sum(a) > (SELECT sum(a) / 8 FROM df_nc WHERE id > 0) ORDER BY g;
+ g  |   sum    
+----+----------
+  0 | 17287.49
+  1 | -7058.34
+  2 | -1404.17
+  6 |  1212.51
+ 90 |      NaN
+ 92 |     0.00
+ 93 |     1.50
+(7 rows)
+
+SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
+ count 
+-------
+ 25000
+(1 row)
+
+SET datafusion.mode = off;
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

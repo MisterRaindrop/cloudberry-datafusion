@@ -377,6 +377,9 @@ fn literal(v: &Value) -> Result<Expr, String> {
                 // NaN is "NaN": NUMERIC_NAN
                 Some(match val.and_then(Value::as_str) {
                     Some("NaN") => crate::pgnum::NUMERIC_NAN,
+                    // IP1: a parameter beyond any value it is compared with
+                    Some("Infinity") => crate::pgnum::NUMERIC_PINF,
+                    Some("-Infinity") => crate::pgnum::NUMERIC_NINF,
                     v => v
                         .and_then(datafusion::arrow::datatypes::i256::from_string)
                         .ok_or("bad numeric literal")?,

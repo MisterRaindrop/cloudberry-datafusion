@@ -91,6 +91,10 @@ typedef struct DfCheckContext
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
 	Node	   *mixed_scales_ok;	/* a sum's argument whose branches may have
 									 * different scales (MS1) */
+	Node	   *numeric_param_ok;	/* a numeric parameter compared with a
+									 * numeric of known scale (IP1) */
+	Bitmapset  *init_params;	/* PARAM_EXEC ids init plans set (IP1) */
+	bool		init_params_found;
 	Plan	   *node;			/* the node whose expressions are checked */
 	Plan	   *top;			/* where a Limit or Sort may be: the top of
 								 * the slice, or below its Limit (S1) */
@@ -112,10 +116,56 @@ typedef struct DfCheckContext
 
 static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
 static bool df_check_expr(Node *node, DfCheckContext *cxt);
+static bool df_name_in(const char *name, const char *const *list);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
 static void df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 							   bool root_is_sender);
+
+/* Add the parameters the init plans of 'plan' and below it set. */
+static void
+df_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+	foreach(lc, plan->initPlan)
+	{
+		SubPlan    *sp = lfirst_node(SubPlan, lc);
+		ListCell   *lp;
+
+		foreach(lp, sp->setParam)
+			*params = bms_add_member(*params, lfirst_int(lp));
+	}
+	df_collect_init_params(stmt, outerPlan(plan), params);
+	df_collect_init_params(stmt, innerPlan(plan), params);
+	if (IsA(plan, SubqueryScan))
+		df_collect_init_params(stmt, ((SubqueryScan *) plan)->subplan, params);
+	if (IsA(plan, Append))
+		foreach(lc, ((Append *) plan)->appendplans)
+			df_collect_init_params(stmt, lfirst(lc), params);
+}
+
+/*
+ * The PARAM_EXEC ids that init plans of the statement set (IP1), whose
+ * values are known when a slice starts: the coordinator computes them
+ * before dispatching (preprocess_initplans) and the segments receive them.
+ */
+static Bitmapset *
+df_init_params(DfCheckContext *cxt)
+{
+	ListCell   *lc;
+
+	if (!cxt->init_params_found)
+	{
+		df_collect_init_params(cxt->stmt, cxt->stmt->planTree, &cxt->init_params);
+		foreach(lc, cxt->stmt->subplans)
+			df_collect_init_params(cxt->stmt, lfirst(lc), &cxt->init_params);
+		cxt->init_params_found = true;
+	}
+	return cxt->init_params;
+}
 
 /* Record the first reason a slice does not qualify. */
 static void
@@ -452,9 +502,12 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *child;
 				TargetEntry *tle;
 
-				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
+				if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
+					child = ((SubqueryScan *) ctx)->subplan;
+				else if (var->varno == OUTER_VAR || var->varno == INNER_VAR)
+					child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+				else
 					return false;
-				child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
 				tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
 				return tle != NULL && df_numeric_may_be_infinite(child, (Node *) tle->expr);
 			}
@@ -610,9 +663,12 @@ df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale)
 	int			p;
 
 	while (IsA(expr, Var) &&
-		   (((Var *) expr)->varno == OUTER_VAR || ((Var *) expr)->varno == INNER_VAR))
+		   (((Var *) expr)->varno == OUTER_VAR || ((Var *) expr)->varno == INNER_VAR ||
+			(IsA(ctx, SubqueryScan) && ((Var *) expr)->varno == ((Scan *) ctx)->scanrelid)))
 	{
-		Plan	   *child = ((Var *) expr)->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+		Plan	   *child = IsA(ctx, SubqueryScan) && ((Var *) expr)->varno == ((Scan *) ctx)->scanrelid ?
+			((SubqueryScan *) ctx)->subplan :
+			((Var *) expr)->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
 		TargetEntry *tle = child ? get_tle_by_resno(child->targetlist,
 													((Var *) expr)->varattno) : NULL;
 
@@ -644,6 +700,43 @@ df_agg_state_at(Plan *ctx, Aggref *agg)
 }
 
 /*
+ * Is 'op' a comparison of a numeric of known scale (at most 38 digits, not
+ * infinite) with a numeric init plan parameter (IP1)?  Sets the other side
+ * and whether the parameter is on the left.  The parameter's value is
+ * rounded to that side's scale when the slice starts.
+ */
+bool
+df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
+{
+	static const char *const cmps[] = {"<", "<=", ">", ">=", "=", "<>", NULL};
+	Node	   *l,
+			   *r,
+			   *x;
+	char	   *name;
+	int			p,
+				s;
+
+	if (list_length(op->args) != 2 || op->opresulttype != BOOLOID ||
+		(name = get_opname(op->opno)) == NULL || !df_name_in(name, cmps))
+		return false;
+	l = linitial(op->args);
+	r = lsecond(op->args);
+	if (exprType(l) != NUMERICOID || exprType(r) != NUMERICOID ||
+		IsA(l, Param) == IsA(r, Param) ||
+		((Param *) (IsA(l, Param) ? l : r))->paramkind != PARAM_EXEC)
+		return false;
+	x = IsA(l, Param) ? r : l;
+	if (!df_numeric_ps(ctx, x, &p, &s) || p > DF_NUMERIC_MAX_PRECISION ||
+		df_numeric_may_be_infinite(ctx, x))
+		return false;
+	if (other)
+		*other = x;
+	if (param_left)
+		*param_left = IsA(l, Param);
+	return true;
+}
+
+/*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
  * numeric(p, s) with p <= 38, found through the references of the nodes
@@ -668,6 +761,14 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				 * A reference is followed whatever its type: one to a partial
 				 * sum or avg has PostgreSQL's state type (bytea).
 				 */
+				if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
+				{
+					/* a column of the subquery: its expression there */
+					Plan	   *sub = ((SubqueryScan *) ctx)->subplan;
+
+					tle = get_tle_by_resno(sub->targetlist, var->varattno);
+					return tle != NULL && df_numeric_ps(sub, (Node *) tle->expr, precision, scale);
+				}
 				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 					return var->vartype == NUMERICOID &&
 						df_numeric_typmod(var->vartypmod, precision, scale);
@@ -1275,6 +1376,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 										  "its scale depends on the values" :
 										  "of unknown precision or more than 76 digits");
 						}
+						else if (df_numeric_param_cmp(cxt->node, op, NULL, NULL))
+							/* IP1: the parameter, rounded to the other side's scale */
+							cxt->numeric_param_ok = IsA(linitial(op->args), Param) ?
+								linitial(op->args) : lsecond(op->args);
 						else if (!df_numeric_ps(cxt->node, linitial(op->args), &lp, &ls) ||
 								 !df_numeric_ps(cxt->node, lsecond(op->args), &rp, &rs))
 							df_reject(cxt, "operator %s on numeric of unknown precision", name);
@@ -1512,8 +1617,22 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			return true;
 
 		case T_Param:
-			df_reject(cxt, "query parameter");
-			return true;
+			{
+				/*
+				 * IP1: the value of an init plan, known before the slice runs
+				 * (computed on the coordinator and dispatched), as a constant
+				 */
+				Param	   *param = (Param *) node;
+
+				if (param->paramkind != PARAM_EXEC ||
+					!bms_is_member(param->paramid, df_init_params(cxt)))
+					df_reject(cxt, "query parameter");
+				else if (!df_type_supported(param->paramtype))
+					df_reject(cxt, "query parameter of type %s", format_type_be(param->paramtype));
+				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok)
+					df_reject(cxt, "numeric query parameter other than compared with a numeric of known scale");
+				return cxt->failed;
+			}
 
 		case T_CaseExpr:
 			{
@@ -2150,12 +2269,6 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 {
 	if (plan == NULL || cxt->failed)
 		return;
-
-	if (plan->initPlan != NIL)
-	{
-		df_reject(cxt, "init plan");
-		return;
-	}
 
 	switch (nodeTag(plan))
 	{

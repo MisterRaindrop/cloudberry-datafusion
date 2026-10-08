@@ -1223,12 +1223,26 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	EState	   *estate = queryDesc->estate;
 	MemoryContext oldcxt;
 	DfExec	   *x;
+	volatile bool ok = false;
 	int			c,
 				j;
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
 	x = palloc0(sizeof(DfExec));
-	if (!df_translate_slice(root->plan, tails, &x->spec, reason, reasonlen))
+	/* IP1: init plan values become constants of the plan */
+	df_param_values = estate->es_param_exec_vals;
+	df_param_econtext = GetPerTupleExprContext(estate);
+	PG_TRY();
+	{
+		ok = df_translate_slice(root->plan, tails, &x->spec, reason, reasonlen);
+	}
+	PG_FINALLY();
+	{
+		df_param_values = NULL;
+		df_param_econtext = NULL;
+	}
+	PG_END_TRY();
+	if (!ok)
 	{
 		MemoryContextSwitchTo(oldcxt);
 		pfree(x);

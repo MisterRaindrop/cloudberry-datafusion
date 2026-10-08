@@ -56,6 +56,7 @@
 #include <math.h>
 
 #include "catalog/pg_type_d.h"
+#include "executor/nodeSubplan.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
@@ -64,6 +65,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/numeric.h"
 
 #include "df_executor.h"
 
@@ -105,6 +107,7 @@ typedef struct DfBuilder
 static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
+static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
 
 static void
 df_fail(DfBuilder *b, const char *what)
@@ -322,6 +325,130 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 	while (n > 0)
 		appendStringInfoChar(out, digits[--n]);
 	appendStringInfoString(out, "\"}}");
+}
+
+/* IP1: init plan values for the slice being translated to start it */
+ParamExecData *df_param_values = NULL;
+ExprContext *df_param_econtext = NULL;
+
+/*
+ * The value of init plan parameter 'param': dispatched, computed before
+ * dispatching, or computed now on the coordinator, as PostgreSQL would when
+ * the parameter is first read.  NULL when translating only to check (EXPLAIN,
+ * batch Motions), where it does not matter.
+ */
+static Const *
+df_param_const(Param *param)
+{
+	int16		len;
+	bool		byval;
+	Datum		value = (Datum) 0;
+	bool		isnull = true;
+
+	get_typlenbyval(param->paramtype, &len, &byval);
+	if (df_param_values != NULL)
+	{
+		ParamExecData *prm = &df_param_values[param->paramid];
+
+		if (prm->execPlan != NULL)
+			ExecSetParamPlan(prm->execPlan, df_param_econtext, NULL);
+		value = prm->value;
+		isnull = prm->isnull;
+	}
+	return makeConst(param->paramtype, param->paramtypmod, param->paramcollid, len,
+					 value, isnull, byval);
+}
+
+static Datum
+df_numeric_from(const char *s)
+{
+	return DirectFunctionCall3(numeric_in, CStringGetDatum(s), ObjectIdGetDatum(InvalidOid),
+							   Int32GetDatum(-1));
+}
+
+static int
+df_numeric_cmp(Datum a, Datum b)
+{
+	return DatumGetInt32(DirectFunctionCall2(numeric_cmp, a, b));
+}
+
+/*
+ * IP1: numeric 'x' (of known scale s and at most p digits) compared by 'op'
+ * with an init plan parameter, as x compared with a literal of scale s:
+ * the value rounded up for < and >=, down for <= and >; = and <> with a
+ * value finer than s are constant.  A value beyond any x becomes the
+ * infinity on its side, NaN stays NaN, so NaN x compare as in PostgreSQL.
+ */
+static void
+df_emit_numeric_param_cmp(DfBuilder *b, StringInfo out, OpExpr *op, DfLevel level)
+{
+	static const char *const swapped[][2] = {
+		{"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}, {"=", "="}, {"<>", "<>"}
+	};
+	Plan	   *ctx = df_level_ctx(b, level);
+	Node	   *x;
+	bool		param_left;
+	const char *name = get_opname(op->opno);
+	const char *special = NULL;
+	Const	   *c;
+	int			p,
+				s,
+				i;
+
+	(void) df_numeric_param_cmp(ctx, op, &x, &param_left);
+	(void) df_numeric_ps(ctx, x, &p, &s);
+	for (i = 0; param_left && strcmp(swapped[i][0], name) != 0; i++)
+		;
+	if (param_left)
+		name = swapped[i][1];
+	c = df_param_const((Param *) (param_left ? linitial(op->args) : lsecond(op->args)));
+	if (!c->constisnull)
+	{
+		Datum		v = c->constvalue;
+		Numeric		n = DatumGetNumeric(v);
+
+		if (numeric_is_nan(n))
+			special = "NaN";
+		else if (numeric_is_inf(n))
+			special = df_numeric_cmp(v, df_numeric_from("0")) > 0 ? "Infinity" : "-Infinity";
+		else
+		{
+			Datum		q = DirectFunctionCall2(numeric_trunc, v, Int32GetDatum(s));
+			Datum		ulp = df_numeric_from(psprintf("1e-%d", s));
+			Datum		bound = df_numeric_from(psprintf("1e%d", p - s));
+			bool		exact = df_numeric_cmp(q, v) == 0;
+			int			sign = df_numeric_cmp(v, df_numeric_from("0"));
+
+			if (exact)
+				v = q;
+			else if (strcmp(name, "<") == 0 || strcmp(name, ">=") == 0)
+				v = sign > 0 ? DirectFunctionCall2(numeric_add, q, ulp) : q;	/* up */
+			else if (strcmp(name, "<=") == 0 || strcmp(name, ">") == 0)
+				v = sign < 0 ? DirectFunctionCall2(numeric_sub, q, ulp) : q;	/* down */
+			else
+			{
+				/* = never, <> always (NULL for a NULL x) */
+				name = strcmp(name, "=") == 0 ? "<" : ">=";
+				special = "-Infinity";
+			}
+			/* |x| < 10^(p - s): beyond, the infinity on that side answers alike */
+			if (special == NULL && df_numeric_cmp(v, bound) >= 0)
+				special = "Infinity";
+			else if (special == NULL &&
+					 df_numeric_cmp(v, DirectFunctionCall1(numeric_uminus, bound)) <= 0)
+				special = "-Infinity";
+			c = makeConst(NUMERICOID, -1, InvalidOid, -1, v, false, false);
+		}
+	}
+	appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[", name);
+	df_emit(b, out, x, level);
+	appendStringInfoChar(out, ',');
+	if (special != NULL)
+		appendStringInfo(out, "{\"lit\":{\"type\":\"%s\",\"value\":\"%s\"}}",
+						 df_tag(NUMERICOID, s), special);
+	else
+		df_emit_numeric_const(b, out, c, s);
+	appendStringInfoString(out, "]}");
 }
 
 static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
@@ -761,6 +888,16 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				return;
 			}
 
+		case T_Param:
+			/* IP1: an init plan's value (numeric only compared: above) */
+			if (((Param *) node)->paramtype == NUMERICOID)
+			{
+				df_fail(b, "a numeric parameter");
+				return;
+			}
+			df_emit(b, out, (Node *) df_param_const((Param *) node), level);
+			return;
+
 		case T_Const:
 			df_emit_const(b, out, (Const *) node);
 			return;
@@ -777,6 +914,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (name == NULL || tag == NULL)
 				{
 					df_fail(b, "an operator");
+					return;
+				}
+				if (df_numeric_param_cmp(df_level_ctx(b, level), op, NULL, NULL))
+				{
+					df_emit_numeric_param_cmp(b, out, op, level);
 					return;
 				}
 				if (df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))

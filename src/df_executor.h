@@ -285,6 +285,11 @@ extern bool df_limit_value(Node *expr, int64 *value);
 extern bool df_sort_direction(Oid sortop, Oid type, bool *desc);
 extern bool df_passes_through(Plan *plan);
 extern Node *df_semi_key_for(HashJoin *hj, Var *var);
+extern bool df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left);
+
+/* IP1: init plan values for the translation of a slice that starts, or NULL */
+extern ParamExecData *df_param_values;
+extern ExprContext *df_param_econtext;
 extern bool df_date_timestamp_cmp(OpExpr *op, Node **date_arg, const char **cmp,
 								  int32 *value);
 

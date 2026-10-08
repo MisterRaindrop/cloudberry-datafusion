@@ -666,6 +666,20 @@ which only drops zeros.  A group whose rows all took `ELSE 0` shows `0`,
 as in PostgreSQL, not `0.0000`.  `avg` of such an argument stays on
 PostgreSQL.
 
+An uncorrelated scalar subquery becomes an init plan whose value
+(`$0`) the rest of the plan reads: TPC-H Q11, Q15 and Q22 compare an
+aggregate or a column with one.  Its value is known before a slice starts
+(the coordinator computes it before dispatching, `preprocess_initplans`,
+and the segments receive it), so DataFusion takes it as a constant.  A
+numeric value has no declared scale, so it is only compared, with a
+numeric of known scale and at most 38 digits: the value is rounded to that
+scale (up for `<` and `>=`, down for `<=` and `>`; `=` and `<>` with a
+finer value are constant), and a value beyond every value of the other
+side becomes the infinity on its side, which keeps NaN above it as in
+PostgreSQL.  Whether a slice runs in DataFusion depends on the plan only,
+not on the value.  Other parameters (of a correlated subquery, a Nested
+Loop or a prepared statement) stay on PostgreSQL.
+
 ### Expressions
 
 E1 adds the expressions found most in filters and select lists:
