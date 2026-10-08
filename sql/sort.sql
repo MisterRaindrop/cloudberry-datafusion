@@ -142,6 +142,27 @@ SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET
 RESET enable_hashagg;
 DROP TABLE df_lk;
 
+-- A GroupAggregate over a sorted Gather's merge (D5, TPC-H Q5) whose order
+-- no one reads runs hashed, and the Gather carries batches unmerged; one
+-- whose order the query reads stays on PostgreSQL.
+CREATE TABLE df_mg (k int, a int, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_mg SELECT i, i % 23, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_mg;
+SET enable_hashagg = off;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+SET datafusion.mode = off;
+SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+SET datafusion.mode = on;
+SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+RESET datafusion.motion_batches;
+RESET enable_hashagg;
+DROP TABLE df_mg;
+
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

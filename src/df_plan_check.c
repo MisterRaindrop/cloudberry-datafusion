@@ -2467,6 +2467,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 */
 					cxt->skipped_sort = child;
 				}
+				else if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
+						 child != NULL && IsA(child, Motion) && ((Motion *) child)->sendSorted)
+				{
+					/*
+					 * D5: one over a sorted Motion's merge, as a Finalize
+					 * GroupAggregate (TPC-H Q5), runs hashed and reads the
+					 * Motion unmerged.
+					 */
+				}
 				else if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
 				{
 					df_reject(cxt, "sorted or mixed aggregation");
@@ -2941,6 +2950,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
+				bool		sorted;
 
 				if (!root_is_sender)
 				{
@@ -2959,8 +2969,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 								  df_plan_name(plan));
 						return;
 					}
-					if (motion->sendSorted)
+					if (motion->sendSorted && !cxt->node_order_free)
 					{
+						/* D5: unmerged where no one reads the order */
 						df_reject(cxt, "receives rows from a sorted %s", df_plan_name(plan));
 						return;
 					}
@@ -2995,9 +3006,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * The sending Motion stays on PostgreSQL and pulls DataFusion's
 				 * rows.  A sorted send needs them sorted: a Sort at the top of
 				 * the slice (S1).  The remaining types belong to parallel or
-				 * DML plans.
+				 * DML plans.  Batches through it are not merged (D5): their
+				 * order does not matter.
 				 */
-				if (motion->sendSorted &&
+				sorted = motion->sendSorted && !bms_is_member(motion->motionID, cxt->batches);
+				if (sorted &&
 					(outerPlan(plan) == NULL || !df_sorted_for(outerPlan(plan), motion)))
 				{
 					/*
@@ -3022,7 +3035,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				cxt->agg_input = false;
 				cxt->batch_sender = bms_is_member(motion->motionID, cxt->batches);
-				cxt->order_free = !motion->sendSorted || cxt->tails.resort != NULL;
+				cxt->order_free = !sorted || cxt->tails.resort != NULL;
 				df_check_plan(outerPlan(plan), cxt, NULL, false);
 				cxt->batch_sender = false;
 				return;
@@ -3385,7 +3398,9 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 static bool
 df_motion_batchable(Motion *motion)
 {
-	if (motion->sendSorted)
+	/* D5: a sorted Gather's receiver reading batches merges nothing */
+	if (motion->sendSorted && motion->motionType != MOTIONTYPE_GATHER &&
+		motion->motionType != MOTIONTYPE_GATHER_SINGLE)
 		return false;
 	if (motion->motionType == MOTIONTYPE_HASH)
 	{

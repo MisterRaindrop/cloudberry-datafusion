@@ -438,6 +438,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | RI1 | RowIdExpr: semi joins deduplicated after the join |
 | R1 | GPORCA's Result: a projection and filter over its child |
 | D4 | A Limit over a GroupAggregate below a sorted Motion |
+| D5 | Sorted Gathers carry batches where the order is not read |
 
 ### Aggregates below a join or another aggregate
 
@@ -857,6 +858,15 @@ the Sort below.  The slice runs the GroupAggregate hashed, sorts its output
 by that Sort's keys and then limits it.  The order is the GroupAggregate's
 only when every grouping column is among those keys (one row per group, no
 ties) and output; the Motion merges by a prefix of them.
+
+D5: a GroupAggregate over a sorted Gather's merge, as the Postgres
+planner combines grouped partial aggregates (TPC-H Q5), runs hashed when no
+one reads its order (a Sort or another aggregate above it), and the Gather
+then carries batches, received unmerged.  Its sender need not sort for
+them, so a sort by a character key under a collation that differs between
+the coordinator and the segments no longer keeps it out.  Where the
+query's order rests on the merge (`GROUP BY a ORDER BY a` without a Sort
+above), it stays on PostgreSQL.
 
 ### Subtrees below PostgreSQL's nodes
 

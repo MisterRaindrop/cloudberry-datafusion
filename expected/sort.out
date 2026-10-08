@@ -846,6 +846,123 @@ SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET
 
 RESET enable_hashagg;
 DROP TABLE df_lk;
+-- A GroupAggregate over a sorted Gather's merge (D5, TPC-H Q5) whose order
+-- no one reads runs hashed, and the Gather carries batches unmerged; one
+-- whose order the query reads stays on PostgreSQL.
+CREATE TABLE df_mg (k int, a int, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_mg SELECT i, i % 23, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_mg;
+SET enable_hashagg = off;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Aggregate
+   ->  Finalize GroupAggregate
+         Group Key: df_mg.a
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: df_mg.a
+               ->  Partial GroupAggregate
+                     Group Key: df_mg.a
+                     ->  Sort
+                           Sort Key: df_mg.a
+                           ->  Seq Scan on df_mg
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+                                              QUERY PLAN                                               
+-------------------------------------------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: a
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: a
+         ->  Partial GroupAggregate
+               Group Key: a
+               ->  Sort
+                     Sort Key: a DESC
+                     ->  Seq Scan on df_mg
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: sorted or mixed aggregation
+ DataFusion: slice 1 eligible below the top: Sort (above: partial aggregate sum without batch Motions)
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+ count |    sum     |   max    
+-------+------------+----------
+    23 | 1572323.25 | 68490.00
+(1 row)
+
+SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+ a  |   sum    
+----+----------
+ 22 | 68412.75
+ 21 | 68394.00
+ 20 | 68375.25
+ 19 | 68356.50
+ 18 | 68337.75
+ 17 | 68319.00
+ 16 | 68300.25
+ 15 | 68281.50
+ 14 | 68262.75
+ 13 | 68368.50
+ 12 | 68349.00
+ 11 | 68329.50
+ 10 | 68310.00
+  9 | 68290.50
+  8 | 68271.00
+  7 | 68409.75
+  6 | 68390.25
+  5 | 68370.75
+  4 | 68351.25
+  3 | 68490.00
+  2 | 68470.50
+  1 | 68451.00
+  0 | 68431.50
+(23 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
+ count |    sum     |   max    
+-------+------------+----------
+    23 | 1572323.25 | 68490.00
+(1 row)
+
+SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
+ a  |   sum    
+----+----------
+ 22 | 68412.75
+ 21 | 68394.00
+ 20 | 68375.25
+ 19 | 68356.50
+ 18 | 68337.75
+ 17 | 68319.00
+ 16 | 68300.25
+ 15 | 68281.50
+ 14 | 68262.75
+ 13 | 68368.50
+ 12 | 68349.00
+ 11 | 68329.50
+ 10 | 68310.00
+  9 | 68290.50
+  8 | 68271.00
+  7 | 68409.75
+  6 | 68390.25
+  5 | 68370.75
+  4 | 68351.25
+  3 | 68490.00
+  2 | 68470.50
+  1 | 68451.00
+  0 | 68431.50
+(23 rows)
+
+RESET datafusion.motion_batches;
+RESET enable_hashagg;
+DROP TABLE df_mg;
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
