@@ -124,8 +124,10 @@ static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
 static void df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
 							  List *aggfns);
 static DfNamedAgg *df_named_of(DfBuilder *b, Agg *agg);
-static void df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call);
+static void df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn);
 static void df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var);
+static bool df_avg_parts(Aggref *agg, const char **sfn, const char **cfn);
+static void df_emit_call_ref(DfBuilder *b, StringInfo out, Aggref *agg, const char *fn);
 static int	df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn);
 static bool df_numbers_rows(Plan *plan);
 
@@ -319,6 +321,47 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 	if (c->constisnull)
 	{
 		appendStringInfoString(out, ",\"null\":true}}");
+		return;
+	}
+	if (df_numeric_value(c->constvalue, scale, &v) == DF_NUMERIC_TOO_LONG)
+	{
+		/*
+		 * AVG1: beyond 38 digits at this scale (one compared with an avg):
+		 * its digits from numeric_out, the fraction padded to the scale
+		 */
+		char	   *text = DatumGetCString(DirectFunctionCall1(numeric_out, c->constvalue));
+		char	   *point = strchr(text, '.');
+		const char *frac = point ? point + 1 : "";
+		char	   *p = text;
+		int			nfrac = strlen(frac);
+		int			ndig;
+		int			i;
+
+		if (point)
+			*point = '\0';
+		for (i = scale; i < nfrac; i++)
+			if (frac[i] != '0')
+				break;
+		if (i < nfrac)
+		{
+			df_fail(b, "a numeric constant");
+			return;
+		}
+		if (*p == '-')
+			p++;
+		while (*p == '0' && p[1] != '\0')
+			p++;
+		ndig = strlen(p) + scale;
+		if (ndig > DF_NUMERIC_MAX_EXPR_PRECISION)
+		{
+			df_fail(b, "a numeric constant");
+			return;
+		}
+		appendStringInfo(out, ",\"value\":\"%s%s%.*s", text[0] == '-' ? "-" : "", p,
+						 Min(nfrac, scale), frac);
+		for (i = nfrac; i < scale; i++)
+			appendStringInfoChar(out, '0');
+		appendStringInfoString(out, "\"}}");
 		return;
 	}
 	if (df_numeric_value(c->constvalue, scale, &v) != DF_NUMERIC_FITS)
@@ -663,21 +706,57 @@ df_named_of(DfBuilder *b, Agg *agg)
  * by its index in its own HAVING.
  */
 static void
-df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call)
+df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn)
 {
-	List	   *calls = df_named_of(b, b->agg)->aggrefs;
-	int			k = list_length(calls);
-	ListCell   *lc;
+	DfNamedAgg *na = df_named_of(b, b->agg);
+	int			k = list_length(na->aggrefs);
+	ListCell   *la,
+			   *lf;
 
-	foreach(lc, calls)
-		if (equal(lfirst(lc), call))
-			k = foreach_current_index(lc);
-	if (k == list_length(calls))
+	forboth(la, na->aggrefs, lf, na->aggfns)
+	{
+		const char *f = lfirst(lf);
+
+		if (equal(lfirst(la), call) &&
+			((f == NULL && fn == NULL) || (f && fn && strcmp(f, fn) == 0)))
+			k = foreach_current_index(la);
+	}
+	if (k == list_length(na->aggrefs))
 		df_fail(b, "an aggregate call");
 	else if (b->agg_named)
 		appendStringInfo(out, "{\"name\":\"q%d_a%d\"}", b->agg->plan.plan_node_id, k);
 	else
 		appendStringInfo(out, "{\"agg\":%d}", k);
+}
+
+/*
+ * AVG1: is 'agg' an avg returning numeric of the whole input, whose sum
+ * and count calls (*sfn, *cfn) DataFusion keeps?  Not a partial one.
+ */
+static bool
+df_avg_parts(Aggref *agg, const char **sfn, const char **cfn)
+{
+	bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+
+	if ((df_agg_state(agg) != DF_AGG_AVG_NUMERIC && df_agg_state(agg) != DF_AGG_AVG_INT) ||
+		agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
+		return false;
+	if (sfn)
+		*sfn = combine ? "merge_sum" :
+			df_agg_state(agg) == DF_AGG_AVG_NUMERIC ? "sum_decimal" : "sum_numeric";
+	if (cfn)
+		*cfn = combine ? "merge_count" : "count";
+	return true;
+}
+
+/* Call ('agg', 'fn') of b->agg: by name or index below the top (A1). */
+static void
+df_emit_call_ref(DfBuilder *b, StringInfo out, Aggref *agg, const char *fn)
+{
+	if (df_named_of(b, b->agg) != NULL)
+		df_emit_named_call(b, out, agg, fn);
+	else
+		appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, agg, fn));
 }
 
 /*
@@ -708,7 +787,7 @@ static void
 df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var)
 {
 	if (df_named_of(b, b->agg) != NULL)
-		df_emit_named_call(b, out, df_any_call(var));
+		df_emit_named_call(b, out, df_any_call(var), "any");
 	else
 		appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, df_any_call(var), "any"));
 }
@@ -1405,16 +1484,34 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				df_fail(b, "an aggregate outside the aggregate node");
 				return;
 			}
-			if (df_agg_state((Aggref *) node) == DF_AGG_AVG_INT)
+			if (df_avg_parts((Aggref *) node, NULL, NULL))
 			{
-				/* only a whole output column (df_emit_outputs) */
-				df_fail(b, "an avg returning numeric inside an expression");
+				/*
+				 * AVG1: avg returning numeric, inside an expression or below
+				 * the top: numeric_avg of its sum and count (df_core pg_avg),
+				 * at df_avg_scale.  A whole output column is the C side's
+				 * (df_emit_outputs).
+				 */
+				Aggref	   *agg = (Aggref *) node;
+				const char *sfn = NULL,
+						   *cfn = NULL;
+				int			from = df_agg_state(agg) == DF_AGG_AVG_INT ? 0 :
+					df_scale_of((Plan *) b->agg,
+								(Node *) linitial_node(TargetEntry, agg->args)->expr);
+
+				(void) df_avg_parts(agg, &sfn, &cfn);
+				appendStringInfoString(out, "{\"avg_numeric\":[");
+				df_emit_call_ref(b, out, agg, sfn);
+				appendStringInfoChar(out, ',');
+				df_emit_call_ref(b, out, agg, cfn);
+				appendStringInfo(out, "],\"scale\":%d,\"type\":\"%s\"}", from,
+								 df_tag(NUMERICOID, df_avg_scale(from)));
 				return;
 			}
 			if (df_named_of(b, b->agg) != NULL)
 			{
 				/* A1: a call of an Agg below the top (df_emit_node) */
-				df_emit_named_call(b, out, (Aggref *) node);
+				df_emit_named_call(b, out, (Aggref *) node, NULL);
 				return;
 			}
 			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
@@ -1592,11 +1689,25 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				df_collect_aggrefs((Node *) plan->targetlist, &calls);
 				df_collect_aggrefs((Node *) plan->qual, &calls);
 				foreach(lc, calls)
-					if (!list_member(na->aggrefs, lfirst(lc)))
+				{
+					const char *sfn = NULL,
+							   *cfn = NULL;
+
+					if (df_avg_parts(lfirst(lc), &sfn, &cfn))
+					{
+						/* AVG1: its sum and count */
+						if (!list_member(na->aggrefs, lfirst(lc)))
+						{
+							na->aggrefs = lappend(lappend(na->aggrefs, lfirst(lc)), lfirst(lc));
+							na->aggfns = lappend(lappend(na->aggfns, (void *) sfn), (void *) cfn);
+						}
+					}
+					else if (!list_member(na->aggrefs, lfirst(lc)))
 					{
 						na->aggrefs = lappend(na->aggrefs, lfirst(lc));
 						na->aggfns = lappend(na->aggfns, NULL);
 					}
+				}
 				/* RI1: the columns it does not group by, as any() */
 				ungrouped.agg = agg;
 				ungrouped.vars = NIL;

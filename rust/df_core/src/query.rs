@@ -89,6 +89,9 @@
 //!                                 0, NaN as the positive NaN; see pgfloat)
 //!         | {"extract": <expr>, "field": "year"}   (of a date, as numeric
 //!                                 of scale 0; see pgdate)
+//!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
+//!                                 (numeric_avg of a sum of scale s, rounded
+//!                                 as PostgreSQL does, at scale S; pgnum)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -587,6 +590,22 @@ fn expr(v: &Value) -> Result<Expr, String> {
             _ => return Err("plan spec: rescale to a non-numeric type".into()),
         };
         return Ok(PgNumeric::udf(NumericFn::Rescale { by, to }).call(vec![expr(e)?]));
+    }
+    if let Some(a) = v.get("avg_numeric").and_then(Value::as_array) {
+        // AVG1: numeric_avg of a sum and a count, at the type's scale
+        let from = field(v, "scale")?
+            .as_i64()
+            .ok_or("plan spec: bad avg scale")? as i8;
+        let to = match PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+            PgType::Numeric(s) => s,
+            _ => return Err("plan spec: avg of a non-numeric type".into()),
+        };
+        if a.len() != 2 {
+            return Err("plan spec: avg_numeric takes a sum and a count".into());
+        }
+        return Ok(
+            PgNumeric::udf(NumericFn::Avg { from, to }).call(vec![expr(&a[0])?, expr(&a[1])?])
+        );
     }
     if let Some(e) = v.get("pgcast") {
         let kind = field(v, "kind")?

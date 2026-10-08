@@ -444,6 +444,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
+| AVG1 | avg returning numeric inside expressions and below the top |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -701,6 +702,24 @@ an avg's result (`avg(a) + 1`), whose scale depends on the values, stays
 on PostgreSQL.  Over 30 million heap rows, `sum(b), avg(a),
 avg(b)` took 0.26 s with batch Motions against 1.04 s in PostgreSQL, and
 grouped by a column 0.31 s against 1.46 s.
+
+### avg inside expressions
+
+AVG1: numeric_avg divides the sum by the count at a scale it picks by the
+values (select_div_scale: 16 significant digits, not below the sum's), so
+avg of numeric or of integers had no fixed scale and stayed whole output
+columns, which the C side divides.  DataFusion now computes it inside an
+expression, a HAVING, a join filter or an aggregate below the top (TPC-H
+Q17's `l_quantity < 0.2 * avg(l_quantity)`): df_core::pgnum::pg_avg picks
+the same scale, rounds half away from zero as div_var does, and gives the
+value at the largest scale numeric_avg may pick, 36 + 4 * ceil(s / 4) for
+a sum of scale s (a dividend of at least 10^-s, a count below 10^20).
+Comparing, grouping and hashing by it read the value only.  Its display
+scale is not PostgreSQL's, so it leaves DataFusion only through a batch
+Motion: as an output column PostgreSQL finishes the expression over the
+avg the C side divides, or the slice stays on PostgreSQL, and a tuple
+Motion's numeric columns stay within 38 digits.  A numeric constant
+compared with it may have up to 76 digits.
 
 ### numeric(p, s) columns
 

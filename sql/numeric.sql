@@ -46,7 +46,8 @@ EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(a) FROM df_nm GROUP BY g;
 EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
 SET datafusion.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
--- an avg's numeric result has no fixed scale: not computed on further
+-- an avg's numeric result has no fixed scale: compared at the largest it may
+-- have (AVG1)
 EXPLAIN (COSTS OFF) SELECT g FROM df_nm GROUP BY g HAVING avg(a) + 1 > 2;
 RESET datafusion.motion_batches;
 
@@ -247,6 +248,36 @@ SELECT id, CASE WHEN a = 0 THEN 0 ELSE b / a END FROM df_nc WHERE id IN (-6, -2,
 SELECT id, b / a FROM df_nc WHERE id = -6;
 \set VERBOSITY default
 RESET datafusion.motion_batches;
+
+-- An avg returning numeric inside an expression or below the top (AVG1,
+-- TPC-H Q17): numeric_avg's value, rounded as PostgreSQL rounds it, at the
+-- largest scale it may have; compared, never shown at that scale.
+CREATE TABLE df_av (id int, g int, x numeric(12,2), i int, y numeric(10,2)) DISTRIBUTED BY (id);
+INSERT INTO df_av SELECT k, k % 4,
+  CASE k % 4 WHEN 0 THEN CASE WHEN k % 3 = 0 THEN 0 ELSE 1 END
+             WHEN 1 THEN CASE WHEN k % 3 = 0 THEN 0 ELSE -1 END
+             ELSE k % 7 END,
+  CASE WHEN k % 3 = 0 THEN 0 ELSE 1 END, (k % 50) * 0.5
+FROM generate_series(1, 3000) k;
+ANALYZE df_av;
+SET datafusion.motion_batches = on;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g FROM df_av GROUP BY g HAVING avg(x) = 0.66666666666666666667 OR avg(x) = -0.66666666666666666667 ORDER BY g;
+SET datafusion.mode = off;
+SELECT g FROM df_av GROUP BY g HAVING avg(x) = 0.66666666666666666667 OR avg(x) = -0.66666666666666666667 ORDER BY g;
+SELECT g FROM df_av GROUP BY g HAVING avg(i) > 0.66666666666666666666 ORDER BY g;
+SELECT count(*), sum(a.id) FROM df_av a WHERE a.y < (SELECT 0.2 * avg(y) * 4 FROM df_av b WHERE b.g = a.g);
+SELECT g, avg(x), avg(x) * 2, avg(i) FROM df_av GROUP BY g ORDER BY g;
+SET datafusion.mode = on;
+SELECT g FROM df_av GROUP BY g HAVING avg(x) = 0.66666666666666666667 OR avg(x) = -0.66666666666666666667 ORDER BY g;
+SELECT g FROM df_av GROUP BY g HAVING avg(i) > 0.66666666666666666666 ORDER BY g;
+SELECT count(*), sum(a.id) FROM df_av a WHERE a.y < (SELECT 0.2 * avg(y) * 4 FROM df_av b WHERE b.g = a.g);
+SELECT g, avg(x), avg(x) * 2, avg(i) FROM df_av GROUP BY g ORDER BY g;
+SET optimizer = off;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_av;
 
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

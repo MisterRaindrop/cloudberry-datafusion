@@ -238,38 +238,7 @@ pub fn hash_numeric(v: i256, scale: i8) -> u32 {
     if v == i256::ZERO {
         return u32::MAX;
     }
-    let scale = scale as u32;
-    let pad = (4 - scale % 4) % 4;
-    let nfrac = ((scale + pad) / 4) as i32;
-    // NBASE digits of |v| * 10^pad, least significant first; the lowest
-    // takes the last 4 - pad decimal digits, so nothing overflows
-    let mut digits: Vec<u16> = Vec::with_capacity(20);
-    let mut x = v.wrapping_abs();
-    if pad > 0 {
-        let low = i256::from_i128(10i128.pow(4 - pad));
-        digits.push(((x % low).as_i128() * 10i128.pow(pad)) as u16);
-        x /= low;
-    }
-    match x.to_i128() {
-        Some(x) => {
-            let mut x = x as u128;
-            while x > 0 {
-                let mut chunk = (x % 10_000_000_000_000_000) as u64;
-                x /= 10_000_000_000_000_000;
-                for _ in 0..4 {
-                    digits.push((chunk % 10000) as u16);
-                    chunk /= 10000;
-                }
-            }
-        }
-        None => {
-            let base = i256::from_i128(10000);
-            while x > i256::ZERO {
-                digits.push((x % base).as_i128() as u16);
-                x /= base;
-            }
-        }
-    }
+    let (mut digits, nfrac) = crate::pgnum::nbase_digits(v, scale);
     while digits.last() == Some(&0) {
         digits.pop();
     }

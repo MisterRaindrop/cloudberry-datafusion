@@ -56,6 +56,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "nodes/bitmapset.h"
+#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/walkers.h"
 #include "parser/parsetree.h"
@@ -87,6 +88,8 @@ typedef struct DfCheckContext
 								 * Agg, whose values others read (A1) */
 	bool		projection_input;	/* checking the plan below a Subquery
 									 * Scan or a Result */
+	List	   *whole_aggs;		/* Aggrefs that are whole output columns of
+								 * the Agg being checked */
 	bool		rowid_ok;		/* checking a scan's or join's targetlist,
 								 * where a RowIdExpr may be (RI1) */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
@@ -192,6 +195,18 @@ df_cursor_sysattrs(PlannedStmt *stmt)
 			return true;
 	}
 	return false;
+}
+
+/*
+ * AVG1: the scale DataFusion gives avg of numeric(p, 's') or of integers
+ * (s = 0): the largest numeric_avg may pick, 16 significant digits of a
+ * quotient whose dividend is at least 10^-s (NBASE weight -ceil(s/4)) and
+ * whose divisor is a count, below 10^20 (weight 4).
+ */
+int
+df_avg_scale(int s)
+{
+	return 36 + 4 * ((s + 3) / 4);
 }
 
 /* Record the first reason a slice does not qualify. */
@@ -767,6 +782,32 @@ df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
 }
 
 /*
+ * AVG1: the partial aggregate whose state reference 'arg' of a combining
+ * aggregate of node *ctx reads, through the Motion and any Sort between,
+ * or NULL; *ctx becomes its Agg.
+ */
+static Aggref *
+df_partial_below(Plan **ctx, Node *arg)
+{
+	Plan	   *child = *ctx;
+
+	while (IsA(arg, Var) && ((Var *) arg)->varno == OUTER_VAR &&
+		   (child = outerPlan(child)) != NULL)
+	{
+		TargetEntry *tle = get_tle_by_resno(child->targetlist, ((Var *) arg)->varattno);
+
+		if (tle == NULL)
+			return NULL;
+		arg = (Node *) tle->expr;
+	}
+	if (child == NULL || !IsA(arg, Aggref) ||
+		((Aggref *) arg)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+		return NULL;
+	*ctx = child;
+	return (Aggref *) arg;
+}
+
+/*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
  * numeric(p, s) with p <= 38, found through the references of the nodes
@@ -948,8 +989,8 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				else if (exprType(arg) == INT8OID || exprType(arg) == INT4OID ||
 						 exprType(arg) == INT2OID)
 				{
-					/* a partial avg of integers: its numeric sum */
-					if (strcmp(name, "avg") != 0 || agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+					/* avg of integers: its numeric sum, or the avg (below) */
+					if (strcmp(name, "avg") != 0)
 						return false;
 					p = 19, s = 0;
 				}
@@ -967,6 +1008,32 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					*precision = DF_NUMERIC_MAX_PRECISION;
 					*scale = s;
 					return true;
+				}
+				if (strcmp(name, "avg") == 0)
+				{
+					/*
+					 * AVG1: within the values' integer digits, at the largest
+					 * scale numeric_avg may give it (df_avg_scale).  Those of
+					 * a combining one are its partial avg's argument's.
+					 */
+					int			digits = p - s;
+
+					if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+					{
+						Plan	   *pctx = ctx;
+						Aggref	   *partial = df_partial_below(&pctx, arg);
+						int			pp,
+									ps;
+
+						if (partial != NULL &&
+							exprType((Node *) linitial_node(TargetEntry, partial->args)->expr) == NUMERICOID &&
+							df_numeric_ps(pctx, (Node *) linitial_node(TargetEntry, partial->args)->expr,
+										  &pp, &ps))
+							digits = pp - ps;
+					}
+					*scale = df_avg_scale(s);
+					*precision = digits + *scale;
+					return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 				}
 				return false;
 			}
@@ -1463,9 +1530,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
 				else if (cxt->inner_agg &&
-						 (df_agg_state(agg) == DF_AGG_AVG_INT ||
-						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC ||
-						  df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED))
+						 df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED)
 					/* A1: finished where tuples are made, which those above cannot read */
 					df_reject(cxt, "aggregate %s returning numeric below a join or another aggregate",
 							  name);
@@ -1494,8 +1559,13 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "aggregate %s returning numeric of unknown precision", name);
 				else if ((df_agg_state(agg) == DF_AGG_AVG_INT ||
 						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
-						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL && cxt->agg_to_batches)
-					/* avg = sum / count is computed where tuples are made */
+						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL && cxt->agg_to_batches &&
+						 list_member_ptr(cxt->whole_aggs, agg))
+					/*
+					 * avg = sum / count of a whole output column is computed
+					 * where tuples are made; one in an expression is
+					 * DataFusion's (AVG1)
+					 */
 					df_reject(cxt, "aggregate avg returning numeric into a batch Motion");
 				else if (df_agg_state(agg) != DF_AGG_PLAIN && agg->aggsplit != AGGSPLIT_SIMPLE)
 				{
@@ -1894,6 +1964,18 @@ df_join_key_type(Oid a, Oid b)
 	return InvalidOid;
 }
 
+/* A copy of 'node' with each Aggref a Var of its type (df_plain_outputs). */
+static Node *
+df_aggrefs_as_vars(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Aggref))
+		return (Node *) makeVar(OUTER_VAR, 1, exprType(node), exprTypmod(node),
+								exprCollation(node), 0);
+	return expression_tree_mutator(node, df_aggrefs_as_vars, context);
+}
+
 /*
  * Are output columns 'attnos' of 'plan' plain columns all the way down?
  * Expressions on the side an outer join fills with NULLs must be computed
@@ -1948,14 +2030,25 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	}
 	if (IsA(plan, Agg))
 	{
-		/* A1: its groups and calls are columns of its node, below the join */
+		/*
+		 * A1: its groups and calls are columns of its node, below the join.
+		 * An expression over them computed above the join instead is NULL
+		 * where nothing matched if strict and reading one of them (AVG1:
+		 * TPC-H Q17's 0.2 * avg).
+		 */
 		foreach(lc, plan->targetlist)
 		{
 			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Node	   *e = (Node *) tle->expr;
 
-			if (bms_is_member(tle->resno, attnos) && !IsA(tle->expr, Aggref) &&
-				!(IsA(tle->expr, Var) && ((Var *) tle->expr)->varno == OUTER_VAR))
-				return false;
+			if (bms_is_member(tle->resno, attnos) && !IsA(e, Aggref) &&
+				!(IsA(e, Var) && ((Var *) e)->varno == OUTER_VAR))
+			{
+				/* its calls are its inputs, as its columns are */
+				e = df_aggrefs_as_vars(e, NULL);
+				if (contain_nonstrict_functions(e) || pull_var_clause(e, 0) == NIL)
+					return false;
+			}
 		}
 		return true;
 	}
@@ -2036,6 +2129,88 @@ df_expr_ok(Node *node, DfCheckContext *cxt)
 
 static void df_check_tail(Node *node, DfCheckContext *cxt);
 
+/*
+ * AVG1: an avg returning numeric that DataFusion computes (pg_avg) holds
+ * PostgreSQL's value at a fixed scale, not the display scale numeric_avg
+ * picks by the values: right to compare, group or hash by, not to hand to
+ * PostgreSQL as a tuple.  Does numeric 'expr' of node 'ctx' depend on one,
+ * through the nodes below?
+ */
+typedef struct DfVarying
+{
+	Plan	   *ctx;
+	bool		found;
+} DfVarying;
+
+static bool
+df_numeric_varying_walker(Node *node, DfVarying *v)
+{
+	if (node == NULL || v->found)
+		return v->found;
+	if (IsA(node, Aggref))
+	{
+		Aggref	   *agg = (Aggref *) node;
+
+		if ((df_agg_state(agg) == DF_AGG_AVG_NUMERIC || df_agg_state(agg) == DF_AGG_AVG_INT) &&
+			agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+			return v->found = true;
+	}
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		Plan	   *child = NULL;
+		TargetEntry *tle;
+
+		if (var->varno == OUTER_VAR)
+			child = outerPlan(v->ctx);
+		else if (var->varno == INNER_VAR)
+			child = innerPlan(v->ctx);
+		else if (IsA(v->ctx, SubqueryScan) && var->varno == ((Scan *) v->ctx)->scanrelid)
+			child = ((SubqueryScan *) v->ctx)->subplan;
+		tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+		if (tle != NULL)
+		{
+			Plan	   *saved = v->ctx;
+
+			v->ctx = child;
+			(void) df_numeric_varying_walker((Node *) tle->expr, v);
+			v->ctx = saved;
+		}
+		return v->found;
+	}
+	return expression_tree_walker(node, df_numeric_varying_walker, v);
+}
+
+static bool
+df_numeric_varying(Plan *ctx, Node *expr)
+{
+	DfVarying	v = {ctx, false};
+
+	(void) df_numeric_varying_walker(expr, &v);
+	return v.found;
+}
+
+/*
+ * The same for an output column of 'ctx': not an avg of the Agg itself,
+ * whose value the C side divides as numeric_avg does (DF_OUT_NUMERIC_AVG).
+ */
+static bool
+df_output_varying(Plan *ctx, Node *expr)
+{
+	if (IsA(ctx, Agg) && IsA(expr, Aggref) &&
+		(df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
+		 df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT))
+		return false;
+	return df_numeric_varying(ctx, expr);
+}
+
+/* Could DataFusion compute output value 'node' whole (P1, AVG1)? */
+static bool
+df_value_ok(Node *node, DfCheckContext *cxt)
+{
+	return df_expr_ok(node, cxt) && !df_output_varying(cxt->node, node);
+}
+
 static bool
 df_check_tail_walker(Node *node, DfCheckContext *cxt)
 {
@@ -2071,9 +2246,15 @@ df_check_tail(Node *node, DfCheckContext *cxt)
 		df_check_tail((Node *) ((CaseWhen *) node)->result, cxt);
 		return;
 	}
-	if (df_expr_ok(node, cxt))
+	if (df_value_ok(node, cxt))
 	{
 		cxt->tails.leaves = lappend(cxt->tails.leaves, node);
+		return;
+	}
+	if (df_output_varying(cxt->node, node) && !IsA(node, OpExpr) && !IsA(node, FuncExpr))
+	{
+		/* AVG1: its value is DataFusion's, at a scale not PostgreSQL's */
+		df_reject(cxt, "avg returning numeric of an aggregate below in an output column");
 		return;
 	}
 	switch (nodeTag(node))
@@ -2136,8 +2317,11 @@ df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 			return;
 		if (needed != NULL && !bms_is_member(tle->resno, needed))
 			continue;
-		if (!output || bms_is_member(tle->resno, cxt->sort_keys) ||
-			df_expr_ok((Node *) tle->expr, cxt))
+		if (output && bms_is_member(tle->resno, cxt->sort_keys) &&
+			df_output_varying(cxt->node, (Node *) tle->expr))
+			df_reject(cxt, "sort key of an avg returning numeric");
+		else if (!output || bms_is_member(tle->resno, cxt->sort_keys) ||
+				 df_value_ok((Node *) tle->expr, cxt))
 			df_check_expr((Node *) tle->expr, cxt);
 		else
 		{
@@ -2484,6 +2668,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Plan	   *child = outerPlan(plan);
 				Bitmapset  *child_needed = NULL;
 				bool		inner;
+				ListCell   *lc;
 				int			i;
 
 				if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
@@ -2582,6 +2767,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
 				cxt->inner_agg = inner;
+				cxt->whole_aggs = NIL;
+				foreach(lc, plan->targetlist)
+					if (IsA(lfirst_node(TargetEntry, lc)->expr, Aggref))
+						cxt->whole_aggs = lappend(cxt->whole_aggs,
+												  lfirst_node(TargetEntry, lc)->expr);
 				/* A1: an Agg below computes all its calls (df_emit_node) */
 				df_check_targetlist(plan->targetlist, inner ? NULL : needed, cxt);
 				df_check_expr_list(plan->qual, cxt);
@@ -3061,15 +3251,21 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						TargetEntry *tle = lfirst_node(TargetEntry, lc);
 						Oid			type = exprType((Node *) tle->expr);
 
-						bool		state = bms_is_member(motion->motionID, cxt->batches) &&
+						bool		batch = bms_is_member(motion->motionID, cxt->batches);
+						bool		state = batch &&
 							df_motion_state_columns(motion, tle->resno) > 0;
 						int			p,
 									s;
 
+						/*
+						 * Tuples' numeric values are read into 38 digits;
+						 * batches carry Decimal256 (an avg, AVG1)
+						 */
 						if (bms_is_member(tle->resno, needed) && !state &&
 							(!df_type_supported(type) ||
 							 (type == NUMERICOID &&
-							  !df_numeric_ps(plan, (Node *) tle->expr, &p, &s))))
+							  (!df_numeric_ps(plan, (Node *) tle->expr, &p, &s) ||
+							   (!batch && p > DF_NUMERIC_MAX_PRECISION)))))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;
