@@ -292,12 +292,14 @@ impl RawColumn {
     }
 }
 
-/// A column as the PAX reader hands it out (fixed-width types only).
+/// A column as the PAX reader hands it out: fixed-width values, or a
+/// string's bytes with `nrows + 1` offsets (null for fixed-width types).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaxColumn {
     pub values: *const u8,
     pub nulls: *const u8,
+    pub offsets: *const i32,
 }
 
 /// Converted output column whose buffers stay valid until the next poll.
@@ -971,7 +973,12 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
             .enumerate()
             .map(|(i, ty)| {
                 let c = *cols.add(i);
-                build_array(*ty, RawColumn::fixed(c.values, c.nulls), n)
+                let raw = RawColumn {
+                    values: c.values,
+                    nulls: c.nulls,
+                    offsets: c.offsets,
+                };
+                build_array(*ty, raw, n)
             })
             .collect::<Result<Vec<ArrayRef>, PgError>>()?;
         make_batch(&ctx.schema, arrays, n)
@@ -3007,6 +3014,7 @@ mod tests {
             let col = PaxColumn {
                 values: vals.as_ptr() as *const u8,
                 nulls: nulls.as_ptr(),
+                offsets: std::ptr::null(),
             };
             if emit(ctx, 5, &col) != 0 {
                 account(ctx, -1000);

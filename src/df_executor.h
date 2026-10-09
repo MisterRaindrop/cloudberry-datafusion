@@ -233,7 +233,7 @@ extern bool df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *sp
  * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
  * two identical.
  */
-#define DF_PAX_SCAN_API_VERSION 2
+#define DF_PAX_SCAN_API_VERSION 3
 
 /* What the scan's min/max skipping did (DatafusionPaxScanInfo). */
 typedef struct DfPaxScanInfo

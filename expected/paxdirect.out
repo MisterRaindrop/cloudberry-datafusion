@@ -122,9 +122,9 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd W
 SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
  d | count  | min |   max    
 ---+--------+-----+----------
-   |      2 |   7 |      1.5
  f | 149700 |   1 | 74999.75
  t | 150000 |   0 |    75000
+   |      2 |   7 |      1.5
 (3 rows)
 
 SELECT count(*) FROM df_pd;
@@ -388,12 +388,226 @@ SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
 SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e;
  e  | count |    sum    
 ----+-------+-----------
+ 98 |  2000 | 200096000
     |     1 |          
  97 |  2000 | 200094000
  99 |  2000 | 200098000
- 98 |  2000 | 200096000
 (4 rows)
 
-DROP TABLE df_pd_dist;
+-- Strings (C1): text, varchar and char(n) as offsets and bytes, with NULLs,
+-- empty strings, multibyte characters and char(n)'s padding; values PAX
+-- compressed (over pax.min_size_of_compress_toast) or put in its toast file
+-- (over pax.min_size_of_external_toast); the vectorized storage format,
+-- which keeps char(n) without padding and strings without headers.
+CREATE TABLE df_pd_str (id int, t text, v varchar(12), b char(5)) USING pax DISTRIBUTED BY (id);
+INSERT INTO df_pd_str SELECT k,
+  CASE WHEN k % 11 = 0 THEN NULL WHEN k % 7 = 0 THEN '' ELSE 'é' || k END,
+  CASE WHEN k % 13 = 0 THEN NULL ELSE substr('中文字符串abcdefgh', 1 + k % 5, k % 12) END,
+  CASE WHEN k % 17 = 0 THEN NULL WHEN k % 5 = 0 THEN '' ELSE chr(97 + k % 26) || (k % 100) END
+FROM generate_series(1, 20000) k;
+INSERT INTO df_pd_str VALUES (-1, repeat('ab', 300000), 'big', 'z'),
+  (-2, repeat('xyz', 3600000), 'bigger', 'z');
+DELETE FROM df_pd_str WHERE id % 1000 = 3;
+CREATE TABLE df_pd_vec (id int, t text, b char(4)) USING pax
+  WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_vec SELECT k, CASE WHEN k % 9 = 0 THEN NULL ELSE 'v' || k END,
+  CASE WHEN k % 6 = 0 THEN NULL ELSE (k % 50)::text END FROM generate_series(1, 5000) k;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(t), count(v), count(b), sum(length(t)), sum(length(v)), sum(octet_length(b)) FROM df_pd_str;
+ count | count | count | count |   sum    |  sum   |  sum  
+-------+-------+-------+-------+----------+--------+-------
+ 19982 | 18166 | 18446 | 18808 | 11484765 | 100201 | 94040
+(1 row)
+
+SELECT id, t, v, b, octet_length(b) FROM df_pd_str WHERE id BETWEEN 1 AND 12 ORDER BY id;
+ id |  t  |        v        |   b   | octet_length 
+----+-----+-----------------+-------+--------------
+  1 | é1  | 文              | b1    |            5
+  2 | é2  | 字符            | c2    |            5
+  4 | é4  | 串abc           | e4    |            5
+  5 | é5  | 中文字符串      |       |            5
+  6 | é6  | 文字符串ab      | g6    |            5
+  7 |     | 字符串abcd      | h7    |            5
+  8 | é8  | 符串abcdef      | i8    |            5
+  9 | é9  | 串abcdefgh      | j9    |            5
+ 10 | é10 | 中文字符串abcde |       |            5
+ 11 |     | 文字符串abcdefg | l11   |            5
+ 12 | é12 |                 | m12   |            5
+(11 rows)
+
+SELECT id, length(t), substr(t, 1, 7) FROM df_pd_str WHERE id < 0 ORDER BY id;
+ id |  length  | substr  
+----+----------+---------
+ -2 | 10800000 | xyzxyzx
+ -1 |   600000 | abababa
+(2 rows)
+
+SELECT b, count(*) FROM df_pd_str WHERE b < 'b' COLLATE "C" OR b IS NULL GROUP BY b ORDER BY b COLLATE "C";
+   b   | count 
+-------+-------
+       |  3765
+ a12   |    15
+ a14   |    14
+ a16   |    16
+ a18   |    14
+ a2    |    14
+ a22   |    14
+ a24   |    14
+ a26   |    15
+ a28   |    14
+ a32   |    15
+ a34   |    15
+ a36   |    14
+ a38   |    15
+ a4    |    15
+ a42   |    15
+ a44   |    14
+ a46   |    14
+ a48   |    14
+ a52   |    15
+ a54   |    14
+ a56   |    15
+ a58   |    15
+ a6    |    14
+ a62   |    14
+ a64   |    15
+ a66   |    14
+ a68   |    15
+ a72   |    14
+ a74   |    15
+ a76   |    14
+ a78   |    15
+ a8    |    15
+ a82   |    15
+ a84   |    14
+ a86   |    15
+ a88   |    14
+ a92   |    14
+ a94   |    15
+ a96   |    14
+ a98   |    14
+       |  1174
+(42 rows)
+
+SELECT count(*), count(t), sum(length(t)), sum(octet_length(b)) FROM df_pd_vec;
+ count | count |  sum  |  sum  
+-------+-------+-------+-------
+  5000 |  4445 | 21241 | 16668
+(1 row)
+
+SELECT id, t, b, octet_length(b) FROM df_pd_vec WHERE id BETWEEN 5 AND 13 ORDER BY id;
+ id |  t  |  b   | octet_length 
+----+-----+------+--------------
+  5 | v5  | 5    |            4
+  6 | v6  |      |             
+  7 | v7  | 7    |            4
+  8 | v8  | 8    |            4
+  9 |     | 9    |            4
+ 10 | v10 | 10   |            4
+ 11 | v11 | 11   |            4
+ 12 | v12 |      |             
+ 13 | v13 | 13   |            4
+(9 rows)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(t), count(v), count(b), sum(length(t)), sum(length(v)), sum(octet_length(b)) FROM df_pd_str;
+ count | count | count | count |   sum    |  sum   |  sum  
+-------+-------+-------+-------+----------+--------+-------
+ 19982 | 18166 | 18446 | 18808 | 11484765 | 100201 | 94040
+(1 row)
+
+SELECT id, t, v, b, octet_length(b) FROM df_pd_str WHERE id BETWEEN 1 AND 12 ORDER BY id;
+ id |  t  |        v        |   b   | octet_length 
+----+-----+-----------------+-------+--------------
+  1 | é1  | 文              | b1    |            5
+  2 | é2  | 字符            | c2    |            5
+  4 | é4  | 串abc           | e4    |            5
+  5 | é5  | 中文字符串      |       |            5
+  6 | é6  | 文字符串ab      | g6    |            5
+  7 |     | 字符串abcd      | h7    |            5
+  8 | é8  | 符串abcdef      | i8    |            5
+  9 | é9  | 串abcdefgh      | j9    |            5
+ 10 | é10 | 中文字符串abcde |       |            5
+ 11 |     | 文字符串abcdefg | l11   |            5
+ 12 | é12 |                 | m12   |            5
+(11 rows)
+
+SELECT id, length(t), substr(t, 1, 7) FROM df_pd_str WHERE id < 0 ORDER BY id;
+ id |  length  | substr  
+----+----------+---------
+ -2 | 10800000 | xyzxyzx
+ -1 |   600000 | abababa
+(2 rows)
+
+SELECT b, count(*) FROM df_pd_str WHERE b < 'b' COLLATE "C" OR b IS NULL GROUP BY b ORDER BY b COLLATE "C";
+   b   | count 
+-------+-------
+       |  3765
+ a12   |    15
+ a14   |    14
+ a16   |    16
+ a18   |    14
+ a2    |    14
+ a22   |    14
+ a24   |    14
+ a26   |    15
+ a28   |    14
+ a32   |    15
+ a34   |    15
+ a36   |    14
+ a38   |    15
+ a4    |    15
+ a42   |    15
+ a44   |    14
+ a46   |    14
+ a48   |    14
+ a52   |    15
+ a54   |    14
+ a56   |    15
+ a58   |    15
+ a6    |    14
+ a62   |    14
+ a64   |    15
+ a66   |    14
+ a68   |    15
+ a72   |    14
+ a74   |    15
+ a76   |    14
+ a78   |    15
+ a8    |    15
+ a82   |    15
+ a84   |    14
+ a86   |    15
+ a88   |    14
+ a92   |    14
+ a94   |    15
+ a96   |    14
+ a98   |    14
+       |  1174
+(42 rows)
+
+SELECT count(*), count(t), sum(length(t)), sum(octet_length(b)) FROM df_pd_vec;
+ count | count |  sum  |  sum  
+-------+-------+-------+-------
+  5000 |  4445 | 21241 | 16668
+(1 row)
+
+SELECT id, t, b, octet_length(b) FROM df_pd_vec WHERE id BETWEEN 5 AND 13 ORDER BY id;
+ id |  t  |  b   | octet_length 
+----+-----+------+--------------
+  5 | v5  | 5    |            4
+  6 | v6  |      |             
+  7 | v7  | 7    |            4
+  8 | v8  | 8    |            4
+  9 |     | 9    |            4
+ 10 | v10 | 10   |            4
+ 11 | v11 | 11   |            4
+ 12 | v12 |      |             
+ 13 | v13 | 13   |            4
+(9 rows)
+
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -98,11 +98,15 @@ typedef struct DfColumn
 	const int32_t *offsets;
 } DfColumn;
 
-/* A column as the PAX reader hands it out: fixed-width values only. */
+/*
+ * A column as the PAX reader hands it out: fixed-width values, or a
+ * string's bytes and nrows + 1 offsets (DatafusionPaxColumn).
+ */
 typedef struct DfPaxColumn
 {
 	const void *values;
 	const uint8_t *nulls;
+	const int32_t *offsets;
 } DfPaxColumn;
 
 /* The message may be followed by a newline and an error detail. */

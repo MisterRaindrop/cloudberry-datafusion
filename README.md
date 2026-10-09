@@ -187,6 +187,11 @@ That code calls PAX's internal C++ classes, not a published API:
   does not load, warns once and reads through the table AM.
 - Cloudberry's parallel mode keeps the table AM path.
 
+It reads fixed-width columns and strings (text, varchar, char(n)); a scan
+of numeric columns or of ctid goes through the table AM.  Each
+micro-partition is read whole by one DataFusion partition, so a table of
+one micro-partition per segment decodes and filters on one thread.
+
 Like PAX's own scan, it skips micro-partitions and then groups whose
 min/max statistics (`minmax_columns`) rule out the scan's qual, honouring
 `pax.enable_sparse_filter`.  That evaluates operators through fmgr, so it
@@ -446,6 +451,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
 | WT1 | Numeric values received as tuples with up to 76 digits |
+| C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -591,8 +597,13 @@ aggregate in DataFusion, and the Sort above it too where the collation is
 C, or on PostgreSQL where it is not.  An explicit `COLLATE "C"` is the
 same everywhere and keeps the batches.  `ILIKE`, regular expressions, `md5`, `initcap` and other
 string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
-other encodings.  The direct PAX reader hands out fixed-width values only;
-a PAX table with a string column is read through the table AM.
+other encodings.  The direct PAX reader hands out strings too (C1), as
+offsets and bytes like the main thread's batches: char(n) keeps its
+padding, PAX's toast is decoded on the worker with PAX's own pglz/lz4, and
+files of the vectorized format (no headers, char(n) trimmed) go through
+the column's GetDatum, which restores both.  A group whose strings take
+more than 64 MB is handed out in several pieces, so that Arrow's int32
+offsets cannot overflow.
 
 `LIKE` and `NOT LIKE` (L1) run through `df_core::pgstr`, a transcription
 of PostgreSQL's matcher for UTF-8 (`UTF8_MatchText`): `%`, `_` as one
