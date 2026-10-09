@@ -199,7 +199,13 @@ columns of lineitem takes 43 ms against 154 ms through the table AM.  DataFusion
 partitions take micro-partitions one at a time while at least as many are
 left as there are partitions; past that (C1b) a partition taking one
 counts its groups from the footer, reads the first and queues the others,
-which idle partitions read in parallel.  Without that, a table of one
+which idle partitions read in parallel.  The reader hands out a group's
+rows 8192 at a time, and each piece goes to a queue all partitions take
+from (C2b): the work above the scan starts while the group is still being
+converted, on every partition, not only the one reading.  Partitions
+waiting for work sleep until a read queues some or ends; only partitions
+holding work count as pending, since two that were only looking each
+waited for the other, with nobody left to wake them.  Without that, a table of one
 micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
 and filtered on one thread, slower than through the table AM; on one
 segment it now takes 23 ms against 32 ms through the table AM.
@@ -466,6 +472,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
 | C2 | Direct PAX reader: numeric(p, s) columns |
+| C2b | Direct PAX reader: decoded rows shared by all partitions as they come |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side

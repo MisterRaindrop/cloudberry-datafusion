@@ -914,9 +914,15 @@ pub type PaxGroupsFn =
 /// partitions idle (a table of one micro-partition per segment would be
 /// read by one thread), so a partition taking a block counts its groups,
 /// reads the first and queues the others, which idle partitions take
-/// before any new block.  A partition only stops once no block is left,
-/// the queue is empty and no other partition may still queue groups
-/// (`pending`); until then it waits.
+/// before any new block.
+///
+/// A group decodes into batches of all its rows; a table of one group per
+/// segment would leave everything above the scan (filters, aggregation) to
+/// the partition that read it.  So decoded batches go, in slices of
+/// PAX_SLICE_ROWS, to a queue all partitions take from before reading
+/// anything (C2b).  A partition only stops once no block is left, both
+/// queues are empty and no other partition holds work that may still add
+/// to them (`pending`); until then it waits.
 pub struct PaxScan {
     scan: *mut c_void,
     nblocks: usize,
@@ -926,9 +932,12 @@ pub struct PaxScan {
     next: AtomicUsize,
     /// (block, group) left to read by whichever partition is free
     queue: Mutex<std::collections::VecDeque<(usize, usize)>>,
-    /// partitions that took, or are taking, a block whose groups they may
-    /// still queue
+    /// decoded batches, sliced, for whichever partition is free
+    ready: Mutex<std::collections::VecDeque<RecordBatch>>,
+    /// partitions holding work that may still queue groups or batches
     pending: AtomicUsize,
+    /// wakes the partitions waiting for queued work or the end of the scan
+    notify: tokio::sync::Notify,
     /// how many partitions read the scan, set when the plan is built
     partitions: AtomicUsize,
     memory: Arc<PaxMemory>,
@@ -976,62 +985,107 @@ impl PaxScan {
             groups,
             next: AtomicUsize::new(0),
             queue: Default::default(),
+            ready: Default::default(),
             pending: AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
             partitions: AtomicUsize::new(1),
             memory: Arc::default(),
         }
     }
 
-    /// The next piece to read.
+    /// The next piece to read.  A Read holds the scan's `pending` count
+    /// until the caller has queued its batches and calls `done_reading`.
     fn take(&self) -> Result<PaxPiece, String> {
         if let Some(piece) = self.pop_queued() {
             return Ok(piece);
         }
-        // Counted before the block is taken: a partition that finds no
-        // block left then knows this one may still queue groups.
-        self.pending.fetch_add(1, Ordering::SeqCst);
-        let index = self.next.fetch_add(1, Ordering::SeqCst);
-        if index >= self.nblocks {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
+        // Counted before the block is claimed, so that a partition finding
+        // none left knows this one may still queue groups or batches; only
+        // partitions holding work count, or two partitions looking at the
+        // same time would each wait for the other, with nobody to wake them.
+        let mut claimed = None;
+        if self.next.load(Ordering::SeqCst) < self.nblocks {
+            self.pending.fetch_add(1, Ordering::SeqCst);
+            let index = self.next.fetch_add(1, Ordering::SeqCst);
+            if index < self.nblocks {
+                claimed = Some(index);
+            } else {
+                // another partition took the last block meanwhile
+                self.pending.fetch_sub(1, Ordering::SeqCst);
+                self.notify.notify_waiters();
+            }
+        }
+        let Some(index) = claimed else {
             if let Some(piece) = self.pop_queued() {
                 return Ok(piece);
             }
-            // Groups are queued before `pending` drops: look once more.
-            if self.pending.load(Ordering::SeqCst) == 0 {
-                return Ok(self.pop_queued().unwrap_or(PaxPiece::Done));
+            // Work is queued before `pending` drops.
+            if self.pending.load(Ordering::SeqCst) == 0
+                && self.queue.lock().unwrap().is_empty()
+                && self.ready.lock().unwrap().is_empty()
+            {
+                return Ok(PaxPiece::Done);
             }
             return Ok(PaxPiece::Wait);
-        }
+        };
         if self.nblocks - index >= self.partitions.load(Ordering::Relaxed) {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
             return Ok(PaxPiece::Read(index, 0, -1));
         }
         let mut err = vec![0 as c_char; 1024];
         // SAFETY: see PaxScan.
         let n = unsafe { (self.groups)(self.scan, index as i32, err.as_mut_ptr(), err.len()) };
+        if n < 0 {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            self.notify.notify_waiters();
+            return Err(unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
         if n > 1 {
             self.queue
                 .lock()
                 .unwrap()
                 .extend((1..n as usize).map(|g| (index, g)));
-        }
-        self.pending.fetch_sub(1, Ordering::SeqCst);
-        if n < 0 {
-            return Err(unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
-                .to_string_lossy()
-                .into_owned());
+            self.notify.notify_waiters();
         }
         Ok(PaxPiece::Read(index, 0, 1))
     }
 
+    /// Queue a batch a Read decoded, in slices, while the read goes on.
+    fn push_batch(&self, batch: RecordBatch) {
+        {
+            let mut ready = self.ready.lock().unwrap();
+            let mut offset = 0;
+            while offset < batch.num_rows() {
+                let len = PAX_SLICE_ROWS.min(batch.num_rows() - offset);
+                ready.push_back(batch.slice(offset, len));
+                offset += len;
+            }
+        }
+        self.notify.notify_waiters();
+    }
+
+    /// The end of a Read: all its batches are queued.
+    fn done_reading(&self) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn pop_ready(&self) -> Option<RecordBatch> {
+        self.ready.lock().unwrap().pop_front()
+    }
+
+    /// A queued group, counted in `pending` as it leaves the queue.
     fn pop_queued(&self) -> Option<PaxPiece> {
-        self.queue
-            .lock()
-            .unwrap()
-            .pop_front()
-            .map(|(block, group)| PaxPiece::Read(block, group as i32, 1))
+        let mut queue = self.queue.lock().unwrap();
+        let (block, group) = queue.pop_front()?;
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        Some(PaxPiece::Read(block, group as i32, 1))
     }
 }
+
+/// Rows per batch a decoded PAX group is sliced into for the partitions.
+const PAX_SLICE_ROWS: usize = 8192;
 
 /// What a partition reads next from a PAX scan.
 enum PaxPiece {
@@ -1050,10 +1104,10 @@ impl Drop for PaxScan {
 }
 
 struct EmitContext {
-    memory: Arc<PaxMemory>,
+    /// the scan, whose queue each piece goes to as soon as it is built
+    scan: Arc<PaxScan>,
     schema: SchemaRef,
     types: Vec<PgType>,
-    batches: Vec<RecordBatch>,
     error: Option<String>,
 }
 
@@ -1079,7 +1133,7 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
     }));
     match result {
         Ok(Ok(batch)) => {
-            ctx.batches.push(batch);
+            ctx.scan.push_batch(batch);
             0
         }
         Ok(Err(e)) => {
@@ -1095,7 +1149,7 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
 
 unsafe extern "C" fn pax_account(ctx: *mut c_void, delta: i64) {
     let ctx = &*(ctx as *const EmitContext);
-    ctx.memory.add(delta);
+    ctx.scan.memory.add(delta);
 }
 
 fn make_batch(
@@ -1137,39 +1191,40 @@ impl PartitionStream for PaxPartition {
         let schema = self.schema.clone();
         let types = self.types.clone();
         let scan = self.scan.clone();
-        let state = (
-            scan,
-            std::collections::VecDeque::<RecordBatch>::new(),
-            false,
-        );
-        let stream = futures::stream::unfold(state, move |(scan, mut queue, failed)| {
+        let stream = futures::stream::unfold((scan, false), move |(scan, failed)| {
             let schema = schema.clone();
             let types = types.clone();
             async move {
                 loop {
-                    if let Some(batch) = queue.pop_front() {
-                        return Some((Ok(batch), (scan, queue, failed)));
-                    }
                     if failed {
                         return None;
+                    }
+                    // Registered before looking for work, so that a
+                    // partition queuing some meanwhile wakes this one.
+                    let waker = scan.clone();
+                    let notified = waker.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    // what any partition decoded comes first
+                    if let Some(batch) = scan.pop_ready() {
+                        return Some((Ok(batch), (scan, false)));
                     }
                     let (index, first, count) = match scan.take() {
                         Ok(PaxPiece::Read(index, first, count)) => (index, first, count),
                         Ok(PaxPiece::Wait) => {
-                            tokio::time::sleep(Duration::from_micros(200)).await;
+                            notified.await;
                             continue;
                         }
                         Ok(PaxPiece::Done) => return None,
                         Err(msg) => {
                             let e = DataFusionError::External(Box::new(PgError::internal(msg)));
-                            return Some((Err(e), (scan, queue, true)));
+                            return Some((Err(e), (scan, true)));
                         }
                     };
                     let mut ctx = EmitContext {
-                        memory: scan.memory.clone(),
+                        scan: scan.clone(),
                         schema: schema.clone(),
                         types: types.clone(),
-                        batches: Vec::new(),
                         error: None,
                     };
                     let mut err = vec![0 as c_char; 1024];
@@ -1193,10 +1248,11 @@ impl PartitionStream for PaxPartition {
                                 .to_string_lossy()
                                 .into_owned()
                         });
+                        scan.done_reading();
                         let e = DataFusionError::External(Box::new(PgError::internal(msg)));
-                        return Some((Err(e), (scan, queue, true)));
+                        return Some((Err(e), (scan, true)));
                     }
-                    queue.extend(ctx.batches);
+                    scan.done_reading();
                     // Let other tasks run between blocks.
                     tokio::task::yield_now().await;
                 }
@@ -3268,6 +3324,71 @@ mod tests {
         assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 2);
     }
 
+    /// The partitions of many small scans all finish: none waits for a
+    /// wake-up that never comes (partitions only looking for work once
+    /// counted as pending, and two looking at once each waited for the other).
+    #[test]
+    fn pax_partitions_never_wait_forever() {
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..200 {
+                let fake = FakeScan::default();
+                let (row, _) = run_fake_scan(&fake, 1, 8);
+                assert_eq!(row[2], 10);
+            }
+            let _ = done_tx.send(());
+        });
+        done.recv_timeout(Duration::from_secs(60))
+            .expect("a PAX scan did not finish");
+    }
+
+    /// A decoded group's rows go to every partition in slices: one that read
+    /// nothing takes them, and stops only once they are gone.
+    #[test]
+    fn pax_partitions_share_decoded_batches() {
+        let fake = FakeScan::default();
+        let ptr = &fake as *const FakeScan as *mut c_void;
+        let scan = PaxScan::new(ptr, 1, fake_read, fake_end, fake_groups);
+        scan.partitions.store(1, Ordering::Relaxed);
+        // the reader takes the only block whole
+        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 0, -1))));
+        // another partition finds nothing yet, but the read is not done
+        assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let rows = 2 * PAX_SLICE_ROWS + 3616;
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(
+                datafusion::arrow::array::Int32Array::from_iter_values(0..rows as i32),
+            )],
+        )
+        .unwrap();
+        scan.push_batch(batch);
+        {
+            // a partition waiting now is woken by the end of the read itself
+            let woken = scan.notify.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            scan.done_reading();
+            assert!(futures::FutureExt::now_or_never(woken).is_some());
+        }
+        // the other partition takes the slices, in order
+        let mut lens = Vec::new();
+        let mut first = Vec::new();
+        while let Some(b) = scan.pop_ready() {
+            lens.push(b.num_rows());
+            first.push(b.column(0).as_primitive::<Int32Type>().value(0));
+        }
+        assert_eq!(lens, vec![PAX_SLICE_ROWS, PAX_SLICE_ROWS, 3616]);
+        assert_eq!(
+            first,
+            vec![0, PAX_SLICE_ROWS as i32, 2 * PAX_SLICE_ROWS as i32]
+        );
+        assert!(matches!(scan.take(), Ok(PaxPiece::Done)));
+        drop(scan);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+    }
+
     /// While a partition counts a block's groups, the others wait for them
     /// instead of stopping, then read what it queued.
     #[test]
@@ -3298,6 +3419,10 @@ mod tests {
                 Ok(PaxPiece::Read(0, 0, 1))
             ));
             assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 1, 1))));
+            // both reads hold the scan until their batches are queued
+            assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
+            scan.done_reading();
+            scan.done_reading();
             assert!(matches!(scan.take(), Ok(PaxPiece::Done)));
         });
         drop(scan);

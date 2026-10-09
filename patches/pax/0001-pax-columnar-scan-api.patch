@@ -1,4 +1,4 @@
-From c14abcb1ea59c18131192b4df2756660e557808b Mon Sep 17 00:00:00 2001
+From 65d6e751863f670ad7f5890f3faa8b6b33a2a704 Mon Sep 17 00:00:00 2001
 From: MisterRaindrop <p_xiaoyu.liu@synxdata.com>
 Date: Mon, 5 Oct 2026 17:05:43 +0800
 Subject: [PATCH] pax: add a columnar scan interface for datafusion_executor
@@ -18,18 +18,18 @@ memory it holds (read buffer, decoded columns, visibility map, handed-out
 rows) so that the caller can account for it.  block_groups lets callers
 spread the groups of one block over several threads.
 ---
- .../src/cpp/access/datafusion_scan_api.cc     | 509 ++++++++++++++++++
+ .../src/cpp/access/datafusion_scan_api.cc     | 512 ++++++++++++++++++
  .../src/cpp/access/datafusion_scan_api.h      | 128 +++++
- 2 files changed, 637 insertions(+)
+ 2 files changed, 640 insertions(+)
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 new file mode 100644
-index 0000000..929ff5f
+index 0000000..a923a15
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,509 @@
+@@ -0,0 +1,512 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -421,9 +421,11 @@ index 0000000..929ff5f
 +        nonnull[k] = 0;
 +      }
 +
-+      // Rows go out in chunks whose string bytes stay below kChunkBytes,
-+      // so that their int32 offsets cannot overflow (a value has at most
-+      // 1 GB).
++      // Rows go out in chunks of kChunkRows, so that the caller can start
++      // on them while the rest of the group is converted, and whose string
++      // bytes stay below kChunkBytes, so that their int32 offsets cannot
++      // overflow (a value has at most 1 GB).
++      constexpr size_t kChunkRows = 8192;
 +      constexpr size_t kChunkBytes = 64 << 20;
 +      size_t chunk = 0, chunk_bytes = 0;
 +      auto flush = [&]() -> bool {
@@ -505,7 +507,8 @@ index 0000000..929ff5f
 +        if (kept) {
 +          next++;
 +          chunk++;
-+          if (chunk_bytes >= kChunkBytes && !flush()) return -1;
++          if ((chunk >= kChunkRows || chunk_bytes >= kChunkBytes) && !flush())
++            return -1;
 +        }
 +      }
 +      if (chunk > 0 && !flush()) return -1;
@@ -541,7 +544,7 @@ index 0000000..929ff5f
 +}
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 new file mode 100644
-index 0000000..fcac5f6
+index 0000000..284ab34
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 @@ -0,0 +1,128 @@
@@ -619,8 +622,8 @@ index 0000000..fcac5f6
 +  const int32_t *offsets;
 +} DatafusionPaxColumn;
 +
-+/* Called once per group with its visible rows (several times for a group
-+ * whose strings take more than 64 MB); non-zero stops the read. */
++/* Called with a group's visible rows, at most 8192 at a time (fewer when
++ * their strings take more than 64 MB); non-zero stops the read. */
 +typedef int (*DatafusionPaxEmit)(void *ctx, uint32_t nrows,
 +                                 const DatafusionPaxColumn *cols);
 +
