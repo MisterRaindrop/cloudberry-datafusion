@@ -909,12 +909,14 @@ pub type PaxGroupsFn =
 /// A PAX scan listed on the main thread.  Partitions take blocks from it
 /// one at a time; it is freed when the last partition is done with it.
 ///
-/// While there are at least as many blocks left as partitions, a partition
-/// reads a whole block.  Past that, one block per partition would leave
-/// partitions idle (a table of one micro-partition per segment would be
-/// read by one thread), so a partition taking a block counts its groups,
-/// reads the first and queues the others, which idle partitions take
-/// before any new block.
+/// A read is one group (C4b): a partition taking a block counts its groups,
+/// reads the first and queues the others, which partitions take before any
+/// new block.  Reading a whole block at once queued all its groups' rows
+/// before the partition could take any of them, and with every partition
+/// doing so the rows waiting grew with the blocks' size (TPC-H's lineitem
+/// at scale factor 10: 600 MB per QE, against 330 MB read by group).  A
+/// table of one micro-partition per segment is read by several partitions
+/// the same way.
 ///
 /// A group decodes into batches of all its rows; a table of one group per
 /// segment would leave everything above the scan (filters, aggregation) to
@@ -938,8 +940,6 @@ pub struct PaxScan {
     pending: AtomicUsize,
     /// wakes the partitions waiting for queued work or the end of the scan
     notify: tokio::sync::Notify,
-    /// how many partitions read the scan, set when the plan is built
-    partitions: AtomicUsize,
     memory: Arc<PaxMemory>,
 }
 
@@ -988,7 +988,6 @@ impl PaxScan {
             ready: Default::default(),
             pending: AtomicUsize::new(0),
             notify: tokio::sync::Notify::new(),
-            partitions: AtomicUsize::new(1),
             memory: Arc::default(),
         }
     }
@@ -1028,9 +1027,6 @@ impl PaxScan {
             }
             return Ok(PaxPiece::Wait);
         };
-        if self.nblocks - index >= self.partitions.load(Ordering::Relaxed) {
-            return Ok(PaxPiece::Read(index, 0, -1));
-        }
         let mut err = vec![0 as c_char; 1024];
         // SAFETY: see PaxScan.
         let n = unsafe { (self.groups)(self.scan, index as i32, err.as_mut_ptr(), err.len()) };
@@ -1943,7 +1939,6 @@ impl Query {
                     if let Some(memory) = &pax_memory {
                         scan.memory = memory.clone();
                     }
-                    scan.partitions.store(partitions, Ordering::Relaxed);
                     let scan = Arc::new(scan);
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
                         .map(|_| {
@@ -3310,11 +3305,11 @@ mod tests {
         // 500 rows 0..499, 50 of them NULL (those ending in 3).
         let sum: i64 = (0..500).filter(|v| v % 10 != 3).sum();
         assert_eq!(row, vec![450, sum, 500]);
-        // At least one block was held, at most one per partition at a time.
+        // At least one group was held, at most one per partition at a time.
         assert!((1000..=4000).contains(&peak), "pax_decode_peak {peak}");
-        // Whole blocks while at least 4 are left; the last 3 by group.
-        assert_eq!(fake.group_calls.load(Ordering::SeqCst), 3);
-        assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 6);
+        // Every block's groups counted, and each group read alone.
+        assert_eq!(fake.group_calls.load(Ordering::SeqCst), 50);
+        assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 100);
     }
 
     #[test]
@@ -3353,10 +3348,11 @@ mod tests {
         let fake = FakeScan::default();
         let ptr = &fake as *const FakeScan as *mut c_void;
         let scan = PaxScan::new(ptr, 1, fake_read, fake_end, fake_groups);
-        scan.partitions.store(1, Ordering::Relaxed);
-        // the reader takes the only block whole
-        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 0, -1))));
-        // another partition finds nothing yet, but the read is not done
+        // the reader takes the block's first group, another its second
+        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 0, 1))));
+        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 1, 1))));
+        scan.done_reading();
+        // a third finds nothing yet, but the first read is not done
         assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
         let rows = 2 * PAX_SLICE_ROWS + 3616;
@@ -3408,7 +3404,6 @@ mod tests {
         };
         let ptr = &fake as *const FakeScan as *mut c_void;
         let scan = PaxScan::new(ptr, 1, fake_read, fake_end, fake_groups);
-        scan.partitions.store(4, Ordering::Relaxed);
         std::thread::scope(|s| {
             // dropped if an assertion fails, which releases the other thread
             let release = release;

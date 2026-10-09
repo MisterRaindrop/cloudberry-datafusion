@@ -204,10 +204,13 @@ format's 16-byte numerics are rebuilt in that representation by the
 reader, since PAX's own conversion calls PostgreSQL's numeric functions.
 On one segment of TPC-H at scale factor 1, summing four numeric(15,2)
 columns of lineitem takes 43 ms against 154 ms through the table AM.  DataFusion's
-partitions take micro-partitions one at a time while at least as many are
-left as there are partitions; past that (C1b) a partition taking one
-counts its groups from the footer, reads the first and queues the others,
-which idle partitions read in parallel.  The reader hands out a group's
+partitions take micro-partitions one at a time; a partition taking one
+counts its groups from the footer, reads the first and queues the others
+(C1b), which partitions take before any new micro-partition, so that one
+micro-partition is read by several partitions in parallel.  Every read is
+one group (C4b), and a partition reads another only once the rows decoded
+so far are taken: reading whole micro-partitions queued all their groups'
+rows first, which at scale factor 10 took a QE to 600 MB on TPC-H's Q1.  The reader hands out a group's
 rows 8192 at a time, and each piece goes to a queue all partitions take
 from (C2b): the work above the scan starts while the group is still being
 converted, on every partition, not only the one reading.  Partitions
@@ -482,6 +485,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C2 | Direct PAX reader: numeric(p, s) columns |
 | C2b | Direct PAX reader: decoded rows shared by all partitions as they come |
 | C3 | Direct PAX reader: every PAX scan of a slice, beside other inputs |
+| C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
