@@ -1888,10 +1888,11 @@ impl Query {
         } else {
             partitions.max(1)
         };
-        let pax_memory = sources.iter().find_map(|s| match s {
-            Source::Pax(scan) => Some(scan.memory.clone()),
-            _ => None,
-        });
+        // all PAX inputs of the query report to one account (C3)
+        let pax_memory = sources
+            .iter()
+            .any(|s| matches!(s, Source::Pax(_)))
+            .then(Arc::<PaxMemory>::default);
         let mut in_tx = Vec::with_capacity(sources.len());
         let mut ipc_tx = Vec::with_capacity(sources.len());
         let mut decoders = Vec::new();
@@ -1938,7 +1939,10 @@ impl Query {
                             .map_err(df)?,
                     )
                 }
-                Source::Pax(scan) => {
+                Source::Pax(mut scan) => {
+                    if let Some(memory) = &pax_memory {
+                        scan.memory = memory.clone();
+                    }
                     scan.partitions.store(partitions, Ordering::Relaxed);
                     let scan = Arc::new(scan);
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)

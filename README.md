@@ -187,6 +187,14 @@ That code calls PAX's internal C++ classes, not a published API:
   does not load, warns once and reads through the table AM.
 - Cloudberry's parallel mode keeps the table AM path.
 
+Every PAX scan of a slice is read this way (C3), beside inputs read
+through the table AM or received from a Motion: the two sides of a join of
+co-located PAX tables, a PAX table joined with a broadcast or
+redistributed one.  The scans of one query share the account their
+decoding memory is reported to.  Over TPC-H at scale factor 1 (both
+planners, 44 runs) DataFusion took 11.6 s reading PAX directly against
+15.1 s through the table AM, with no query slower.
+
 It reads fixed-width columns, strings (text, varchar, char(n)) and
 numeric(p, s) columns (C2); a scan of ctid goes through the table AM.
 Numerics come out in PostgreSQL's representation and are read by
@@ -473,6 +481,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
 | C2 | Direct PAX reader: numeric(p, s) columns |
 | C2b | Direct PAX reader: decoded rows shared by all partitions as they come |
+| C3 | Direct PAX reader: every PAX scan of a slice, beside other inputs |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side

@@ -738,7 +738,132 @@ SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
  19996 |         -10249.48 |              61234567.4052345232 | -0.80003
 (9 rows)
 
+-- Several inputs in one slice (C3): each PAX scan is read directly, the
+-- others through the table AM or their Motion; here two PAX tables joined
+-- on their distribution key, and one joined with a heap table.
+CREATE TABLE df_pd_heap (id int, w numeric(12,2)) DISTRIBUTED BY (id);
+INSERT INTO df_pd_heap SELECT k, k * 0.25 FROM generate_series(1, 20000, 3) k;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
+ count |     sum      | count |  sum   
+-------+--------------+-------+--------
+ 19982 | -32126712.26 | 18166 | 100201
+(1 row)
+
+SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = s.id AND n.d < 0 WHERE s.b < 'b' COLLATE "C" GROUP BY s.b ORDER BY s.b COLLATE "C" NULLS FIRST;
+   b   | count |         max         
+-------+-------+---------------------
+       |  3765 | 61111110.6161110665
+ a12   |    15 | 50864197.1188641604
+ a14   |    14 | 51111110.6971110738
+ a16   |    16 | 51358024.2753579872
+ a18   |    14 | 51604937.8536049006
+ a2    |    14 | 49629629.2276295934
+ a22   |    14 | 52098765.0100987274
+ a24   |    14 | 52345678.5883456408
+ a26   |    15 | 52592592.1665925542
+ a28   |    14 | 52839505.7448394676
+ a32   |    15 | 53333332.9013332944
+ a34   |    15 | 41234567.5672345378
+ a36   |    14 | 53827160.0578271212
+ a38   |    15 | 54074073.6360740346
+ a4    |    15 | 49876542.8058765068
+ a42   |    15 | 54567900.7925678614
+ a44   |    14 | 54814814.3708147748
+ a46   |    14 | 55061727.9490616882
+ a48   |    14 | 55308641.5273086016
+ a52   |    15 | 55802468.6838024284
+ a54   |    14 | 56049382.2620493418
+ a56   |    15 | 43950616.9279505852
+ a58   |    15 | 56543209.4185431686
+ a6    |    14 | 50123456.3841234202
+ a62   |    14 | 57037036.5750369954
+ a64   |    15 | 57283950.1532839088
+ a66   |    14 | 57530863.7315308222
+ a68   |    15 | 57777777.3097777356
+ a72   |    14 | 58271604.4662715624
+ a74   |    15 | 58518518.0445184758
+ a76   |    14 | 58765431.6227653892
+ a78   |    15 | 59012345.2010123026
+ a8    |    15 | 50370369.9623703336
+ a82   |    15 | 59506172.3575061294
+ a84   |    14 | 59753085.9357530428
+ a86   |    15 | 59999999.5139999562
+ a88   |    14 | 60246913.0922468696
+ a92   |    14 | 60740740.2487406964
+ a94   |    15 | 60987653.8269876098
+ a96   |    14 | 61234567.4052345232
+ a98   |    14 | 61481480.9834814366
+(41 rows)
+
+SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
+ count |     sum     |     sum     
+-------+-------------+-------------
+  6667 | 16667500.00 | -5806.69678
+(1 row)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
+ count |     sum      | count |  sum   
+-------+--------------+-------+--------
+ 19982 | -32126712.26 | 18166 | 100201
+(1 row)
+
+SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = s.id AND n.d < 0 WHERE s.b < 'b' COLLATE "C" GROUP BY s.b ORDER BY s.b COLLATE "C" NULLS FIRST;
+   b   | count |         max         
+-------+-------+---------------------
+       |  3765 | 61111110.6161110665
+ a12   |    15 | 50864197.1188641604
+ a14   |    14 | 51111110.6971110738
+ a16   |    16 | 51358024.2753579872
+ a18   |    14 | 51604937.8536049006
+ a2    |    14 | 49629629.2276295934
+ a22   |    14 | 52098765.0100987274
+ a24   |    14 | 52345678.5883456408
+ a26   |    15 | 52592592.1665925542
+ a28   |    14 | 52839505.7448394676
+ a32   |    15 | 53333332.9013332944
+ a34   |    15 | 41234567.5672345378
+ a36   |    14 | 53827160.0578271212
+ a38   |    15 | 54074073.6360740346
+ a4    |    15 | 49876542.8058765068
+ a42   |    15 | 54567900.7925678614
+ a44   |    14 | 54814814.3708147748
+ a46   |    14 | 55061727.9490616882
+ a48   |    14 | 55308641.5273086016
+ a52   |    15 | 55802468.6838024284
+ a54   |    14 | 56049382.2620493418
+ a56   |    15 | 43950616.9279505852
+ a58   |    15 | 56543209.4185431686
+ a6    |    14 | 50123456.3841234202
+ a62   |    14 | 57037036.5750369954
+ a64   |    15 | 57283950.1532839088
+ a66   |    14 | 57530863.7315308222
+ a68   |    15 | 57777777.3097777356
+ a72   |    14 | 58271604.4662715624
+ a74   |    15 | 58518518.0445184758
+ a76   |    14 | 58765431.6227653892
+ a78   |    15 | 59012345.2010123026
+ a8    |    15 | 50370369.9623703336
+ a82   |    15 | 59506172.3575061294
+ a84   |    14 | 59753085.9357530428
+ a86   |    15 | 59999999.5139999562
+ a88   |    14 | 60246913.0922468696
+ a92   |    14 | 60740740.2487406964
+ a94   |    15 | 60987653.8269876098
+ a96   |    14 | 61234567.4052345232
+ a98   |    14 | 61481480.9834814366
+(41 rows)
+
+SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
+ count |     sum     |     sum     
+-------+-------------+-------------
+  6667 | 16667500.00 | -5806.69678
+(1 row)
+
 RESET datafusion.motion_batches;
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

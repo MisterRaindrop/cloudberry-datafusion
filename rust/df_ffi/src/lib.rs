@@ -299,13 +299,23 @@ fn report_panic(
     DF_PANIC
 }
 
+/// An input DataFusion reads from PAX itself (C3): its scan and blocks, or
+/// a null scan.
+#[repr(C)]
+pub struct DfPaxInput {
+    pub scan: *mut std::ffi::c_void,
+    pub nblocks: u32,
+}
+
 /// Build the plan described by the JSON `spec` and start it with
 /// `partitions` parallel partitions, an operator memory budget of
 /// `memory_limit` bytes and spill files under `spill_dir`; `flags` are
 /// DF_QUERY_* bits.  The plan has `ninputs` inputs; bit j of `ipc_inputs`
 /// says input j arrives as Arrow IPC streams from a Motion
-/// (df_ffi_query_push_ipc), otherwise as pushed batches.  The runtime must
-/// be running.
+/// (df_ffi_query_push_ipc), otherwise as pushed batches, unless `pax`
+/// (null, or one entry per input) gives it a PAX scan, which the workers
+/// read with `read`, `end` and `groups` and which the query owns from the
+/// call on, even if it fails.  The runtime must be running.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start(
     spec: *const c_char,
@@ -315,81 +325,50 @@ pub extern "C" fn df_ffi_query_start(
     flags: u32,
     ninputs: u32,
     ipc_inputs: u64,
+    pax: *const DfPaxInput,
+    read: Option<df_core::query::PaxReadFn>,
+    end: Option<df_core::query::PaxEndFn>,
+    groups: Option<df_core::query::PaxGroupsFn>,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
     buflen: usize,
 ) -> i32 {
+    // The PAX scans are the query's from here on: wrapped first, so that
+    // they are ended whatever fails below.
+    let sources: Vec<df_core::query::Source> = (0..ninputs as usize)
+        .map(|j| {
+            // SAFETY: `pax` is null or holds `ninputs` entries.
+            let p = if pax.is_null() {
+                None
+            } else {
+                Some(unsafe { &*pax.add(j) })
+            };
+            match (p, read, end, groups) {
+                (Some(p), Some(read), Some(end), Some(groups)) if !p.scan.is_null() => {
+                    df_core::query::Source::Pax(df_core::query::PaxScan::new(
+                        p.scan,
+                        p.nblocks as usize,
+                        read,
+                        end,
+                        groups,
+                    ))
+                }
+                _ if j < 64 && ipc_inputs & (1u64 << j) != 0 => df_core::query::Source::Ipc,
+                _ => df_core::query::Source::Pushed,
+            }
+        })
+        .collect();
     let r = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller passes a NUL-terminated string.
         let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
         let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
-        let sources = (0..ninputs)
-            .map(|j| {
-                if j < 64 && ipc_inputs & (1u64 << j) != 0 {
-                    df_core::query::Source::Ipc
-                } else {
-                    df_core::query::Source::Pushed
-                }
-            })
-            .collect();
         df_core::query::Query::start_multi(
             &spec,
             partitions as usize,
             memory_limit as usize,
             &dir,
             sources,
-            flags & DF_QUERY_IPC_OUTPUT != 0,
-        )
-    }));
-    match r {
-        Ok(Ok(q)) => {
-            // SAFETY: the caller passes a valid out pointer.
-            unsafe { *out_query = Box::into_raw(Box::new(DfQuery(q))) };
-            DF_OK
-        }
-        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
-        Err(p) => report_panic(p, sqlstate, buf, buflen),
-    }
-}
-
-/// Like df_ffi_query_start, reading PAX micro-partitions on the workers:
-/// `scan` (with `nblocks` blocks) is read with `read`, a block's groups
-/// counted with `groups`, and released with `end`, which the query owns from now on, even if this call fails.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_start_pax(
-    spec: *const c_char,
-    partitions: u32,
-    memory_limit: u64,
-    spill_dir: *const c_char,
-    scan: *mut std::ffi::c_void,
-    nblocks: u32,
-    read: df_core::query::PaxReadFn,
-    end: df_core::query::PaxEndFn,
-    groups: df_core::query::PaxGroupsFn,
-    flags: u32,
-    out_query: *mut *mut DfQuery,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
-) -> i32 {
-    let source = df_core::query::Source::Pax(df_core::query::PaxScan::new(
-        scan,
-        nblocks as usize,
-        read,
-        end,
-        groups,
-    ));
-    let r = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the caller passes NUL-terminated strings.
-        let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
-        let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
-        df_core::query::Query::start_with(
-            &spec,
-            partitions as usize,
-            memory_limit as usize,
-            &dir,
-            source,
             flags & DF_QUERY_IPC_OUTPUT != 0,
         )
     }));

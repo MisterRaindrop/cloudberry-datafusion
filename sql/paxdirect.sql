@@ -116,8 +116,24 @@ SELECT id, a, b, d FROM df_pd_num WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
 SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_vnum;
 SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_vnum;
 SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+
+-- Several inputs in one slice (C3): each PAX scan is read directly, the
+-- others through the table AM or their Motion; here two PAX tables joined
+-- on their distribution key, and one joined with a heap table.
+CREATE TABLE df_pd_heap (id int, w numeric(12,2)) DISTRIBUTED BY (id);
+INSERT INTO df_pd_heap SELECT k, k * 0.25 FROM generate_series(1, 20000, 3) k;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
+SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = s.id AND n.d < 0 WHERE s.b < 'b' COLLATE "C" GROUP BY s.b ORDER BY s.b COLLATE "C" NULLS FIRST;
+SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
+SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = s.id AND n.d < 0 WHERE s.b < 'b' COLLATE "C" GROUP BY s.b ORDER BY s.b COLLATE "C" NULLS FIRST;
+SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

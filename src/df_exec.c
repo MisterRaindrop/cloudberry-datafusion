@@ -613,26 +613,26 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 }
 
 /*
- * Experimental: start the query on PAX micro-partitions that DataFusion's
- * partitions decode themselves.  Returns false when the direct reader does
- * not apply; the caller then reads through the table AM.  Only for a slice
- * with that one input.
+ * Experimental: begin a direct read of input 'in' if it scans a PAX table
+ * (C3: any input of the slice, the others read through the table AM or a
+ * Motion): DataFusion's partitions decode its micro-partitions themselves.
+ * Returns false when the direct reader does not apply; 'pax' then stays
+ * empty.  The scan's min/max skipping is added to the slice's.
  */
 static bool
-df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
+df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, DfPaxInput *pax)
 {
-	Relation	rel = in->scan->ss.ss_currentRelation;
-	const DfPaxReader *reader;
+	Relation	rel;
 	char		buf[DF_MSG_BUFLEN];
-	char		sqlstate[6] = "XX000";
+	DfPaxScanInfo info;
 	int		   *cols;
 	int		   *widths;
 	void	   *scan;
-	int32		status;
 	int			c;
 
-	if (!df_pax_direct_read || x->ninputs != 1 || in->scan->ss.ss_currentScanDesc != NULL)
-		return false;
+	if (in->scan == NULL || in->scan->ss.ss_currentScanDesc != NULL)
+		return false;			/* a Motion, or Cloudberry's parallel mode */
+	rel = in->scan->ss.ss_currentRelation;
 	{
 		char	   *amname = get_am_name(rel->rd_rel->relam);
 
@@ -646,9 +646,6 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 	for (c = 0; c < in->spec->ncols; c++)
 		if (in->spec->attnos[c] <= 0)
 			return false;
-	reader = df_pax_reader_get();
-	if (reader == NULL)
-		return false;
 
 	cols = palloc(sizeof(int) * Max(in->spec->ncols, 1));
 	widths = palloc(sizeof(int) * Max(in->spec->ncols, 1));
@@ -666,25 +663,20 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 	 */
 	scan = reader->begin(rel, x->estate->es_snapshot, in->scan->ss.ps.plan->qual,
 						 cols, widths, in->spec->ncols, buf, sizeof(buf));
+	pfree(cols);
+	pfree(widths);
 	if (scan == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion: %s", buf)));
-	reader->info(scan, &x->pax_info);
+	reader->info(scan, &info);
+	x->pax_info.files += info.files;
+	x->pax_info.files_skipped += info.files_skipped;
+	x->pax_info.groups += info.groups;
+	x->pax_info.groups_skipped += info.groups_skipped;
 	x->pax_direct = true;
-
-	/* From here on the query owns the scan. */
-	status = df_ffi_query_start_pax(x->spec.json, (uint32_t) workers,
-									(uint64_t) x->memory_limit, df_spill_dir(),
-									scan, (uint32_t) reader->nblocks(scan),
-									reader->read, reader->end, reader->block_groups,
-									df_query_flags(x),
-									&x->query, sqlstate, buf, sizeof(buf));
-	if (status != DF_OK)
-	{
-		x->query = NULL;
-		df_raise_query(status, sqlstate, buf);
-	}
+	pax->scan = scan;
+	pax->nblocks = (uint32_t) reader->nblocks(scan);
 	in->done = true;			/* nothing to push from the main thread */
 	df_pax_direct_scans++;
 	return true;
@@ -698,16 +690,39 @@ df_exec_begin(DfExec *x)
 	int			workers;
 	int32		status;
 	int			j;
+	const DfPaxReader *reader = NULL;
+	DfPaxInput *pax = NULL;
 
 	workers = df_runtime_ensure();
-	if (x->inputs[0].scan && df_exec_begin_pax(x, &x->inputs[0], workers))
+	if (df_pax_direct_read && (reader = df_pax_reader_get()) != NULL)
 	{
-		df_vmem_sync(x->headroom);
-		return;
+		pax = palloc0(sizeof(DfPaxInput) * x->ninputs);
+		for (j = 0; j < x->ninputs; j++)
+		{
+			PG_TRY();
+			{
+				df_pax_begin_input(x, &x->inputs[j], reader, &pax[j]);
+			}
+			PG_CATCH();
+			{
+				int			k;
+
+				/* the scans begun so far are not the query's yet */
+				for (k = 0; k < j; k++)
+					if (pax[k].scan != NULL)
+						reader->end(pax[k].scan);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+		}
 	}
+	/* From here on the query owns the PAX scans, even if this fails. */
 	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
 								(uint64_t) x->memory_limit, df_spill_dir(),
 								df_query_flags(x), (uint32_t) x->ninputs, df_ipc_inputs(x),
+								pax, reader ? reader->read : NULL,
+								reader ? reader->end : NULL,
+								reader ? reader->block_groups : NULL,
 								&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
@@ -721,8 +736,8 @@ df_exec_begin(DfExec *x)
 		DfInput    *in = &x->inputs[j];
 		Relation	rel;
 
-		if (in->scan == NULL)
-			continue;			/* a Motion is ready to receive */
+		if (in->scan == NULL || in->done)
+			continue;			/* a Motion is ready to receive, or PAX read directly */
 
 		/*
 		 * In Cloudberry's parallel mode several QEs of one segment share the

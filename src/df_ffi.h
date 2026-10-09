@@ -109,13 +109,6 @@ typedef struct DfPaxColumn
 	const int32_t *offsets;
 } DfPaxColumn;
 
-/* The message may be followed by a newline and an error detail. */
-/* Bit j of 'ipc_inputs': input j arrives as Arrow IPC streams from a Motion. */
-extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
-								  uint64_t memory_limit, const char *spill_dir,
-								  uint32_t flags, uint32_t ninputs, uint64_t ipc_inputs,
-								  DfQuery **out_query,
-								  char *sqlstate, char *buf, size_t buflen);
 /* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfPaxColumn *cols);
 typedef void (*DfPaxAccount) (void *ctx, int64_t delta);
@@ -125,14 +118,27 @@ typedef int (*DfPaxRead) (void *scan, int index, int first, int count,
 typedef void (*DfPaxEnd) (void *scan);
 typedef int (*DfPaxGroups) (void *scan, int index, char *err, size_t errlen);
 
-/* Takes ownership of 'scan' (released with 'end'), even on failure. */
-extern int32_t df_ffi_query_start_pax(const char *spec, uint32_t partitions,
-									  uint64_t memory_limit, const char *spill_dir,
-									  void *scan, uint32_t nblocks,
-									  DfPaxRead read, DfPaxEnd end,
-									  DfPaxGroups groups, uint32_t flags,
-									  DfQuery **out_query, char *sqlstate,
-									  char *buf, size_t buflen);
+/* An input read directly from PAX: its scan and blocks, or a NULL scan. */
+typedef struct DfPaxInput
+{
+	void	   *scan;
+	uint32_t	nblocks;
+} DfPaxInput;
+
+/* The message may be followed by a newline and an error detail. */
+/* Bit j of 'ipc_inputs': input j arrives as Arrow IPC streams from a Motion. */
+/*
+ * 'pax' (NULL, or one per input) names the inputs DataFusion reads from PAX
+ * itself, with 'read', 'end' and 'groups'; the query owns those scans from
+ * the call on, even if it fails.
+ */
+extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
+								  uint64_t memory_limit, const char *spill_dir,
+								  uint32_t flags, uint32_t ninputs, uint64_t ipc_inputs,
+								  const DfPaxInput *pax, DfPaxRead read, DfPaxEnd end,
+								  DfPaxGroups groups, DfQuery **out_query,
+								  char *sqlstate, char *buf, size_t buflen);
+
 extern int32_t df_ffi_query_push(DfQuery *query, uint32_t input, const DfColumn *cols,
 								 uint32_t ncols, uint32_t nrows,
 								 char *sqlstate, char *buf, size_t buflen);
