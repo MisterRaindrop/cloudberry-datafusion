@@ -119,16 +119,18 @@ extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 /* PAX blocks read on the workers (experimental); see patches/pax. */
 typedef int (*DfPaxEmit) (void *ctx, uint32_t nrows, const DfPaxColumn *cols);
 typedef void (*DfPaxAccount) (void *ctx, int64_t delta);
-typedef int (*DfPaxRead) (void *scan, int index, DfPaxEmit emit,
-						  DfPaxAccount account, void *ctx,
+typedef int (*DfPaxRead) (void *scan, int index, int first, int count,
+						  DfPaxEmit emit, DfPaxAccount account, void *ctx,
 						  char *err, size_t errlen);
 typedef void (*DfPaxEnd) (void *scan);
+typedef int (*DfPaxGroups) (void *scan, int index, char *err, size_t errlen);
 
 /* Takes ownership of 'scan' (released with 'end'), even on failure. */
 extern int32_t df_ffi_query_start_pax(const char *spec, uint32_t partitions,
 									  uint64_t memory_limit, const char *spill_dir,
 									  void *scan, uint32_t nblocks,
-									  DfPaxRead read, DfPaxEnd end, uint32_t flags,
+									  DfPaxRead read, DfPaxEnd end,
+									  DfPaxGroups groups, uint32_t flags,
 									  DfQuery **out_query, char *sqlstate,
 									  char *buf, size_t buflen);
 extern int32_t df_ffi_query_push(DfQuery *query, uint32_t input, const DfColumn *cols,

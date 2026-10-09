@@ -1,4 +1,4 @@
-From 0c175224c02b5cd8f45454e6252948366dcbea3d Mon Sep 17 00:00:00 2001
+From 4d7fa47dd6e035067443885dfd0c4eaa524f02fc Mon Sep 17 00:00:00 2001
 From: MisterRaindrop <p_xiaoyu.liu@synxdata.com>
 Date: Mon, 5 Oct 2026 17:05:43 +0800
 Subject: [PATCH] pax: add a columnar scan interface for datafusion_executor
@@ -14,20 +14,21 @@ PAX's own scan does, on the main thread since that calls fmgr.  read_block
 hands out fixed-width columns and strings (text, varchar, bpchar, as
 offsets and bytes, PAX's toast decoded) and reports the memory it holds
 (read buffer, decoded columns, visibility map, handed-out rows) so that
-the caller can account for it.
+the caller can account for it.  block_groups lets callers spread the
+groups of one block over several threads.
 ---
- .../src/cpp/access/datafusion_scan_api.cc     | 423 ++++++++++++++++++
- .../src/cpp/access/datafusion_scan_api.h      | 120 +++++
- 2 files changed, 543 insertions(+)
+ .../src/cpp/access/datafusion_scan_api.cc     | 452 ++++++++++++++++++
+ .../src/cpp/access/datafusion_scan_api.h      | 127 +++++
+ 2 files changed, 579 insertions(+)
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 new file mode 100644
-index 0000000..003eee7
+index 0000000..4eaff2c
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,423 @@
+@@ -0,0 +1,452 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -77,6 +78,7 @@ index 0000000..003eee7
 +
 +#include "access/datafusion_scan_api.h"
 +
++#include <algorithm>
 +#include <cstring>
 +#include <memory>
 +#include <string>
@@ -239,9 +241,31 @@ index 0000000..003eee7
 +
 +void ScanEnd(void *scan) { delete static_cast<DfScan *>(scan); }
 +
-+int ReadBlock(void *scan_arg, int index, DatafusionPaxEmit emit,
-+              DatafusionPaxAccount account, void *ctx, char *err,
-+              size_t errlen) {
++int BlockGroups(void *scan_arg, int index, char *err, size_t errlen) {
++  auto scan = static_cast<DfScan *>(scan_arg);
++  try {
++    const DfBlock &block = scan->blocks.at(index);
++    if (!block.all_groups) return static_cast<int>(block.groups.size());
++    // Only the footer is read: no group of the read column is decoded.
++    std::vector<bool> proj(scan->natts, false);
++    proj[scan->read_col] = true;
++    auto reader = OpenReader(block, std::move(proj), nullptr);
++    const int n = static_cast<int>(reader->GetGroupNums());
++    reader->Close();
++    return n;
++  } catch (cbdb::CException &e) {
++    SetError(err, errlen, "cannot read PAX micro-partition", e.What().c_str());
++  } catch (std::exception &e) {
++    SetError(err, errlen, "cannot read PAX micro-partition", e.what());
++  } catch (...) {
++    SetError(err, errlen, "cannot read PAX micro-partition", "unknown error");
++  }
++  return -1;
++}
++
++int ReadBlock(void *scan_arg, int index, int first, int count,
++              DatafusionPaxEmit emit, DatafusionPaxAccount account, void *ctx,
++              char *err, size_t errlen) {
 +  auto scan = static_cast<DfScan *>(scan_arg);
 +  try {
 +    // Declared first, so that it is destroyed last: everything it counts is
@@ -279,9 +303,14 @@ index 0000000..003eee7
 +    std::vector<DatafusionPaxColumn> out(ncols);
 +    std::vector<size_t> nonnull(ncols);
 +
++    // The block's groups to read are numbered 0 .. ngroups - 1; this call
++    // reads 'count' of them from 'first' (all from there if count < 0).
 +    const size_t ngroups =
 +        block.all_groups ? reader->GetGroupNums() : block.groups.size();
-+    for (size_t n = 0; n < ngroups; n++) {
++    const size_t from = std::min(static_cast<size_t>(std::max(first, 0)), ngroups);
++    const size_t to =
++        count < 0 ? ngroups : std::min(from + static_cast<size_t>(count), ngroups);
++    for (size_t n = from; n < to; n++) {
 +      const size_t g = block.all_groups ? n : block.groups[n];
 +      auto group = reader->ReadGroup(g);
 +      auto &columns = *group->GetAllColumns();
@@ -443,6 +472,7 @@ index 0000000..003eee7
 +    ScanInfo,
 +    ReadBlock,
 +    ScanEnd,
++    BlockGroups,
 +};
 +
 +}  // namespace
@@ -453,10 +483,10 @@ index 0000000..003eee7
 +}
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 new file mode 100644
-index 0000000..e0f5c10
+index 0000000..b66c7ed
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,127 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -490,7 +520,8 @@ index 0000000..e0f5c10
 + *     visible to the snapshot reads PAX's auxiliary table, and skipping
 + *     them by min/max statistics calls PostgreSQL's comparison functions.
 + *     It copies what the readers need and keeps no PostgreSQL object.
-+ *   - read_block may run on any thread, concurrently for different blocks.
++ *   - read_block may run on any thread, concurrently for different blocks
++ *     or different groups of one block.
 + *     It opens the block's files through PAX's LocalFileSystem (POSIX I/O),
 + *     decodes the projected columns with PAX's reader (malloc, C++
 + *     exceptions, no PostgreSQL calls) and hands out rows group by group.
@@ -512,7 +543,7 @@ index 0000000..e0f5c10
 +extern "C" {
 +#endif
 +
-+#define DATAFUSION_PAX_SCAN_API_VERSION 3
++#define DATAFUSION_PAX_SCAN_API_VERSION 4
 +
 +struct List;
 +struct RelationData;
@@ -563,13 +594,19 @@ index 0000000..e0f5c10
 +                 int ncols, char *err, size_t errlen);
 +  int (*nblocks)(void *scan);
 +  void (*info)(void *scan, DatafusionPaxScanInfo *out);
-+  /* Decode block 'index' and call 'emit' once per group, 'account' as the
-+   * memory held changes; both get 'ctx'.  Returns 0, or -1 with a message
-+   * (also when 'emit' returns non-zero). */
-+  int (*read_block)(void *scan, int index, DatafusionPaxEmit emit,
-+                    DatafusionPaxAccount account, void *ctx, char *err,
-+                    size_t errlen);
++  /* Decode groups first .. first + count - 1 of block 'index' (all from
++   * 'first' if count < 0; see block_groups) and call 'emit' once per group,
++   * 'account' as the memory held changes; both get 'ctx'.  Returns 0, or -1
++   * with a message (also when 'emit' returns non-zero). */
++  int (*read_block)(void *scan, int index, int first, int count,
++                    DatafusionPaxEmit emit, DatafusionPaxAccount account,
++                    void *ctx, char *err, size_t errlen);
 +  void (*end)(void *scan);
++  /* The number of groups of block 'index' left to read once min/max
++   * statistics skipped some, reading the file's footer if needed: callers
++   * may read them in separate read_block calls, on several threads.
++   * Returns -1 with a message on failure.  Any thread, like read_block. */
++  int (*block_groups)(void *scan, int index, char *err, size_t errlen);
 +} DatafusionPaxScanApi;
 +
 +const DatafusionPaxScanApi *datafusion_pax_scan_api(void);

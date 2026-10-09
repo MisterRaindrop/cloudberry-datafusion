@@ -354,8 +354,8 @@ pub extern "C" fn df_ffi_query_start(
 }
 
 /// Like df_ffi_query_start, reading PAX micro-partitions on the workers:
-/// `scan` (with `nblocks` blocks) is read with `read` and released with
-/// `end`, which the query owns from now on, even if this call fails.
+/// `scan` (with `nblocks` blocks) is read with `read`, a block's groups
+/// counted with `groups`, and released with `end`, which the query owns from now on, even if this call fails.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start_pax(
     spec: *const c_char,
@@ -366,6 +366,7 @@ pub extern "C" fn df_ffi_query_start_pax(
     nblocks: u32,
     read: df_core::query::PaxReadFn,
     end: df_core::query::PaxEndFn,
+    groups: df_core::query::PaxGroupsFn,
     flags: u32,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
@@ -377,6 +378,7 @@ pub extern "C" fn df_ffi_query_start_pax(
         nblocks as usize,
         read,
         end,
+        groups,
     ));
     let r = catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller passes NUL-terminated strings.

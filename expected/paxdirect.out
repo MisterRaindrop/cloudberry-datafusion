@@ -63,12 +63,12 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd W
  149701 | 149701 | 149700 | 22451922901 | 3672907 | 0.25 | 3000000
 (1 row)
 
-SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
+SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d ORDER BY d;
  d | count  | min |   max    
 ---+--------+-----+----------
  f | 149700 |   1 | 74999.75
-   |      2 |   7 |      1.5
  t | 150000 |   0 |    75000
+   |      2 |   7 |      1.5
 (3 rows)
 
 SELECT count(*) FROM df_pd;
@@ -77,14 +77,14 @@ SELECT count(*) FROM df_pd;
  299702
 (1 row)
 
-SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL ORDER BY a, b;
    a    |    b    |   c   | d | e 
 --------+---------+-------+---+---
-        |         |       |   |  
- 300001 |         |   1.5 |   | 7
  100000 | 1000000 | 25000 | t | 0
  200000 | 2000000 | 50000 | t | 0
  300000 | 3000000 | 75000 | t | 0
+ 300001 |         |   1.5 |   | 7
+        |         |       |   |  
 (5 rows)
 
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_vec WHERE e < 50;
@@ -93,22 +93,22 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_v
  149701 | 149701 | 149700 | 22451922901 | 3672907 | 0.25 | 3000000
 (1 row)
 
-SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL ORDER BY a, b;
    a    |    b    |   c   | d | e 
 --------+---------+-------+---+---
  100000 | 1000000 | 25000 | t | 0
  200000 | 2000000 | 50000 | t | 0
  300000 | 3000000 | 75000 | t | 0
-        |         |       |   |  
  300001 |         |   1.5 |   | 7
+        |         |       |   |  
 (5 rows)
 
-SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d;
+SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
  d | count  |   sum   
 ---+--------+---------
-   |      2 |       7
  f | 149700 | 7497900
  t | 150000 | 7350000
+   |      2 |       7
 (3 rows)
 
 SET datafusion.mode = on;
@@ -119,7 +119,7 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd W
  149701 | 149701 | 149700 | 22451922901 | 3672907 | 0.25 | 3000000
 (1 row)
 
-SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
+SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d ORDER BY d;
  d | count  | min |   max    
 ---+--------+-----+----------
  f | 149700 |   1 | 74999.75
@@ -133,14 +133,14 @@ SELECT count(*) FROM df_pd;
  299702
 (1 row)
 
-SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL ORDER BY a, b;
    a    |    b    |   c   | d | e 
 --------+---------+-------+---+---
-        |         |       |   |  
- 300001 |         |   1.5 |   | 7
  100000 | 1000000 | 25000 | t | 0
  200000 | 2000000 | 50000 | t | 0
  300000 | 3000000 | 75000 | t | 0
+ 300001 |         |   1.5 |   | 7
+        |         |       |   |  
 (5 rows)
 
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_vec WHERE e < 50;
@@ -149,22 +149,22 @@ SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_v
  149701 | 149701 | 149700 | 22451922901 | 3672907 | 0.25 | 3000000
 (1 row)
 
-SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL ORDER BY a, b;
    a    |    b    |   c   | d | e 
 --------+---------+-------+---+---
  100000 | 1000000 | 25000 | t | 0
  200000 | 2000000 | 50000 | t | 0
  300000 | 3000000 | 75000 | t | 0
-        |         |       |   |  
  300001 |         |   1.5 |   | 7
+        |         |       |   |  
 (5 rows)
 
-SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d;
+SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
  d | count  |   sum   
 ---+--------+---------
-   |      2 |       7
  f | 149700 | 7497900
  t | 150000 | 7350000
+   |      2 |       7
 (3 rows)
 
 SELECT datafusion_debug_pax_direct_scans() AS direct_scans;
@@ -312,7 +312,7 @@ SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d 
   3100 | Tue Jan 30 10:40:00 1990 | Thu Feb 01 14:19:00 1990
 (1 row)
 
-SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL ORDER BY d, ts;
     d     |    ts     
 ----------+-----------
  infinity | -infinity
@@ -332,7 +332,7 @@ SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_p
      2 |             1 |      7 |              6
 (1 row)
 
-SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL ORDER BY d, ts;
     d     |    ts     
 ----------+-----------
  infinity | -infinity
@@ -368,13 +368,13 @@ SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
  99800 | 99800 | 9977748600 | 50000 | 2448600
 (1 row)
 
-SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e;
+SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e ORDER BY e;
  e  | count |    sum    
 ----+-------+-----------
-    |     1 |          
  97 |  2000 | 200094000
- 99 |  2000 | 200098000
  98 |  2000 | 200096000
+ 99 |  2000 | 200098000
+    |     1 |          
 (4 rows)
 
 SET datafusion.mode = on;
@@ -385,20 +385,23 @@ SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
  99800 | 99800 | 9977748600 | 50000 | 2448600
 (1 row)
 
-SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e;
+SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e ORDER BY e;
  e  | count |    sum    
 ----+-------+-----------
- 98 |  2000 | 200096000
-    |     1 |          
  97 |  2000 | 200094000
+ 98 |  2000 | 200096000
  99 |  2000 | 200098000
+    |     1 |          
 (4 rows)
 
 -- Strings (C1): text, varchar and char(n) as offsets and bytes, with NULLs,
 -- empty strings, multibyte characters and char(n)'s padding; values PAX
 -- compressed (over pax.min_size_of_compress_toast) or put in its toast file
 -- (over pax.min_size_of_external_toast); the vectorized storage format,
--- which keeps char(n) without padding and strings without headers.
+-- which keeps char(n) without padding and strings without headers.  Groups
+-- of 1000 rows give each segment's one micro-partition several groups,
+-- which DataFusion's partitions read in parallel (C1b).
+SET pax.max_tuples_per_group = 1000;
 CREATE TABLE df_pd_str (id int, t text, v varchar(12), b char(5)) USING pax DISTRIBUTED BY (id);
 INSERT INTO df_pd_str SELECT k,
   CASE WHEN k % 11 = 0 THEN NULL WHEN k % 7 = 0 THEN '' ELSE 'é' || k END,
@@ -408,6 +411,7 @@ FROM generate_series(1, 20000) k;
 INSERT INTO df_pd_str VALUES (-1, repeat('ab', 300000), 'big', 'z'),
   (-2, repeat('xyz', 3600000), 'bigger', 'z');
 DELETE FROM df_pd_str WHERE id % 1000 = 3;
+RESET pax.max_tuples_per_group;
 CREATE TABLE df_pd_vec (id int, t text, b char(4)) USING pax
   WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
 INSERT INTO df_pd_vec SELECT k, CASE WHEN k % 9 = 0 THEN NULL ELSE 'v' || k END,

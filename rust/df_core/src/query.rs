@@ -884,11 +884,14 @@ pub type PaxEmitFn =
     unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32;
 /// Called by the PAX reader with the change in bytes it holds.
 pub type PaxAccountFn = unsafe extern "C" fn(ctx: *mut c_void, delta: i64);
-/// read_block of the PAX scan interface (patches/pax): decode one block,
-/// emitting its groups and accounting for the memory it holds.
+/// read_block of the PAX scan interface (patches/pax): decode `count`
+/// groups of one block from `first` (all from there if negative), emitting
+/// them and accounting for the memory it holds.
 pub type PaxReadFn = unsafe extern "C" fn(
     scan: *mut c_void,
     index: i32,
+    first: i32,
+    count: i32,
     emit: PaxEmitFn,
     account: PaxAccountFn,
     ctx: *mut c_void,
@@ -897,15 +900,36 @@ pub type PaxReadFn = unsafe extern "C" fn(
 ) -> i32;
 /// end of the PAX scan interface: free the scan.
 pub type PaxEndFn = unsafe extern "C" fn(scan: *mut c_void);
+/// block_groups of the PAX scan interface: how many groups of a block are
+/// left to read, or -1 with a message.
+pub type PaxGroupsFn =
+    unsafe extern "C" fn(scan: *mut c_void, index: i32, err: *mut c_char, errlen: usize) -> i32;
 
 /// A PAX scan listed on the main thread.  Partitions take blocks from it
 /// one at a time; it is freed when the last partition is done with it.
+///
+/// While there are at least as many blocks left as partitions, a partition
+/// reads a whole block.  Past that, one block per partition would leave
+/// partitions idle (a table of one micro-partition per segment would be
+/// read by one thread), so a partition taking a block counts its groups,
+/// reads the first and queues the others, which idle partitions take
+/// before any new block.  A partition only stops once no block is left,
+/// the queue is empty and no other partition may still queue groups
+/// (`pending`); until then it waits.
 pub struct PaxScan {
     scan: *mut c_void,
     nblocks: usize,
     read: PaxReadFn,
     end: PaxEndFn,
+    groups: PaxGroupsFn,
     next: AtomicUsize,
+    /// (block, group) left to read by whichever partition is free
+    queue: Mutex<std::collections::VecDeque<(usize, usize)>>,
+    /// partitions that took, or are taking, a block whose groups they may
+    /// still queue
+    pending: AtomicUsize,
+    /// how many partitions read the scan, set when the plan is built
+    partitions: AtomicUsize,
     memory: Arc<PaxMemory>,
 }
 
@@ -936,16 +960,85 @@ unsafe impl Sync for PaxScan {}
 
 impl PaxScan {
     /// Take ownership of a scan; `end` runs when this is dropped.
-    pub fn new(scan: *mut c_void, nblocks: usize, read: PaxReadFn, end: PaxEndFn) -> Self {
+    pub fn new(
+        scan: *mut c_void,
+        nblocks: usize,
+        read: PaxReadFn,
+        end: PaxEndFn,
+        groups: PaxGroupsFn,
+    ) -> Self {
         PaxScan {
             scan,
             nblocks,
             read,
             end,
+            groups,
             next: AtomicUsize::new(0),
+            queue: Default::default(),
+            pending: AtomicUsize::new(0),
+            partitions: AtomicUsize::new(1),
             memory: Arc::default(),
         }
     }
+
+    /// The next piece to read.
+    fn take(&self) -> Result<PaxPiece, String> {
+        if let Some(piece) = self.pop_queued() {
+            return Ok(piece);
+        }
+        // Counted before the block is taken: a partition that finds no
+        // block left then knows this one may still queue groups.
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        let index = self.next.fetch_add(1, Ordering::SeqCst);
+        if index >= self.nblocks {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            if let Some(piece) = self.pop_queued() {
+                return Ok(piece);
+            }
+            // Groups are queued before `pending` drops: look once more.
+            if self.pending.load(Ordering::SeqCst) == 0 {
+                return Ok(self.pop_queued().unwrap_or(PaxPiece::Done));
+            }
+            return Ok(PaxPiece::Wait);
+        }
+        if self.nblocks - index >= self.partitions.load(Ordering::Relaxed) {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            return Ok(PaxPiece::Read(index, 0, -1));
+        }
+        let mut err = vec![0 as c_char; 1024];
+        // SAFETY: see PaxScan.
+        let n = unsafe { (self.groups)(self.scan, index as i32, err.as_mut_ptr(), err.len()) };
+        if n > 1 {
+            self.queue
+                .lock()
+                .unwrap()
+                .extend((1..n as usize).map(|g| (index, g)));
+        }
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        if n < 0 {
+            return Err(unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        Ok(PaxPiece::Read(index, 0, 1))
+    }
+
+    fn pop_queued(&self) -> Option<PaxPiece> {
+        self.queue
+            .lock()
+            .unwrap()
+            .pop_front()
+            .map(|(block, group)| PaxPiece::Read(block, group as i32, 1))
+    }
+}
+
+/// What a partition reads next from a PAX scan.
+enum PaxPiece {
+    /// block, first group, group count (-1: all from the first)
+    Read(usize, i32, i32),
+    /// nothing now, but another partition may still queue groups
+    Wait,
+    Done,
 }
 
 impl Drop for PaxScan {
@@ -1059,10 +1152,18 @@ impl PartitionStream for PaxPartition {
                     if failed {
                         return None;
                     }
-                    let index = scan.next.fetch_add(1, Ordering::Relaxed);
-                    if index >= scan.nblocks {
-                        return None;
-                    }
+                    let (index, first, count) = match scan.take() {
+                        Ok(PaxPiece::Read(index, first, count)) => (index, first, count),
+                        Ok(PaxPiece::Wait) => {
+                            tokio::time::sleep(Duration::from_micros(200)).await;
+                            continue;
+                        }
+                        Ok(PaxPiece::Done) => return None,
+                        Err(msg) => {
+                            let e = DataFusionError::External(Box::new(PgError::internal(msg)));
+                            return Some((Err(e), (scan, queue, true)));
+                        }
+                    };
                     let mut ctx = EmitContext {
                         memory: scan.memory.clone(),
                         schema: schema.clone(),
@@ -1076,6 +1177,8 @@ impl PartitionStream for PaxPartition {
                         (scan.read)(
                             scan.scan,
                             index as i32,
+                            first,
+                            count,
                             pax_emit,
                             pax_account,
                             &mut ctx as *mut EmitContext as *mut c_void,
@@ -1779,6 +1882,7 @@ impl Query {
                     )
                 }
                 Source::Pax(scan) => {
+                    scan.partitions.store(partitions, Ordering::Relaxed);
                     let scan = Arc::new(scan);
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
                         .map(|_| {
@@ -2995,20 +3099,43 @@ mod tests {
         );
     }
 
+    /// What a fake PAX scan counts; `scan` points to it.
+    #[derive(Default)]
+    struct FakeScan {
+        group_calls: AtomicUsize,
+        single_group_reads: AtomicUsize,
+        ended: AtomicUsize,
+        gate: Option<FakeGate>,
+    }
+
+    /// block_groups says it started, then waits to be released (or for the
+    /// releasing side to be dropped).
+    struct FakeGate {
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
     /// A fake PAX reader: block i holds rows i*10 .. i*10+9 of one int4
     /// column, in two groups, with the row i*10+3 NULL.  It reports holding
-    /// 1000 bytes while it reads a block.
+    /// 1000 bytes while it reads.
     unsafe extern "C" fn fake_read(
-        _scan: *mut c_void,
+        scan: *mut c_void,
         index: i32,
+        first: i32,
+        count: i32,
         emit: PaxEmitFn,
         account: PaxAccountFn,
         ctx: *mut c_void,
         _err: *mut c_char,
         _errlen: usize,
     ) -> i32 {
+        let fake = &*(scan as *const FakeScan);
+        if count == 1 {
+            fake.single_group_reads.fetch_add(1, Ordering::SeqCst);
+        }
+        let to = if count < 0 { 2 } else { (first + count).min(2) };
         account(ctx, 1000);
-        for g in 0..2 {
+        for g in first..to {
             let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
             let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
             let col = PaxColumn {
@@ -3025,24 +3152,40 @@ mod tests {
         0
     }
 
-    static FAKE_ENDED: AtomicUsize = AtomicUsize::new(0);
-    unsafe extern "C" fn fake_end(_scan: *mut c_void) {
-        FAKE_ENDED.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn fake_groups(
+        scan: *mut c_void,
+        _index: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        let fake = &*(scan as *const FakeScan);
+        fake.group_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &fake.gate {
+            let _ = gate.entered.lock().unwrap().send(());
+            let _ = gate.release.lock().unwrap().recv();
+        }
+        2
     }
 
-    #[test]
-    fn pax_source_reads_all_blocks_once() {
+    unsafe extern "C" fn fake_end(scan: *mut c_void) {
+        let fake = &*(scan as *const FakeScan);
+        fake.ended.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// count(col), sum(col), count(*) over a fake scan of `nblocks` blocks
+    /// read by `partitions` partitions, and the scan's peak memory.
+    fn run_fake_scan(fake: &FakeScan, nblocks: usize, partitions: usize) -> (Vec<i64>, u64) {
         runtime::init(2).unwrap();
         let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}},{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
             "having":null,
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
-        let before = FAKE_ENDED.load(Ordering::SeqCst);
-        let scan = PaxScan::new(std::ptr::null_mut(), 50, fake_read, fake_end);
+        let ptr = fake as *const FakeScan as *mut c_void;
+        let scan = PaxScan::new(ptr, nblocks, fake_read, fake_end, fake_groups);
         let dir = std::env::temp_dir();
         let mut q = Query::start_with(
             spec,
-            4,
+            partitions,
             64 << 20,
             dir.to_str().unwrap(),
             Source::Pax(scan),
@@ -3066,21 +3209,78 @@ mod tests {
                 Poll::Bytes(_) => panic!("unexpected IPC output"),
             }
         }
-        // 500 rows 0..499, 50 of them NULL (those ending in 3).
-        let sum: i64 = (0..500).filter(|v| v % 10 != 3).sum();
-        assert_eq!(row, vec![450, sum, 500]);
-        // At least one block was held, at most one per partition at a time.
         let peak = q.stats().pax_decode_peak;
-        assert!((1000..=4000).contains(&peak), "pax_decode_peak {peak}");
         drop(q);
         // The scan is released once the plan is gone.
         for _ in 0..100 {
-            if FAKE_ENDED.load(Ordering::SeqCst) > before {
+            if fake.ended.load(Ordering::SeqCst) > 0 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(FAKE_ENDED.load(Ordering::SeqCst), before + 1);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+        (row, peak)
+    }
+
+    #[test]
+    fn pax_source_reads_all_blocks_once() {
+        let fake = FakeScan::default();
+        let (row, peak) = run_fake_scan(&fake, 50, 4);
+        // 500 rows 0..499, 50 of them NULL (those ending in 3).
+        let sum: i64 = (0..500).filter(|v| v % 10 != 3).sum();
+        assert_eq!(row, vec![450, sum, 500]);
+        // At least one block was held, at most one per partition at a time.
+        assert!((1000..=4000).contains(&peak), "pax_decode_peak {peak}");
+        // Whole blocks while at least 4 are left; the last 3 by group.
+        assert_eq!(fake.group_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 6);
+    }
+
+    #[test]
+    fn pax_source_spreads_groups_of_few_blocks() {
+        let fake = FakeScan::default();
+        let (row, _) = run_fake_scan(&fake, 1, 4);
+        // rows 0..9, row 3 NULL: each of the block's two groups read once
+        let sum: i64 = (0..10).filter(|v| v % 10 != 3).sum();
+        assert_eq!(row, vec![9, sum, 10]);
+        assert_eq!(fake.group_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 2);
+    }
+
+    /// While a partition counts a block's groups, the others wait for them
+    /// instead of stopping, then read what it queued.
+    #[test]
+    fn pax_partitions_wait_for_queued_groups() {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let fake = FakeScan {
+            gate: Some(FakeGate {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+            ..Default::default()
+        };
+        let ptr = &fake as *const FakeScan as *mut c_void;
+        let scan = PaxScan::new(ptr, 1, fake_read, fake_end, fake_groups);
+        scan.partitions.store(4, Ordering::Relaxed);
+        std::thread::scope(|s| {
+            // dropped if an assertion fails, which releases the other thread
+            let release = release;
+            let counting = s.spawn(|| scan.take());
+            entered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the block's groups were not counted");
+            assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
+            release.send(()).unwrap();
+            assert!(matches!(
+                counting.join().unwrap(),
+                Ok(PaxPiece::Read(0, 0, 1))
+            ));
+            assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 1, 1))));
+            assert!(matches!(scan.take(), Ok(PaxPiece::Done)));
+        });
+        drop(scan);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
     }
 
     #[test]

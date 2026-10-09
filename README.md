@@ -188,9 +188,14 @@ That code calls PAX's internal C++ classes, not a published API:
 - Cloudberry's parallel mode keeps the table AM path.
 
 It reads fixed-width columns and strings (text, varchar, char(n)); a scan
-of numeric columns or of ctid goes through the table AM.  Each
-micro-partition is read whole by one DataFusion partition, so a table of
-one micro-partition per segment decodes and filters on one thread.
+of numeric columns or of ctid goes through the table AM.  DataFusion's
+partitions take micro-partitions one at a time while at least as many are
+left as there are partitions; past that (C1b) a partition taking one
+counts its groups from the footer, reads the first and queues the others,
+which idle partitions read in parallel.  Without that, a table of one
+micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
+and filtered on one thread, slower than through the table AM; on one
+segment it now takes 23 ms against 32 ms through the table AM.
 
 Like PAX's own scan, it skips micro-partitions and then groups whose
 min/max statistics (`minmax_columns`) rule out the scan's qual, honouring
@@ -452,6 +457,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | AVG1 | avg returning numeric inside expressions and below the top |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
+| C1b | Direct PAX reader: a micro-partition's groups read in parallel |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side

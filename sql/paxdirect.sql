@@ -35,17 +35,20 @@ DELETE FROM df_pd_dist WHERE a % 1000 = 7;
 
 SET datafusion.mode = off;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
-SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e;
+SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e ORDER BY e;
 SET datafusion.mode = on;
 SET datafusion.pax_direct_read = on;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
-SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e;
+SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e ORDER BY e;
 
 -- Strings (C1): text, varchar and char(n) as offsets and bytes, with NULLs,
 -- empty strings, multibyte characters and char(n)'s padding; values PAX
 -- compressed (over pax.min_size_of_compress_toast) or put in its toast file
 -- (over pax.min_size_of_external_toast); the vectorized storage format,
--- which keeps char(n) without padding and strings without headers.
+-- which keeps char(n) without padding and strings without headers.  Groups
+-- of 1000 rows give each segment's one micro-partition several groups,
+-- which DataFusion's partitions read in parallel (C1b).
+SET pax.max_tuples_per_group = 1000;
 CREATE TABLE df_pd_str (id int, t text, v varchar(12), b char(5)) USING pax DISTRIBUTED BY (id);
 INSERT INTO df_pd_str SELECT k,
   CASE WHEN k % 11 = 0 THEN NULL WHEN k % 7 = 0 THEN '' ELSE 'é' || k END,
@@ -55,6 +58,7 @@ FROM generate_series(1, 20000) k;
 INSERT INTO df_pd_str VALUES (-1, repeat('ab', 300000), 'big', 'z'),
   (-2, repeat('xyz', 3600000), 'bigger', 'z');
 DELETE FROM df_pd_str WHERE id % 1000 = 3;
+RESET pax.max_tuples_per_group;
 CREATE TABLE df_pd_vec (id int, t text, b char(4)) USING pax
   WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
 INSERT INTO df_pd_vec SELECT k, CASE WHEN k % 9 = 0 THEN NULL ELSE 'v' || k END,

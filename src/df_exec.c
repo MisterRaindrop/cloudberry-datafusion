@@ -675,7 +675,8 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 	status = df_ffi_query_start_pax(x->spec.json, (uint32_t) workers,
 									(uint64_t) x->memory_limit, df_spill_dir(),
 									scan, (uint32_t) reader->nblocks(scan),
-									reader->read, reader->end, df_query_flags(x),
+									reader->read, reader->end, reader->block_groups,
+									df_query_flags(x),
 									&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{

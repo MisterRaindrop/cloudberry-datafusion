@@ -34,22 +34,22 @@ DELETE FROM df_pd_vec WHERE a % 1000 = 7;
 
 SET datafusion.mode = off;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd WHERE e < 50;
-SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
+SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d ORDER BY d;
 SELECT count(*) FROM df_pd;
-SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL ORDER BY a, b;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_vec WHERE e < 50;
-SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL;
-SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d;
+SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL ORDER BY a, b;
+SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
 
 SET datafusion.mode = on;
 SET datafusion.pax_direct_read = on;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd WHERE e < 50;
-SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d;
+SELECT d, count(*), min(e), max(c) FROM df_pd GROUP BY d ORDER BY d;
 SELECT count(*) FROM df_pd;
-SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL;
+SELECT a, b, c, d, e FROM df_pd WHERE a % 100000 = 0 OR a % 1000 = 7 OR a IS NULL OR b IS NULL ORDER BY a, b;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd_vec WHERE e < 50;
-SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL;
-SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d;
+SELECT a, b, c, d, e FROM df_pd_vec WHERE a % 100000 = 0 OR a IS NULL OR b IS NULL ORDER BY a, b;
+SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
 SELECT datafusion_debug_pax_direct_scans() AS direct_scans;
 
 -- Rows inserted and deleted earlier in the same transaction are seen as
@@ -102,11 +102,11 @@ INSERT INTO df_pd_date VALUES ('infinity', '-infinity'), (NULL, NULL);
 RESET pax.max_tuples_per_group;
 SET datafusion.mode = off;
 SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
-SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL ORDER BY d, ts;
 SET datafusion.mode = on;
 SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
 SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
-SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL;
+SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL ORDER BY d, ts;
 -- The memory PAX's reader held is given back once the scan is over.
 SELECT count(*) FROM df_pd_skip;
 SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
