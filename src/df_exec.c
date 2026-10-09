@@ -640,11 +640,11 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 			return false;
 	}
 	/*
-	 * The reader hands out fixed-width values and strings (not numeric), of
-	 * the table's own columns (not ctid).
+	 * The reader hands out fixed-width values, strings and numerics, of the
+	 * table's own columns (not ctid).
 	 */
 	for (c = 0; c < in->spec->ncols; c++)
-		if (in->spec->types[c] == NUMERICOID || in->spec->attnos[c] <= 0)
+		if (in->spec->attnos[c] <= 0)
 			return false;
 	reader = df_pax_reader_get();
 	if (reader == NULL)
@@ -655,7 +655,9 @@ df_exec_begin_pax(DfExec *x, DfInput *in, int workers)
 	for (c = 0; c < in->spec->ncols; c++)
 	{
 		cols[c] = in->spec->attnos[c] - 1;
-		widths[c] = df_type_is_string(in->spec->types[c]) ? -1 :
+		/* strings and numerics as their bytes (C1, C2) */
+		widths[c] = df_type_is_string(in->spec->types[c]) ||
+			in->spec->types[c] == NUMERICOID ? -1 :
 			df_type_width(in->spec->types[c]);
 	}
 	/*

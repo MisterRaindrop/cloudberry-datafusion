@@ -187,8 +187,15 @@ That code calls PAX's internal C++ classes, not a published API:
   does not load, warns once and reads through the table AM.
 - Cloudberry's parallel mode keeps the table AM path.
 
-It reads fixed-width columns and strings (text, varchar, char(n)); a scan
-of numeric columns or of ctid goes through the table AM.  DataFusion's
+It reads fixed-width columns, strings (text, varchar, char(n)) and
+numeric(p, s) columns (C2); a scan of ctid goes through the table AM.
+Numerics come out in PostgreSQL's representation and are read by
+df_core::pgnum::from_pg_numeric, as df_numeric.c reads them on the main
+thread (within 38 digits in i128, without allocating); the vectorized
+format's 16-byte numerics are rebuilt in that representation by the
+reader, since PAX's own conversion calls PostgreSQL's numeric functions.
+On one segment of TPC-H at scale factor 1, summing four numeric(15,2)
+columns of lineitem takes 43 ms against 154 ms through the table AM.  DataFusion's
 partitions take micro-partitions one at a time while at least as many are
 left as there are partitions; past that (C1b) a partition taking one
 counts its groups from the footer, reads the first and queues the others,
@@ -458,6 +465,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
+| C2 | Direct PAX reader: numeric(p, s) columns |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -772,8 +780,8 @@ operands may have, not by their values, so nothing can overflow at run
 time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
 + tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
 `numeric`, `/` and `%` (whose result scale depends on the values) and
-unary minus stay on PostgreSQL; the direct PAX reader leaves numeric
-columns to the table AM.  Over 20 million rows of `numeric(15,2)` columns,
+unary minus stay on PostgreSQL; the direct PAX reader reads numeric
+columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
 against 2.31 s in PostgreSQL.

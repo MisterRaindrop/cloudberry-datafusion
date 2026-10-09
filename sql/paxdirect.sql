@@ -81,6 +81,43 @@ SELECT b, count(*) FROM df_pd_str WHERE b < 'b' COLLATE "C" OR b IS NULL GROUP B
 SELECT count(*), count(t), sum(length(t)), sum(octet_length(b)) FROM df_pd_vec;
 SELECT id, t, b, octet_length(b) FROM df_pd_vec WHERE id BETWEEN 5 AND 13 ORDER BY id;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec;
+-- numeric(p, s) (C2): handed out in PostgreSQL's representation and read
+-- like the main thread's numerics; the vectorized format's 16-byte values
+-- (an integer, its display scale, NaN and infinity tags) are rebuilt as
+-- PostgreSQL's representation without PostgreSQL's functions.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_num (id int, a numeric(15,2), b numeric(30,10), d numeric(5,5)) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vnum (LIKE df_pd_num) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_num SELECT k,
+  CASE WHEN k % 97 = 0 THEN NULL WHEN k % 89 = 0 THEN 'NaN' ELSE (k * 37 % 100000 - 50000) * 1.01 END,
+  CASE WHEN k % 53 = 0 THEN NULL ELSE ((k % 1000) - 500) * 123456.7891234567 END,
+  CASE WHEN k % 31 = 0 THEN NULL ELSE ((k % 199999) - 99999) / 100000.0 END
+FROM generate_series(1, 20000) k;
+INSERT INTO df_pd_num VALUES (-1, 9999999999999.99, 99999999999999999999.9999999999, 0.99999),
+  (-2, -9999999999999.99, -99999999999999999999.9999999999, -0.99999),
+  (-3, 0, 0, 0), (-4, 0.01, 0.0000000001, 0.00001), (-5, -0.01, -0.0000000001, -0.00001);
+INSERT INTO df_pd_vnum SELECT * FROM df_pd_num;
+RESET pax.max_tuples_per_group;
+
+SET datafusion.motion_batches = on;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_num;
+SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_num;
+SELECT id, a, b, d FROM df_pd_num WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_vnum;
+SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_vnum;
+SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_num;
+SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_num;
+SELECT id, a, b, d FROM df_pd_num WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_vnum;
+SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_vnum;
+SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+RESET datafusion.motion_batches;
+
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

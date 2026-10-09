@@ -321,11 +321,168 @@ impl ScalarUDFImpl for PgNumeric {
     }
 }
 
+/// A numeric value in PostgreSQL's representation (utils/numeric.h), the
+/// bytes after its varlena header, at `scale`: as df_numeric_value_wide
+/// reads it on the C side, for the direct PAX reader (C2).  NaN and the
+/// infinities become their sentinels; a value with more fractional digits
+/// than `scale`, or more than 76 digits at it, is an error.
+pub fn from_pg_numeric(bytes: &[u8], scale: i8) -> std::result::Result<i256, String> {
+    const NUMERIC_SIGN_MASK: u16 = 0xC000;
+    const NUMERIC_NEG: u16 = 0x4000;
+    const NUMERIC_SHORT: u16 = 0x8000;
+    const NUMERIC_SPECIAL: u16 = 0xC000;
+    const NUMERIC_NAN_HDR: u16 = 0xC000;
+    const NUMERIC_NINF_HDR: u16 = 0xF000;
+    let word = |at: usize| -> std::result::Result<u16, String> {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+            .ok_or_else(|| "truncated numeric value".to_string())
+    };
+    let h = word(0)?;
+    if h & NUMERIC_SIGN_MASK == NUMERIC_SPECIAL {
+        return Ok(match h {
+            NUMERIC_NAN_HDR => NUMERIC_NAN,
+            NUMERIC_NINF_HDR => NUMERIC_NINF,
+            _ => NUMERIC_PINF,
+        });
+    }
+    let (neg, dscale, weight, first) = if h & NUMERIC_SHORT != 0 {
+        // short form: sign, display scale and weight in the header word
+        let weight = (h & 0x003F) as i32 - if h & 0x0040 != 0 { 0x40 } else { 0 };
+        (h & 0x2000 != 0, ((h & 0x1F80) >> 7) as i32, weight, 2)
+    } else {
+        let weight = word(2)? as i16 as i32;
+        (
+            h & NUMERIC_SIGN_MASK == NUMERIC_NEG,
+            (h & 0x3FFF) as i32,
+            weight,
+            4,
+        )
+    };
+    // NBASE digits, read in place: this runs once per value of a scan
+    let digits = &bytes[first..];
+    let ndigits = digits.len() / 2;
+    let digit = |i: usize| u16::from_ne_bytes([digits[2 * i], digits[2 * i + 1]]) as i32;
+    let scale = scale as i32;
+    // decimal digits before the point
+    let int_digits = if ndigits > 0 && weight >= 0 {
+        let d = digit(0);
+        weight * 4 + if d == 0 { 0 } else { d.ilog10() as i32 + 1 }
+    } else {
+        0
+    };
+    if dscale > scale || int_digits + scale > NUMERIC_PRECISION as i32 {
+        return Err(format!(
+            "numeric value beyond numeric({NUMERIC_PRECISION}, {scale})"
+        ));
+    }
+    // Horner over the digits worth at least 1 at `scale`; the next one may
+    // reach past it, with zeros there since dscale <= scale.  Within 38
+    // digits (any numeric(p, s) column) in i128, beyond that in i256.
+    if int_digits + scale <= 38 {
+        let mut acc: i128 = 0;
+        let mut exp10 = 0i32;
+        for i in 0..ndigits {
+            let e = (weight - i as i32) * 4 + scale;
+            if e >= 0 {
+                acc = acc * 10000 + digit(i) as i128;
+                exp10 = e;
+            } else {
+                acc *= POW10_I128[exp10 as usize];
+                exp10 = 0;
+                if e > -4 {
+                    acc += (digit(i) / 10i32.pow((-e) as u32)) as i128;
+                }
+                break;
+            }
+        }
+        acc *= POW10_I128[exp10 as usize];
+        return Ok(i256::from_i128(if neg { -acc } else { acc }));
+    }
+    let nbase = i256::from_i128(10000);
+    let mut acc = i256::ZERO;
+    let mut exp10 = 0i32;
+    for i in 0..ndigits {
+        let e = (weight - i as i32) * 4 + scale;
+        if e >= 0 {
+            acc = acc * nbase + i256::from_i128(digit(i) as i128);
+            exp10 = e;
+        } else {
+            acc *= pow10(exp10 as u32);
+            exp10 = 0;
+            if e > -4 {
+                acc += i256::from_i128((digit(i) / 10i32.pow((-e) as u32)) as i128);
+            }
+            break;
+        }
+    }
+    acc *= pow10(exp10 as u32);
+    Ok(if neg { acc.wrapping_neg() } else { acc })
+}
+
+/// 10^0 .. 10^38
+const POW10_I128: [i128; 39] = {
+    let mut t = [1i128; 39];
+    let mut k = 1;
+    while k < 39 {
+        t[k] = t[k - 1] * 10;
+        k += 1;
+    }
+    t
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use datafusion::arrow::datatypes::Field;
     use datafusion::config::ConfigOptions;
+
+    /// PostgreSQL's representation of a numeric, after the varlena header.
+    fn pg_bytes(header: u16, weight: Option<i16>, digits: &[u16]) -> Vec<u8> {
+        let mut b = header.to_ne_bytes().to_vec();
+        if let Some(w) = weight {
+            b.extend(w.to_ne_bytes());
+        }
+        for d in digits {
+            b.extend(d.to_ne_bytes());
+        }
+        b
+    }
+
+    #[test]
+    fn reads_pg_numerics() {
+        let v = |b: &[u8], s: i8| from_pg_numeric(b, s).unwrap();
+        // 1.50, short form: dscale 2 in bits 7-12, weight 0
+        let x = pg_bytes(0x8000 | (2 << 7), None, &[1, 5000]);
+        assert_eq!(v(&x, 2), i256::from_i128(150));
+        assert_eq!(v(&x, 4), i256::from_i128(15000));
+        assert!(from_pg_numeric(&x, 1).is_err());
+        // -1234.5678, long form: NUMERIC_NEG | dscale 4, weight 0
+        let x = pg_bytes(0x4000 | 4, Some(0), &[1234, 5678]);
+        assert_eq!(v(&x, 4), i256::from_i128(-12345678));
+        // 0.001: weight -1 in the short form's 7-bit field, digit 0010
+        let x = pg_bytes(0x8000 | (3 << 7) | 0x0040 | 0x3F, None, &[10]);
+        assert_eq!(v(&x, 3), i256::from_i128(1));
+        assert_eq!(v(&x, 5), i256::from_i128(100));
+        // 12.3: its last digit 3000 reaches past scale 1, with zeros there
+        let x = pg_bytes(0x8000 | (1 << 7), None, &[12, 3000]);
+        assert_eq!(v(&x, 1), i256::from_i128(123));
+        // 0 has no digits
+        assert_eq!(v(&pg_bytes(0x8000, None, &[]), 2), i256::ZERO);
+        // 10^36 at scale 2 (38 digits) and the largest 76-digit integer
+        let x = pg_bytes(0x8000 | 9, None, &[1]);
+        assert_eq!(v(&x, 2), pow10(38));
+        let x = pg_bytes(0, Some(18), &[9999; 19]);
+        assert_eq!(v(&x, 0), pow10(76) - i256::ONE);
+        // one more digit is too many
+        let x = pg_bytes(0, Some(19), &[1]);
+        assert!(from_pg_numeric(&x, 0).is_err());
+        // NaN and the infinities
+        assert_eq!(v(&pg_bytes(0xC000, None, &[]), 2), NUMERIC_NAN);
+        assert_eq!(v(&pg_bytes(0xD000, None, &[]), 2), NUMERIC_PINF);
+        assert_eq!(v(&pg_bytes(0xF000, None, &[]), 2), NUMERIC_NINF);
+    }
 
     /// numeric_div(s::numeric(38, 2), c), as numeric_avg computes avg:
     /// SELECT (s::numeric(38,2) / c::numeric)::text.

@@ -99,8 +99,8 @@ typedef struct DfColumn
 } DfColumn;
 
 /*
- * A column as the PAX reader hands it out: fixed-width values, or a
- * string's bytes and nrows + 1 offsets (DatafusionPaxColumn).
+ * A column as the PAX reader hands it out: fixed-width values, or the
+ * bytes of strings or numerics and nrows + 1 offsets (DatafusionPaxColumn).
  */
 typedef struct DfPaxColumn
 {

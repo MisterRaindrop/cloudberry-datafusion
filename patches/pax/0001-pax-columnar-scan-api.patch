@@ -1,4 +1,4 @@
-From 4d7fa47dd6e035067443885dfd0c4eaa524f02fc Mon Sep 17 00:00:00 2001
+From c14abcb1ea59c18131192b4df2756660e557808b Mon Sep 17 00:00:00 2001
 From: MisterRaindrop <p_xiaoyu.liu@synxdata.com>
 Date: Mon, 5 Oct 2026 17:05:43 +0800
 Subject: [PATCH] pax: add a columnar scan interface for datafusion_executor
@@ -11,24 +11,25 @@ symbol is local, so nothing can clash with PAX or PostgreSQL.
 
 begin skips micro-partitions and groups by their min/max statistics, as
 PAX's own scan does, on the main thread since that calls fmgr.  read_block
-hands out fixed-width columns and strings (text, varchar, bpchar, as
-offsets and bytes, PAX's toast decoded) and reports the memory it holds
-(read buffer, decoded columns, visibility map, handed-out rows) so that
-the caller can account for it.  block_groups lets callers spread the
-groups of one block over several threads.
+hands out fixed-width columns, and strings (text, varchar, bpchar) and
+numerics as offsets and bytes, with PAX's toast and the vectorized
+format's numerics decoded without PostgreSQL calls.  It reports the
+memory it holds (read buffer, decoded columns, visibility map, handed-out
+rows) so that the caller can account for it.  block_groups lets callers
+spread the groups of one block over several threads.
 ---
- .../src/cpp/access/datafusion_scan_api.cc     | 452 ++++++++++++++++++
- .../src/cpp/access/datafusion_scan_api.h      | 127 +++++
- 2 files changed, 579 insertions(+)
+ .../src/cpp/access/datafusion_scan_api.cc     | 509 ++++++++++++++++++
+ .../src/cpp/access/datafusion_scan_api.h      | 128 +++++
+ 2 files changed, 637 insertions(+)
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
  create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 new file mode 100644
-index 0000000..4eaff2c
+index 0000000..929ff5f
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,452 @@
+@@ -0,0 +1,509 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -122,6 +123,54 @@ index 0000000..4eaff2c
 +  size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
 +  DatafusionPaxScanInfo info;
 +};
++
++// A numeric of the vectorized format (comm/vec_numeric.cc), 16 bytes: the
++// value times 10^dscale as a 120-bit two's complement integer, in the low
++// word and bits 0-55 of the high word, dscale in bits 56-61 and a special
++// tag in bits 62-63 (1 +Infinity, 2 NaN, 3 -Infinity).  Appended to 'out'
++// as PostgreSQL's numeric without its varlena header, in the long form:
++// sign and dscale, weight, NBASE digits aligned on the decimal point.
++void AppendVecNumeric(const char *src, std::vector<char> &out) {
++  uint64_t lo, hi;
++  std::memcpy(&lo, src, sizeof(lo));
++  std::memcpy(&hi, src + sizeof(lo), sizeof(hi));
++  auto put16 = [&out](uint16_t v) {
++    const char *b = reinterpret_cast<const char *>(&v);
++    out.insert(out.end(), b, b + sizeof(v));
++  };
++  const unsigned tag = static_cast<unsigned>(hi >> 62);
++  if (tag != 0) {
++    put16(tag == 1 ? 0xD000 : tag == 3 ? 0xF000 : 0xC000);
++    return;
++  }
++  const int dscale = static_cast<int>((hi >> 56) & 0x3F);
++  const unsigned __int128 mask = (static_cast<unsigned __int128>(1) << 120) - 1;
++  unsigned __int128 mag =
++      (static_cast<unsigned __int128>(hi & 0x00FFFFFFFFFFFFFFULL) << 64) | lo;
++  const bool neg = ((hi >> 55) & 1) != 0;
++  if (neg) mag = (~mag + 1) & mask;
++
++  // NBASE digits, least significant first; the lowest fractional one holds
++  // the last dscale % 4 decimal digits, padded with zeros.
++  static const unsigned kPow10[] = {1, 10, 100, 1000, 10000};
++  std::vector<uint16_t> digits;
++  const int partial = dscale % 4;
++  if (partial > 0) {
++    digits.push_back(static_cast<uint16_t>(
++        (mag % kPow10[partial]) * kPow10[4 - partial]));
++    mag /= kPow10[partial];
++  }
++  while (mag > 0) {
++    digits.push_back(static_cast<uint16_t>(mag % 10000));
++    mag /= 10000;
++  }
++  while (!digits.empty() && digits.back() == 0) digits.pop_back();
++  const int nfrac = (dscale + 3) / 4;
++  const int weight = digits.empty() ? 0 : static_cast<int>(digits.size()) - 1 - nfrac;
++  put16(static_cast<uint16_t>((neg && !digits.empty() ? 0x4000 : 0) | dscale));
++  put16(static_cast<uint16_t>(static_cast<int16_t>(weight)));
++  for (auto d = digits.rbegin(); d != digits.rend(); ++d) put16(*d);
++}
 +
 +void SetError(char *err, size_t errlen, const char *what, const char *msg) {
 +  if (err && errlen > 0) snprintf(err, errlen, "%s: %s", what, msg);
@@ -343,6 +392,7 @@ index 0000000..4eaff2c
 +        pax::Bitmap8 *bm;  // bit set: the row has a value
 +        bool dense;
 +        bool bits;
++        bool vec_numeric;
 +      };
 +      std::vector<ColState> cols(ncols);
 +      for (size_t k = 0; k < ncols; k++) {
@@ -361,7 +411,9 @@ index 0000000..4eaff2c
 +            col->GetStorageFormat() !=
 +                pax::PaxStorageFormat::kTypeStoragePorcVec,
 +            col->GetPaxColumnTypeInMem() ==
-+                pax::PaxColumnTypeInMem::kTypeVecBitPacked};
++                pax::PaxColumnTypeInMem::kTypeVecBitPacked,
++            col->GetPaxColumnTypeInMem() ==
++                pax::PaxColumnTypeInMem::kTypeVecDecimal};
 +        const int w = scan->widths[k];
 +        values[k].assign(w > 0 ? keep.size() * w : 0, 0);
 +        nulls[k].assign(keep.size(), 0);
@@ -416,8 +468,14 @@ index 0000000..4eaff2c
 +                std::memset(values[k].data() + chunk * w, 0, w);
 +              else
 +                offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++            } else if (w <= 0 && st.vec_numeric) {
++              // the vectorized format's numeric, decoded here: its own
++              // GetDatum goes through PostgreSQL's numeric functions
++              nulls[k][chunk] = 0;
++              AppendVecNumeric(st.buf + i * 16, values[k]);
++              offsets[k].push_back(static_cast<int32_t>(values[k].size()));
 +            } else if (w <= 0) {
-+              // A string: its bytes without the varlena header.  GetDatum
++              // A string or a numeric: its bytes without the varlena header.  GetDatum
 +              // decodes PAX's toast (compressed inline or in the toast
 +              // file, with PAX's own pglz/lz4) and, in the vectorized
 +              // format, restores the header and char(n)'s padding.
@@ -483,10 +541,10 @@ index 0000000..4eaff2c
 +}
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 new file mode 100644
-index 0000000..b66c7ed
+index 0000000..fcac5f6
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,128 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -543,7 +601,7 @@ index 0000000..b66c7ed
 +extern "C" {
 +#endif
 +
-+#define DATAFUSION_PAX_SCAN_API_VERSION 4
++#define DATAFUSION_PAX_SCAN_API_VERSION 5
 +
 +struct List;
 +struct RelationData;
@@ -551,9 +609,10 @@ index 0000000..b66c7ed
 +
 +/* Rows of one group, or of part of it: one null byte per row (1 = null).
 + * A fixed-width column's values are packed at its width and 'offsets' is
-+ * NULL; a string column's are the bytes of its values (without varlena
-+ * headers, char(n) with its padding), row i at offsets[i]..offsets[i + 1],
-+ * nrows + 1 offsets. */
++ * NULL; a string or numeric column's are the bytes of its values (without
++ * varlena headers, char(n) with its padding, a numeric as PostgreSQL's
++ * representation), row i at offsets[i]..offsets[i + 1], nrows + 1
++ * offsets. */
 +typedef struct DatafusionPaxColumn {
 +  const void *values;
 +  const uint8_t *nulls;
@@ -588,7 +647,7 @@ index 0000000..b66c7ed
 +   * micro-partitions and groups whose min/max statistics rule it out, as
 +   * PAX's own scan does; the caller still applies it to every row.  'cols'
 +   * are the 0-based table columns to read, with their value widths: -1 for
-+   * a string (text, varchar, bpchar). */
++   * a string (text, varchar, bpchar) or a numeric. */
 +  void *(*begin)(struct RelationData *rel, struct SnapshotData *snapshot,
 +                 struct List *qual, const int *cols, const int *widths,
 +                 int ncols, char *err, size_t errlen);

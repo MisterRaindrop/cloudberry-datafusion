@@ -292,8 +292,9 @@ impl RawColumn {
     }
 }
 
-/// A column as the PAX reader hands it out: fixed-width values, or a
-/// string's bytes with `nrows + 1` offsets (null for fixed-width types).
+/// A column as the PAX reader hands it out: fixed-width values, or the
+/// bytes of strings or numerics (PostgreSQL's representation) with
+/// `nrows + 1` offsets (null for fixed-width types).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PaxColumn {
@@ -2507,6 +2508,26 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
         PgType::Int8 => primitive::<Int64Type>(c, n, nulls),
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
+        PgType::Numeric(s) if !c.offsets.is_null() => {
+            // PostgreSQL's representation, as the direct PAX reader hands it
+            // out (C2): each row's bytes after the varlena header
+            let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
+            let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
+            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+            let values = (0..n)
+                .map(|r| {
+                    if null_bytes[r] != 0 {
+                        return Ok(datafusion::arrow::datatypes::i256::ZERO);
+                    }
+                    let row = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
+                    crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)
+                })
+                .collect::<Result<Vec<_>, PgError>>()?;
+            Arc::new(
+                PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
+                    .with_data_type(crate::pgnum::numeric_type(s)),
+            )
+        }
         PgType::Numeric(s) => {
             // 32 little-endian bytes each; palloc aligns to 8 only.
             let p = c.values as *const [u8; 32];
