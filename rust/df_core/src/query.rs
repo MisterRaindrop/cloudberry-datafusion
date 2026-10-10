@@ -124,7 +124,7 @@ use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
+use datafusion::functions_aggregate::expr_fn::{avg, bool_or, count, max, min, sum};
 use datafusion::logical_expr::{
     binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, LogicalPlanBuilder, Operator,
 };
@@ -747,11 +747,13 @@ fn is_float_expr(e: &Expr, input: &DFSchema) -> bool {
 }
 
 /// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
-/// counts, sum_decimal's "some value is NaN".
+/// counts, sum_decimal's "some value is NaN".  The latter is bool_or, not
+/// max: DataFusion's max of booleans has no groups accumulator and keeps one
+/// row accumulator per group, about 50 times slower over many groups.
 fn aggregate_extra(v: &Value, over: Option<&Expr>) -> Result<Option<Expr>, String> {
     match field(v, "fn")?.as_str() {
         Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
-        Some("sum_decimal") => Ok(Some(max(PgNumeric::udf(NumericFn::IsNan).call(vec![
+        Some("sum_decimal") => Ok(Some(bool_or(PgNumeric::udf(NumericFn::IsNan).call(vec![
             agg_arg(v, over)?.ok_or("sum_decimal needs an argument")?,
         ])))),
         _ => Ok(None),
@@ -1612,7 +1614,7 @@ fn build_node(
                     }
                     "sum_decimal" => {
                         agg_exprs.push(sum(p).alias(&a));
-                        agg_exprs.push(max(pn).alias(format!("{a}_n")));
+                        agg_exprs.push(bool_or(pn).alias(format!("{a}_n")));
                     }
                     _ => agg_exprs.push(sum(p).alias(&a)),
                 }
