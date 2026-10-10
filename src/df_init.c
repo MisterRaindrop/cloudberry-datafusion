@@ -132,6 +132,19 @@ _PG_init(void)
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("datafusion.cluster_collation_c",
+							 "Whether the database's default collation is C on every node.",
+							 "Set by the extension on the coordinator, which asks every "
+							 "segment, and sent to them: ordering strings by the default "
+							 "collation then runs in DataFusion where batch Motions are "
+							 "chosen alike on every node.",
+							 &df_cluster_collation_c,
+							 false,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE |
+							 GUC_DISALLOW_IN_FILE,
+							 NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();

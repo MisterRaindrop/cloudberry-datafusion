@@ -43,11 +43,16 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_type_d.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
 #include "commands/defrem.h"
+#include "executor/spi.h"
 #include "mb/pg_wchar.h"
 #include "executor/execUtils.h"
 #include "miscadmin.h"
@@ -66,6 +71,7 @@
 #include "utils/date.h"
 #include "utils/timestamp.h"
 #include "utils/fmgroids.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -356,7 +362,8 @@ df_type_is_string(Oid type)
  * Why comparing strings under 'collation' as 'name' does stays on
  * PostgreSQL, or NULL.  Whether the database's default collation is C is
  * each node's own: the coordinator and the segments can differ (e.g. C and
- * C.UTF-8), so such a verdict is marked as depending on the node.
+ * C.UTF-8), so such a verdict is marked as depending on the node, unless
+ * the coordinator found it C on every node (df_sync_cluster_collation).
  */
 static const char *
 df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
@@ -365,7 +372,7 @@ df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 	bool		equality = strcmp(name, "=") == 0 || strcmp(name, "<>") == 0 ||
 		strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0;
 
-	if (!equality && collation == DEFAULT_COLLATION_OID)
+	if (!equality && collation == DEFAULT_COLLATION_OID && !df_cluster_collation_c)
 		cxt->locale_dependent = true;
 	if (!OidIsValid(collation))
 		return "without a collation";
@@ -3604,6 +3611,111 @@ df_plan_contains(Plan *plan, Plan *target)
  * ---------------------------------------------------------------------
  */
 bool		df_motion_batches = false;
+bool		df_cluster_collation_c = false;
+
+/*
+ * Is the database's default collation C (or POSIX, by libc) on the
+ * coordinator and every primary segment?  Asked once per session: a
+ * database's collation does not change.  An error asking, other than a
+ * cancel, counts as no.
+ */
+static bool
+df_probe_cluster_collation(void)
+{
+	MemoryContext cxt = CurrentMemoryContext;
+	ResourceOwner owner = CurrentResourceOwner;
+	bool		c = false;
+
+	if (!lc_collate_is_c(DEFAULT_COLLATION_OID))
+		return false;
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(cxt);
+	PG_TRY();
+	{
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute("SELECT count(*), count(*) FILTER (WHERE datlocprovider = 'c' "
+						"AND datcollate IN ('C', 'POSIX')) "
+						"FROM gp_dist_random('pg_database') "
+						"WHERE datname = current_database()",
+						true, 0) == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			bool		isnull;
+			int64		all = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+														  SPI_tuptable->tupdesc, 1, &isnull));
+			int64		clike = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+															SPI_tuptable->tupdesc, 2, &isnull));
+
+			c = all == getgpsegmentCount() && clike == all;
+		}
+		SPI_finish();
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(cxt);
+		edata = CopyErrorData();
+		FlushErrorState();
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(cxt);
+		CurrentResourceOwner = owner;
+		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
+			ReThrowError(edata);
+		elog(LOG, "datafusion: cannot ask the segments for their collation: %s",
+			 edata->message);
+		FreeErrorData(edata);
+		c = false;
+	}
+	PG_END_TRY();
+	return c;
+}
+
+/*
+ * On the coordinator, before a query is planned for EXPLAIN or dispatched:
+ * set datafusion.cluster_collation_c to whether the default collation is C
+ * on every node, here and on the segments.  Their running processes get
+ * the SET; those started later, every synchronized setting (makeOptions).
+ * The checker of each process then reads one value, so all of them agree
+ * on which Motions carry batches.  A transaction that aborts undoes the
+ * SET everywhere, and the next query sets it again.
+ */
+void
+df_sync_cluster_collation(void)
+{
+	static int	verdict = -1;	/* not asked yet */
+	static bool asking = false;
+	bool		c;
+
+	if (Gp_role != GP_ROLE_DISPATCH || df_mode == DF_MODE_OFF || asking ||
+		!IsTransactionState())
+		return;
+	if (verdict < 0)
+	{
+		/* the question is a query, which comes back here */
+		asking = true;
+		PG_TRY();
+		{
+			verdict = df_probe_cluster_collation() ? 1 : 0;
+		}
+		PG_FINALLY();
+		{
+			asking = false;
+		}
+		PG_END_TRY();
+	}
+	c = verdict == 1;
+	if (df_cluster_collation_c == c)
+		return;
+	SetConfigOption("datafusion.cluster_collation_c", c ? "on" : "off",
+					PGC_USERSET, PGC_S_SESSION);
+	if (cdbcomponent_qesExist())
+		CdbDispatchSetCommand(c ? "SET datafusion.cluster_collation_c TO on" :
+							  "SET datafusion.cluster_collation_c TO off", true);
+}
 
 /*
  * Would the executor hook run slice 'index' in DataFusion, if the Motions

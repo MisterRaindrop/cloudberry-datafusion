@@ -40,7 +40,7 @@ EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor runtime hooks exec memory motion receive batches joins types strings numeric expressions sort distinct partial storage parallel
+REGRESS = datafusion_executor runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort distinct partial storage parallel
 # The direct PAX reader is only tested when it is built.
 ifdef DF_PAX_SRC
 REGRESS += paxdirect

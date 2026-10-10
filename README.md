@@ -506,6 +506,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4 | Direct PAX reader on by default |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
+| CL1 | Strings ordered by the default collation where it is C on every node |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would
@@ -700,7 +701,22 @@ not depend on it: in TPC-H Q1 the aggregate under a Sort by `char(1)`
 columns reads the batches of a split numeric sum; every node runs that
 aggregate in DataFusion, and the Sort above it too where the collation is
 C, or on PostgreSQL where it is not.  An explicit `COLLATE "C"` is the
-same everywhere and keeps the batches.  `ILIKE`, regular expressions, `md5`, `initcap` and other
+same everywhere and keeps the batches.
+
+CL1: where the default collation is C (or POSIX, by libc) on every node,
+ordering by it no longer depends on the node.  The coordinator asks once
+per session, before its first query with `datafusion.mode` on is planned
+for EXPLAIN or dispatched, querying `pg_database` on every segment, and
+sets the internal `datafusion.cluster_collation_c` accordingly (a value
+set by hand is put back); the segments' running processes get the SET,
+those started later every synchronized setting.  Each process's checker
+then reads the same value, and the Motions of such slices carry batches:
+in TPC-H Q7 on GPORCA the Sort below the combining aggregate kept its
+slice on PostgreSQL, and the partial sums below it in tuples.  A database
+created without `LC_COLLATE` takes each node's own template's, so a
+cluster initialized with different locales needs `CREATE DATABASE ...
+TEMPLATE template0 LC_COLLATE 'C'` for this.  Asking costs about 4 ms
+once per session.  `ILIKE`, regular expressions, `md5`, `initcap` and other
 string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out strings too (C1), as
 offsets and bytes like the main thread's batches: char(n) keeps its
