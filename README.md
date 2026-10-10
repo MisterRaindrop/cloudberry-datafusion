@@ -507,6 +507,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | CL1 | Strings ordered by the default collation where it is C on every node |
+| IP2 | The slices below an init plan's top slice, with batch Motions between them |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would
@@ -597,8 +598,7 @@ read its plan's, and its own filter runs over them.  An aggregate below it
 is not the slice's top one, so it runs as A1 has it.  The Motions below a
 Subquery Scan or an Append now count when choosing batch Motions; before,
 they always carried tuples, so a partial sum below one stayed on
-PostgreSQL.  Those of init plans still do: an init plan's top slice has
-no sending Motion to find its plan by.
+PostgreSQL.  Those of init plans count too since IP2.
 
 RI1: for a semi join whose outer side is small, Cloudberry's planner
 joins first and drops the copies afterwards (JOIN_DEDUP_SEMI, TPC-H Q4 and
@@ -919,6 +919,17 @@ side becomes the infinity on its side, which keeps NaN above it as in
 PostgreSQL.  Whether a slice runs in DataFusion depends on the plan only,
 not on the value.  Other parameters (of a correlated subquery, a Nested
 Loop or a prepared statement) stay on PostgreSQL.
+
+IP2: an init plan has slices of its own.  Its top slice runs on the
+coordinator, on PostgreSQL's executor, when the coordinator sets the init
+plan's parameters before the query (`preprocess_initplans`): the executor
+hook never sees it, so it counts as a slice that does not run in
+DataFusion, and the Motion into it carries tuples.  The slices below it are
+like any other, found by the Motion they send through (`subplan_sliceIds`
+maps an init plan to its top slice, the one without a parent), and the
+Motions between them count when choosing batch Motions: TPC-H Q15's
+maximum revenue sums by supplier in DataFusion, the partial sums passing to
+the final ones as batches.  EXPLAIN lists these slices too.
 
 ### Expressions
 

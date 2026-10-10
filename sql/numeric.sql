@@ -205,6 +205,22 @@ SELECT g, sum(a) FROM df_nc GROUP BY g HAVING sum(a) > (SELECT sum(a) / 8 FROM d
 SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
 SET datafusion.mode = off;
 
+-- The slices of an init plan (IP2, TPC-H Q15): the coordinator runs its top
+-- slice before the query, on PostgreSQL's executor; those below it run in
+-- DataFusion, a split sum's state passing between them as batches.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r);
+SET datafusion.mode = off;
+SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc WHERE id > 0 GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r) ORDER BY g;
+SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t FROM df_nc GROUP BY g) r);
+SET datafusion.mode = on;
+SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc WHERE id > 0 GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r) ORDER BY g;
+SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t FROM df_nc GROUP BY g) r);
+SET datafusion.mode = off;
+
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

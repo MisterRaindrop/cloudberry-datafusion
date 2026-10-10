@@ -3718,6 +3718,44 @@ df_sync_cluster_collation(void)
 }
 
 /*
+ * IP2: the plan of init plan 'i' of 'stmt' (0-based in stmt->subplans) if
+ * it starts a slice of its own, the top slice of an init plan: one without
+ * a parent, which the coordinator runs on PostgreSQL's executor when it
+ * sets the init plan's parameters (preprocess_initplans), before the
+ * executor hook ever sees the query.  NULL for any other subplan.
+ */
+static Plan *
+df_init_plan_root(PlannedStmt *stmt, int i, int *slice)
+{
+	int			s;
+
+	if (stmt->subplan_sliceIds == NULL || i < 0 || i >= list_length(stmt->subplans))
+		return NULL;
+	s = stmt->subplan_sliceIds[i];
+	if (s <= 0 || s >= stmt->numSlices || stmt->slices[s].parentIndex != -1)
+		return NULL;
+	if (slice)
+		*slice = s;
+	return (Plan *) list_nth(stmt->subplans, i);
+}
+
+/* IP2: is slice 'index' the top slice of an init plan? */
+static bool
+df_is_init_plan_slice(PlannedStmt *stmt, int index)
+{
+	int			i;
+
+	for (i = 0; i < list_length(stmt->subplans); i++)
+	{
+		int			s;
+
+		if (df_init_plan_root(stmt, i, &s) != NULL && s == index)
+			return true;
+	}
+	return false;
+}
+
+/*
  * Would the executor hook run slice 'index' in DataFusion, if the Motions
  * in 'batches' carry batches?  The same check and translation it applies,
  * from the plan alone.  A slice whose verdict depends on the node's locale
@@ -3737,6 +3775,11 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 
 	if (index < 0 || index >= stmt->numSlices)
 		return false;
+	if (df_is_init_plan_slice(stmt, index))
+	{
+		elog(DEBUG2, "datafusion: slice %d is an init plan's top slice", index);
+		return false;
+	}
 	sender = findSenderMotion(stmt, index);
 	root = sender ? (Plan *) sender : stmt->planTree;
 	compute = sender ? outerPlan(root) : root;
@@ -3771,7 +3814,7 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
 
 	if (df_slice_runs_in_datafusion(stmt, index, batches))
 		return true;
-	if (index < 0 || index >= stmt->numSlices)
+	if (index < 0 || index >= stmt->numSlices || df_is_init_plan_slice(stmt, index))
 		return false;
 	sender = findSenderMotion(stmt, index);
 	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
@@ -3890,8 +3933,7 @@ df_motion_batchable(Motion *motion)
 
 /*
  * The Motions of the plan tree 'plan', also below a Subquery Scan and an
- * Append.  Those of init plans are not listed: their top slice has no
- * sending Motion to find it by (df_slice_runs_in_datafusion).
+ * Append.  Those of init plans are listed by the caller (IP2).
  */
 static void
 df_list_motions(Plan *plan, List **motions)
@@ -3931,10 +3973,13 @@ df_batch_motions(PlannedStmt *stmt)
 	Bitmapset  *batches = NULL;
 	ListCell   *lc;
 	bool		changed;
+	int			i;
 
 	if (!df_motion_batches || df_mode == DF_MODE_OFF)
 		return NULL;
 	df_list_motions(stmt->planTree, &motions);
+	for (i = 0; i < list_length(stmt->subplans); i++)
+		df_list_motions(df_init_plan_root(stmt, i, NULL), &motions);
 	foreach(lc, motions)
 	{
 		Motion	   *m = (Motion *) lfirst(lc);
@@ -4085,6 +4130,7 @@ typedef struct DfSliceRoot
 	int			index;
 	Plan	   *root;
 	bool		is_sender;		/* root is the Motion this slice sends through */
+	bool		init_plan;		/* the top slice of an init plan (IP2) */
 } DfSliceRoot;
 
 typedef struct DfCollectContext
@@ -4105,6 +4151,7 @@ df_add_root(DfCollectContext *cxt, int index, Plan *root, bool is_sender)
 	cxt->roots[cxt->nroots].index = index;
 	cxt->roots[cxt->nroots].root = root;
 	cxt->roots[cxt->nroots].is_sender = is_sender;
+	cxt->roots[cxt->nroots].init_plan = false;
 	cxt->nroots++;
 }
 
@@ -4146,13 +4193,28 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 	cxt.roots = palloc(sizeof(DfSliceRoot) * cxt.maxroots);
 	df_add_root(&cxt, root_index, stmt->planTree, false);
 	df_collect_motions((Node *) stmt->planTree, &cxt);
+	for (i = 0; i < list_length(stmt->subplans); i++)
+	{
+		int			slice;
+		Plan	   *plan = df_init_plan_root(stmt, i, &slice);
+
+		if (plan == NULL)
+			continue;
+		df_add_root(&cxt, slice, plan, false);
+		cxt.roots[cxt.nroots - 1].init_plan = true;
+		df_collect_motions((Node *) plan, &cxt);
+	}
 	qsort(cxt.roots, cxt.nroots, sizeof(DfSliceRoot), df_root_cmp);
 
 	for (i = 0; i < cxt.nroots; i++)
 	{
 		char		reason[256];
 
-		if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender, NULL,
+		if (cxt.roots[i].init_plan)
+			appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
+							 "which the coordinator runs before the query\n",
+							 cxt.roots[i].index);
+		else if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender, NULL,
 						   reason, sizeof(reason)))
 			appendStringInfo(out, "DataFusion: slice %d eligible%s\n", cxt.roots[i].index,
 							 cxt.roots[i].is_sender &&

@@ -663,8 +663,8 @@ SET datafusion.mode = off;
 -- a value beyond every row's becomes the infinity on its side.
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
-                       QUERY PLAN                       
---------------------------------------------------------
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    InitPlan 1 (returns $0)  (slice2)
      ->  Finalize Aggregate
@@ -679,11 +679,13 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a > (SELECT avg(a) FROM df_
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible, sends Arrow batches
-(14 rows)
+ DataFusion: slice 2 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 3 not eligible: partial aggregate avg without batch Motions
+(16 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc) > 0;
-                                  QUERY PLAN                                  
-------------------------------------------------------------------------------
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
  Finalize Aggregate
    InitPlan 1 (returns $0)  (slice2)
      ->  Finalize Aggregate
@@ -697,7 +699,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a + (SELECT avg(a) FROM df_
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
  DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
-(13 rows)
+ DataFusion: slice 2 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 3 not eligible: partial aggregate avg without batch Motions
+(15 rows)
 
 SET datafusion.mode = off;
 SELECT count(*), sum(id) FROM df_nc WHERE a > (SELECT avg(a) FROM df_nc WHERE id > 0);
@@ -831,6 +835,75 @@ SELECT count(*) FROM df_nc WHERE id > (SELECT max(id) / 2 FROM df_nc);
  count 
 -------
  25000
+(1 row)
+
+SET datafusion.mode = off;
+-- The slices of an init plan (IP2, TPC-H Q15): the coordinator runs its top
+-- slice before the query, on PostgreSQL's executor; those below it run in
+-- DataFusion, a split sum's state passing between them as batches.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r);
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   InitPlan 1 (returns $0)  (slice3)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice4; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Finalize HashAggregate
+                             Group Key: df_nc_1.g
+                             ->  Redistribute Motion 3:3  (slice5; segments: 3)
+                                   Hash Key: df_nc_1.g
+                                   ->  Streaming Partial HashAggregate
+                                         Group Key: df_nc_1.g
+                                         ->  Seq Scan on df_nc df_nc_1
+                                               Filter: (id > 0)
+   ->  Finalize GroupAggregate
+         Group Key: df_nc.g
+         Filter: (sum(df_nc.a) = $0)
+         ->  Sort
+               Sort Key: df_nc.g
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: df_nc.g
+                     ->  Streaming Partial HashAggregate
+                           Group Key: df_nc.g
+                           ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 4 eligible
+ DataFusion: slice 5 eligible, sends Arrow batches
+(30 rows)
+
+SET datafusion.mode = off;
+SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc WHERE id > 0 GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r) ORDER BY g;
+ g |    s     
+---+----------
+ 0 | 17287.49
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t FROM df_nc GROUP BY g) r);
+ count 
+-------
+     1
+(1 row)
+
+SET datafusion.mode = on;
+SELECT g, s FROM (SELECT g, sum(a) AS s FROM df_nc WHERE id > 0 GROUP BY g) q
+WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 GROUP BY g) r) ORDER BY g;
+ g |    s     
+---+----------
+ 0 | 17287.49
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t FROM df_nc GROUP BY g) r);
+ count 
+-------
+     1
 (1 row)
 
 SET datafusion.mode = off;
