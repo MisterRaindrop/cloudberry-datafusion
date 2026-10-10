@@ -383,6 +383,37 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
 
+-- A hash join's build side coming from another join (JE1,
+-- datafusion.join_estimates, bounded by default): DataFusion's hash join
+-- cannot spill, and the planner's estimate of a join can be far off
+-- (TPC-H Q9 at scale factor 10: 40 rows estimated, a million per segment
+-- built).  Such a build side is taken to hold up to as many rows as its
+-- largest input; past the budget the join stays on PostgreSQL, the join
+-- below it in DataFusion.
+CREATE TABLE df_je_big (k int, v int) DISTRIBUTED BY (k);
+CREATE TABLE df_je_a (k int, x int) DISTRIBUTED BY (k);
+CREATE TABLE df_je_b (k int, y int) DISTRIBUTED BY (k);
+INSERT INTO df_je_big SELECT i % 5000, i FROM generate_series(1, 200000) i;
+INSERT INTO df_je_a SELECT i, i FROM generate_series(1, 20000) i;
+INSERT INTO df_je_b SELECT i, i FROM generate_series(1, 20000) i;
+ANALYZE df_je_big;
+ANALYZE df_je_a;
+ANALYZE df_je_b;
+SET join_collapse_limit = 1;
+SET work_mem = 64;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+SET datafusion.join_estimates = trusted;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+RESET datafusion.join_estimates;
+SET datafusion.mode = off;
+SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+SET datafusion.mode = on;
+SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+RESET work_mem;
+RESET join_collapse_limit;
+DROP TABLE df_je_big, df_je_a, df_je_b;
+
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

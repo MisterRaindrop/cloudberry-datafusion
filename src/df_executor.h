@@ -45,6 +45,15 @@ typedef enum DfMode
 
 extern int	df_mode;
 
+/* datafusion.join_estimates: how far a hash join's build estimate is trusted */
+typedef enum DfJoinEstimates
+{
+	DF_JOIN_ESTIMATES_TRUSTED,
+	DF_JOIN_ESTIMATES_BOUNDED,
+	DF_JOIN_ESTIMATES_STRICT
+} DfJoinEstimates;
+extern int	df_join_estimates;
+
 /* GUC datafusion.worker_threads */
 extern int	df_worker_threads;
 

@@ -46,6 +46,13 @@ static const struct config_enum_entry df_mode_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry df_join_estimates_options[] = {
+	{"trusted", DF_JOIN_ESTIMATES_TRUSTED, false},
+	{"bounded", DF_JOIN_ESTIMATES_BOUNDED, false},
+	{"strict", DF_JOIN_ESTIMATES_STRICT, false},
+	{NULL, 0, false}
+};
+
 void
 _PG_init(void)
 {
@@ -57,6 +64,20 @@ _PG_init(void)
 							 &df_mode,
 							 DF_MODE_OFF,
 							 df_mode_options,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
+	DefineCustomEnumVariable("datafusion.join_estimates",
+							 "How far a hash join's build side estimate is trusted.",
+							 "DataFusion's hash join cannot spill, so a slice whose build "
+							 "side may outgrow its budget stays on PostgreSQL.  trusted: "
+							 "the planner's estimate.  bounded: a build side coming from "
+							 "a join may hold as many rows as its largest input.  strict: "
+							 "a build side coming from a join stays on PostgreSQL.",
+							 &df_join_estimates,
+							 DF_JOIN_ESTIMATES_BOUNDED,
+							 df_join_estimates_options,
 							 PGC_USERSET,
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);

@@ -502,6 +502,21 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
+| JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
+
+JE1: DataFusion's hash join cannot spill: a build side larger than the
+memory pool fails the query ("out of memory") where PostgreSQL's would
+spill.  The planner hook keeps a Hash Join on PostgreSQL when its build
+side's estimate exceeds the Hash node's budget, but a join's estimate can
+be far off: TPC-H Q9 at scale factor 10 builds on partsupp joined with
+lineitem, estimated at 40 rows and holding about a million per segment.
+`datafusion.join_estimates` (bounded by default) therefore takes a build
+side coming from a join to hold up to as many rows as its largest input
+(any node below it, across Motions); strict keeps every such join on
+PostgreSQL, trusted believes the planner.  Over TPC-H, bounded made every
+run complete and match PostgreSQL, at a cost: 12.9 s instead of 10.8 at
+scale factor 1, 109 s instead of 77 at scale factor 10 (where Q9 failed),
+against 207 s on PostgreSQL.  A hash join that spills would remove it.
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side

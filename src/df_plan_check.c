@@ -71,6 +71,8 @@
 
 #include "df_executor.h"
 
+int			df_join_estimates = DF_JOIN_ESTIMATES_BOUNDED;
+
 /*
  * From utils/pg_locale.h, which needs ICU's headers when the server was
  * built with ICU.
@@ -2089,6 +2091,58 @@ df_hash_estimate(Plan *hash)
 }
 
 /*
+ * Under 'plan' (crossing Motions into the slices sending to it): is there a
+ * join, and the most rows the planner expects of any node.  A join's own
+ * estimate is the one to doubt: TPC-H Q9 at scale factor 10 builds a hash
+ * table on partsupp joined with lineitem, estimated at 40 rows, while it
+ * holds about a million per segment, and DataFusion's hash join cannot
+ * spill.
+ */
+static void
+df_build_inputs(Plan *plan, bool *join, double *rows)
+{
+	ListCell   *lc;
+
+	if (plan == NULL)
+		return;
+	if (IsA(plan, HashJoin) || IsA(plan, NestLoop) || IsA(plan, MergeJoin))
+		*join = true;
+	else
+		*rows = Max(*rows, plan->plan_rows);
+	df_build_inputs(outerPlan(plan), join, rows);
+	df_build_inputs(innerPlan(plan), join, rows);
+	if (IsA(plan, Append))
+		foreach(lc, ((Append *) plan)->appendplans)
+			df_build_inputs(lfirst(lc), join, rows);
+	if (IsA(plan, SubqueryScan))
+		df_build_inputs(((SubqueryScan *) plan)->subplan, join, rows);
+}
+
+/*
+ * Why a Hash node's table may outgrow its budget although its estimate fits,
+ * or NULL (datafusion.join_estimates): with 'strict', any join below it
+ * makes the estimate untrusted; with 'bounded', its rows are taken to be at
+ * most the largest input's below it, which holds for joins on keys.
+ */
+static const char *
+df_hash_doubt(Plan *hash, double *bound)
+{
+	bool		join = false;
+	double		rows = 0;
+
+	if (df_join_estimates == DF_JOIN_ESTIMATES_TRUSTED)
+		return NULL;
+	df_build_inputs(outerPlan(hash), &join, &rows);
+	if (!join)
+		return NULL;
+	if (df_join_estimates == DF_JOIN_ESTIMATES_STRICT)
+		return "comes from a join, whose estimate is not trusted";
+	*bound = rows * (hash->plan_width + 48.0);
+	return *bound > df_hash_budget(hash) ?
+		"comes from a join of inputs whose largest exceeds its budget" : NULL;
+}
+
+/*
  * Bytes the executor would give a Hash node's table: like a hashed Agg's
  * budget, min(operatorMemKB, work_mem) * hash_mem_multiplier.
  */
@@ -2964,6 +3018,23 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 							  df_plan_name(plan), df_hash_estimate(inner) / 1024,
 							  df_hash_budget(inner) / 1024);
 					return;
+				}
+				{
+					double		bound = 0;
+					const char *doubt = df_hash_doubt(inner, &bound);
+
+					if (doubt != NULL && bound > 0)
+					{
+						df_reject(cxt, "%s build side %s (up to about %.0f kB, budget %.0f kB)",
+								  df_plan_name(plan), doubt, bound / 1024,
+								  df_hash_budget(inner) / 1024);
+						return;
+					}
+					if (doubt != NULL)
+					{
+						df_reject(cxt, "%s build side %s", df_plan_name(plan), doubt);
+						return;
+					}
 				}
 				if (join->jointype == JOIN_LASJ_NOTIN &&
 					df_hash_estimate(outer) > df_hash_budget(inner))
