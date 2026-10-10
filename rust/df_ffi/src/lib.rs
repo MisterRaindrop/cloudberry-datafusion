@@ -314,8 +314,9 @@ pub struct DfPaxInput {
 /// says input j arrives as Arrow IPC streams from a Motion
 /// (df_ffi_query_push_ipc), otherwise as pushed batches, unless `pax`
 /// (null, or one entry per input) gives it a PAX scan, which the workers
-/// read with `read`, `end` and `groups` and which the query owns from the
-/// call on, even if it fails.  The runtime must be running.
+/// read with `read`, `end` and `groups`, at most `pax_max_readers` groups
+/// at once (0: no limit), and which the query owns from the call on, even
+/// if it fails.  The runtime must be running.
 #[no_mangle]
 pub extern "C" fn df_ffi_query_start(
     spec: *const c_char,
@@ -329,6 +330,7 @@ pub extern "C" fn df_ffi_query_start(
     read: Option<df_core::query::PaxReadFn>,
     end: Option<df_core::query::PaxEndFn>,
     groups: Option<df_core::query::PaxGroupsFn>,
+    pax_max_readers: u32,
     out_query: *mut *mut DfQuery,
     sqlstate: *mut c_char,
     buf: *mut c_char,
@@ -346,13 +348,10 @@ pub extern "C" fn df_ffi_query_start(
             };
             match (p, read, end, groups) {
                 (Some(p), Some(read), Some(end), Some(groups)) if !p.scan.is_null() => {
-                    df_core::query::Source::Pax(df_core::query::PaxScan::new(
-                        p.scan,
-                        p.nblocks as usize,
-                        read,
-                        end,
-                        groups,
-                    ))
+                    df_core::query::Source::Pax(
+                        df_core::query::PaxScan::new(p.scan, p.nblocks as usize, read, end, groups)
+                            .with_max_readers(pax_max_readers as usize),
+                    )
                 }
                 _ if j < 64 && ipc_inputs & (1u64 << j) != 0 => df_core::query::Source::Ipc,
                 _ => df_core::query::Source::Pushed,

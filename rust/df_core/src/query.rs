@@ -938,9 +938,57 @@ pub struct PaxScan {
     ready: Mutex<std::collections::VecDeque<RecordBatch>>,
     /// partitions holding work that may still queue groups or batches
     pending: AtomicUsize,
-    /// wakes the partitions waiting for queued work or the end of the scan
+    /// what the query's PAX scans share
+    shared: Arc<PaxShared>,
+    /// most groups decoded at once for the query (0: no limit)
+    max_readers: usize,
+}
+
+/// What the PAX scans of one query share: the account their decoding
+/// memory is reported to (C3), the reads under way and how many may be
+/// (C4c), and the wake-up of partitions waiting for work or for a read to
+/// end.  Each read holds its decoded group: with one read per partition a
+/// QE held 330 MB on TPC-H's lineitem at scale factor 10 (10 partitions).
+/// `max_readers` (datafusion.pax_max_decoders) trades that for time, the
+/// other partitions taking the rows decoded meanwhile: 4 reads took 270-300
+/// MB and 1.6 times as long, 2 took 190-225 MB and 2.5 times as long.
+#[derive(Debug)]
+pub struct PaxShared {
+    pub memory: PaxMemory,
+    readers: AtomicUsize,
+    max_readers: usize,
     notify: tokio::sync::Notify,
-    memory: Arc<PaxMemory>,
+}
+
+impl PaxShared {
+    pub fn new(max_readers: usize) -> Self {
+        PaxShared {
+            memory: PaxMemory::default(),
+            readers: AtomicUsize::new(0),
+            max_readers: if max_readers == 0 {
+                usize::MAX
+            } else {
+                max_readers
+            },
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// A read may start: one more under way, unless there are as many as
+    /// allowed.
+    fn acquire(&self) -> bool {
+        self.readers
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.max_readers).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// A read ends, or did not start: partitions waiting for one may go.
+    fn release(&self) {
+        self.readers.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
 }
 
 /// Memory the PAX reader reports holding for one scan, all partitions
@@ -987,14 +1035,53 @@ impl PaxScan {
             queue: Default::default(),
             ready: Default::default(),
             pending: AtomicUsize::new(0),
-            notify: tokio::sync::Notify::new(),
-            memory: Arc::default(),
+            shared: Arc::new(PaxShared::new(0)),
+            max_readers: 0,
         }
     }
 
-    /// The next piece to read.  A Read holds the scan's `pending` count
-    /// until the caller has queued its batches and calls `done_reading`.
+    /// At most `n` groups of the query's PAX scans decoded at once (0: no
+    /// limit); the query takes the smallest of its scans'.
+    pub fn with_max_readers(mut self, n: usize) -> Self {
+        self.max_readers = n;
+        self
+    }
+
+    /// The next piece to read.  A Read holds the scan's `pending` count and
+    /// one of the query's reads until the caller has queued its batches and
+    /// calls `done_reading`.
     fn take(&self) -> Result<PaxPiece, String> {
+        let left = self.next.load(Ordering::SeqCst) < self.nblocks
+            || !self.queue.lock().unwrap().is_empty();
+        if !left {
+            return Ok(self.idle());
+        }
+        if !self.shared.acquire() {
+            // as many reads as allowed: one ending wakes this partition
+            return Ok(PaxPiece::Wait);
+        }
+        let piece = self.take_read();
+        if !matches!(piece, Ok(PaxPiece::Read(..))) {
+            self.shared.release();
+        }
+        piece
+    }
+
+    /// Nothing left to read: done once nothing may still be queued.
+    fn idle(&self) -> PaxPiece {
+        // Work is queued before `pending` drops.
+        if self.pending.load(Ordering::SeqCst) == 0
+            && self.queue.lock().unwrap().is_empty()
+            && self.ready.lock().unwrap().is_empty()
+        {
+            PaxPiece::Done
+        } else {
+            PaxPiece::Wait
+        }
+    }
+
+    /// `take` with a read of the query's held.
+    fn take_read(&self) -> Result<PaxPiece, String> {
         if let Some(piece) = self.pop_queued() {
             return Ok(piece);
         }
@@ -1011,28 +1098,21 @@ impl PaxScan {
             } else {
                 // another partition took the last block meanwhile
                 self.pending.fetch_sub(1, Ordering::SeqCst);
-                self.notify.notify_waiters();
+                self.shared.notify.notify_waiters();
             }
         }
         let Some(index) = claimed else {
             if let Some(piece) = self.pop_queued() {
                 return Ok(piece);
             }
-            // Work is queued before `pending` drops.
-            if self.pending.load(Ordering::SeqCst) == 0
-                && self.queue.lock().unwrap().is_empty()
-                && self.ready.lock().unwrap().is_empty()
-            {
-                return Ok(PaxPiece::Done);
-            }
-            return Ok(PaxPiece::Wait);
+            return Ok(self.idle());
         };
         let mut err = vec![0 as c_char; 1024];
         // SAFETY: see PaxScan.
         let n = unsafe { (self.groups)(self.scan, index as i32, err.as_mut_ptr(), err.len()) };
         if n < 0 {
             self.pending.fetch_sub(1, Ordering::SeqCst);
-            self.notify.notify_waiters();
+            self.shared.notify.notify_waiters();
             return Err(unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
                 .to_string_lossy()
                 .into_owned());
@@ -1042,7 +1122,7 @@ impl PaxScan {
                 .lock()
                 .unwrap()
                 .extend((1..n as usize).map(|g| (index, g)));
-            self.notify.notify_waiters();
+            self.shared.notify.notify_waiters();
         }
         Ok(PaxPiece::Read(index, 0, 1))
     }
@@ -1058,13 +1138,13 @@ impl PaxScan {
                 offset += len;
             }
         }
-        self.notify.notify_waiters();
+        self.shared.notify.notify_waiters();
     }
 
     /// The end of a Read: all its batches are queued.
     fn done_reading(&self) {
         self.pending.fetch_sub(1, Ordering::SeqCst);
-        self.notify.notify_waiters();
+        self.shared.release();
     }
 
     fn pop_ready(&self) -> Option<RecordBatch> {
@@ -1145,7 +1225,7 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
 
 unsafe extern "C" fn pax_account(ctx: *mut c_void, delta: i64) {
     let ctx = &*(ctx as *const EmitContext);
-    ctx.scan.memory.add(delta);
+    ctx.scan.shared.memory.add(delta);
 }
 
 fn make_batch(
@@ -1198,7 +1278,7 @@ impl PartitionStream for PaxPartition {
                     // Registered before looking for work, so that a
                     // partition queuing some meanwhile wakes this one.
                     let waker = scan.clone();
-                    let notified = waker.notify.notified();
+                    let notified = waker.shared.notify.notified();
                     tokio::pin!(notified);
                     notified.as_mut().enable();
                     // what any partition decoded comes first
@@ -1759,7 +1839,7 @@ pub struct Query {
     pool: Arc<TrackingPool>,
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
-    pax_memory: Option<Arc<PaxMemory>>,
+    pax_shared: Option<Arc<PaxShared>>,
 }
 
 /// Memory and spill figures of a query, for EXPLAIN ANALYZE.
@@ -1884,11 +1964,18 @@ impl Query {
         } else {
             partitions.max(1)
         };
-        // all PAX inputs of the query report to one account (C3)
-        let pax_memory = sources
+        // all PAX inputs of the query share one account and one limit
+        let pax_shared = sources
             .iter()
-            .any(|s| matches!(s, Source::Pax(_)))
-            .then(Arc::<PaxMemory>::default);
+            .filter_map(|s| match s {
+                Source::Pax(scan) => Some(scan.max_readers),
+                _ => None,
+            })
+            .reduce(|a, b| match (a, b) {
+                (0, n) | (n, 0) => n,
+                (a, b) => a.min(b),
+            })
+            .map(|n| Arc::new(PaxShared::new(n)));
         let mut in_tx = Vec::with_capacity(sources.len());
         let mut ipc_tx = Vec::with_capacity(sources.len());
         let mut decoders = Vec::new();
@@ -1936,8 +2023,8 @@ impl Query {
                     )
                 }
                 Source::Pax(mut scan) => {
-                    if let Some(memory) = &pax_memory {
-                        scan.memory = memory.clone();
+                    if let Some(shared) = &pax_shared {
+                        scan.shared = shared.clone();
                     }
                     let scan = Arc::new(scan);
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
@@ -2165,7 +2252,7 @@ impl Query {
             pool,
             physical: physical_slot,
             partitions,
-            pax_memory,
+            pax_shared,
         })
     }
 
@@ -2175,7 +2262,7 @@ impl Query {
             partitions: self.partitions as u64,
             memory_limit: self.pool.limit() as u64,
             memory_peak: self.pool.peak() as u64,
-            pax_decode_peak: self.pax_memory.as_ref().map_or(0, |m| m.peak()),
+            pax_decode_peak: self.pax_shared.as_ref().map_or(0, |m| m.memory.peak()),
             ..Default::default()
         };
         if let Ok(slot) = self.physical.lock() {
@@ -3366,7 +3453,7 @@ mod tests {
         scan.push_batch(batch);
         {
             // a partition waiting now is woken by the end of the read itself
-            let woken = scan.notify.notified();
+            let woken = scan.shared.notify.notified();
             tokio::pin!(woken);
             woken.as_mut().enable();
             scan.done_reading();
@@ -3385,6 +3472,34 @@ mod tests {
             vec![0, PAX_SLICE_ROWS as i32, 2 * PAX_SLICE_ROWS as i32]
         );
         assert!(matches!(scan.take(), Ok(PaxPiece::Done)));
+        drop(scan);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+    }
+
+    /// With one read allowed at a time (C4c), a partition finding a queued
+    /// group waits while another reads, is woken when that read ends, then
+    /// reads the group.
+    #[test]
+    fn pax_reads_wait_for_a_free_reader() {
+        let fake = FakeScan::default();
+        let ptr = &fake as *const FakeScan as *mut c_void;
+        let mut scan = PaxScan::new(ptr, 1, fake_read, fake_end, fake_groups);
+        scan.shared = Arc::new(PaxShared::new(1));
+        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 0, 1))));
+        // the block's second group is queued, but the one read is under way
+        assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
+        {
+            let woken = scan.shared.notify.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            scan.done_reading();
+            assert!(futures::FutureExt::now_or_never(woken).is_some());
+        }
+        assert!(matches!(scan.take(), Ok(PaxPiece::Read(0, 1, 1))));
+        assert!(matches!(scan.take(), Ok(PaxPiece::Wait)));
+        scan.done_reading();
+        assert!(matches!(scan.take(), Ok(PaxPiece::Done)));
+        assert_eq!(scan.shared.readers.load(Ordering::SeqCst), 0);
         drop(scan);
         assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
     }

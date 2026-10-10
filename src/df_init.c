@@ -83,6 +83,18 @@ _PG_init(void)
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);
 
+	DefineCustomIntVariable("datafusion.pax_max_decoders",
+							"Most PAX groups the direct reader decodes at once per query.",
+							"Each holds a decoded group, about 30 MB of a QE's memory on "
+							"TPC-H's lineitem; fewer save memory and cost time, since "
+							"decoding is most of a scan's work.  0 decodes one group per "
+							"partition.",
+							&df_pax_max_decoders,
+							0, 0, 1024,
+							PGC_USERSET,
+							GUC_GPDB_NEED_SYNC,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("datafusion.motion_batches",
 							 "Experimental: send Arrow batches through Gather Motions between DataFusion slices.",
 							 "When both the sending and the receiving slice of a Gather Motion run "

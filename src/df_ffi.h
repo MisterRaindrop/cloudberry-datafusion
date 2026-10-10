@@ -129,14 +129,16 @@ typedef struct DfPaxInput
 /* Bit j of 'ipc_inputs': input j arrives as Arrow IPC streams from a Motion. */
 /*
  * 'pax' (NULL, or one per input) names the inputs DataFusion reads from PAX
- * itself, with 'read', 'end' and 'groups'; the query owns those scans from
- * the call on, even if it fails.
+ * itself, with 'read', 'end' and 'groups', decoding at most
+ * 'pax_max_readers' groups at once (0: no limit); the query owns those
+ * scans from the call on, even if it fails.
  */
 extern int32_t df_ffi_query_start(const char *spec, uint32_t partitions,
 								  uint64_t memory_limit, const char *spill_dir,
 								  uint32_t flags, uint32_t ninputs, uint64_t ipc_inputs,
 								  const DfPaxInput *pax, DfPaxRead read, DfPaxEnd end,
-								  DfPaxGroups groups, DfQuery **out_query,
+								  DfPaxGroups groups, uint32_t pax_max_readers,
+								  DfQuery **out_query,
 								  char *sqlstate, char *buf, size_t buflen);
 
 extern int32_t df_ffi_query_push(DfQuery *query, uint32_t input, const DfColumn *cols,

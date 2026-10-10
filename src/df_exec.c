@@ -119,6 +119,7 @@
 uint64		df_runs_completed = 0;
 DfQueryStats df_last_run;
 bool		df_pax_direct_read = false;
+int			df_pax_max_decoders = 0;
 uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
 DfPaxScanInfo df_last_pax_scan;
@@ -723,6 +724,7 @@ df_exec_begin(DfExec *x)
 								pax, reader ? reader->read : NULL,
 								reader ? reader->end : NULL,
 								reader ? reader->block_groups : NULL,
+								(uint32_t) df_pax_max_decoders,
 								&x->query, sqlstate, buf, sizeof(buf));
 	if (status != DF_OK)
 	{
