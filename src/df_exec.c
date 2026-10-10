@@ -118,7 +118,7 @@
 
 uint64		df_runs_completed = 0;
 DfQueryStats df_last_run;
-bool		df_pax_direct_read = false;
+bool		df_pax_direct_read = true;
 int			df_pax_max_decoders = 0;
 uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
@@ -613,8 +613,20 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 	df_rx_release(x, in, motion_id);
 }
 
+/* Does input 'in' scan a PAX table the direct reader may read? */
+static bool
+df_input_scans_pax(DfInput *in)
+{
+	char	   *amname;
+
+	if (in->scan == NULL || in->scan->ss.ss_currentScanDesc != NULL)
+		return false;			/* a Motion, or Cloudberry's parallel mode */
+	amname = get_am_name(in->scan->ss.ss_currentRelation->rd_rel->relam);
+	return amname != NULL && strcmp(amname, "pax") == 0;
+}
+
 /*
- * Experimental: begin a direct read of input 'in' if it scans a PAX table
+ * Begin a direct read of input 'in' if it scans a PAX table
  * (C3: any input of the slice, the others read through the table AM or a
  * Motion): DataFusion's partitions decode its micro-partitions themselves.
  * Returns false when the direct reader does not apply; 'pax' then stays
@@ -631,15 +643,9 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, DfPaxInput
 	void	   *scan;
 	int			c;
 
-	if (in->scan == NULL || in->scan->ss.ss_currentScanDesc != NULL)
-		return false;			/* a Motion, or Cloudberry's parallel mode */
+	if (!df_input_scans_pax(in))
+		return false;
 	rel = in->scan->ss.ss_currentRelation;
-	{
-		char	   *amname = get_am_name(rel->rd_rel->relam);
-
-		if (amname == NULL || strcmp(amname, "pax") != 0)
-			return false;
-	}
 	/*
 	 * The reader hands out fixed-width values, strings and numerics, of the
 	 * table's own columns (not ctid).
@@ -695,7 +701,14 @@ df_exec_begin(DfExec *x)
 	DfPaxInput *pax = NULL;
 
 	workers = df_runtime_ensure();
-	if (df_pax_direct_read && (reader = df_pax_reader_get()) != NULL)
+	if (df_pax_direct_read)
+	{
+		/* loaded only once a PAX table is read: pax.so is loaded by then */
+		for (j = 0; j < x->ninputs && reader == NULL; j++)
+			if (df_input_scans_pax(&x->inputs[j]))
+				reader = df_pax_reader_get();
+	}
+	if (reader != NULL)
 	{
 		pax = palloc0(sizeof(DfPaxInput) * x->ninputs);
 		for (j = 0; j < x->ninputs; j++)

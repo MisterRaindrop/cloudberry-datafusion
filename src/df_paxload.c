@@ -101,7 +101,7 @@ df_find_pax_build_id(struct dl_phdr_info *info, size_t size, void *data)
 }
 
 static bool
-df_pax_load(char *why, size_t whylen)
+df_pax_load(char *why, size_t whylen, bool *installed)
 {
 	char		path[MAXPGPATH];
 	void	   *handle;
@@ -118,6 +118,12 @@ df_pax_load(char *why, size_t whylen)
 	}
 
 	snprintf(path, sizeof(path), "%s/datafusion_pax.so", pkglib_path);
+	*installed = access(path, F_OK) == 0;
+	if (!*installed)
+	{
+		snprintf(why, whylen, "%s is not installed", path);
+		return false;
+	}
 	handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (handle == NULL)
 	{
@@ -149,8 +155,11 @@ df_pax_load(char *why, size_t whylen)
 }
 
 /*
- * The experimental PAX reader, or NULL if it cannot be used in this backend.
- * Call only when a PAX relation is open, so that pax.so is loaded.
+ * The direct PAX reader, or NULL if it cannot be used in this backend.
+ * Call only when a PAX relation is open, so that pax.so is loaded.  An
+ * extension built without it (no DF_PAX_SRC) reads PAX through the table
+ * AM and says so in the server log only; a reader that is installed but
+ * does not fit the running pax.so is worth a warning.
  */
 const DfPaxReader *
 df_pax_reader_get(void)
@@ -158,11 +167,12 @@ df_pax_reader_get(void)
 	if (!df_pax_tried)
 	{
 		char		why[512];
+		bool		installed = false;
 
 		df_pax_tried = true;
-		df_pax_ok = df_pax_load(why, sizeof(why));
+		df_pax_ok = df_pax_load(why, sizeof(why), &installed);
 		if (!df_pax_ok)
-			ereport(WARNING,
+			ereport(installed ? WARNING : LOG,
 					(errmsg("datafusion: reading PAX tables through the table access method"),
 					 errdetail("The direct PAX reader is unavailable: %s", why)));
 	}

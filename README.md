@@ -160,9 +160,9 @@ segment and one DataFusion thread each, a grouped aggregate on heap took
 0.14 s instead of 0.27 s without parallel mode (PostgreSQL: 0.58 s with
 parallel mode, 1.16 s without), and on PAX 0.14 s instead of 0.20 s.
 
-### Experimental: direct PAX reader
+### Direct PAX reader
 
-`datafusion.pax_direct_read = on` reads PAX tables without the table AM's
+`datafusion.pax_direct_read`, on by default (C4), reads PAX tables without the table AM's
 row-at-a-time interface.  The main thread lists the micro-partitions
 visible to the snapshot; DataFusion's partitions then take blocks one at a
 time and decode the needed columns themselves, through PAX's own reader
@@ -184,7 +184,10 @@ That code calls PAX's internal C++ classes, not a published API:
   needs the protobuf headers of the version pax.so links and GNU `patch`.
 - It records the installed pax.so's ELF build ID.  At run time the extension
   compares it with the running pax.so and, if they differ or the library
-  does not load, warns once and reads through the table AM.
+  does not load, warns once per backend and reads through the table AM.  An
+  extension built without it (no `DF_PAX_SRC`) reads PAX through the table
+  AM and says so in the server log only.  The library is loaded only once a
+  slice reads a PAX table.
 - Cloudberry's parallel mode keeps the table AM path.
 
 Every PAX scan of a slice is read this way (C3), beside inputs read
@@ -498,6 +501,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C3 | Direct PAX reader: every PAX scan of a slice, beside other inputs |
 | C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
+| C4 | Direct PAX reader on by default |
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
