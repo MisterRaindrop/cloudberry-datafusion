@@ -71,7 +71,7 @@
 
 #include "df_executor.h"
 
-int			df_join_estimates = DF_JOIN_ESTIMATES_BOUNDED;
+int			df_join_estimates = DF_JOIN_ESTIMATES_SPILL;
 
 /*
  * From utils/pg_locale.h, which needs ICU's headers when the server was
@@ -2130,8 +2130,9 @@ df_hash_doubt(Plan *hash, double *bound)
 	bool		join = false;
 	double		rows = 0;
 
-	if (df_join_estimates == DF_JOIN_ESTIMATES_TRUSTED)
-		return NULL;
+	if (df_join_estimates == DF_JOIN_ESTIMATES_TRUSTED ||
+		df_join_estimates == DF_JOIN_ESTIMATES_SPILL)
+		return NULL;			/* spill: as trusted where it does not spill */
 	df_build_inputs(outerPlan(hash), &join, &rows);
 	if (!join)
 		return NULL;
@@ -2926,6 +2927,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 		case T_NestLoop:
 			{
 				HashJoin   *hj = IsA(plan, HashJoin) ? (HashJoin *) plan : NULL;
+				bool		spills;
 				Join	   *join = (Join *) plan;
 				List	   *hashclauses = hj ? hj->hashclauses : NIL;
 				Plan	   *outer = outerPlan(plan);
@@ -3012,7 +3014,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						return;
 					}
 				}
-				if (df_hash_estimate(inner) > df_hash_budget(inner))
+				/*
+				 * SHJ: a hash join spills what does not fit, but for a NOT IN
+				 * anti join (null-aware) and a nested loop
+				 */
+				spills = df_join_estimates == DF_JOIN_ESTIMATES_SPILL &&
+					hj != NULL && join->jointype != JOIN_LASJ_NOTIN;
+				if (!spills && df_hash_estimate(inner) > df_hash_budget(inner))
 				{
 					df_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
 							  df_plan_name(plan), df_hash_estimate(inner) / 1024,
@@ -3021,7 +3029,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				{
 					double		bound = 0;
-					const char *doubt = df_hash_doubt(inner, &bound);
+					const char *doubt = spills ? NULL : df_hash_doubt(inner, &bound);
 
 					if (doubt != NULL && bound > 0)
 					{

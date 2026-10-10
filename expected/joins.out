@@ -138,6 +138,9 @@ LEFT JOIN (SELECT k, b IS NULL AS isn FROM df_jb) s ON ja.k = s.k;
 (11 rows)
 
 SET work_mem = '64kB';
+-- A build side past the Hash node's budget stays on PostgreSQL unless hash
+-- joins spill (datafusion.join_estimates = spill, the default).
+SET datafusion.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                                         QUERY PLAN                                         
 -------------------------------------------------------------------------------------------
@@ -152,6 +155,23 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
  DataFusion: slice 1 not eligible: Hash Join build side of about 169 kB exceeds its 128 kB
+(11 rows)
+
+RESET datafusion.join_estimates;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
+                     QUERY PLAN                     
+----------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (ja.k = jb.k)
+                     ->  Seq Scan on df_ja ja
+                     ->  Hash
+                           ->  Seq Scan on df_jb jb
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
 (11 rows)
 
 RESET work_mem;
@@ -1640,12 +1660,13 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
 -- A hash join's build side coming from another join (JE1,
--- datafusion.join_estimates, bounded by default): DataFusion's hash join
--- cannot spill, and the planner's estimate of a join can be far off
--- (TPC-H Q9 at scale factor 10: 40 rows estimated, a million per segment
--- built).  Such a build side is taken to hold up to as many rows as its
--- largest input; past the budget the join stays on PostgreSQL, the join
--- below it in DataFusion.
+-- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
+-- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
+-- scale factor 10: 40 rows estimated, a million per segment built).  Such
+-- a build side is taken to hold up to as many rows as its largest input;
+-- past the budget the join stays on PostgreSQL, the join below it in
+-- DataFusion.  By default (spill, SHJ) hash joins spill what does not fit
+-- and run in DataFusion whatever their size.
 CREATE TABLE df_je_big (k int, v int) DISTRIBUTED BY (k);
 CREATE TABLE df_je_a (k int, x int) DISTRIBUTED BY (k);
 CREATE TABLE df_je_b (k int, y int) DISTRIBUTED BY (k);
@@ -1658,6 +1679,7 @@ ANALYZE df_je_b;
 SET join_collapse_limit = 1;
 SET work_mem = 64;
 SET datafusion.mode = explain;
+SET datafusion.join_estimates = bounded;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
                                                                                       QUERY PLAN                                                                                      
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -1702,11 +1724,39 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
 (16 rows)
 
 RESET datafusion.join_estimates;
+-- spill: the whole slice in DataFusion, its joins spilling within 64 kB
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (g.k = b.k)
+                     ->  Seq Scan on df_je_big g
+                     ->  Hash
+                           ->  Hash Join
+                                 Hash Cond: (a.k = b.k)
+                                 ->  Seq Scan on df_je_a a
+                                 ->  Hash
+                                       ->  Seq Scan on df_je_b b
+                                             Filter: (y < 3000)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(16 rows)
+
 SET datafusion.mode = off;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
  count  |     sum     
 --------+-------------
  119960 | 11876040000
+(1 row)
+
+SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
+ count |    sum    
+-------+-----------
+ 15001 | 187512500
 (1 row)
 
 SET datafusion.mode = on;
@@ -1716,6 +1766,20 @@ SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k
  119960 | 11876040000
 (1 row)
 
+SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
+ count |    sum    
+-------+-----------
+ 15001 | 187512500
+(1 row)
+
+SET datafusion.join_estimates = bounded;
+SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+ count  |     sum     
+--------+-------------
+ 119960 | 11876040000
+(1 row)
+
+RESET datafusion.join_estimates;
 RESET work_mem;
 RESET join_collapse_limit;
 DROP TABLE df_je_big, df_je_a, df_je_b;

@@ -406,10 +406,12 @@ first (NJ1, below): each Motion's sending slice sends to that join's slice
 alone, so the inner side's senders only wait for room meanwhile.  IS NOT
 DISTINCT FROM joins stay on PostgreSQL.
 
-DataFusion's hash join does not spill.  A slice qualifies only if the Hash
-node's estimated size (planner rows times width plus a per-row allowance)
-fits its budget, `min(operatorMemKB, work_mem) * hash_mem_multiplier`, as a
-PostgreSQL hash table's would; EXPLAIN gives the figures otherwise.  An
+Hash joins spill what does not fit (SHJ, below), the default.  With
+DataFusion's own hash join, which does not spill
+(`datafusion.join_estimates` other than spill), a slice qualifies only if
+the Hash node's estimated size (planner rows times width plus a per-row
+allowance) fits its budget, `min(operatorMemKB, work_mem) *
+hash_mem_multiplier`, as a PostgreSQL hash table's would; EXPLAIN gives the figures otherwise.  An
 underestimate (stale statistics) can still end in an "out of memory" error
 (53200) naming DataFusion's reservation, where PostgreSQL would have
 spilled.
@@ -503,6 +505,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
+| SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would
@@ -510,13 +513,50 @@ spill.  The planner hook keeps a Hash Join on PostgreSQL when its build
 side's estimate exceeds the Hash node's budget, but a join's estimate can
 be far off: TPC-H Q9 at scale factor 10 builds on partsupp joined with
 lineitem, estimated at 40 rows and holding about a million per segment.
-`datafusion.join_estimates` (bounded by default) therefore takes a build
+`datafusion.join_estimates = bounded` therefore takes a build
 side coming from a join to hold up to as many rows as its largest input
 (any node below it, across Motions); strict keeps every such join on
 PostgreSQL, trusted believes the planner.  Over TPC-H, bounded made every
 run complete and match PostgreSQL, at a cost: 12.9 s instead of 10.8 at
 scale factor 1, 109 s instead of 77 at scale factor 10 (where Q9 failed),
 against 207 s on PostgreSQL.  A hash join that spills would remove it.
+
+SHJ: hash joins spill.  With `datafusion.join_estimates = spill`, the
+default, a hash join runs in DataFusion whatever the size of its build
+side, and a slice no longer stays on PostgreSQL for it; a NOT IN anti join
+(null-aware) and a nested loop are checked as with trusted.  Each hash join
+hash-partitions both sides (no table collected for all partitions on the
+planner's estimate) and is wrapped in `SpillingHashJoinExec`
+(`rust/df_core/src/spilljoin.rs`), a grace hash join around DataFusion's:
+
+- a partition collects its build side under a reservation of the batches'
+  size and 40 bytes a row for the hash table; when it fits, DataFusion's
+  in-memory hash join runs on it, taking that reservation over (a pool of
+  its own drawn from it): freed and reserved again, the bytes could go to
+  another consumer in between, and the join, which cannot spill, finds no
+  room in a pool that consumers which can spill have filled (DataFusion's
+  fair pool bounds each of those by its share, not their sum: TPC-H Q21 on
+  GPORCA at scale factor 10 failed so, with repartition buffers holding
+  165 of its 192 MB);
+- past the reservation, the build rows and then the probe rows are written
+  to 16 spill files by their keys' hash, a bucket's rows gathered into
+  batches of up to 1 MB or the batch size, and the buckets are joined one
+  after the other; one that still does not fit is split again with another
+  hash, four times at most, then joined in memory if the pool has the room
+  (rows of one key cannot be split).  A batch read back is copied: the
+  batches of a spill file share the chunks it is read in, and each would
+  count a whole chunk (twenty rows counted as 128 kB, which split every
+  bucket down to the last depth);
+- rows of equal keys share a bucket, so inner, outer, semi, anti and mark
+  joins, with or without a join filter, give the rows they give in memory;
+  the build side is read to its end before the probe side, the order in
+  which the main thread feeds a slice's inputs.
+
+Over TPC-H every query matched PostgreSQL, Q9 at scale factor 10
+included: 11.5 s at scale factor 1 (bounded 12.9, trusted 10.8), 83.8 s at
+scale factor 10 (bounded 109, trusted 77 with Q9 failing), against 223 s
+on PostgreSQL in the same run.  Under `work_mem` of 512 kB to 2 MB, eleven
+joins spilling on one segment matched PostgreSQL.
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side

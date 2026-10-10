@@ -843,8 +843,10 @@ fn session_state(
         .filter(|r| !matches!(r.name(), "simplify_expressions" | "eliminate_cross_join"))
         .cloned()
         .collect();
+    // last, once DataFusion has chosen each hash join's mode
     Ok(SessionStateBuilder::new_from_existing(state)
         .with_optimizer_rules(rules)
+        .with_physical_optimizer_rule(Arc::new(crate::spilljoin::SpillHashJoins))
         .build())
 }
 
@@ -2128,6 +2130,18 @@ impl Query {
         // statistics, or it waits for an input the main thread has not
         // reached while that one waits for room.
         config.options_mut().optimizer.join_reordering = false;
+        // Every hash join hash-partitions both sides, so that each partition
+        // builds a table of its own, which spills when it does not fit
+        // (spilljoin.rs): a table collected for all partitions is chosen by
+        // the planner's estimate of its size, which can be far off.
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 0;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 0;
         // A sort reserves this much up front to merge its spilled runs
         // (10 MB by default): keep it within a partition's share.
         let execution = &mut config.options_mut().execution;

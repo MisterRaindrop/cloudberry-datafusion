@@ -54,6 +54,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::
 EXPLAIN (COSTS OFF) SELECT count(*), count(s.isn) FROM df_ja ja
 LEFT JOIN (SELECT k, b IS NULL AS isn FROM df_jb) s ON ja.k = s.k;
 SET work_mem = '64kB';
+-- A build side past the Hash node's budget stays on PostgreSQL unless hash
+-- joins spill (datafusion.join_estimates = spill, the default).
+SET datafusion.join_estimates = trusted;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
+RESET datafusion.join_estimates;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
 RESET work_mem;
 
@@ -384,12 +389,13 @@ RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
 
 -- A hash join's build side coming from another join (JE1,
--- datafusion.join_estimates, bounded by default): DataFusion's hash join
--- cannot spill, and the planner's estimate of a join can be far off
--- (TPC-H Q9 at scale factor 10: 40 rows estimated, a million per segment
--- built).  Such a build side is taken to hold up to as many rows as its
--- largest input; past the budget the join stays on PostgreSQL, the join
--- below it in DataFusion.
+-- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
+-- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
+-- scale factor 10: 40 rows estimated, a million per segment built).  Such
+-- a build side is taken to hold up to as many rows as its largest input;
+-- past the budget the join stays on PostgreSQL, the join below it in
+-- DataFusion.  By default (spill, SHJ) hash joins spill what does not fit
+-- and run in DataFusion whatever their size.
 CREATE TABLE df_je_big (k int, v int) DISTRIBUTED BY (k);
 CREATE TABLE df_je_a (k int, x int) DISTRIBUTED BY (k);
 CREATE TABLE df_je_b (k int, y int) DISTRIBUTED BY (k);
@@ -402,14 +408,22 @@ ANALYZE df_je_b;
 SET join_collapse_limit = 1;
 SET work_mem = 64;
 SET datafusion.mode = explain;
+SET datafusion.join_estimates = bounded;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
 SET datafusion.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
 RESET datafusion.join_estimates;
+-- spill: the whole slice in DataFusion, its joins spilling within 64 kB
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
 SET datafusion.mode = off;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
 SET datafusion.mode = on;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
+SET datafusion.join_estimates = bounded;
+SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
+RESET datafusion.join_estimates;
 RESET work_mem;
 RESET join_collapse_limit;
 DROP TABLE df_je_big, df_je_a, df_je_b;

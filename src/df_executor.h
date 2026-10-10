@@ -48,6 +48,7 @@ extern int	df_mode;
 /* datafusion.join_estimates: how far a hash join's build estimate is trusted */
 typedef enum DfJoinEstimates
 {
+	DF_JOIN_ESTIMATES_SPILL,	/* hash joins spill: no size to check */
 	DF_JOIN_ESTIMATES_TRUSTED,
 	DF_JOIN_ESTIMATES_BOUNDED,
 	DF_JOIN_ESTIMATES_STRICT

@@ -30,3 +30,4 @@ pub mod pgstr;
 pub mod query;
 pub mod rowid;
 pub mod runtime;
+pub mod spilljoin;
