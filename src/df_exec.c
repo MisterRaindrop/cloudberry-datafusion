@@ -126,6 +126,15 @@ uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
 DfPaxScanInfo df_last_pax_scan;
 
+/* PS1: a column read from PostgreSQL's partial state */
+#define DF_PART_NONE	0
+#define DF_PART_SUM		1
+#define DF_PART_COUNT	2
+
+#define DF_STATE_NUMERIC	1	/* numeric_avg_serialize */
+#define DF_STATE_INT8		2	/* int8_avg_serialize */
+#define DF_STATE_INT_ARRAY	3	/* int4_avg_accum's int8[] {count, sum} */
+
 /* One input of the slice: a table scanned, or a Motion received from. */
 typedef struct DfInput
 {
@@ -135,6 +144,17 @@ typedef struct DfInput
 	MotionState *motion;		/* else the receiving Motion we read */
 	TableScanDesc scandesc;
 	int			maxattno;		/* highest column read */
+
+	/*
+	 * PS1: from a Motion of tuples, the tuple column behind each column read
+	 * (its stream column counts a state as DataFusion's columns), and for a
+	 * partial aggregate's state, which part and which of PostgreSQL's
+	 * formats; NULL without states.
+	 */
+	AttrNumber *tupatt;
+	uint8	   *statepart;		/* DF_PART_* */
+	uint8	   *stateformat;	/* DF_STATE_* */
+	MemoryContext statecxt;
 
 	/* batch being assembled or offered */
 	char	  **invalues;		/* string columns: their bytes */
@@ -784,6 +804,96 @@ df_exec_begin(DfExec *x)
  * Read up to the slice's rows per batch (at most DF_BATCH_ROWS) of the
  * needed columns of input 'in'.
  */
+/*
+ * PS1: a NumericVar as numericvar_serialize wrote it at 'p' (int32 ndigits,
+ * weight, sign and display scale, int16 digits), as a numeric: numeric_recv
+ * reads the same fields as int16.  Returns the bytes read.
+ */
+static int
+df_recv_numericvar(const char *p, int len, Datum *out)
+{
+	StringInfoData wire;
+	int32		f[4];
+	int			i;
+
+	if (len < 16)
+		elog(ERROR, "datafusion: short partial aggregate state");
+	for (i = 0; i < 4; i++)
+		f[i] = (int32) pg_ntoh32(*(const uint32 *) (p + 4 * i));
+	if (f[0] < 0 || len < 16 + 2 * f[0])
+		elog(ERROR, "datafusion: short partial aggregate state");
+	initStringInfo(&wire);
+	for (i = 0; i < 4; i++)
+		pq_sendint16(&wire, (int16) f[i]);
+	pq_sendbytes(&wire, p + 16, 2 * f[0]);
+	*out = DirectFunctionCall3(numeric_recv, PointerGetDatum(&wire),
+							   ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+	return 16 + 2 * f[0];
+}
+
+/*
+ * PS1: part 'part' of PostgreSQL's partial state 'd' of format 'format': its
+ * sum, NULL without values and NaN after a NaN, or its count of values.
+ */
+static Datum
+df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
+{
+	int64		count;
+	Datum		sum = (Datum) 0;
+
+	*isnull = false;
+	if (format == DF_STATE_INT_ARRAY)
+	{
+		ArrayType  *a = DatumGetArrayTypeP(d);
+		Datum	   *elems;
+		int			n;
+
+		deconstruct_array(a, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE,
+						  &elems, NULL, &n);
+		if (n != 2)
+			elog(ERROR, "datafusion: unexpected avg state");
+		count = DatumGetInt64(elems[0]);
+		sum = NumericGetDatum(int64_to_numeric(DatumGetInt64(elems[1])));
+	}
+	else
+	{
+		bytea	   *b = DatumGetByteaPP(d);
+		const char *p = VARDATA_ANY(b);
+		int			len = VARSIZE_ANY_EXHDR(b);
+		int			used;
+
+		if (len < 8)
+			elog(ERROR, "datafusion: short partial aggregate state");
+		count = (int64) pg_ntoh64(*(const uint64 *) p);
+		used = 8 + df_recv_numericvar(p + 8, len - 8, &sum);
+		if (format == DF_STATE_NUMERIC)
+		{
+			int64		nans,
+						pinfs,
+						ninfs;
+
+			/* maxScale (int32) and maxScaleCount (int64): an inverse transition's */
+			if (len < used + 12 + 24)
+				elog(ERROR, "datafusion: short partial aggregate state");
+			nans = (int64) pg_ntoh64(*(const uint64 *) (p + used + 12));
+			pinfs = (int64) pg_ntoh64(*(const uint64 *) (p + used + 20));
+			ninfs = (int64) pg_ntoh64(*(const uint64 *) (p + used + 28));
+			if (pinfs > 0 || ninfs > 0)
+				elog(ERROR, "datafusion: infinite numeric in a partial aggregate state");
+			if (nans > 0)
+				sum = DirectFunctionCall3(numeric_in, CStringGetDatum("NaN"),
+										  ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+			/* the count of values but NaNs; with one, the result is NaN */
+			if (count == 0 && nans > 0)
+				count = nans;
+		}
+	}
+	if (part == DF_PART_COUNT)
+		return Int64GetDatum(count);
+	*isnull = (count == 0);
+	return sum;
+}
+
 static void
 df_exec_fill(DfExec *x, DfInput *in)
 {
@@ -813,7 +923,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 			slot_getsomeattrs(slot, in->maxattno);
 		for (c = 0; c < in->spec->ncols; c++)
 		{
-			int			att = in->spec->attnos[c] - 1;
+			int			att = (in->tupatt ? in->tupatt[c] : in->spec->attnos[c]) - 1;
 			bool		isnull;
 			Datum		d;
 			char	   *dst = in->invalues[c];
@@ -825,6 +935,26 @@ df_exec_fill(DfExec *x, DfInput *in)
 			{
 				isnull = slot->tts_isnull[att];
 				d = slot->tts_values[att];
+			}
+			if (in->statepart && in->statepart[c] != DF_PART_NONE)
+			{
+				/* PS1: a part of PostgreSQL's partial state */
+				MemoryContext oldcxt = MemoryContextSwitchTo(in->statecxt);
+
+				MemoryContextReset(in->statecxt);
+				if (isnull)
+				{
+					/*
+					 * No values: a partial aggregate without groups over
+					 * no rows keeps its NULL initial state, which the
+					 * strict serial function leaves NULL
+					 */
+					isnull = in->statepart[c] == DF_PART_SUM;
+					d = Int64GetDatum(0);
+				}
+				else
+					d = df_state_part(d, in->stateformat[c], in->statepart[c], &isnull);
+				MemoryContextSwitchTo(oldcxt);
 			}
 
 			in->innulls[c][n] = isnull ? 1 : 0;
@@ -1379,6 +1509,68 @@ df_exec_find_state(PlanState *ps, Plan *plan)
 	return df_find_state(ps, plan);
 }
 
+/*
+ * PS1: map the columns input 'in' reads from Motion of tuples 'motion' to
+ * its tuple's columns.  The translator numbers them as stream columns, a
+ * partial aggregate's state as DataFusion's (M7d), sum then count: here
+ * that state is PostgreSQL's, in one column.
+ */
+static void
+df_input_states(DfInput *in, Motion *motion)
+{
+	int			ncols = list_length(motion->plan.targetlist);
+	int			c;
+
+	for (c = 1; c <= ncols; c++)
+		if (df_motion_state_columns(motion, c) > 0)
+			break;
+	if (c > ncols)
+		return;					/* no states: stream and tuple columns agree */
+	in->tupatt = palloc0(sizeof(AttrNumber) * Max(in->spec->ncols, 1));
+	in->statepart = palloc0(sizeof(uint8) * Max(in->spec->ncols, 1));
+	in->stateformat = palloc0(sizeof(uint8) * Max(in->spec->ncols, 1));
+	in->statecxt = AllocSetContextCreate(CurrentMemoryContext, "datafusion states",
+										 ALLOCSET_SMALL_SIZES);
+	for (c = 0; c < in->spec->ncols; c++)
+	{
+		int			pos = in->spec->attnos[c] - 1;
+		int			start = 0;
+		AttrNumber	r;
+
+		if (pos < 0)
+		{
+			in->tupatt[c] = in->spec->attnos[c];	/* a system column */
+			continue;
+		}
+		for (r = 1; r <= ncols; r++)
+		{
+			int			width = df_motion_state_columns(motion, r);
+
+			if (pos < start + Max(width, 1))
+			{
+				in->tupatt[c] = r;
+				if (width > 0)
+				{
+					Plan	   *agg = NULL;
+					Aggref	   *partial = df_motion_column_partial(motion, r, &agg);
+					DfAggState	state = df_agg_state_at(agg, partial);
+
+					in->statepart[c] = pos == start ? DF_PART_SUM : DF_PART_COUNT;
+					in->stateformat[c] =
+						state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ?
+						DF_STATE_NUMERIC :
+						state == DF_AGG_AVG_INT && linitial_oid(partial->aggargtypes) != INT8OID ?
+						DF_STATE_INT_ARRAY : DF_STATE_INT8;
+				}
+				break;
+			}
+			start += Max(width, 1);
+		}
+		if (r > ncols)
+			elog(ERROR, "datafusion: stream column %d beyond Motion %d", pos, motion->motionID);
+	}
+}
+
 bool
 df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			   const DfTails *tails, char *reason, size_t reasonlen)
@@ -1439,6 +1631,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			snprintf(reason, reasonlen, "unexpected executor state for this slice");
 			return false;
 		}
+		if (in->motion != NULL && !in->ipc)
+			df_input_states(in, (Motion *) in->motion->ps.plan);
 		in->invalues = palloc0(sizeof(char *) * Max(in->spec->ncols, 1));
 		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
 		in->inoffsets = palloc0(sizeof(int32 *) * Max(in->spec->ncols, 1));
@@ -1459,7 +1653,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			in->incols[c].values = in->invalues[c];
 			in->incols[c].nulls = in->innulls[c];
 			in->incols[c].offsets = in->inoffsets[c];
-			in->maxattno = Max(in->maxattno, in->spec->attnos[c]);
+			in->maxattno = Max(in->maxattno,
+							   in->tupatt ? in->tupatt[c] : in->spec->attnos[c]);
 		}
 	}
 	x->root = root;

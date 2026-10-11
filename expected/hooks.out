@@ -148,14 +148,14 @@ EXPLAIN (COSTS OFF) SELECT a, b FROM df_hooks_t WHERE c > 0;
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(b) FROM df_hooks_t;
-                                   QUERY PLAN                                    
----------------------------------------------------------------------------------
+                   QUERY PLAN                   
+------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_hooks_t
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 0 eligible
  DataFusion: slice 1 eligible
 (7 rows)
 
@@ -246,7 +246,7 @@ SELECT sum(b), count(*) FROM df_hooks_t WHERE c > 50;
 SELECT datafusion_debug_takeovers();
  datafusion_debug_takeovers 
 ----------------------------
-                          1
+                          2
 (1 row)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0;
@@ -262,7 +262,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0;
 SELECT datafusion_debug_takeovers();
  datafusion_debug_takeovers 
 ----------------------------
-                          1
+                          2
 (1 row)
 
 -- An error while a routed slice runs drops its record with the query; the
@@ -278,7 +278,7 @@ SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0;
 SELECT datafusion_debug_takeovers();
  datafusion_debug_takeovers 
 ----------------------------
-                          3
+                          4
 (1 row)
 
 -- A cursor runs its slice once per FETCH.
@@ -292,7 +292,7 @@ COMMIT;
 SELECT datafusion_debug_takeovers();
  datafusion_debug_takeovers 
 ----------------------------
-                          5
+                          6
 (1 row)
 
 -- Not tested here: an updatable cursor (e.g. a plain SELECT over pg_class)

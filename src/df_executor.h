@@ -299,6 +299,8 @@ extern void df_sync_cluster_collation(void);
 extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);
 extern Bitmapset *df_batch_motions(PlannedStmt *stmt);
 extern int	df_motion_state_columns(Motion *motion, AttrNumber resno);
+extern Aggref *df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg);
+extern bool df_motion_pg_state(Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern uint64 df_motion_signature(Motion *motion);
 extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **tag);

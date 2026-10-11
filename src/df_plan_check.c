@@ -105,6 +105,8 @@ typedef struct DfCheckContext
 	bool		partial_states; /* this Agg may output DataFusion avg states */
 	bool		pg_states;		/* this partial Agg's states leave the slice
 								 * as tuples, made PostgreSQL's (PS1) */
+	bool		pg_final_states;	/* this combining Agg reads PostgreSQL's
+									 * states from a Motion of tuples (PS1) */
 	bool		final_states;	/* this Agg may read DataFusion avg states */
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
@@ -889,6 +891,33 @@ df_numeric_append_ps(List *plans, AttrNumber attno, int *precision, int *scale)
 		found = true;
 	}
 	return found;
+}
+
+/*
+ * PS1: can combining aggregate 'agg' of Agg 'ctx' read the state of its
+ * partial aggregate on PostgreSQL as DataFusion's columns?  A numeric sum
+ * is read at its argument's scale, which must be known, within the digits
+ * a sum may take.
+ */
+static bool
+df_pg_partial_readable(Plan *ctx, Aggref *agg)
+{
+	Plan	   *pctx = ctx;
+	Aggref	   *partial;
+	Node	   *arg;
+	int			p,
+				s;
+
+	if (list_length(agg->args) != 1)
+		return false;
+	partial = df_partial_below(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
+	if (partial == NULL || list_length(partial->args) != 1)
+		return false;
+	arg = (Node *) linitial_node(TargetEntry, partial->args)->expr;
+	if (exprType(arg) != NUMERICOID)
+		return true;
+	return df_numeric_ps(pctx, arg, &p, &s) && p <= DF_NUMERIC_MAX_SUM_PRECISION &&
+		!df_numeric_may_be_infinite(pctx, arg);
 }
 
 /*
@@ -1705,7 +1734,12 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						(cxt->pg_states && list_member_ptr(cxt->whole_aggs, agg) &&
 						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
 						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT)) :
-						cxt->final_states;
+						cxt->final_states ||
+						/* PS1: from tuples, the C side reads PostgreSQL's state */
+						(cxt->pg_final_states &&
+						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
+						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT) &&
+						 df_pg_partial_readable(cxt->node, agg));
 
 					if (!allowed)
 						df_reject(cxt, "%s aggregate %s without batch Motions",
@@ -2948,6 +2982,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(df_below_sort(child), Motion) &&
 					bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches);
+				cxt->pg_final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
+					IsA(df_below_sort(child), Motion) &&
+					!bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches) &&
+					outerPlan(df_below_sort(child)) != NULL &&
+					IsA(outerPlan(df_below_sort(child)), Agg);
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
 				cxt->inner_agg = inner;
@@ -2963,6 +3002,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->allow_aggref = false;
 				cxt->partial_states = false;
 				cxt->pg_states = false;
+				cxt->pg_final_states = false;
 				cxt->final_states = false;
 				cxt->agg_to_batches = false;
 
@@ -3461,8 +3501,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						Oid			type = exprType((Node *) tle->expr);
 
 						bool		batch = bms_is_member(motion->motionID, cxt->batches);
-						bool		state = batch &&
-							df_motion_state_columns(motion, tle->resno) > 0;
+						bool		state = batch ?
+							df_motion_state_columns(motion, tle->resno) > 0 :
+							df_motion_pg_state(motion, tle->resno);
 						int			p,
 									s;
 
@@ -4174,30 +4215,66 @@ df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
 }
 
 /*
- * Columns of DataFusion state that column 'resno' of 'motion' carries
- * through a batch Motion: 2 for a partial avg (sum, count), 1 for a partial
- * sum(int8), 0 for an ordinary column.
+ * The partial aggregate column 'resno' of 'motion' carries, or NULL; *agg
+ * becomes its Agg, the Motion's child.
  */
-int
-df_motion_state_columns(Motion *motion, AttrNumber resno)
+Aggref *
+df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg)
 {
 	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
 	Plan	   *child = outerPlan(motion);
 	Node	   *expr;
 
 	if (tle == NULL || child == NULL)
-		return 0;
+		return NULL;
 	expr = (Node *) tle->expr;
 	if (IsA(expr, Var) && ((Var *) expr)->varno == OUTER_VAR)
 	{
 		tle = get_tle_by_resno(child->targetlist, ((Var *) expr)->varattno);
 		if (tle == NULL)
-			return 0;
+			return NULL;
 		expr = (Node *) tle->expr;
 	}
 	if (!IsA(expr, Aggref) || ((Aggref *) expr)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
+		return NULL;
+	if (agg)
+		*agg = child;
+	return (Aggref *) expr;
+}
+
+/*
+ * PS1: does column 'resno' of Motion of tuples 'motion' carry PostgreSQL's
+ * state of a partial aggregate the C side reads (df_state_part)?
+ */
+bool
+df_motion_pg_state(Motion *motion, AttrNumber resno)
+{
+	Plan	   *child = NULL;
+	Aggref	   *partial = df_motion_column_partial(motion, resno, &child);
+	DfAggState	state;
+
+	if (partial == NULL)
+		return false;
+	state = df_agg_state_at(child, partial);
+	return state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
+		state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT;
+}
+
+/*
+ * Columns of DataFusion state that column 'resno' of 'motion' carries
+ * through a batch Motion: 2 for a partial avg (sum, count), 1 for a partial
+ * sum(int8), 0 for an ordinary column.  Read from tuples, PostgreSQL's state
+ * becomes the same columns (PS1).
+ */
+int
+df_motion_state_columns(Motion *motion, AttrNumber resno)
+{
+	Plan	   *child = NULL;
+	Aggref	   *partial = df_motion_column_partial(motion, resno, &child);
+
+	if (partial == NULL)
 		return 0;
-	return df_agg_state_ncols(df_agg_state_at(child, (Aggref *) expr));
+	return df_agg_state_ncols(df_agg_state_at(child, partial));
 }
 
 /* Which state DataFusion keeps for 'agg'. */

@@ -509,7 +509,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | CL1 | Strings ordered by the default collation where it is C on every node |
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
 | NR1 | Numeric columns through Append, GPORCA's Sequence and Shared Scan; sums 19 digits wider than their argument |
-| PS1 | Partial sum and avg into tuples: PostgreSQL's states, for a combining aggregate on PostgreSQL |
+| PS1 | Partial sum and avg through tuples both ways: PostgreSQL's states, written and read by the C side |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would

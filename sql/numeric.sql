@@ -402,6 +402,34 @@ SET datafusion.mode = on;
 SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
 FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
 SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE g > 1000 HAVING count(*)::text ~ '^[0-9]';
+-- and the other way: the partial aggregate stays on PostgreSQL (a filter
+-- DataFusion cannot run), its combining aggregate reads PostgreSQL's states
+-- from tuples as DataFusion's columns
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g ORDER BY g;
+SET datafusion.mode = off;
+SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g ORDER BY g;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE k::text ~ '^[0-9]' AND g > 1000;
+SET datafusion.mode = on;
+SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g ORDER BY g;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE k::text ~ '^[0-9]' AND g > 1000;
+-- without groups over no rows, PostgreSQL's partial state is NULL; a sum of
+-- a numeric of unknown scale stays on PostgreSQL
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT sum(v), avg(v), avg(i), sum(b), avg(b), count(*) FROM df_ps WHERE k::text ~ '^x';
+EXPLAIN (COSTS OFF) SELECT g, sum(v / 3), avg(v / 3) FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g;
+SET datafusion.mode = off;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b), count(*) FROM df_ps WHERE k::text ~ '^x';
+SELECT g, sum(v / 3), avg(v / 3) FROM df_ps WHERE k::text ~ '^[0-9]' AND g < 3 GROUP BY g ORDER BY g;
+SET datafusion.mode = on;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b), count(*) FROM df_ps WHERE k::text ~ '^x';
+SELECT g, sum(v / 3), avg(v / 3) FROM df_ps WHERE k::text ~ '^[0-9]' AND g < 3 GROUP BY g ORDER BY g;
+SET optimizer = on;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b), count(*) FROM df_ps WHERE k::text ~ '^x';
+SET optimizer = off;
 SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_ps;
