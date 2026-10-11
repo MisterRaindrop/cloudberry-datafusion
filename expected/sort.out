@@ -848,7 +848,8 @@ RESET enable_hashagg;
 DROP TABLE df_lk;
 -- A GroupAggregate over a sorted Gather's merge (D5, TPC-H Q5) whose order
 -- no one reads runs hashed, and the Gather carries batches unmerged; one
--- whose order the query reads stays on PostgreSQL.
+-- whose order the query reads runs hashed and sorted by the merge keys
+-- (D7).
 CREATE TABLE df_mg (k int, a int, n numeric(10,2)) DISTRIBUTED BY (k);
 INSERT INTO df_mg SELECT i, i % 23, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
 ANALYZE df_mg;
@@ -874,8 +875,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FRO
 (13 rows)
 
 EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
-                          QUERY PLAN                           
----------------------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Finalize GroupAggregate
    Group Key: a
    ->  Gather Motion 3:1  (slice1; segments: 3)
@@ -886,8 +887,8 @@ EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
                      Sort Key: a DESC
                      ->  Seq Scan on df_mg
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: sorted or mixed aggregation
- DataFusion: slice 1 eligible
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
 (12 rows)
 
 SET datafusion.mode = off;
@@ -963,6 +964,427 @@ SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
 RESET datafusion.motion_batches;
 RESET enable_hashagg;
 DROP TABLE df_mg;
+-- A GroupAggregate at the top of the slice, or below a Limit there, whose
+-- order the rows leave in (D7, TPC-DS Q7): DataFusion groups hashed and
+-- sorts by the keys of its input, a merging Gather's or a Sort's, every
+-- grouping column among them.  One below a join, whose order no one reads
+-- (D6, TPC-DS Q32), runs hashed.  Grouping sets stay on PostgreSQL: the
+-- Agg names the columns of one set only.
+CREATE TABLE df_go (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_go SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
+  'v' || (i % 17), (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_go;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Limit
+   ->  Finalize GroupAggregate
+         Group Key: a
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: a
+               ->  Partial GroupAggregate
+                     Group Key: a
+                     ->  Sort
+                           Sort Key: a
+                           ->  Seq Scan on df_go
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Limit
+   ->  Finalize GroupAggregate
+         Group Key: a, ((t)::text)
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: a, ((t)::text)
+               ->  Partial GroupAggregate
+                     Group Key: a, ((t)::text)
+                     ->  Sort
+                           Sort Key: a DESC NULLS LAST, ((t)::text) COLLATE "C" DESC
+                           ->  Seq Scan on df_go
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g.a, (sum(df_go.n))
+   ->  Sort
+         Sort Key: g.a, (sum(df_go.n))
+         ->  Hash Join
+               Hash Cond: (df_go.k = g.k)
+               ->  GroupAggregate
+                     Group Key: df_go.k
+                     ->  Sort
+                           Sort Key: df_go.k
+                           ->  Seq Scan on df_go
+               ->  Hash
+                     ->  Seq Scan on df_go g
+                           Filter: ((k % 1000) = 7)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(17 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: (sum(n)), a
+   ->  Sort
+         Sort Key: (sum(n)), a
+         ->  Finalize GroupAggregate
+               Group Key: a, (GROUPINGSET_ID())
+               ->  Sort
+                     Sort Key: a, (GROUPINGSET_ID())
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a, (GROUPINGSET_ID())
+                           ->  Partial GroupAggregate
+                                 Group Key: a
+                                 Group Key: ()
+                                 ->  Sort
+                                       Sort Key: a
+                                       ->  Seq Scan on df_go
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible below the top: Sort (above: grouping sets)
+(20 rows)
+
+SET datafusion.mode = off;
+SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+ a | count |    sum    
+---+-------+-----------
+ 0 |  1513 | 119013.75
+ 1 |  1514 | 119103.75
+ 2 |  1514 | 119200.50
+ 3 |  1514 | 118980.75
+ 4 |  1514 | 119077.50
+(5 rows)
+
+SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+ a  | t  |   sum   
+----+----+---------
+ 12 | v6 | 7264.50
+ 12 | v5 | 7302.00
+ 12 | v4 | 7032.75
+ 12 | v3 | 6709.50
+(4 rows)
+
+SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
+ a  | count 
+----+-------
+    |   327
+  0 |  1513
+  1 |  1514
+  2 |  1514
+  3 |  1514
+  4 |  1514
+  5 |  1513
+  6 |  1514
+  7 |  1513
+  8 |  1513
+  9 |  1512
+ 10 |  1513
+ 11 |  1513
+ 12 |  1513
+(14 rows)
+
+SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+ a  |   s    
+----+--------
+  0 |  33.00
+  1 |  12.75
+  1 |  74.25
+  2 |  54.00
+  2 | 115.50
+  3 |  95.25
+  3 | 156.75
+  4 |  39.75
+  4 | 136.50
+  5 |  19.50
+  5 |  81.00
+  6 |  60.75
+  6 | 122.25
+  7 |   5.25
+  7 | 102.00
+  8 | 143.25
+  9 |  26.25
+ 10 |  67.50
+ 11 | 108.75
+ 12 | 150.00
+(20 rows)
+
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+ a  |    sum     
+----+------------
+    |   25767.75
+  9 |  118749.00
+  7 |  118761.00
+ 10 |  118884.00
+ 12 |  118917.75
+  5 |  118924.50
+  6 |  118947.75
+ 11 |  118980.00
+  3 |  118980.75
+  0 |  119013.75
+  8 |  119015.25
+  4 |  119077.50
+  1 |  119103.75
+  2 |  119200.50
+    | 1572323.25
+(15 rows)
+
+SET gp_enable_multiphase_agg = off;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+ a  |    sum     
+----+------------
+    |   25767.75
+  9 |  118749.00
+  7 |  118761.00
+ 10 |  118884.00
+ 12 |  118917.75
+  5 |  118924.50
+  6 |  118947.75
+ 11 |  118980.00
+  3 |  118980.75
+  0 |  119013.75
+  8 |  119015.25
+  4 |  119077.50
+  1 |  119103.75
+  2 |  119200.50
+    | 1572323.25
+(15 rows)
+
+RESET enable_hashagg;
+SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+ a  |  t  |   sum   
+----+-----+---------
+    |     |  299.25
+    | v11 | 1083.00
+    | v12 | 1095.75
+    | v7  | 1095.75
+    | v13 | 1108.50
+    | v8  | 1109.25
+    | v14 | 1121.25
+    | v9  | 1122.75
+    | v15 | 1134.00
+    | v10 | 1136.25
+    | v16 | 1146.75
+    | v0  | 1159.50
+    | v1  | 1173.00
+    | v2  | 1186.50
+    | v3  | 1200.00
+    | v4  | 1213.50
+    | v5  | 1227.00
+    | v6  | 1240.50
+  5 |     | 1353.75
+  1 |     | 1397.25
+  3 |     | 1410.75
+  4 |     | 1428.00
+  6 |     | 1462.50
+  9 |     | 1468.50
+  7 |     | 1479.75
+  8 |     | 1497.00
+ 10 |     | 1506.75
+ 11 |     | 1548.75
+  2 |     | 1551.75
+ 12 |     | 1566.00
+  0 |     | 1583.25
+(31 rows)
+
+SET enable_hashagg = off;
+RESET gp_enable_multiphase_agg;
+SET datafusion.mode = on;
+SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+ a | count |    sum    
+---+-------+-----------
+ 0 |  1513 | 119013.75
+ 1 |  1514 | 119103.75
+ 2 |  1514 | 119200.50
+ 3 |  1514 | 118980.75
+ 4 |  1514 | 119077.50
+(5 rows)
+
+SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+ a  | t  |   sum   
+----+----+---------
+ 12 | v6 | 7264.50
+ 12 | v5 | 7302.00
+ 12 | v4 | 7032.75
+ 12 | v3 | 6709.50
+(4 rows)
+
+SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
+ a  | count 
+----+-------
+    |   327
+  0 |  1513
+  1 |  1514
+  2 |  1514
+  3 |  1514
+  4 |  1514
+  5 |  1513
+  6 |  1514
+  7 |  1513
+  8 |  1513
+  9 |  1512
+ 10 |  1513
+ 11 |  1513
+ 12 |  1513
+(14 rows)
+
+SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+ a  |   s    
+----+--------
+  0 |  33.00
+  1 |  12.75
+  1 |  74.25
+  2 |  54.00
+  2 | 115.50
+  3 |  95.25
+  3 | 156.75
+  4 |  39.75
+  4 | 136.50
+  5 |  19.50
+  5 |  81.00
+  6 |  60.75
+  6 | 122.25
+  7 |   5.25
+  7 | 102.00
+  8 | 143.25
+  9 |  26.25
+ 10 |  67.50
+ 11 | 108.75
+ 12 | 150.00
+(20 rows)
+
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+ a  |    sum     
+----+------------
+    |   25767.75
+  9 |  118749.00
+  7 |  118761.00
+ 10 |  118884.00
+ 12 |  118917.75
+  5 |  118924.50
+  6 |  118947.75
+ 11 |  118980.00
+  3 |  118980.75
+  0 |  119013.75
+  8 |  119015.25
+  4 |  119077.50
+  1 |  119103.75
+  2 |  119200.50
+    | 1572323.25
+(15 rows)
+
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Sort
+   Sort Key: (sum(n)), a
+   ->  GroupAggregate
+         Group Key: a
+         Group Key: ()
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: a
+               ->  Sort
+                     Sort Key: a
+                     ->  Seq Scan on df_go
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: grouping sets
+ DataFusion: slice 1 eligible
+(13 rows)
+
+SET datafusion.mode = on;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+ a  |    sum     
+----+------------
+    |   25767.75
+  9 |  118749.00
+  7 |  118761.00
+ 10 |  118884.00
+ 12 |  118917.75
+  5 |  118924.50
+  6 |  118947.75
+ 11 |  118980.00
+  3 |  118980.75
+  0 |  119013.75
+  8 |  119015.25
+  4 |  119077.50
+  1 |  119103.75
+  2 |  119200.50
+    | 1572323.25
+(15 rows)
+
+RESET enable_hashagg;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Sort
+   Sort Key: (sum(n)), a, t
+   ->  HashAggregate
+         Hash Key: a
+         Hash Key: t
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               ->  Seq Scan on df_go
+                     Filter: (k < 300)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: grouping sets
+ DataFusion: slice 1 eligible
+(11 rows)
+
+SET datafusion.mode = on;
+SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+ a  |  t  |   sum   
+----+-----+---------
+    |     |  299.25
+    | v11 | 1083.00
+    | v12 | 1095.75
+    | v7  | 1095.75
+    | v13 | 1108.50
+    | v8  | 1109.25
+    | v14 | 1121.25
+    | v9  | 1122.75
+    | v15 | 1134.00
+    | v10 | 1136.25
+    | v16 | 1146.75
+    | v0  | 1159.50
+    | v1  | 1173.00
+    | v2  | 1186.50
+    | v3  | 1200.00
+    | v4  | 1213.50
+    | v5  | 1227.00
+    | v6  | 1240.50
+  5 |     | 1353.75
+  1 |     | 1397.25
+  3 |     | 1410.75
+  4 |     | 1428.00
+  6 |     | 1462.50
+  9 |     | 1468.50
+  7 |     | 1479.75
+  8 |     | 1497.00
+ 10 |     | 1506.75
+ 11 |     | 1548.75
+  2 |     | 1551.75
+ 12 |     | 1566.00
+  0 |     | 1583.25
+(31 rows)
+
+RESET gp_enable_multiphase_agg;
+DROP TABLE df_go;
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

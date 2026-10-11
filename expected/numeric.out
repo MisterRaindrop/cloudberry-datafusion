@@ -1590,8 +1590,8 @@ SET datafusion.motion_batches = on;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
 FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
-                          QUERY PLAN                           
----------------------------------------------------------------
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
  Finalize GroupAggregate
    Group Key: g
    Filter: ((count(*))::text ~ '^[0-9]'::text)
@@ -1603,7 +1603,7 @@ FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
                      Group Key: g
                      ->  Seq Scan on df_ps
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: sorted or mixed aggregation
+ DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
  DataFusion: slice 1 eligible
 (13 rows)
 

@@ -137,7 +137,7 @@ typedef struct DfCheckContext
 
 static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
 static bool df_check_expr(Node *node, DfCheckContext *cxt);
-static bool df_check_resort_limit(DfCheckContext *cxt, Motion *motion, Limit *limit);
+static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
 static bool df_name_in(const char *name, const char *const *list);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
@@ -2707,54 +2707,92 @@ df_agg_output_of(Agg *agg, AttrNumber attno)
 }
 
 /*
- * D4: below sorted Motion 'motion', a Limit over a GroupAggregate over a
- * Sort, as the planner pushes a LIMIT down (TPC-H Q18): the Limit keeps
- * the first rows in the GroupAggregate's order, the Sort's.  May the slice
- * run it hashed, sort its output by the Sort's keys and then limit it?
- * That order is the GroupAggregate's when the Sort's keys are grouping
- * columns covering all of them (one row per group, so no ties), each an
- * output column; the Motion merges by a prefix of them.  Records it.
+ * The order a GroupAggregate's input arrives in: the keys of 'plan', a
+ * Sort below it or a sorted Motion it reads merged.  False for anything
+ * else.
  */
 static bool
-df_check_resort_limit(DfCheckContext *cxt, Motion *motion, Limit *limit)
+df_group_input_order(Plan *plan, int *ncols, AttrNumber **cols, Oid **ops,
+					 Oid **collations, bool **nulls)
 {
-	Agg		   *agg = (Agg *) outerPlan(limit);
-	Sort	   *sort;
+	if (plan != NULL && IsA(plan, Sort))
+	{
+		Sort	   *sort = (Sort *) plan;
+
+		*ncols = sort->numCols;
+		*cols = sort->sortColIdx;
+		*ops = sort->sortOperators;
+		*collations = sort->collations;
+		*nulls = sort->nullsFirst;
+		return true;
+	}
+	if (plan != NULL && IsA(plan, Motion) && ((Motion *) plan)->sendSorted)
+	{
+		Motion	   *motion = (Motion *) plan;
+
+		*ncols = motion->numSortCols;
+		*cols = motion->sortColIdx;
+		*ops = motion->sortOperators;
+		*collations = motion->collations;
+		*nulls = motion->nullsFirst;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * D4, D7: may the slice run GroupAggregate 'agg' hashed and sort its
+ * output in the order the GroupAggregate gives, for a Limit above it to
+ * keep the first rows or for the rows to leave in?  That order is its
+ * input's (df_group_input_order), when those keys are grouping columns
+ * covering all of them (one row per group, so no ties), each an output
+ * column.  Below sorted Motion 'motion' (D4, TPC-H Q18), the Motion merges
+ * by a prefix of them; at the top of a slice (D7), 'motion' is NULL.
+ * Records it.
+ */
+static bool
+df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
+{
+	Plan	   *input = agg != NULL && IsA(agg, Agg) ? outerPlan(agg) : NULL;
 	Bitmapset  *groups = NULL;
 	Bitmapset  *keys = NULL;
+	int			ncols;
+	AttrNumber *cols;
+	Oid		   *ops;
+	Oid		   *collations;
+	bool	   *nulls;
 	int			i,
 				k;
 
-	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
-		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) ||
-		!df_passes_through((Plan *) limit) || motion->numSortCols == 0)
+	if (input == NULL || agg->aggstrategy != AGG_SORTED ||
+		!df_group_input_order(input, &ncols, &cols, &ops, &collations, &nulls) ||
+		agg->numCols == 0)
 		return false;
-	sort = (Sort *) outerPlan(agg);
-	if (sort->numCols < motion->numSortCols)
+	if (motion != NULL && (motion->numSortCols == 0 || ncols < motion->numSortCols))
 		return false;
-	for (i = 0; i < sort->numCols; i++)
+	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
 	{
-		AttrNumber	col = df_agg_output_of(agg, sort->sortColIdx[i]);
+		AttrNumber	col = df_agg_output_of(agg, cols[i]);
 		TargetEntry *tle = col > 0 ? get_tle_by_resno(agg->plan.targetlist, col) : NULL;
 		Oid			type;
 		bool		desc;
 
-		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != sort->sortColIdx[i]; k++)
+		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != cols[i]; k++)
 			;
 		if (tle == NULL || k == agg->numCols)
 			return false;
 		groups = bms_add_member(groups, k);
 		type = exprType((Node *) tle->expr);
-		if (!df_type_supported(type) || !df_sort_direction(sort->sortOperators[i], type, &desc))
+		if (!df_type_supported(type) || !df_sort_direction(ops[i], type, &desc))
 			return false;
 		if (df_type_is_string(type) &&
-			df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
+			df_string_compare_problem(cxt, "<", collations[i]) != NULL)
 		{
 			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-					  df_string_compare_problem(cxt, "<", sort->collations[i]));
+					  df_string_compare_problem(cxt, "<", collations[i]));
 			return false;
 		}
-		if (i < motion->numSortCols)
+		if (motion != NULL && i < motion->numSortCols)
 		{
 			/* the Motion's key i is the same column, the same way */
 			TargetEntry *mtle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
@@ -2762,17 +2800,18 @@ df_check_resort_limit(DfCheckContext *cxt, Motion *motion, Limit *limit)
 			if (mtle == NULL || !IsA(mtle->expr, Var) ||
 				((Var *) mtle->expr)->varno != OUTER_VAR ||
 				((Var *) mtle->expr)->varattno != col ||
-				motion->sortOperators[i] != sort->sortOperators[i] ||
-				motion->nullsFirst[i] != sort->nullsFirst[i])
+				motion->sortOperators[i] != ops[i] ||
+				motion->nullsFirst[i] != nulls[i])
 				return false;
 		}
 		keys = bms_add_member(keys, col);
 	}
-	if (bms_num_members(groups) != agg->numCols)
+	if (bms_num_members(groups) != agg->numCols ||
+		(motion != NULL && i < motion->numSortCols))
 		return false;
 	cxt->sort_keys = bms_union(cxt->sort_keys, keys);
 	cxt->tails.resort = motion;
-	cxt->tails.resort_by = sort;
+	cxt->tails.resort_by = input;
 	return true;
 }
 
@@ -2789,7 +2828,8 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 				k;
 
 	if (agg != NULL && IsA(agg, Limit))
-		return df_check_resort_limit(cxt, motion, (Limit *) agg);
+		return df_passes_through((Plan *) agg) &&
+			df_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
 	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
 		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) || motion->numSortCols == 0)
 		return false;
@@ -2887,6 +2927,12 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				ListCell   *lc;
 				int			i;
 
+				if (agg->groupingSets != NIL || agg->chain != NIL)
+				{
+					/* GROUPING SETS, ROLLUP, CUBE: grpColIdx names only one set */
+					df_reject(cxt, "grouping sets");
+					return;
+				}
 				if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
 					child != NULL && IsA(child, Sort))
 				{
@@ -2905,6 +2951,19 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * GroupAggregate (TPC-H Q5), runs hashed and reads the
 					 * Motion unmerged.
 					 */
+				}
+				else if (agg->aggstrategy == AGG_SORTED && plan == cxt->top &&
+						 cxt->tails.resort == NULL && cxt->tails.resort_by == NULL &&
+						 df_check_group_order(cxt, NULL, agg))
+				{
+					/*
+					 * D7: one at the top of the slice, or below a Limit there,
+					 * whose order the rows leave in (TPC-DS Q7, a Finalize
+					 * GroupAggregate over a merging Gather), runs hashed and
+					 * the slice sorts its output in that order.
+					 */
+					if (IsA(child, Sort))
+						cxt->skipped_sort = child;
 				}
 				else if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
 				{
@@ -3104,6 +3163,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Plan	   *inner = innerPlan(plan);
 				Bitmapset  *outer_needed = NULL;
 				Bitmapset  *inner_needed = NULL;
+				bool		order_free = cxt->node_order_free;	/* checking the inner
+																 * side resets it */
 				ListCell   *lc;
 
 				if (hj == NULL)
@@ -3315,8 +3376,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				inner_needed = bms_add_member(inner_needed, 0);
 				cxt->agg_input = false;
 				cxt->join_input = true;
+				/*
+				 * D6: no one reads the order of a Hash Join's sides, nor of a
+				 * Nested Loop's inner one: to both planners a Hash Join's
+				 * rows come in no order and a Nested Loop's in its outer
+				 * side's.
+				 */
+				cxt->order_free = true;
 				df_check_plan(inner, cxt, inner_needed, false);
 				cxt->join_input = true;
+				cxt->order_free = hj != NULL || order_free;
 				df_check_plan(outer, cxt, outer_needed, false);
 				cxt->join_input = false;
 				return;
@@ -3343,6 +3412,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						df_collect_outer_refs((Node *) tle->expr, &child_needed);
 				}
 				child_needed = bms_add_member(child_needed, 0);
+				/* D6: a Hash keeps no order, a Materialize its child's */
+				cxt->order_free = IsA(plan, Hash) || cxt->node_order_free;
 				df_check_plan(outerPlan(plan), cxt, child_needed, false);
 				return;
 			}

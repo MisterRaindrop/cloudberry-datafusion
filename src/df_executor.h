@@ -86,9 +86,11 @@ typedef struct DfTails
 	Motion	   *resort;			/* a sorted Motion whose GroupAggregate below
 								 * runs hashed: the slice sorts its output by
 								 * the Motion's keys (D3) */
-	Sort	   *resort_by;		/* or, with a Limit between them, by this
-								 * Sort's keys, the GroupAggregate's order
-								 * (D4) */
+	Plan	   *resort_by;		/* or, with a Limit between them, by the
+								 * keys of this Sort or merging Motion below
+								 * the GroupAggregate, its order (D4); or so
+								 * at the top of the slice, with no Motion
+								 * (D7) */
 } DfTails;
 
 /*

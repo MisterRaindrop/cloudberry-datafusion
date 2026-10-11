@@ -2373,17 +2373,39 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 }
 
 /*
- * D4: the order of Sort 'sort' below 'body', a GroupAggregate run hashed
- * under a Limit, as the spec's "sort" by output columns (the Limit applies
- * after it).
+ * D4, D7: the order of 'input', a Sort or merging Motion below 'body', a
+ * GroupAggregate run hashed, as the spec's "sort" by output columns (a
+ * Limit applies after it).
  */
 static void
-df_emit_resort_by(DfBuilder *b, StringInfo out, Sort *sort, Plan *body, DfSliceSpec *spec)
+df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSliceSpec *spec)
 {
-	int			i;
+	int			ncols;
+	AttrNumber *cols;
+	Oid		   *ops;
+	bool	   *nulls;
+	Agg		   *agg = (Agg *) body;
+	Bitmapset  *groups = NULL;
+	int			i,
+				k;
 
+	if (IsA(input, Sort))
+	{
+		ncols = ((Sort *) input)->numCols;
+		cols = ((Sort *) input)->sortColIdx;
+		ops = ((Sort *) input)->sortOperators;
+		nulls = ((Sort *) input)->nullsFirst;
+	}
+	else
+	{
+		ncols = ((Motion *) input)->numSortCols;
+		cols = ((Motion *) input)->sortColIdx;
+		ops = ((Motion *) input)->sortOperators;
+		nulls = ((Motion *) input)->nullsFirst;
+	}
 	appendStringInfoString(out, ",\"sort\":[");
-	for (i = 0; i < sort->numCols; i++)
+	/* up to the key that completes the groups, as df_check_group_order */
+	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
 	{
 		TargetEntry *tle = NULL;
 		ListCell   *lc;
@@ -2395,11 +2417,14 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Sort *sort, Plan *body, DfSliceS
 			TargetEntry *t = lfirst_node(TargetEntry, lc);
 
 			if (IsA(t->expr, Var) && ((Var *) t->expr)->varno == OUTER_VAR &&
-				((Var *) t->expr)->varattno == sort->sortColIdx[i])
+				((Var *) t->expr)->varattno == cols[i])
 				tle = t;
 		}
-		if (tle == NULL || spec->col_value[tle->resno - 1] < 0 ||
-			!df_sort_direction(sort->sortOperators[i], exprType((Node *) tle->expr), &desc))
+		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != cols[i]; k++)
+			;
+		groups = bms_add_member(groups, k);
+		if (tle == NULL || k == agg->numCols || spec->col_value[tle->resno - 1] < 0 ||
+			!df_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
 		{
 			df_fail(b, "a sort key of the GroupAggregate");
 			return;
@@ -2407,7 +2432,7 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Sort *sort, Plan *body, DfSliceS
 		c = b->out_col[spec->col_value[tle->resno - 1]];
 		appendStringInfo(out, "%s{\"col\":%d,\"desc\":%s,\"nulls_first\":%s}",
 						 i > 0 ? "," : "", c, desc ? "true" : "false",
-						 sort->nullsFirst[i] ? "true" : "false");
+						 nulls[i] ? "true" : "false");
 	}
 	appendStringInfoChar(out, ']');
 }
@@ -2519,7 +2544,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	initStringInfo(&sortlimit);
 	if (!b.failed)
 		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
-	if (!b.failed && tails != NULL && tails->resort != NULL)
+	if (!b.failed && tails != NULL && (tails->resort != NULL || tails->resort_by != NULL))
 	{
 		if (sort != NULL || (limit != NULL && tails->resort_by == NULL))
 			df_fail(&b, "a Sort below a sorted Motion's GroupAggregate");

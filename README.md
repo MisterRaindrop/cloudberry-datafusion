@@ -491,6 +491,8 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | R1 | GPORCA's Result: a projection and filter over its child |
 | D4 | A Limit over a GroupAggregate below a sorted Motion |
 | D5 | Sorted Gathers carry batches where the order is not read |
+| D6 | GroupAggregates below a Hash Join or Hash, whose order no one reads |
+| D7 | GroupAggregates whose order the slice's rows leave in, sorted after |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1053,8 +1055,7 @@ reads, below an unsorted Motion, a Sort or another aggregate, runs
 hashed without the Sort below it.  Below a sorted Motion whose keys are
 its groups (D3), it runs hashed and the slice sorts its output by those
 keys: the groups are unique, so the order is the same.  One below a Limit
-or at the top of the coordinator's slice stays on PostgreSQL, since the
-query's ORDER BY may rest on its order.  `count(DISTINCT a % 100000)`
+or at the top of a slice is D7's.  `count(DISTINCT a % 100000)`
 over 30 million rows took 0.65 s against 3.29 s.
 
 D4: the planner also pushes a LIMIT below the sorted Motion, over the
@@ -1071,7 +1072,24 @@ then carries batches, received unmerged.  Its sender need not sort for
 them, so a sort by a character key under a collation that differs between
 the coordinator and the segments no longer keeps it out.  Where the
 query's order rests on the merge (`GROUP BY a ORDER BY a` without a Sort
-above), it stays on PostgreSQL.
+above), D7 sorts.
+
+D6: no one reads the order of a Hash Join's sides, a Nested Loop's inner
+side or a Hash's child: to both planners a Hash Join's rows come in no
+order and a Nested Loop's in its outer side's.  A GroupAggregate there
+(TPC-DS Q32, in a subquery joined) runs hashed, as D2.
+
+D7: a GroupAggregate at the top of a slice, or below a Limit there, whose
+order the rows leave in: on the coordinator over a sorted Gather's merge
+(TPC-DS Q7, a Finalize GroupAggregate under the query's LIMIT), or the top
+of a subtree a PostgreSQL node above reads in order (T2).  It runs hashed,
+and the slice sorts its output by the keys of its input, the merge's or
+the Sort's, then limits it; as D4, every grouping column must be among
+them.
+
+GROUPING SETS, ROLLUP and CUBE stay on PostgreSQL: their Agg names the
+grouping columns of one set only, and running that as a GROUP BY lost the
+other sets' rows.
 
 ### Subtrees below PostgreSQL's nodes
 

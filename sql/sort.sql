@@ -144,7 +144,8 @@ DROP TABLE df_lk;
 
 -- A GroupAggregate over a sorted Gather's merge (D5, TPC-H Q5) whose order
 -- no one reads runs hashed, and the Gather carries batches unmerged; one
--- whose order the query reads stays on PostgreSQL.
+-- whose order the query reads runs hashed and sorted by the merge keys
+-- (D7).
 CREATE TABLE df_mg (k int, a int, n numeric(10,2)) DISTRIBUTED BY (k);
 INSERT INTO df_mg SELECT i, i % 23, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
 ANALYZE df_mg;
@@ -162,6 +163,53 @@ SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
 RESET datafusion.motion_batches;
 RESET enable_hashagg;
 DROP TABLE df_mg;
+
+-- A GroupAggregate at the top of the slice, or below a Limit there, whose
+-- order the rows leave in (D7, TPC-DS Q7): DataFusion groups hashed and
+-- sorts by the keys of its input, a merging Gather's or a Sort's, every
+-- grouping column among them.  One below a join, whose order no one reads
+-- (D6, TPC-DS Q32), runs hashed.  Grouping sets stay on PostgreSQL: the
+-- Agg names the columns of one set only.
+CREATE TABLE df_go (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_go SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
+  'v' || (i % 17), (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_go;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+EXPLAIN (COSTS OFF) SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+EXPLAIN (COSTS OFF) SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+SET datafusion.mode = off;
+SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
+SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+SET gp_enable_multiphase_agg = off;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+RESET enable_hashagg;
+SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+SET enable_hashagg = off;
+RESET gp_enable_multiphase_agg;
+SET datafusion.mode = on;
+SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
+SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
+SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
+SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+SET datafusion.mode = on;
+SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
+RESET enable_hashagg;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+SET datafusion.mode = on;
+SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
+RESET gp_enable_multiphase_agg;
+DROP TABLE df_go;
 
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
