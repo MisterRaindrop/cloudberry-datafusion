@@ -153,10 +153,7 @@ impl JoinSpec {
         held: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
         let mut env = (*ctx.runtime_env()).clone();
-        env.memory_pool = Arc::new(HeldPool {
-            parent: ctx.memory_pool().clone(),
-            state: Mutex::new((held, 0)),
-        });
+        env.memory_pool = Arc::new(HeldPool::new(ctx.memory_pool().clone(), held));
         let ctx = Arc::new(TaskContext::new(
             ctx.task_id(),
             ctx.session_id(),
@@ -189,12 +186,35 @@ impl JoinSpec {
 /// another consumer could take the bytes in between, and the join, which
 /// cannot spill, finds no room in a pool that consumers which can spill
 /// have filled (DataFusion's fair pool limits each of those to its share,
-/// not their sum).  The reservation is freed when the join is.
+/// not their sum).  What the join takes past them, once its share of the
+/// pool has shrunk below, is memory that cannot spill (`extra`): the build
+/// side is in (TPC-DS Q80 failed for 68 bytes).  The reservations are freed
+/// when the join is.
 #[derive(Debug)]
 struct HeldPool {
     parent: Arc<dyn MemoryPool>,
-    /// the reservation, and the bytes handed out of it
-    state: Mutex<(MemoryReservation, usize)>,
+    state: Mutex<Held>,
+}
+
+#[derive(Debug)]
+struct Held {
+    /// the build side's reservation, which can spill
+    held: MemoryReservation,
+    /// grown where `held` may not grow any more, as memory that cannot spill
+    extra: MemoryReservation,
+    /// the bytes handed out of the two
+    used: usize,
+}
+
+impl HeldPool {
+    fn new(parent: Arc<dyn MemoryPool>, held: MemoryReservation) -> Self {
+        let extra = MemoryConsumer::new(format!("{} in memory", held.consumer().name()))
+            .register(&parent);
+        HeldPool {
+            parent,
+            state: Mutex::new(Held { held, extra, used: 0 }),
+        }
+    }
 }
 
 impl fmt::Display for HeldPool {
@@ -210,30 +230,30 @@ impl MemoryPool for HeldPool {
 
     fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
         let mut state = self.state.lock().unwrap();
-        state.1 += additional;
-        let short = state.1.saturating_sub(state.0.size());
-        state.0.grow(short);
+        state.used += additional;
+        let short = state.used.saturating_sub(state.held.size() + state.extra.size());
+        state.extra.grow(short);
     }
 
     fn shrink(&self, _reservation: &MemoryReservation, shrink: usize) {
         // the bytes stay held until the join ends
-        self.state.lock().unwrap().1 -= shrink;
+        self.state.lock().unwrap().used -= shrink;
     }
 
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let short = (state.1 + additional).saturating_sub(state.0.size());
+        let short = (state.used + additional).saturating_sub(state.held.size() + state.extra.size());
         // Bytes already held are the join's even when the pool's share of
         // a consumer has shrunk below them since.
-        if short > 0 {
-            state.0.try_grow(short)?;
+        if short > 0 && state.held.try_grow(short).is_err() {
+            state.extra.try_grow(short)?;
         }
-        state.1 += additional;
+        state.used += additional;
         Ok(())
     }
 
     fn reserved(&self) -> usize {
-        self.state.lock().unwrap().1
+        self.state.lock().unwrap().used
     }
 
     fn memory_limit(&self) -> MemoryLimit {
@@ -998,7 +1018,8 @@ mod tests {
     }
 
     /// The join's memory comes out of the reservation first, although the
-    /// pool would not grant the reservation as much any more.
+    /// pool would not grant the reservation as much any more; past it, out
+    /// of the pool as memory that cannot spill.
     #[test]
     fn held_bytes_stay_the_joins() {
         let parent: Arc<dyn MemoryPool> = Arc::new(FairSpillPool::new(1000));
@@ -1007,15 +1028,14 @@ mod tests {
         held.try_grow(600).unwrap();
         // two more spillers: a share is a third of the pool
         let _others = (spiller().register(&parent), spiller().register(&parent));
-        let pool: Arc<dyn MemoryPool> = Arc::new(HeldPool {
-            parent: parent.clone(),
-            state: Mutex::new((held, 0)),
-        });
+        let pool: Arc<dyn MemoryPool> = Arc::new(HeldPool::new(parent.clone(), held));
         let join = MemoryConsumer::new("join").register(&pool);
         join.try_grow(500).unwrap();
         join.try_grow(100).unwrap();
-        assert!(join.try_grow(1).is_err());
         assert_eq!(parent.reserved(), 600);
+        join.try_grow(300).unwrap();
+        assert_eq!(parent.reserved(), 900);
+        assert!(join.try_grow(101).is_err(), "the pool is full");
         drop(join);
         drop(pool);
         assert_eq!(parent.reserved(), 0);
