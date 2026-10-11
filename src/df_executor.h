@@ -116,7 +116,8 @@ typedef struct DfSliceSpec
 
 	/*
 	 * The tuple's columns (P1).  The output columns above are values: one
-	 * per value, two for DF_OUT_NUMERIC_AVG and DF_OUT_NUMERIC_MIXED.
+	 * per value, two for DF_OUT_NUMERIC_AVG, DF_OUT_NUMERIC_MIXED and the
+	 * states of two columns.
 	 * Column k of the tuple is value col_value[k], or, if that is -1,
 	 * col_tail[k] evaluated over the values (Vars of OUTER_VAR, attno =
 	 * value + 1).  col_tail is NULL without such columns.
@@ -192,7 +193,18 @@ typedef enum DfOutKind
 								 * avg = sum / count (numeric_div) */
 	DF_OUT_NUMERIC_MIXED,		/* numeric sum and the next column's display
 								 * scale (MS1) */
-	DF_OUT_PART					/* consumed with the column before */
+	DF_OUT_PART,				/* consumed with the column before */
+	/*
+	 * PS1: a partial aggregate's state, from DataFusion's (M7d) and the
+	 * count of its values, as PostgreSQL's serial function writes it, for
+	 * tuples
+	 */
+	DF_OUT_STATE_NUMERIC,		/* numeric sum and the next column's count:
+								 * numeric_avg_serialize's bytea */
+	DF_OUT_STATE_INT8,			/* numeric sum and the next column's count:
+								 * int8_avg_serialize's bytea */
+	DF_OUT_STATE_INT_ARRAY		/* numeric sum and the next column's count:
+								 * int4_avg_accum's int8[] {count, sum} */
 } DfOutKind;
 
 /* String functions DataFusion runs (df_core::pgstr), by pg_proc OID. */
@@ -235,7 +247,7 @@ extern DfQueryStats df_last_run;	/* figures of the latest one */
 
 /* df_translate.c */
 extern const char *df_type_tag(Oid type);
-extern bool df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
+extern bool df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *spec,
 							   char *reason, size_t reasonlen);
 
 /*

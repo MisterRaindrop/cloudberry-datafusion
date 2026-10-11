@@ -106,6 +106,7 @@ typedef struct DfBuilder
 	List	   *aggfns;			/* the function of each: NULL for the
 								 * Aggref's own, or "sum" / "count" for the
 								 * parts of a partial avg's state */
+	bool		tuples;			/* the output leaves as tuples, not batches */
 	Node	   *case_arg;		/* the value of the CASE being emitted (E1) */
 	bool		join_sides;		/* emitting a join's keys or filter, which
 								 * read both sides as they are */
@@ -2059,6 +2060,21 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 }
 
 /*
+ * Columns of the state partial aggregate 'expr' of Agg 'ctx' sends: its
+ * stream columns (M7d), and for tuples, PostgreSQL's state, a sum's count
+ * too (PS1).
+ */
+static int
+df_partial_ncols(DfBuilder *b, Plan *ctx, Node *expr)
+{
+	DfAggState	state = df_partial_state(ctx, expr);
+
+	if (b->tuples && (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_SUM_INT8))
+		return 2;
+	return df_agg_state_ncols(state);
+}
+
+/*
  * The output columns of the spec: the values of 'values', expressions at
  * 'level' over the inputs of node 'ctx'.
  */
@@ -2075,7 +2091,7 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 		Node	   *expr = (Node *) lfirst(lc);
 
 		if (level == DF_LEVEL_AGG && df_partial_state(ctx, expr) != DF_AGG_PLAIN)
-			spec->nout += df_agg_state_ncols(df_partial_state(ctx, expr));
+			spec->nout += df_partial_ncols(b, ctx, expr);
 		else if (level == DF_LEVEL_AGG && IsA(expr, Aggref) &&
 				 (df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT ||
 				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
@@ -2107,6 +2123,14 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				state == DF_AGG_SUM_NUMERIC_MIXED;
 			int			scale = df_scale_of(ctx, (Node *) agg);
 
+			/* PS1: what the C side makes of it for tuples */
+			if (b->tuples && (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC))
+				spec->out_kinds[i] = DF_OUT_STATE_NUMERIC;
+			else if (b->tuples && state == DF_AGG_SUM_INT8)
+				spec->out_kinds[i] = DF_OUT_STATE_INT8;
+			else if (b->tuples && state == DF_AGG_AVG_INT)
+				spec->out_kinds[i] = linitial_oid(agg->aggargtypes) == INT8OID ?
+					DF_OUT_STATE_INT8 : DF_OUT_STATE_INT_ARRAY;
 			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = fsum ? FLOAT8OID : NUMERICOID;
 			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
@@ -2120,8 +2144,10 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int4\"}",
 								 df_agg_ref(b, agg, "mixed_scale"));
 			}
-			else if (df_agg_state_ncols(state) == 2)
+			else if (df_partial_ncols(b, ctx, (Node *) value) == 2)
 			{
+				if (spec->out_kinds[i - 1] != DF_OUT_PLAIN)
+					spec->out_kinds[i] = DF_OUT_PART;
 				spec->out_types[i++] = INT8OID;
 				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
 								 df_agg_ref(b, agg, "count"));
@@ -2423,7 +2449,7 @@ df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSlice
  * false, with a reason, if something cannot be expressed.
  */
 bool
-df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
+df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *spec,
 				   char *reason, size_t reasonlen)
 {
 	DfBuilder	b;
@@ -2460,6 +2486,7 @@ df_translate_slice(Plan *root, const DfTails *tails, DfSliceSpec *spec,
 	memset(&b, 0, sizeof(b));
 	b.reason = reason;
 	b.reasonlen = reasonlen;
+	b.tuples = tuples;
 	memset(spec, 0, sizeof(*spec));
 	initStringInfo(&group);
 	initStringInfo(&having);

@@ -134,7 +134,7 @@ EXPLAIN (COSTS OFF) SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 not eligible: sort key of type character under a collation other than C
- DataFusion: slice 2 not eligible: partial aggregate sum without batch Motions
+ DataFusion: slice 2 eligible
 (17 rows)
 
 SHOW datafusion.cluster_collation_c;

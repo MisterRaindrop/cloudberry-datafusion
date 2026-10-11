@@ -79,8 +79,10 @@
 #include "commands/defrem.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
+#include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -961,6 +963,63 @@ df_numeric_at(const void *values, uint32 r)
 	return (const uint8 *) values + (size_t) r * DF_NUMERIC_BYTES;
 }
 
+/*
+ * PS1: numeric 'num' as numericvar_serialize writes a NumericVar: ndigits,
+ * weight, sign and display scale as int32, then the base-10000 digits.
+ * numeric_send gives the same fields as int16.
+ */
+static void
+df_send_numericvar(StringInfo buf, Datum num)
+{
+	bytea	   *wire = DatumGetByteaPP(DirectFunctionCall1(numeric_send, num));
+	const char *p = VARDATA_ANY(wire);
+	int16		f[4];
+	int			i;
+
+	for (i = 0; i < 4; i++)
+		f[i] = (int16) pg_ntoh16(*(const uint16 *) (p + 2 * i));
+	for (i = 0; i < 4; i++)
+		pq_sendint32(buf, f[i]);
+	pq_sendbytes(buf, p + 8, 2 * f[0]);
+}
+
+/*
+ * PS1: the state numeric_avg_serialize writes for 'count' values (NaNs
+ * among them) adding up to 'sum', each of display scale 'scale': PostgreSQL
+ * counts those of the largest scale for an inverse transition, and sums
+ * all but the NaNs, which make the result NaN.
+ */
+static Datum
+df_numeric_state(Datum sum, bool sumnull, int scale, int64 count)
+{
+	StringInfoData buf;
+	bool		nan = !sumnull && numeric_is_nan(DatumGetNumeric(sum));
+
+	pq_begintypsend(&buf);
+	pq_sendint64(&buf, count);
+	df_send_numericvar(&buf, sumnull || nan || count == 0 ?
+					   NumericGetDatum(int64_to_numeric(0)) : sum);
+	pq_sendint32(&buf, count == 0 ? 0 : scale);	/* maxScale */
+	pq_sendint64(&buf, count == 0 ? 0 : count - (nan ? 1 : 0));	/* maxScaleCount */
+	pq_sendint64(&buf, nan ? 1 : 0);	/* NaNcount */
+	pq_sendint64(&buf, 0);		/* pInfcount: infinities stay on PostgreSQL */
+	pq_sendint64(&buf, 0);		/* nInfcount */
+	return PointerGetDatum(pq_endtypsend(&buf));
+}
+
+/* PS1: the state int8_avg_serialize writes: the count, the sum (an int128). */
+static Datum
+df_int8_state(Datum sum, bool sumnull, int64 count)
+{
+	StringInfoData buf;
+
+	pq_begintypsend(&buf);
+	pq_sendint64(&buf, count);
+	df_send_numericvar(&buf, sumnull || count == 0 ?
+					   NumericGetDatum(int64_to_numeric(0)) : sum);
+	return PointerGetDatum(pq_endtypsend(&buf));
+}
+
 static TupleTableSlot *
 df_exec_emit(DfExec *x)
 {
@@ -1002,6 +1061,44 @@ df_exec_emit(DfExec *x)
 															  Int32GetDatum(shown));
 				MemoryContextSwitchTo(oldcxt);
 			}
+			k++;
+			continue;
+		}
+		if (kind == DF_OUT_STATE_NUMERIC || kind == DF_OUT_STATE_INT8 ||
+			kind == DF_OUT_STATE_INT_ARRAY)
+		{
+			/*
+			 * PS1: PostgreSQL's state of a partial sum or avg, for the
+			 * combining aggregate of the slice that reads these tuples.  A
+			 * partial aggregate's state is never NULL: it has a count of 0.
+			 * PostgreSQL shares one state among aggregates of one transition
+			 * function and argument (sum and avg of a column) and combines
+			 * it from one of their columns: the states agree, count and all.
+			 */
+			int64		count = x->outcols[c + 1].nulls[r] ? 0 :
+				((const int64 *) x->outcols[c + 1].values)[r];
+			Datum		sum = (Datum) 0;
+
+			oldcxt = MemoryContextSwitchTo(x->rowcxt);
+			if (!isnull)
+				sum = df_numeric_datum(df_numeric_at(v, r), x->spec.out_scales[c]);
+			if (kind == DF_OUT_STATE_NUMERIC)
+				slot->tts_values[k] = df_numeric_state(sum, isnull, x->spec.out_scales[c], count);
+			else if (kind == DF_OUT_STATE_INT_ARRAY)
+			{
+				/* int4_avg_accum's Int8TransTypeData: {count, sum} */
+				Datum		elems[2];
+
+				elems[0] = Int64GetDatum(count);
+				elems[1] = isnull || count == 0 ? Int64GetDatum(0) :
+					DirectFunctionCall1(numeric_int8, sum);
+				slot->tts_values[k] = PointerGetDatum(construct_array(elems, 2, INT8OID, sizeof(int64),
+																	  FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+			}
+			else
+				slot->tts_values[k] = df_int8_state(sum, isnull, count);
+			MemoryContextSwitchTo(oldcxt);
+			slot->tts_isnull[k] = false;
 			k++;
 			continue;
 		}
@@ -1301,7 +1398,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	df_numeric_stmt = queryDesc->plannedstmt;
 	PG_TRY();
 	{
-		ok = df_translate_slice(root->plan, tails, &x->spec, reason, reasonlen);
+		ok = df_translate_slice(root->plan, tails, send == NULL, &x->spec, reason, reasonlen);
 	}
 	PG_FINALLY();
 	{

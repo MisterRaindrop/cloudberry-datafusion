@@ -103,6 +103,8 @@ typedef struct DfCheckContext
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
+	bool		pg_states;		/* this partial Agg's states leave the slice
+								 * as tuples, made PostgreSQL's (PS1) */
 	bool		final_states;	/* this Agg may read DataFusion avg states */
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
@@ -1693,8 +1695,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * for avg) instead of PostgreSQL's array or serialized
 					 * state.
 					 */
+					DfAggState	state = df_agg_state_at(cxt->node, agg);
 					bool		allowed = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ?
-						cxt->partial_states : cxt->final_states;
+						cxt->partial_states ||
+						/*
+						 * PS1: into tuples, the C side writes PostgreSQL's
+						 * state from DataFusion's
+						 */
+						(cxt->pg_states && list_member_ptr(cxt->whole_aggs, agg) &&
+						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
+						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT)) :
+						cxt->final_states;
 
 					if (!allowed)
 						df_reject(cxt, "%s aggregate %s without batch Motions",
@@ -2931,6 +2942,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					}
 				}
 				cxt->partial_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && cxt->batch_sender;
+				cxt->pg_states = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL && !cxt->batch_sender &&
+					!inner && plan == cxt->output;
 				cxt->agg_to_batches = cxt->batch_sender && !inner;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(df_below_sort(child), Motion) &&
@@ -2949,6 +2962,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->inner_agg = false;
 				cxt->allow_aggref = false;
 				cxt->partial_states = false;
+				cxt->pg_states = false;
 				cxt->final_states = false;
 				cxt->agg_to_batches = false;
 
@@ -3881,11 +3895,35 @@ df_is_init_plan_slice(PlannedStmt *stmt, int index)
  * counts as not running there: every node must find the same batch
  * Motions, and its Motions carry tuples whichever way each node decides.
  */
+/*
+ * df_translate_slice for a verdict, with the statement at hand for
+ * df_numeric_ps (NR1).
+ */
+static bool
+df_try_translate(PlannedStmt *stmt, Plan *root, const DfTails *tails, bool tuples,
+				 char *reason, size_t reasonlen)
+{
+	PlannedStmt *volatile saved = df_numeric_stmt;
+	DfSliceSpec spec;
+	volatile bool ok = false;
+
+	df_numeric_stmt = stmt;
+	PG_TRY();
+	{
+		ok = df_translate_slice(root, tails, tuples, &spec, reason, reasonlen);
+	}
+	PG_FINALLY();
+	{
+		df_numeric_stmt = saved;
+	}
+	PG_END_TRY();
+	return ok;
+}
+
 static bool
 df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	char		reason[256];
-	DfSliceSpec spec;
 	DfTails		tails;
 	Motion	   *sender;
 	Plan	   *root;
@@ -3906,7 +3944,9 @@ df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
 		df_check_slice_b(stmt, root, sender != NULL, batches, &tails, reason, sizeof(reason),
 						 &locale_dependent) &&
 		!locale_dependent &&
-		df_translate_slice(compute, &tails, &spec, reason, sizeof(reason)))
+		df_try_translate(stmt, compute, &tails,
+						 !(sender && bms_is_member(sender->motionID, batches)),
+						 reason, sizeof(reason)))
 		return true;
 	if (locale_dependent)
 		snprintf(reason, sizeof(reason), "its verdict depends on the node's default collation");
@@ -3941,11 +3981,11 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
 	foreach(lc, points)
 	{
 		DfAttach   *a = lfirst(lc);
-		DfSliceSpec spec;
 		char		reason[256];
 
+		/* T2: below PostgreSQL's nodes, the output is tuples */
 		if (df_plan_contains(a->plan, (Plan *) motion))
-			return df_translate_slice(a->plan, &a->tails, &spec, reason, sizeof(reason));
+			return df_try_translate(stmt, a->plan, &a->tails, true, reason, sizeof(reason));
 	}
 	return false;
 }

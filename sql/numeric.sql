@@ -374,6 +374,38 @@ SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_nr, df_nr2;
 
+-- PS1: a partial sum or avg in DataFusion whose combining aggregate stays
+-- on PostgreSQL (a HAVING it cannot run): the C side writes PostgreSQL's
+-- states from DataFusion's, numeric_avg_serialize's and int8_avg_serialize's
+-- bytea and avg(int)'s int8[].  sum and avg of one column share PostgreSQL's
+-- state, combined from either column: the two agree, counts and all.  A
+-- group of NaN, one of NULLs, sums past int8.
+CREATE TABLE df_ps (k int, g int, v numeric(9,2), i int, s smallint, b bigint) DISTRIBUTED BY (k);
+INSERT INTO df_ps SELECT n, n % 40,
+  CASE WHEN n % 13 = 0 THEN NULL WHEN n % 7 = 0 THEN -n * 0.11 ELSE n * 0.37 END,
+  n % 1000 - 300, (n % 77)::smallint,
+  n::bigint * 1000003 * (CASE WHEN n % 5 = 0 THEN -1 ELSE 1 END)
+FROM generate_series(1, 50000) n;
+INSERT INTO df_ps SELECT n, 99, NULL, NULL, NULL, NULL FROM generate_series(50001, 50010) n;
+INSERT INTO df_ps VALUES (60001, 98, 1.50, 1, 1, 1), (60002, 98, 'NaN', 2, 2, 2),
+  (60003, 98, 2.25, 3, 3, 9223372036854775807), (60004, 98, NULL, NULL, NULL, 9223372036854775807);
+ANALYZE df_ps;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
+SET datafusion.mode = off;
+SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE g > 1000 HAVING count(*)::text ~ '^[0-9]';
+SET datafusion.mode = on;
+SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
+FROM df_ps GROUP BY g HAVING count(*)::text ~ '^[0-9]' ORDER BY g;
+SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE g > 1000 HAVING count(*)::text ~ '^[0-9]';
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_ps;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
