@@ -492,6 +492,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | D4 | A Limit over a GroupAggregate below a sorted Motion |
 | D5 | Sorted Gathers carry batches where the order is not read |
 | D6 | GroupAggregates below a Hash Join or Hash, whose order no one reads |
+| S2 | GPORCA's Result over the slice's Sort |
 | D7 | GroupAggregates whose order the slice's rows leave in, sorted after |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
@@ -1129,6 +1130,11 @@ coordinator merges the sorted streams as it would PostgreSQL's.  The
 coordinator's own Limit over that merge stays on PostgreSQL: it computes
 nothing.  A slice without a Motion (catalog queries) runs its Sort and
 Limit itself.
+
+S2: GPORCA puts a Result over the Sort, projecting its columns (TPC-DS
+Q58).  DataFusion projects, then sorts by the columns the Result passes
+the Sort's keys on as, and a Limit above applies after; a key the Result
+does not pass on keeps the slice on PostgreSQL.
 
 | Sort key | Order |
 |---|---|

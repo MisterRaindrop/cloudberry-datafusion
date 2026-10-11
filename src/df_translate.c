@@ -2501,6 +2501,29 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		sort = (Sort *) root;
 		root = outerPlan(root);
 	}
+	else if (root != NULL && IsA(root, Result) && outerPlan(root) != NULL &&
+			 IsA(outerPlan(root), Sort))
+	{
+		/*
+		 * S2: GPORCA's Result over the Sort.  The Result's rows, sorted by
+		 * the columns it passes the Sort's keys on as: the Sort's copy
+		 * with those keys; the Sort itself passes its child's rows on.
+		 */
+		Sort	   *below = (Sort *) outerPlan(root);
+
+		sort = palloc(sizeof(Sort));
+		memcpy(sort, below, sizeof(Sort));
+		sort->sortColIdx = palloc(sizeof(AttrNumber) * Max(below->numCols, 1));
+		for (i = 0; i < below->numCols; i++)
+		{
+			sort->sortColIdx[i] = df_output_of(root, below->sortColIdx[i]);
+			if (sort->sortColIdx[i] == 0)
+			{
+				snprintf(reason, reasonlen, "a sort key the Result does not pass on");
+				return false;
+			}
+		}
+	}
 	if (root == NULL || (limit && !df_passes_through((Plan *) limit)) ||
 		(sort && !df_passes_through((Plan *) sort)))
 	{

@@ -211,6 +211,30 @@ SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) O
 RESET gp_enable_multiphase_agg;
 DROP TABLE df_go;
 
+-- GPORCA's Result over the slice's Sort (S2, TPC-DS Q58): DataFusion
+-- projects, then sorts by the columns the Result passes the Sort's keys on
+-- as, and the Limit above applies after.
+SET optimizer = on;
+CREATE TABLE df_rs (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_rs SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
+  (i % 17)::text, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_rs;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+EXPLAIN (COSTS OFF) SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+SET datafusion.mode = off;
+SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
+SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
+SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+SET datafusion.mode = on;
+SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
+SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
+SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+DROP TABLE df_rs;
+SET optimizer = off;
+
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

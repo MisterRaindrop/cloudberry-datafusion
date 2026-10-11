@@ -1385,6 +1385,191 @@ SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) O
 
 RESET gp_enable_multiphase_agg;
 DROP TABLE df_go;
+-- GPORCA's Result over the slice's Sort (S2, TPC-DS Q58): DataFusion
+-- projects, then sorts by the columns the Result passes the Sort's keys on
+-- as, and the Limit above applies after.
+SET optimizer = on;
+CREATE TABLE df_rs (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_rs SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
+  (i % 17)::text, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_rs;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: a, k
+         ->  Limit
+               ->  Result
+                     ->  Sort
+                           Sort Key: a, k
+                           ->  Seq Scan on df_rs
+                                 Filter: (k < 50)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: a
+   ->  Result
+         ->  Sort
+               Sort Key: a NULLS FIRST
+               ->  Finalize HashAggregate
+                     Group Key: a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: a
+                                 ->  Seq Scan on df_rs
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(16 rows)
+
+SET datafusion.mode = off;
+SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+ k  | a |   d   
+----+---+-------
+ 13 | 0 | 19.50
+ 26 | 0 | 39.00
+ 39 | 0 | 58.50
+  1 | 1 |  1.50
+ 14 | 1 | 21.00
+ 27 | 1 | 40.50
+ 40 | 1 | 60.00
+(7 rows)
+
+SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
+ a |     s     |     d     
+---+-----------+-----------
+ 2 | 119200.50 | 238401.00
+ 1 | 119103.75 | 238207.50
+ 4 | 119077.50 | 238155.00
+ 8 | 119015.25 | 238030.50
+ 0 | 119013.75 | 238027.50
+(5 rows)
+
+SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
+   k   |   n    | b  
+-------+--------+----
+ 10968 | 155.25 | 10
+  3989 | 143.25 | 12
+ 14956 | 139.50 |  7
+  7977 | 127.50 |  9
+ 18944 | 123.75 |  4
+   998 | 115.50 | 11
+ 11965 | 111.75 |  6
+  4986 |  99.75 |  8
+ 15953 |  96.00 |  3
+  8974 |  84.00 |  5
+ 19941 |  80.25 | 13
+  1995 |  72.00 |  7
+ 12962 |  68.25 |  2
+  5983 |  56.25 |  4
+ 16950 |  52.50 | 12
+  9971 |  40.50 |  1
+  2992 |  28.50 |  3
+ 13959 |  24.75 | 11
+  6980 |  12.75 | 13
+ 17947 |   9.00 |  8
+     1 |   0.75 |  2
+(21 rows)
+
+SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+ a  |  c   |  d   
+----+------+------
+    |  327 |  328
+  0 | 1513 | 1514
+  1 | 1514 | 1515
+  2 | 1514 | 1515
+  3 | 1514 | 1515
+  4 | 1514 | 1515
+  5 | 1513 | 1514
+  6 | 1514 | 1515
+  7 | 1513 | 1514
+  8 | 1513 | 1514
+  9 | 1512 | 1513
+ 10 | 1513 | 1514
+ 11 | 1513 | 1514
+ 12 | 1513 | 1514
+(14 rows)
+
+SET datafusion.mode = on;
+SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
+ k  | a |   d   
+----+---+-------
+ 13 | 0 | 19.50
+ 26 | 0 | 39.00
+ 39 | 0 | 58.50
+  1 | 1 |  1.50
+ 14 | 1 | 21.00
+ 27 | 1 | 40.50
+ 40 | 1 | 60.00
+(7 rows)
+
+SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
+ a |     s     |     d     
+---+-----------+-----------
+ 2 | 119200.50 | 238401.00
+ 1 | 119103.75 | 238207.50
+ 4 | 119077.50 | 238155.00
+ 8 | 119015.25 | 238030.50
+ 0 | 119013.75 | 238027.50
+(5 rows)
+
+SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
+   k   |   n    | b  
+-------+--------+----
+ 10968 | 155.25 | 10
+  3989 | 143.25 | 12
+ 14956 | 139.50 |  7
+  7977 | 127.50 |  9
+ 18944 | 123.75 |  4
+   998 | 115.50 | 11
+ 11965 | 111.75 |  6
+  4986 |  99.75 |  8
+ 15953 |  96.00 |  3
+  8974 |  84.00 |  5
+ 19941 |  80.25 | 13
+  1995 |  72.00 |  7
+ 12962 |  68.25 |  2
+  5983 |  56.25 |  4
+ 16950 |  52.50 | 12
+  9971 |  40.50 |  1
+  2992 |  28.50 |  3
+ 13959 |  24.75 | 11
+  6980 |  12.75 | 13
+ 17947 |   9.00 |  8
+     1 |   0.75 |  2
+(21 rows)
+
+SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
+ a  |  c   |  d   
+----+------+------
+    |  327 |  328
+  0 | 1513 | 1514
+  1 | 1514 | 1515
+  2 | 1514 | 1515
+  3 | 1514 | 1515
+  4 | 1514 | 1515
+  5 | 1513 | 1514
+  6 | 1514 | 1515
+  7 | 1513 | 1514
+  8 | 1513 | 1514
+  9 | 1512 | 1513
+ 10 | 1513 | 1514
+ 11 | 1513 | 1514
+ 12 | 1513 | 1514
+(14 rows)
+
+DROP TABLE df_rs;
+SET optimizer = off;
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

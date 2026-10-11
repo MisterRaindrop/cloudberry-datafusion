@@ -302,6 +302,7 @@ extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);
 extern Bitmapset *df_batch_motions(PlannedStmt *stmt);
 extern int	df_motion_state_columns(Motion *motion, AttrNumber resno);
 extern Aggref *df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg);
+extern AttrNumber df_output_of(Plan *plan, AttrNumber attno);
 extern bool df_motion_pg_state(Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern uint64 df_motion_signature(Motion *motion);

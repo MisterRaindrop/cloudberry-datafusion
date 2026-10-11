@@ -2660,18 +2660,24 @@ df_passes_through(Plan *plan)
 }
 
 /*
- * Is the output of the slice part 'top' (a Sort, or a Limit over one) in
- * the order a sorted Motion's receiver merges by?  The planner builds
- * them so; this guards the assumption.
+ * Is the output of the slice part 'top' (a Sort, or a Limit over one; or
+ * GPORCA's Result over a Sort, S2) in the order a sorted Motion's receiver
+ * merges by?  The planner builds them so; this guards the assumption.
  */
 static bool
 df_sorted_for(Plan *top, Motion *motion)
 {
+	Plan	   *result = NULL;
 	Sort	   *sort;
 	int			i;
 
 	if (IsA(top, Limit))
 		top = outerPlan(top);
+	if (IsA(top, Result) && outerPlan(top) != NULL && IsA(outerPlan(top), Sort))
+	{
+		result = top;
+		top = outerPlan(top);
+	}
 	if (!IsA(top, Sort) || motion->numSortCols > ((Sort *) top)->numCols)
 		return false;
 	sort = (Sort *) top;
@@ -2679,9 +2685,11 @@ df_sorted_for(Plan *top, Motion *motion)
 	{
 		TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
 		Var		   *var = tle ? (Var *) tle->expr : NULL;
+		AttrNumber	col = result ? df_output_of(result, sort->sortColIdx[i]) :
+			sort->sortColIdx[i];
 
 		if (var == NULL || !IsA(var, Var) || var->varno != OUTER_VAR ||
-			var->varattno != sort->sortColIdx[i] ||
+			col == 0 || var->varattno != col ||
 			motion->sortOperators[i] != sort->sortOperators[i] ||
 			motion->nullsFirst[i] != sort->nullsFirst[i])
 			return false;
@@ -2689,13 +2697,13 @@ df_sorted_for(Plan *top, Motion *motion)
 	return true;
 }
 
-/* Column of Agg 'agg' that outputs its child's column 'attno', or 0. */
-static AttrNumber
-df_agg_output_of(Agg *agg, AttrNumber attno)
+/* Column of 'plan' that outputs its child's column 'attno', or 0. */
+AttrNumber
+df_output_of(Plan *plan, AttrNumber attno)
 {
 	ListCell   *lc;
 
-	foreach(lc, agg->plan.targetlist)
+	foreach(lc, plan->targetlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
@@ -2772,7 +2780,7 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 		return false;
 	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
 	{
-		AttrNumber	col = df_agg_output_of(agg, cols[i]);
+		AttrNumber	col = df_output_of((Plan *) agg, cols[i]);
 		TargetEntry *tle = col > 0 ? get_tle_by_resno(agg->plan.targetlist, col) : NULL;
 		Oid			type;
 		bool		desc;
@@ -2865,6 +2873,58 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 		cxt->sort_keys = bms_add_member(cxt->sort_keys, var->varattno);
 	}
 	cxt->tails.resort = motion;
+	return true;
+}
+
+/*
+ * S1, S2: may the slice's Sort 'sort' order in DataFusion?  Its keys are
+ * columns of its child of the types DataFusion sorts as PostgreSQL does.
+ */
+static bool
+df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
+{
+	Plan	   *child = outerPlan(sort);
+	int			i;
+
+	for (i = 0; i < sort->numCols; i++)
+	{
+		TargetEntry *tle = get_tle_by_resno(child->targetlist, sort->sortColIdx[i]);
+		Oid			type;
+		bool		desc;
+
+		if (tle == NULL)
+		{
+			df_reject(cxt, "sort key outside the target list");
+			return false;
+		}
+		type = exprType((Node *) tle->expr);
+		if (!df_type_supported(type))
+		{
+			df_reject(cxt, "sort key of type %s", format_type_be(type));
+			return false;
+		}
+		if (!df_sort_direction(sort->sortOperators[i], type, &desc))
+		{
+			df_reject(cxt, "sort key ordered by operator %s",
+					  get_opname(sort->sortOperators[i]));
+			return false;
+		}
+		if (df_type_is_string(type) &&
+			df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
+		{
+			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  df_string_compare_problem(cxt, "<", sort->collations[i]));
+			return false;
+		}
+		if (IsA(tle->expr, Aggref) &&
+			(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
+			 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
+		{
+			/* the C side divides it, after DataFusion */
+			df_reject(cxt, "sort key avg returning numeric");
+			return false;
+		}
+	}
 	return true;
 }
 
@@ -3096,6 +3156,38 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				{
 					df_reject(cxt, "Result without a child or with a one-time filter");
 					return;
+				}
+				if (plan == cxt->top && IsA(outerPlan(plan), Sort))
+				{
+					/*
+					 * S2: GPORCA's Result over the slice's Sort.  DataFusion
+					 * projects, then sorts by the columns the Result passes
+					 * the Sort's keys on as; a Limit above applies after.
+					 */
+					Sort	   *sort = (Sort *) outerPlan(plan);
+					int			i;
+
+					cxt->top = NULL;
+					if (!df_passes_through((Plan *) sort))
+					{
+						df_reject(cxt, "Sort that computes columns");
+						return;
+					}
+					if (!df_check_sort_keys(cxt, sort))
+						return;
+					for (i = 0; i < sort->numCols; i++)
+					{
+						AttrNumber	col = df_output_of(plan, sort->sortColIdx[i]);
+
+						if (col == 0)
+						{
+							df_reject(cxt, "sort key the Result above does not pass on");
+							return;
+						}
+						cxt->sort_keys = bms_add_member(cxt->sort_keys, col);
+						child_needed = bms_add_member(child_needed, sort->sortColIdx[i]);
+					}
+					cxt->skipped_sort = (Plan *) sort;
 				}
 				cxt->allow_aggref = false;
 				df_check_targetlist(plan->targetlist, needed, cxt);
@@ -3484,44 +3576,10 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "Sort that computes columns");
 					return;
 				}
+				if (!df_check_sort_keys(cxt, sort))
+					return;
 				for (i = 0; i < sort->numCols; i++)
 				{
-					TargetEntry *tle = get_tle_by_resno(child->targetlist, sort->sortColIdx[i]);
-					Oid			type;
-					bool		desc;
-
-					if (tle == NULL)
-					{
-						df_reject(cxt, "sort key outside the target list");
-						return;
-					}
-					type = exprType((Node *) tle->expr);
-					if (!df_type_supported(type))
-					{
-						df_reject(cxt, "sort key of type %s", format_type_be(type));
-						return;
-					}
-					if (!df_sort_direction(sort->sortOperators[i], type, &desc))
-					{
-						df_reject(cxt, "sort key ordered by operator %s",
-								  get_opname(sort->sortOperators[i]));
-						return;
-					}
-					if (df_type_is_string(type) &&
-						df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
-					{
-						df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-								  df_string_compare_problem(cxt, "<", sort->collations[i]));
-						return;
-					}
-					if (IsA(tle->expr, Aggref) &&
-						(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
-						 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
-					{
-						/* the C side divides it, after DataFusion */
-						df_reject(cxt, "sort key avg returning numeric");
-						return;
-					}
 					if (child_needed)
 						child_needed = bms_add_member(child_needed, sort->sortColIdx[i]);
 					/* sorted in DataFusion, so computed there */
