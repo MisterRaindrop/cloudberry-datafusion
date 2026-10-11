@@ -1298,6 +1298,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	/* IP1: init plan values become constants of the plan */
 	df_param_values = estate->es_param_exec_vals;
 	df_param_econtext = GetPerTupleExprContext(estate);
+	df_numeric_stmt = queryDesc->plannedstmt;
 	PG_TRY();
 	{
 		ok = df_translate_slice(root->plan, tails, &x->spec, reason, reasonlen);
@@ -1306,6 +1307,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	{
 		df_param_values = NULL;
 		df_param_econtext = NULL;
+		df_numeric_stmt = NULL;
 	}
 	PG_END_TRY();
 	if (!ok)

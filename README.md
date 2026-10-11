@@ -508,6 +508,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | CL1 | Strings ordered by the default collation where it is C on every node |
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
+| NR1 | Numeric columns through Append, GPORCA's Sequence and Shared Scan; sums 19 digits wider than their argument |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would

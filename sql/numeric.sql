@@ -328,6 +328,52 @@ SET optimizer = off;
 SET datafusion.mode = off;
 DROP TABLE df_wv;
 
+-- NR1: a numeric's precision and scale found through the nodes that pass
+-- columns on without a child to follow: an Append's inputs, GPORCA's
+-- Sequence and Shared Scan (its producer's input; GPORCA's references drop
+-- the type modifier).  A sum has 19 digits more than its argument, not 38:
+-- avg(sum) * 1.2, compared with the sum (TPC-DS Q1), fits 76 digits.
+CREATE TABLE df_nr (k int, cust int, store int, v numeric(7,2)) DISTRIBUTED BY (k);
+CREATE TABLE df_nr2 (k int, cust int, store int, v numeric(7,2)) DISTRIBUTED BY (k);
+INSERT INTO df_nr SELECT i, i % 997, i % 7, (i % 1000) * 0.37 FROM generate_series(1, 30000) i;
+INSERT INTO df_nr2 SELECT i, i % 89, i % 5, (i % 300) * 1.25 FROM generate_series(1, 9000) i;
+ANALYZE df_nr;
+ANALYZE df_nr2;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+-- an Append and GPORCA's CTE: their slices stop at what PostgreSQL still
+-- runs (partial states, the Sequence), no more at the numeric columns
+EXPLAIN (COSTS OFF) SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store;
+SET optimizer = on;
+EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+SET optimizer = off;
+SET datafusion.mode = off;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store ORDER BY store;
+SET datafusion.mode = on;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store ORDER BY store;
+SET optimizer = on;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+SET optimizer = off;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_nr, df_nr2;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

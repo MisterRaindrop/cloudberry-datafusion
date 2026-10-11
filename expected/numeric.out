@@ -1390,6 +1390,186 @@ SELECT g, max(y), min(y), count(*) FROM (SELECT g, x * 1000.5 AS y FROM df_wv) s
 SET optimizer = off;
 SET datafusion.mode = off;
 DROP TABLE df_wv;
+-- NR1: a numeric's precision and scale found through the nodes that pass
+-- columns on without a child to follow: an Append's inputs, GPORCA's
+-- Sequence and Shared Scan (its producer's input; GPORCA's references drop
+-- the type modifier).  A sum has 19 digits more than its argument, not 38:
+-- avg(sum) * 1.2, compared with the sum (TPC-DS Q1), fits 76 digits.
+CREATE TABLE df_nr (k int, cust int, store int, v numeric(7,2)) DISTRIBUTED BY (k);
+CREATE TABLE df_nr2 (k int, cust int, store int, v numeric(7,2)) DISTRIBUTED BY (k);
+INSERT INTO df_nr SELECT i, i % 997, i % 7, (i % 1000) * 0.37 FROM generate_series(1, 30000) i;
+INSERT INTO df_nr2 SELECT i, i % 89, i % 5, (i % 300) * 1.25 FROM generate_series(1, 9000) i;
+ANALYZE df_nr;
+ANALYZE df_nr2;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+                                                 QUERY PLAN                                                 
+------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (c1.store = "Expr_SUBQUERY".csq_c0)
+                     Join Filter: (c1.total > "Expr_SUBQUERY".csq_c1)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: c1.store
+                           ->  Subquery Scan on c1
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_nr.cust, df_nr.store
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: df_nr.cust, df_nr.store
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_nr.cust, df_nr.store
+                                                   ->  Seq Scan on df_nr
+                     ->  Hash
+                           ->  Subquery Scan on "Expr_SUBQUERY"
+                                 ->  HashAggregate
+                                       Group Key: c2.store
+                                       ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                             Hash Key: c2.store
+                                             ->  Subquery Scan on c2
+                                                   ->  Finalize HashAggregate
+                                                         Group Key: df_nr_1.cust, df_nr_1.store
+                                                         ->  Redistribute Motion 3:3  (slice5; segments: 3)
+                                                               Hash Key: df_nr_1.cust, df_nr_1.store
+                                                               ->  Streaming Partial HashAggregate
+                                                                     Group Key: df_nr_1.cust, df_nr_1.store
+                                                                     ->  Seq Scan on df_nr df_nr_1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+ DataFusion: slice 5 eligible, sends Arrow batches
+(37 rows)
+
+-- an Append and GPORCA's CTE: their slices stop at what PostgreSQL still
+-- runs (partial states, the Sequence), no more at the numeric columns
+EXPLAIN (COSTS OFF) SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: df_nr.store
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: df_nr.store
+               ->  Streaming Partial HashAggregate
+                     Group Key: df_nr.store
+                     ->  Append
+                           ->  Seq Scan on df_nr
+                           ->  Seq Scan on df_nr2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 2 not eligible: partial aggregate sum without batch Motions
+(14 rows)
+
+SET optimizer = on;
+EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+                                                    QUERY PLAN                                                    
+------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  HashAggregate
+                     Group Key: df_nr.cust, df_nr.store
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: df_nr.cust, df_nr.store
+                           ->  Seq Scan on df_nr
+         ->  Redistribute Motion 1:3  (slice3)
+               ->  Finalize Aggregate
+                     ->  Gather Motion 3:1  (slice4; segments: 3)
+                           ->  Partial Aggregate
+                                 ->  Hash Join
+                                       Hash Cond: (share0_ref3.store = share0_ref2.store)
+                                       Join Filter: (share0_ref3.total > ((avg(share0_ref2.total) * 1.2)))
+                                       ->  Shared Scan (share slice:id 4:0)
+                                       ->  Hash
+                                             ->  Broadcast Motion 3:3  (slice5; segments: 3)
+                                                   ->  Finalize GroupAggregate
+                                                         Group Key: share0_ref2.store
+                                                         ->  Sort
+                                                               Sort Key: share0_ref2.store
+                                                               ->  Redistribute Motion 3:3  (slice6; segments: 3)
+                                                                     Hash Key: share0_ref2.store
+                                                                     ->  Streaming Partial HashAggregate
+                                                                           Group Key: share0_ref2.store
+                                                                           ->  Shared Scan (share slice:id 6:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: plan node type 25 is not supported
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 not eligible: combining aggregate sum without batch Motions
+ DataFusion: slice 4 not eligible: partial aggregate sum without batch Motions
+ DataFusion: slice 5 not eligible: combining aggregate avg without batch Motions
+ DataFusion: slice 6 not eligible: partial aggregate avg without batch Motions
+(35 rows)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+ count |    sum     
+-------+------------
+  2693 | 3355904.07
+(1 row)
+
+SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store ORDER BY store;
+ store |    sum     |  max   
+-------+------------+--------
+     0 | 1123780.45 | 369.63
+     1 | 1126136.27 | 370.00
+     2 | 1128492.09 | 371.25
+     3 | 1130847.91 | 372.50
+     4 | 1133203.73 | 373.75
+     5 |  792064.55 | 369.63
+     6 |  791800.00 | 369.63
+(7 rows)
+
+SET datafusion.mode = on;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+ count |    sum     
+-------+------------
+  2693 | 3355904.07
+(1 row)
+
+SELECT store, sum(v), max(v) FROM
+  (SELECT store, v FROM df_nr UNION ALL SELECT store, v FROM df_nr2) u GROUP BY store ORDER BY store;
+ store |    sum     |  max   
+-------+------------+--------
+     0 | 1123780.45 | 369.63
+     1 | 1126136.27 | 370.00
+     2 | 1128492.09 | 371.25
+     3 | 1130847.91 | 372.50
+     4 | 1133203.73 | 373.75
+     5 |  792064.55 | 369.63
+     6 |  791800.00 | 369.63
+(7 rows)
+
+SET optimizer = on;
+WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
+SELECT count(*), sum(c1.total) FROM ctr c1
+WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
+ count |    sum     
+-------+------------
+  2693 | 3355904.07
+(1 row)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_nr, df_nr2;
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

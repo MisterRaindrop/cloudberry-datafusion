@@ -817,11 +817,84 @@ df_partial_below(Plan **ctx, Node *arg)
 }
 
 /*
+ * The statement whose plan df_numeric_ps follows references through: set
+ * while a slice is checked or translated, for the producer of a Shared
+ * Scan, which may be anywhere in the plan.
+ */
+PlannedStmt *df_numeric_stmt = NULL;
+
+typedef struct DfShareFind
+{
+	plan_tree_base_prefix base; /* for plan_tree_walker */
+	int			share_id;
+	Plan	   *producer;
+} DfShareFind;
+
+static bool
+df_share_find_walker(Node *node, void *context)
+{
+	DfShareFind *find = (DfShareFind *) context;
+
+	if (node == NULL || find->producer != NULL)
+		return find->producer != NULL;
+	if (IsA(node, ShareInputScan) && outerPlan(node) != NULL &&
+		((ShareInputScan *) node)->share_id == find->share_id)
+	{
+		find->producer = (Plan *) node;
+		return true;
+	}
+	return plan_tree_walker(node, df_share_find_walker, context, true);
+}
+
+/* The Shared Scan that produces what 'consumer' reads, or NULL. */
+static Plan *
+df_share_producer(ShareInputScan *consumer)
+{
+	DfShareFind find;
+
+	if (df_numeric_stmt == NULL)
+		return NULL;
+	exec_init_plan_tree_base(&find.base, df_numeric_stmt);
+	find.share_id = consumer->share_id;
+	find.producer = NULL;
+	(void) df_share_find_walker((Node *) df_numeric_stmt->planTree, &find);
+	return find.producer;
+}
+
+/*
+ * Precision and scale of output column 'attno' of the inputs 'plans' of an
+ * Append: all of one scale, the widest precision.  Inputs of different
+ * scales give each value the scale of its input.
+ */
+static bool
+df_numeric_append_ps(List *plans, AttrNumber attno, int *precision, int *scale)
+{
+	ListCell   *lc;
+	bool		found = false;
+
+	foreach(lc, plans)
+	{
+		Plan	   *child = lfirst(lc);
+		TargetEntry *tle = get_tle_by_resno(child->targetlist, attno);
+		int			p,
+					s;
+
+		if (tle == NULL || !df_numeric_ps(child, (Node *) tle->expr, &p, &s) ||
+			(found && s != *scale))
+			return false;
+		*precision = found ? Max(*precision, p) : p;
+		*scale = s;
+		found = true;
+	}
+	return found;
+}
+
+/*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
  * numeric(p, s) with p <= 38, found through the references of the nodes
- * above it; a constant; min/max of such, and sum of such or of int8 (at
- * most 38 digits, the scale of its argument).  A partial avg's sum counts
+ * above it; a constant; min/max of such, and sum of such or of int8 (19
+ * digits more, at most 38, the scale of its argument).  A partial avg's sum counts
  * as such a sum.  Anything else (an avg's result, arithmetic) has none.
  */
 bool
@@ -848,6 +921,35 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 
 					tle = get_tle_by_resno(sub->targetlist, var->varattno);
 					return tle != NULL && df_numeric_ps(sub, (Node *) tle->expr, precision, scale);
+				}
+				if (IsA(ctx, ShareInputScan))
+				{
+					/*
+					 * A Shared Scan passes on the rows of the producer's
+					 * input as they are: a column is the one at its
+					 * position there, whatever the reference (GPORCA's
+					 * refer to the shared scan's range table entry and drop
+					 * the type modifier).
+					 */
+					Plan	   *producer = outerPlan(ctx) ? ctx :
+						df_share_producer((ShareInputScan *) ctx);
+
+					child = producer ? outerPlan(producer) : NULL;
+					tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+					return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
+				}
+				if (var->varno == OUTER_VAR && IsA(ctx, Append))
+					return df_numeric_append_ps(((Append *) ctx)->appendplans, var->varattno,
+												precision, scale);
+				if (var->varno == OUTER_VAR && IsA(ctx, MergeAppend))
+					return df_numeric_append_ps(((MergeAppend *) ctx)->mergeplans, var->varattno,
+												precision, scale);
+				if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
+				{
+					/* GPORCA's Sequence returns its last input's rows */
+					child = llast(((Sequence *) ctx)->subplans);
+					tle = get_tle_by_resno(child->targetlist, var->varattno);
+					return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
 				}
 				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 					return var->vartype == NUMERICOID &&
@@ -1014,7 +1116,13 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				if (strcmp(name, "sum") == 0 ||
 					(strcmp(name, "avg") == 0 && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL))
 				{
-					*precision = DF_NUMERIC_MAX_PRECISION;
+					/*
+					 * Fewer than 2^63 rows, under 10^19, add up to 19 more
+					 * digits; a combining sum's argument, the partial sum,
+					 * has them already.
+					 */
+					*precision = Min(DF_NUMERIC_MAX_PRECISION,
+									 agg->aggsplit == AGGSPLIT_FINAL_DESERIAL ? p : p + 19);
 					*scale = s;
 					return true;
 				}
@@ -1050,6 +1158,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 			return false;
 	}
 }
+
 
 /*
  * D1: what keeps DataFusion from telling the arguments of aggregate 'agg'
@@ -3417,6 +3526,7 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 				 bool *locale_dependent)
 {
 	DfCheckContext cxt;
+	PlannedStmt *volatile saved_stmt = df_numeric_stmt;
 
 	memset(&cxt, 0, sizeof(cxt));
 	cxt.stmt = stmt;
@@ -3440,7 +3550,16 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 		cxt.output = cxt.top;
 		cxt.tails_ok = !(root_is_sender &&
 						 bms_is_member(((Motion *) root)->motionID, batches));
-		df_check_plan(root, &cxt, NULL, root_is_sender);
+		df_numeric_stmt = stmt;
+		PG_TRY();
+		{
+			df_check_plan(root, &cxt, NULL, root_is_sender);
+		}
+		PG_FINALLY();
+		{
+			df_numeric_stmt = saved_stmt;
+		}
+		PG_END_TRY();
 	}
 
 	if (locale_dependent)

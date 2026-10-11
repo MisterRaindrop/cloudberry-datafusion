@@ -212,6 +212,7 @@ typedef struct DfStringFunc
 
 extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
+extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 extern bool df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale);
 extern bool df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale);
