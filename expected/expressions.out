@@ -318,6 +318,41 @@ SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FRO
  8750175000000 | -156246875 | 8750225000 | 50000
 (1 row)
 
+-- numeric to float8 by one division where the digits fit a double (at
+-- most 2^53), else by the decimal string: alike either side of the limit
+-- (in an aggregate, which keeps the cast in DataFusion under GPORCA too)
+CREATE TABLE df_cs_f8 (id int, n numeric(38,20)) DISTRIBUTED BY (id);
+INSERT INTO df_cs_f8 VALUES (1, 0.00000000000000000001), (2, 0.00009007199254740992),
+  (3, 0.00009007199254740993), (4, -900719925474.0993), (5, 123456789012345678.12345678901234567891),
+  (6, -0.1), (7, 3.3), (8, 0);
+SET datafusion.mode = off;
+SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
+ id |          max           
+----+------------------------
+  1 |                  1e-20
+  2 |  9.007199254740992e-05
+  3 |  9.007199254740993e-05
+  4 |     -900719925474.0992
+  5 | 1.2345678901234568e+17
+  6 |                   -0.1
+  7 |                    3.3
+  8 |                      0
+(8 rows)
+
+SET datafusion.mode = on;
+SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
+ id |          max           
+----+------------------------
+  1 |                  1e-20
+  2 |  9.007199254740992e-05
+  3 |  9.007199254740993e-05
+  4 |     -900719925474.0992
+  5 | 1.2345678901234568e+17
+  6 |                   -0.1
+  7 |                    3.3
+  8 |                      0
+(8 rows)
+
 -- PostgreSQL's errors, with their SQLSTATEs
 \set VERBOSITY sqlstate
 SELECT count(i4::int2) FROM df_cs;
@@ -537,6 +572,6 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE
  DataFusion: slice 3 eligible, sends Arrow batches
 (19 rows)
 
-DROP TABLE df_ex, df_cs, df_fl, df_fl2;
+DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

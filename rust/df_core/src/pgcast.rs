@@ -200,6 +200,23 @@ fn decimal_string(v: i256, scale: i8) -> String {
     s
 }
 
+/// `v` * 10^-scale as float8in reads its decimal string: correctly rounded.
+/// Where `v` and 10^scale are both exact in a double (at most 2^53, and
+/// 10^22), one division of the two is correctly rounded too (Clinger's fast
+/// path), and needs no string.
+fn numeric_float8(v: i256, scale: i8) -> f64 {
+    const POW10: [f64; 23] = [
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
+        1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+    ];
+    if let (Some(x), Some(p)) = (v.to_i128(), POW10.get(scale as usize)) {
+        if scale >= 0 && x.unsigned_abs() <= 1 << 53 {
+            return x as f64 / p;
+        }
+    }
+    decimal_string(v, scale).parse::<f64>().unwrap_or(f64::NAN)
+}
+
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgCast {
     kind: CastKind,
@@ -353,9 +370,7 @@ impl ScalarUDFImpl for PgCast {
                             if x == NUMERIC_NAN {
                                 f64::NAN
                             } else {
-                                decimal_string(x, self.from_scale)
-                                    .parse::<f64>()
-                                    .unwrap_or(f64::NAN)
+                                numeric_float8(x, self.from_scale)
                             }
                         })
                     })
@@ -424,5 +439,33 @@ mod tests {
         // rint: half to even
         assert_eq!(2.5f64.round_ties_even(), 2.0);
         assert_eq!((-3.5f64).round_ties_even(), -4.0);
+    }
+
+    /// The fast path of numeric_float8 gives float8in's double, bit for bit.
+    #[test]
+    fn numeric_to_float8_agrees_with_the_decimal_string() {
+        let slow = |x: i256, s: i8| decimal_string(x, s).parse::<f64>().unwrap();
+        let limit = 1i128 << 53;
+        let mut edges = vec![0, 1, -1, 5, 9, 10, 99, 101, 12345, limit - 1, limit, -limit, limit + 1];
+        edges.extend((0..40).map(|k| 10i128.pow(k / 2) + (k as i128 % 2) * 7));
+        // xorshift: values of every width up to 2^54, either sign
+        let mut r = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..200_000 {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            let x = (r >> (r % 54)) as i128 & ((1i128 << 54) - 1);
+            edges.push(if r & 1 == 0 { x } else { -x });
+        }
+        for &x in &edges {
+            for s in [0i8, 1, 2, 3, 4, 6, 9, 15, 17, 22, 23, 30] {
+                let v = i256::from_i128(x);
+                let (a, b) = (numeric_float8(v, s), slow(v, s));
+                assert_eq!(a.to_bits(), b.to_bits(), "{x} scale {s}: {a} vs {b}");
+            }
+        }
+        // past 2^53 and past i128: the decimal string
+        let big = i256::from_i128(i128::MAX).checked_mul(i256::from_i128(1000)).unwrap();
+        assert_eq!(numeric_float8(big, 5), slow(big, 5));
     }
 }

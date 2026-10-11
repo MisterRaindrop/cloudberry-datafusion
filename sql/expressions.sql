@@ -104,6 +104,17 @@ SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4:
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
+-- numeric to float8 by one division where the digits fit a double (at
+-- most 2^53), else by the decimal string: alike either side of the limit
+-- (in an aggregate, which keeps the cast in DataFusion under GPORCA too)
+CREATE TABLE df_cs_f8 (id int, n numeric(38,20)) DISTRIBUTED BY (id);
+INSERT INTO df_cs_f8 VALUES (1, 0.00000000000000000001), (2, 0.00009007199254740992),
+  (3, 0.00009007199254740993), (4, -900719925474.0993), (5, 123456789012345678.12345678901234567891),
+  (6, -0.1), (7, 3.3), (8, 0);
+SET datafusion.mode = off;
+SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
+SET datafusion.mode = on;
+SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
 -- PostgreSQL's errors, with their SQLSTATEs
 \set VERBOSITY sqlstate
 SELECT count(i4::int2) FROM df_cs;
@@ -165,6 +176,6 @@ EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
 EXPLAIN (COSTS OFF) SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
 
-DROP TABLE df_ex, df_cs, df_fl, df_fl2;
+DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
