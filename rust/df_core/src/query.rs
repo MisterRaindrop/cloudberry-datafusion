@@ -96,6 +96,10 @@
 //!                                 0, NaN as the positive NaN; see pgfloat)
 //!         | {"extract": <expr>, "field": "year"}   (of a date, as numeric
 //!                                 of scale 0; see pgdate)
+//!         | {"numdiv": [<x>, <x's display scale>, <y>, <y's>], "scales": [sx, sy],
+//!            "type": "numeric:S"}   (numeric_div, as pgnum::pg_div; DN1)
+//!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
+//!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
 //!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
 //!                                 (numeric_avg of a sum of scale s, rounded
 //!                                 as PostgreSQL does, at scale S; pgnum)
@@ -617,6 +621,32 @@ fn expr(v: &Value) -> Result<Expr, String> {
         };
         return Ok(PgNumeric::udf(NumericFn::Rescale { by, to }).call(vec![expr(e)?]));
     }
+    if let Some(key) = ["numdiv", "numdiv_scale"].into_iter().find(|k| v.get(*k).is_some()) {
+        // DN1: numeric x / y and its display scale, of [x, its display
+        // scale, y, its display scale], x and y of "scales"
+        let a = field(v, key)?.as_array().filter(|a| a.len() == 4).ok_or("plan spec: bad numdiv")?;
+        let sc = field(v, "scales")?.as_array().filter(|a| a.len() == 2).ok_or("plan spec: bad numdiv scales")?;
+        let sc = |i: usize| sc[i].as_i64().map(|s| s as i8).ok_or("plan spec: bad numdiv scale");
+        let (x, y) = (sc(0)?, sc(1)?);
+        let f = if key == "numdiv" {
+            let to = match PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+                PgType::Numeric(s) => s,
+                _ => return Err("plan spec: numdiv of a non-numeric type".into()),
+            };
+            NumericFn::Div { x, y, to }
+        } else {
+            NumericFn::DivScale { x, y }
+        };
+        return Ok(PgNumeric::udf(f).call(a.iter().map(expr).collect::<Result<Vec<_>, _>>()?));
+    }
+    if let Some(a) = v.get("greatest").and_then(Value::as_array) {
+        // DN1: the larger of two display scales
+        if a.len() != 2 {
+            return Err("plan spec: greatest takes two".into());
+        }
+        let (l, r) = (expr(&a[0])?, expr(&a[1])?);
+        return when(l.clone().gt_eq(r.clone()), l).otherwise(r).map_err(|e| e.to_string());
+    }
     if let Some(a) = v.get("avg_numeric").and_then(Value::as_array) {
         // AVG1: numeric_avg of a sum and a count, at the type's scale
         let from = field(v, "scale")?
@@ -671,6 +701,10 @@ fn may_fail(v: &Value) -> bool {
                 if f.may_fail() {
                     return true;
                 }
+            }
+            if map.contains_key("numdiv") || map.contains_key("numdiv_scale") {
+                // DN1: numeric division by zero
+                return true;
             }
             if map.contains_key("pgcast") {
                 // range errors (timestamp_date and numeric_float8 never fail)

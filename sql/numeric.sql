@@ -417,7 +417,8 @@ SELECT g, sum(v), avg(v), avg(i), avg(s), sum(b), avg(b), count(*), count(v)
 FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g ORDER BY g;
 SELECT sum(v), avg(v), avg(i), sum(b), avg(b) FROM df_ps WHERE k::text ~ '^[0-9]' AND g > 1000;
 -- without groups over no rows, PostgreSQL's partial state is NULL; a sum of
--- a numeric of unknown scale stays on PostgreSQL
+-- quotients passes the largest display scale only through batch Motions
+-- (DN1), so with its partial stage on PostgreSQL it stays there too
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT sum(v), avg(v), avg(i), sum(b), avg(b), count(*) FROM df_ps WHERE k::text ~ '^x';
 EXPLAIN (COSTS OFF) SELECT g, sum(v / 3), avg(v / 3) FROM df_ps WHERE k::text ~ '^[0-9]' GROUP BY g;
@@ -433,6 +434,77 @@ SET optimizer = off;
 SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_ps;
+
+-- DN1: values with display scales of their own, row by row: a quotient,
+-- whose scale select_div_scale picks by the values, a CASE or COALESCE of
+-- branches of different scales, and sums or arithmetic of them.  Each is
+-- carried at the largest scale it may have, bounded by its operands'
+-- precision and scale, and compared, sorted and joined as a value; where
+-- it leaves DataFusion, or divides or is added up, its display scale goes
+-- beside it, as numeric.c gives it.  A Motion of such a column carries
+-- tuples, which hold it; min, max, avg and GROUP BY of one stay on
+-- PostgreSQL.
+CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
+INSERT INTO df_dn SELECT g, g % 37,
+  CASE WHEN g % 53 = 0 THEN NULL ELSE ((g * 7919) % 100000 - 30000) / 100.0 END,
+  CASE WHEN g % 41 = 0 THEN 0 WHEN g % 43 = 0 THEN NULL ELSE ((g * 104729) % 9000 + 1) / 100.0 END,
+  ((g * 31) % 1000000) / 10000.0 FROM generate_series(1, 20000) g;
+INSERT INTO df_dn VALUES (20001, 1, 'NaN', 2.00, 1), (20002, 2, 3.00, 'NaN', 1);
+ANALYZE df_dn;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
+EXPLAIN (COSTS OFF) SELECT i, sum(a / 2), sum(a / 7), count(*) FROM df_dn GROUP BY i ORDER BY i;
+EXPLAIN (COSTS OFF) SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
+EXPLAIN (COSTS OFF) SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT i, max(a / b) FROM df_dn WHERE b <> 0 GROUP BY i;
+EXPLAIN (COSTS OFF) SELECT a / b AS r, count(*) FROM df_dn WHERE b <> 0 GROUP BY 1;
+SET datafusion.mode = off;
+SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
+SELECT k, a / b FROM df_dn WHERE b <> 0 ORDER BY a / b DESC, k LIMIT 7;
+SELECT count(*), sum(a) FROM df_dn WHERE b <> 0 AND a / b > 1.5;
+SELECT count(*) FROM df_dn WHERE CASE WHEN b = 0 THEN 0 ELSE a / b END > 2;
+SELECT i, sum(a / 2), sum(a / 7), count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT i, sum(a) / sum(b), sum(c) / count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT k, coalesce(a * i, 0), coalesce(a, 0.0), CASE WHEN b > 50 THEN a / b ELSE c END FROM df_dn WHERE k % 530 = 0 OR k % 1010 = 0 ORDER BY k;
+SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
+SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
+SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
+SET datafusion.mode = on;
+SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
+SELECT k, a / b FROM df_dn WHERE b <> 0 ORDER BY a / b DESC, k LIMIT 7;
+SELECT count(*), sum(a) FROM df_dn WHERE b <> 0 AND a / b > 1.5;
+SELECT count(*) FROM df_dn WHERE CASE WHEN b = 0 THEN 0 ELSE a / b END > 2;
+SELECT i, sum(a / 2), sum(a / 7), count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT i, sum(a) / sum(b), sum(c) / count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT k, coalesce(a * i, 0), coalesce(a, 0.0), CASE WHEN b > 50 THEN a / b ELSE c END FROM df_dn WHERE k % 530 = 0 OR k % 1010 = 0 ORDER BY k;
+SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
+SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
+SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT i, sum(a / 2), sum(a / 7), count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT i, sum(a) / sum(b), sum(c) / count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT k, coalesce(a * i, 0), coalesce(a, 0.0), CASE WHEN b > 50 THEN a / b ELSE c END FROM df_dn WHERE k % 530 = 0 OR k % 1010 = 0 ORDER BY k;
+SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
+SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SET datafusion.mode = on;
+SELECT i, sum(a / 2), sum(a / 7), count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT i, sum(a) / sum(b), sum(c) / count(*) FROM df_dn GROUP BY i ORDER BY i;
+SELECT k, coalesce(a * i, 0), coalesce(a, 0.0), CASE WHEN b > 50 THEN a / b ELSE c END FROM df_dn WHERE k % 530 = 0 OR k % 1010 = 0 ORDER BY k;
+SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
+SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SET optimizer = off;
+-- division by zero, as PostgreSQL raises it; a guard before it in an AND
+-- keeps the rows it fails out
+SELECT k, a / 0 FROM df_dn WHERE k = 5;
+SELECT sum(a / b) FROM df_dn;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_dn;
 
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

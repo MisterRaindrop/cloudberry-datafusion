@@ -287,6 +287,16 @@ df_numeric_value_wide(Datum d, int scale, uint8 *dst)
 	return fit;
 }
 
+/* DN1: the display scale of numeric value 'd' (0 for NaN). */
+int
+df_numeric_dscale(Datum d)
+{
+	DfNumericParts parts;
+
+	df_numeric_parts(pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d)), &parts);
+	return parts.special ? 0 : parts.dscale;
+}
+
 bool
 df_numeric_const_ps(Datum d, int *precision, int *scale)
 {

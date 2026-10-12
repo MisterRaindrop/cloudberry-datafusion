@@ -71,7 +71,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE CASE WHEN n > 1 THEN n ELSE
                      Filter: (CASE WHEN (n > '1'::numeric) THEN n ELSE '0'::numeric END > 0.5)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+ DataFusion: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 SET datafusion.mode = off;
@@ -300,7 +300,7 @@ SET datafusion.mode = off;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
-ERROR:  smallint out of range  (seg1 slice1 172.17.0.3:40001 pid=82441)
+ERROR:  smallint out of range  (seg1 slice1 172.17.0.3:40001 pid=3844)
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
       sum      |    sum     |    sum     | count 
 ---------------+------------+------------+-------
@@ -311,7 +311,7 @@ SET datafusion.mode = on;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
-ERROR:  smallint out of range  (seg1 slice1 172.17.0.3:40001 pid=82441)
+ERROR:  smallint out of range  (seg0 slice1 172.17.0.3:40000 pid=3843)
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
       sum      |    sum     |    sum     | count 
 ---------------+------------+------------+-------

@@ -120,6 +120,8 @@ typedef struct DfBuilder
 static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
+static void df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
+static bool df_is_mixed_sum(Plan *ctx, Node *node);
 static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
 static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
 static void df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
@@ -652,7 +654,9 @@ df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 
 	foreach(lc, in->attnos)
 	{
-		if (lfirst_int(lc) == attno)
+		/* DN1: a numeric column's display scales are a column of their own */
+		if (lfirst_int(lc) == attno &&
+			(list_nth_int(in->scales, i) == DF_SCALE_DSCALE) == (scale == DF_SCALE_DSCALE))
 			return i;
 		i++;
 	}
@@ -860,6 +864,223 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 	}
 }
 
+/*
+ * DN1: the display scale of output column 'resno' of plan node 'child', as
+ * df_emit_output_of finds its value: a Motion's numeric carries it in the
+ * value (df_numeric_dscale), the input's column beside it.
+ */
+static void
+df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
+{
+	TargetEntry *tle = child ? get_tle_by_resno(child->targetlist, resno) : NULL;
+	Plan	   *saved = b->ctx;
+
+	if (tle == NULL)
+		df_fail(b, "a reference to a child's output");
+	else if (IsA(child, Agg))
+	{
+		Agg		   *agg = b->agg;
+		bool		named = b->agg_named;
+
+		b->agg = (Agg *) child;
+		b->agg_named = true;
+		if (df_named_of(b, b->agg) == NULL)
+			df_fail(b, "a reference to an aggregate");
+		else
+			df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_AGG);
+		b->agg = agg;
+		b->agg_named = named;
+	}
+	else if (IsA(child, Motion))
+		df_emit_column(b, out, df_input_of(b, child),
+					   df_motion_stream_column((Motion *) child, resno) + 1,
+					   INT4OID, DF_SCALE_DSCALE);
+	else
+	{
+		b->ctx = child;
+		df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		b->ctx = saved;
+	}
+}
+
+/*
+ * DN1: the display scale (int4) of each value of numeric expression 'node',
+ * as PostgreSQL's numeric.c gives it: an expression of one scale has that
+ * one; + and - the larger of their operands', * their sum, / that of
+ * select_div_scale (df_core::pgnum::pg_div_rscale), a CASE or COALESCE
+ * that of the branch taken, a sum the largest of the values added up
+ * (MS1).  Only where it matters: a value leaving DataFusion, an operand of
+ * /, or a value added up.
+ */
+static void
+df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
+{
+	Plan	   *ctx = df_level_ctx(b, level);
+	Plan	   *saved = b->ctx;
+	int			p,
+				s;
+
+	if (b->failed)
+		return;
+	if (df_numeric_ps(ctx, node, &p, &s))
+	{
+		appendStringInfo(out, "{\"lit\":{\"type\":\"int4\",\"value\":%d}}", s);
+		return;
+	}
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) node;
+
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
+					df_emit_dscale_output_of(b, out, outerPlan(b->ctx), var->varattno);
+				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
+					df_emit_dscale_output_of(b, out, innerPlan(b->ctx), var->varattno);
+				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
+						 ((Scan *) b->ctx)->scanrelid == var->varno)
+					df_emit_dscale_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan,
+											 var->varattno);
+				else
+					/* a grouping key or a column the groups determine */
+					df_fail(b, "the display scale of a column");
+				return;
+			}
+
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) node;
+				char	   *name = get_opname(op->opno);
+				Node	   *l = linitial(op->args);
+				Node	   *r = lsecond(op->args);
+
+				if (name != NULL && strcmp(name, "/") == 0)
+				{
+					appendStringInfoString(out, "{\"numdiv_scale\":[");
+					df_emit(b, out, l, level);
+					appendStringInfoChar(out, ',');
+					b->ctx = saved;
+					df_emit_dscale(b, out, l, level);
+					appendStringInfoChar(out, ',');
+					b->ctx = saved;
+					df_emit(b, out, r, level);
+					appendStringInfoChar(out, ',');
+					b->ctx = saved;
+					df_emit_dscale(b, out, r, level);
+					b->ctx = saved;
+					appendStringInfo(out, "],\"scales\":[%d,%d]}",
+									 df_scale_of(ctx, l), df_scale_of(ctx, r));
+					return;
+				}
+				if (name == NULL || (strcmp(name, "+") != 0 && strcmp(name, "-") != 0 &&
+									 strcmp(name, "*") != 0))
+				{
+					df_fail(b, "the display scale of an operator");
+					return;
+				}
+				/* add_var, sub_var: the larger; mul_var: the sum */
+				appendStringInfoString(out, strcmp(name, "*") == 0 ?
+									   "{\"op\":\"+\",\"type\":\"int4\",\"args\":[" :
+									   "{\"greatest\":[");
+				df_emit_dscale(b, out, l, level);
+				appendStringInfoChar(out, ',');
+				b->ctx = saved;
+				df_emit_dscale(b, out, r, level);
+				b->ctx = saved;
+				appendStringInfoString(out, "]}");
+				return;
+			}
+
+		case T_CaseExpr:
+			{
+				CaseExpr   *ce = (CaseExpr *) node;
+				Node	   *saved_arg = b->case_arg;
+				ListCell   *lc;
+
+				b->case_arg = (Node *) ce->arg;
+				appendStringInfoString(out, "{\"case\":[");
+				foreach(lc, ce->args)
+				{
+					CaseWhen   *w = lfirst_node(CaseWhen, lc);
+
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					appendStringInfoString(out, "{\"when\":");
+					df_emit(b, out, (Node *) w->expr, level);
+					appendStringInfoString(out, ",\"then\":");
+					b->ctx = saved;
+					df_emit_dscale(b, out, (Node *) w->result, level);
+					b->ctx = saved;
+					appendStringInfoChar(out, '}');
+				}
+				b->case_arg = saved_arg;
+				appendStringInfoString(out, "],\"else\":");
+				df_emit_dscale(b, out, (Node *) ce->defresult, level);
+				b->ctx = saved;
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_CoalesceExpr:
+			{
+				CoalesceExpr *co = (CoalesceExpr *) node;
+				int			n = list_length(co->args);
+				ListCell   *lc;
+
+				appendStringInfoString(out, "{\"case\":[");
+				foreach(lc, co->args)
+				{
+					if (foreach_current_index(lc) == n - 1)
+						break;
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					appendStringInfoString(out, "{\"when\":{\"isnotnull\":");
+					df_emit(b, out, lfirst(lc), level);
+					appendStringInfoString(out, "},\"then\":");
+					b->ctx = saved;
+					df_emit_dscale(b, out, lfirst(lc), level);
+					b->ctx = saved;
+					appendStringInfoChar(out, '}');
+				}
+				appendStringInfoString(out, "],\"else\":");
+				df_emit_dscale(b, out, llast(co->args), level);
+				b->ctx = saved;
+				appendStringInfoChar(out, '}');
+				return;
+			}
+
+		case T_Const:
+			/* NULL: no value to show */
+			appendStringInfoString(out, "{\"lit\":{\"type\":\"int4\",\"null\":true}}");
+			return;
+
+		case T_NullIfExpr:
+			df_emit_dscale(b, out, linitial(((NullIfExpr *) node)->args), level);
+			return;
+
+		case T_Aggref:
+			{
+				Aggref	   *agg = (Aggref *) node;
+
+				if (level != DF_LEVEL_AGG || !df_is_mixed_sum((Plan *) b->agg, node))
+				{
+					df_fail(b, "the display scale of an aggregate");
+					return;
+				}
+				if (df_named_of(b, b->agg) != NULL)
+					/* A1: an Agg below, whose sums keep it (df_emit_node) */
+					df_emit_named_call(b, out, agg, "mixed_scale");
+				else
+					appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, agg, "mixed_scale"));
+				return;
+			}
+
+		default:
+			df_fail(b, "the display scale of an expression");
+			return;
+	}
+}
+
 /* Index of aggregate call ('agg', 'fn'), adding it if new. */
 static int
 df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
@@ -897,110 +1118,6 @@ df_is_mixed_sum(Plan *ctx, Node *node)
 {
 	return IsA(node, Aggref) && IsA(ctx, Agg) &&
 		df_agg_state_at(ctx, (Aggref *) node) == DF_AGG_SUM_NUMERIC_MIXED;
-}
-
-/* 'when' result 'then' */
-static CaseWhen *
-df_case_when(Expr *when, Expr *then)
-{
-	CaseWhen   *w = makeNode(CaseWhen);
-
-	w->expr = when;
-	w->result = then;
-	w->location = -1;
-	return w;
-}
-
-/* 'e' IS [NOT] NULL */
-static Expr *
-df_null_test(Expr *e, NullTestType type)
-{
-	NullTest   *nt = makeNode(NullTest);
-
-	nt->arg = e;
-	nt->nulltesttype = type;
-	nt->argisrow = false;
-	nt->location = -1;
-	return (Expr *) nt;
-}
-
-/* An int4 constant, or NULL. */
-static Expr *
-df_int4_const(int v, bool isnull)
-{
-	return (Expr *) makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
-							  Int32GetDatum(v), isnull, true);
-}
-
-/*
- * The display scale of each row of MS1's CASE or COALESCE 'arg' of node
- * 'ctx': its branch's scale, NULL where the value is NULL, which sum
- * leaves out.  The same branches are taken: the CASE keeps its tests.
- */
-static Expr *
-df_mixed_scale_expr(Plan *ctx, Node *arg)
-{
-	CaseExpr   *out = makeNode(CaseExpr);
-	ListCell   *lc;
-	int			p,
-				s;
-
-	out->casetype = INT4OID;
-	out->casecollid = InvalidOid;
-	out->location = -1;
-	if (IsA(arg, CaseExpr))
-	{
-		CaseExpr   *ce = (CaseExpr *) arg;
-		List	   *results = NIL;
-
-		out->arg = ce->arg;
-		foreach(lc, ce->args)
-			results = lappend(results, lfirst_node(CaseWhen, lc)->result);
-		results = lappend(results, ce->defresult);
-		foreach(lc, results)
-		{
-			Expr	   *r = lfirst(lc);
-			Expr	   *scale;
-
-			if (r == NULL || (IsA(r, Const) && ((Const *) r)->constisnull))
-				scale = df_int4_const(0, true);
-			else
-			{
-				CaseExpr   *sc = makeNode(CaseExpr);
-
-				(void) df_numeric_ps(ctx, (Node *) r, &p, &s);
-				sc->casetype = INT4OID;
-				sc->args = list_make1(df_case_when(df_null_test(r, IS_NULL),
-												   df_int4_const(0, true)));
-				sc->defresult = df_int4_const(s, false);
-				sc->location = -1;
-				scale = (Expr *) sc;
-			}
-			if (foreach_current_index(lc) < list_length(ce->args))
-				out->args = lappend(out->args,
-									df_case_when(list_nth_node(CaseWhen, ce->args,
-															   foreach_current_index(lc))->expr,
-												 scale));
-			else
-				out->defresult = scale;
-		}
-	}
-	else
-	{
-		/* COALESCE: the scale of the first argument that is not NULL */
-		foreach(lc, ((CoalesceExpr *) arg)->args)
-		{
-			Expr	   *a = lfirst(lc);
-
-			if (IsA(a, Const) && ((Const *) a)->constisnull)
-				continue;
-			(void) df_numeric_ps(ctx, (Node *) a, &p, &s);
-			out->args = lappend(out->args, df_case_when(df_null_test(a, IS_NOT_NULL),
-														df_int4_const(s, false)));
-		}
-		out->defresult = df_int4_const(0, true);
-	}
-	return (Expr *) out;
 }
 
 static void
@@ -1173,6 +1290,33 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[", date_cmp);
 					df_emit(b, out, date_arg, level);
 					appendStringInfo(out, ",{\"lit\":{\"type\":\"date\",\"value\":%d}}]}", date_value);
+					return;
+				}
+				if (op->opresulttype == NUMERICOID && strcmp(name, "/") == 0)
+				{
+					/*
+					 * DN1: numeric_div (df_core::pgnum::pg_div) of the
+					 * operands at their own scales and with their display
+					 * scales, at the largest scale it may give
+					 */
+					Plan	   *ctx = df_level_ctx(b, level);
+					Node	   *l = linitial(op->args);
+					Node	   *r = lsecond(op->args);
+					Plan	   *saved = b->ctx;
+
+					appendStringInfoString(out, "{\"numdiv\":[");
+					df_emit(b, out, l, level);
+					appendStringInfoChar(out, ',');
+					df_emit_dscale(b, out, l, level);
+					appendStringInfoChar(out, ',');
+					b->ctx = saved;
+					df_emit(b, out, r, level);
+					appendStringInfoChar(out, ',');
+					df_emit_dscale(b, out, r, level);
+					b->ctx = saved;
+					appendStringInfo(out, "],\"scales\":[%d,%d],\"type\":\"%s\"}",
+									 df_scale_of(ctx, l), df_scale_of(ctx, r),
+									 df_tag(NUMERICOID, df_scale_of(ctx, node)));
 					return;
 				}
 				if (op->opresulttype == NUMERICOID)
@@ -1779,6 +1923,22 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						na->aggfns = lappend(na->aggfns, NULL);
 					}
 				}
+				/* MS1, DN1: a sum's largest display scale, for those above */
+				{
+					List	   *mixed = NIL;
+					ListCell   *la,
+							   *lf;
+
+					forboth(la, na->aggrefs, lf, na->aggfns)
+						if (lfirst(lf) == NULL &&
+							df_agg_state_at((Plan *) agg, lfirst(la)) == DF_AGG_SUM_NUMERIC_MIXED)
+							mixed = lappend(mixed, lfirst(la));
+					foreach(la, mixed)
+					{
+						na->aggrefs = lappend(na->aggrefs, lfirst(la));
+						na->aggfns = lappend(na->aggfns, "mixed_scale");
+					}
+				}
 				/* RI1: the columns it does not group by, as any() */
 				ungrouped.agg = agg;
 				ungrouped.vars = NIL;
@@ -2054,14 +2214,19 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		}
 		if (!combine && fn != NULL && strcmp(fn, "mixed_scale") == 0)
 		{
-			/* MS1: the largest display scale of the values added up */
+			/*
+			 * MS1, DN1: the largest display scale of the values added up,
+			 * NULL ones left out as sum leaves them
+			 */
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+
 			b->ctx = (Plan *) aggnode;
-			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":");
-			df_emit(b, aggs,
-					(Node *) df_mixed_scale_expr((Plan *) aggnode,
-												 (Node *) linitial_node(TargetEntry, agg->args)->expr),
-					DF_LEVEL_SCAN);
-			appendStringInfoChar(aggs, '}');
+			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":{\"case\":[{\"when\":{\"isnull\":");
+			df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+			appendStringInfoString(aggs, "},\"then\":{\"lit\":{\"type\":\"int4\",\"null\":true}}}],\"else\":");
+			b->ctx = (Plan *) aggnode;
+			df_emit_dscale(b, aggs, arg, DF_LEVEL_SCAN);
+			appendStringInfoString(aggs, "}}");
 			continue;
 		}
 		if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
@@ -2143,6 +2308,20 @@ df_partial_ncols(DfBuilder *b, Plan *ctx, Node *expr)
  * The output columns of the spec: the values of 'values', expressions at
  * 'level' over the inputs of node 'ctx'.
  */
+/*
+ * DN1: is output column 'expr' of node 'ctx' a numeric whose values have
+ * display scales of their own (not MS1's whole sum, counted apart)?
+ */
+static bool
+df_output_dyn(Plan *ctx, Node *expr)
+{
+	int			p,
+				s;
+
+	return exprType(expr) == NUMERICOID && !df_is_mixed_sum(ctx, expr) &&
+		df_numeric_dyn(ctx, expr, &p, &s);
+}
+
 static void
 df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				DfSliceSpec *spec, Plan *ctx)
@@ -2162,6 +2341,8 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
 				  df_is_mixed_sum(ctx, expr)))
 			spec->nout += 2;	/* numeric sum and count, or display scale */
+		else if (df_output_dyn(ctx, expr))
+			spec->nout += 2;	/* DN1: the value and its display scale */
 		else
 			spec->nout++;
 	}
@@ -2269,6 +2450,28 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 		{
 			df_fail(b, "an output column");
 			return;
+		}
+		if (df_output_dyn(ctx, (Node *) value))
+		{
+			/*
+			 * DN1: the value at the largest scale it may have, and its own
+			 * display scale, which the C side gives it (as MS1's sum)
+			 */
+			int			scale = df_scale_of(ctx, (Node *) value);
+
+			spec->out_kinds[i] = DF_OUT_NUMERIC_MIXED;
+			spec->out_scales[i] = (int16) scale;
+			spec->out_types[i++] = NUMERICOID;
+			spec->out_kinds[i] = DF_OUT_PART;
+			spec->out_types[i++] = INT4OID;
+			appendStringInfoString(out, i > 2 ? ",{\"expr\":" : "{\"expr\":");
+			df_emit(b, out, (Node *) value, level);
+			appendStringInfo(out, ",\"type\":\"%s\"},{\"expr\":", df_tag(NUMERICOID, scale));
+			if (level == DF_LEVEL_SCAN)
+				b->ctx = ctx;
+			df_emit_dscale(b, out, (Node *) value, level);
+			appendStringInfoString(out, ",\"type\":\"int4\"}");
+			continue;
 		}
 		if (type == NUMERICOID)
 		{
@@ -2406,10 +2609,14 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 				return;
 			}
 			c = b->out_col[spec->col_value[k - 1]];
-			if (spec->out_kinds[c] != DF_OUT_PLAIN ||
+			if ((spec->out_kinds[c] != DF_OUT_PLAIN &&
+				 spec->out_kinds[c] != DF_OUT_NUMERIC_MIXED) ||
 				spec->out_types[c] != exprType((Node *) tle->expr))
 			{
-				/* e.g. avg returning numeric, divided after DataFusion */
+				/*
+				 * e.g. avg returning numeric, divided after DataFusion; a
+				 * value of display scales of its own sorts as a value (DN1)
+				 */
 				df_fail(b, "a sort key computed outside DataFusion");
 				return;
 			}

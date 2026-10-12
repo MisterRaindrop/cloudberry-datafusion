@@ -624,50 +624,17 @@ df_rescales_infinity(Plan *ctx, Node *l, Node *r)
 /*
  * Is numeric 'expr' of plan node 'ctx' a CASE or COALESCE whose results
  * have scales of their own, not all the same (MS1)?  Each row's value then
- * has the display scale of its branch.  Sets the largest scale and the
- * precision at it.
+ * has the display scale of its branch.  Since DN1, any expression whose
+ * values have display scales of their own (df_numeric_dyn).  Sets the
+ * largest scale and the precision at it.
  */
 bool
 df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale)
 {
-	List	   *results = NIL;
-	ListCell   *lc;
-	int			first = -1,
-				digits = 0;
-	bool		mixed = false;
-
-	if (expr == NULL || exprType(expr) != NUMERICOID)
-		return false;
-	if (IsA(expr, CaseExpr))
-	{
-		foreach(lc, ((CaseExpr *) expr)->args)
-			results = lappend(results, lfirst_node(CaseWhen, lc)->result);
-		results = lappend(results, ((CaseExpr *) expr)->defresult);
-	}
-	else if (IsA(expr, CoalesceExpr))
-		results = ((CoalesceExpr *) expr)->args;
-	else
-		return false;
-	*scale = 0;
-	foreach(lc, results)
-	{
-		Node	   *e = lfirst(lc);
-		int			p,
-					s;
-
-		if (e == NULL || (IsA(e, Const) && ((Const *) e)->constisnull))
-			continue;
-		if (!df_numeric_ps(ctx, e, &p, &s) || df_numeric_may_be_infinite(ctx, e))
-			return false;
-		if (first >= 0 && s != first)
-			mixed = true;
-		if (first < 0)
-			first = s;
-		*scale = Max(*scale, s);
-		digits = Max(digits, p - s);
-	}
-	*precision = digits + *scale;
-	return mixed && *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+	/* DN1: or any expression whose values have display scales of their own */
+	return expr != NULL && exprType(expr) == NUMERICOID &&
+		df_numeric_dyn(ctx, expr, precision, scale) &&
+		!df_numeric_may_be_infinite(ctx, expr);
 }
 
 /*
@@ -922,6 +889,13 @@ df_pg_partial_readable(Plan *ctx, Aggref *agg)
 		!df_numeric_may_be_infinite(pctx, arg);
 }
 
+/* a / b rounded down, b > 0 */
+static int
+df_floor_div(int a, int b)
+{
+	return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
 /*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
@@ -931,8 +905,9 @@ df_pg_partial_readable(Plan *ctx, Aggref *agg)
  * as such a sum.  Anything else (an avg's result, arithmetic) has none.
  */
 bool
-df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
+df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 {
+	*dyn = false;
 	if (expr == NULL || exprType(expr) == InvalidOid)
 		return false;
 	switch (nodeTag(expr))
@@ -953,7 +928,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					Plan	   *sub = ((SubqueryScan *) ctx)->subplan;
 
 					tle = get_tle_by_resno(sub->targetlist, var->varattno);
-					return tle != NULL && df_numeric_ps(sub, (Node *) tle->expr, precision, scale);
+					return tle != NULL && df_numeric_range(sub, (Node *) tle->expr, precision, scale, dyn);
 				}
 				if (IsA(ctx, ShareInputScan))
 				{
@@ -969,7 +944,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 
 					child = producer ? outerPlan(producer) : NULL;
 					tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-					return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
+					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
 				}
 				if (var->varno == OUTER_VAR && IsA(ctx, Append))
 					return df_numeric_append_ps(((Append *) ctx)->appendplans, var->varattno,
@@ -982,7 +957,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					/* GPORCA's Sequence returns its last input's rows */
 					child = llast(((Sequence *) ctx)->subplans);
 					tle = get_tle_by_resno(child->targetlist, var->varattno);
-					return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
+					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
 				}
 				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 					return var->vartype == NUMERICOID &&
@@ -991,7 +966,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				if (child == NULL)
 					return false;
 				tle = get_tle_by_resno(child->targetlist, var->varattno);
-				return tle != NULL && df_numeric_ps(child, (Node *) tle->expr, precision, scale);
+				return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
 			}
 		case T_Const:
 			if (((Const *) expr)->consttype != NUMERICOID)
@@ -1012,14 +987,17 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 							ls,
 							rp,
 							rs;
+				bool		ldyn,
+							rdyn;
 
 				if (op->opresulttype != NUMERICOID || list_length(op->args) != 2 ||
 					name == NULL || op->opno >= FirstGenbkiObjectId ||
 					exprType(linitial(op->args)) != NUMERICOID ||
 					exprType(lsecond(op->args)) != NUMERICOID ||
-					!df_numeric_ps(ctx, linitial(op->args), &lp, &ls) ||
-					!df_numeric_ps(ctx, lsecond(op->args), &rp, &rs))
+					!df_numeric_range(ctx, linitial(op->args), &lp, &ls, &ldyn) ||
+					!df_numeric_range(ctx, lsecond(op->args), &rp, &rs, &rdyn))
 					return false;
+				*dyn = ldyn || rdyn;
 				if (strcmp(name, "+") == 0 || strcmp(name, "-") == 0)
 				{
 					*scale = Max(ls, rs);
@@ -1030,8 +1008,29 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					*scale = ls + rs;	/* mul_var's rscale */
 					*precision = lp + rp;
 				}
+				else if (strcmp(name, "/") == 0)
+				{
+					/*
+					 * DN1: select_div_scale picks the scale by the values, 16
+					 * significant digits of the quotient but not below either
+					 * display scale: at most for the smallest dividend, 10^-ls
+					 * (NBASE weight floor(-ls / 4)), over the largest divisor,
+					 * below 10^(rp - rs) (weight floor((rp - rs - 1) / 4)),
+					 * one weight less where the first digits are alike.  The
+					 * quotient is below 10^(lp - ls + rs), plus a digit its
+					 * rounding may add.  pgnum::pg_div multiplies the divisor
+					 * by up to 10^(scale - rs) as well.
+					 */
+					int			qweight = df_floor_div(-ls, 4) - df_floor_div(rp - rs - 1, 4) - 1;
+
+					*scale = Min(Max(16 - 4 * qweight, Max(ls, rs)), 1000);
+					*precision = (lp - ls) + rs + 1 + *scale;
+					*dyn = true;
+					if ((rp - rs) + ls + *scale > DF_NUMERIC_MAX_EXPR_PRECISION)
+						return false;
+				}
 				else
-					return false;	/* / and %: the scale depends on the values */
+					return false;	/* %: not done */
 				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 			}
 		case T_CaseExpr:
@@ -1050,26 +1049,36 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				}
 				else
 					results = ((CoalesceExpr *) expr)->args;
-				*precision = 1;
+				/*
+				 * DN1: branches of different scales give each value its
+				 * branch's display scale: the values are carried at the
+				 * largest, with the most integer digits.
+				 */
+				int			digits = 1;
+
 				*scale = 0;
 				foreach(lc, results)
 				{
 					Node	   *e = lfirst(lc);
 					int			p,
 								s;
+					bool		edyn;
 
 					if (IsA(e, Const) && ((Const *) e)->constisnull)
 						continue;
-					if (!df_numeric_ps(ctx, e, &p, &s) || (found && s != *scale))
+					if (!df_numeric_range(ctx, e, &p, &s, &edyn))
 						return false;
-					*precision = Max(*precision, p);
-					*scale = s;
+					if (edyn || (found && s != *scale))
+						*dyn = true;
+					digits = Max(digits, p - s);
+					*scale = Max(*scale, s);
 					found = true;
 				}
-				return true;
+				*precision = digits + *scale;
+				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 			}
 		case T_NullIfExpr:
-			return df_numeric_ps(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale);
+			return df_numeric_range(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn);
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) expr;
@@ -1099,9 +1108,10 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 							Node	   *tm = lsecond(fe->args);
 							int			ap,
 										as;
+							bool		adyn;
 
 							return IsA(tm, Const) && !((Const *) tm)->constisnull &&
-								df_numeric_ps(ctx, linitial(fe->args), &ap, &as) &&
+								df_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn) &&
 								df_numeric_typmod(DatumGetInt32(((Const *) tm)->constvalue),
 												  precision, scale);
 						}
@@ -1125,7 +1135,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
 					/* the argument is the partial result below, of the same scale */
-					if (!df_numeric_ps(ctx, arg, &p, &s))
+					if (!df_numeric_range(ctx, arg, &p, &s, dyn))
 						return false;
 				}
 				else if (exprType(arg) == INT8OID && strcmp(name, "sum") == 0)
@@ -1138,7 +1148,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 						return false;
 					p = 19, s = 0;
 				}
-				else if (!df_numeric_ps(ctx, arg, &p, &s))
+				else if (!df_numeric_range(ctx, arg, &p, &s, dyn))
 					return false;
 				if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
 				{
@@ -1159,6 +1169,8 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 					*scale = s;
 					return true;
 				}
+				if (strcmp(name, "avg") == 0 && *dyn)
+					return false;	/* DN1: not done */
 				if (strcmp(name, "avg") == 0)
 				{
 					/*
@@ -1192,6 +1204,28 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 	}
 }
 
+
+/* df_numeric_range of an expression of one scale (not DN1's). */
+bool
+df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
+{
+	bool		dyn;
+
+	return df_numeric_range(ctx, expr, precision, scale, &dyn) && !dyn;
+}
+
+/*
+ * DN1: is numeric 'expr' of node 'ctx' one whose values have display scales
+ * of their own, row by row?  Sets the scale they are carried at, the
+ * largest, and the precision at it.
+ */
+bool
+df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale)
+{
+	bool		dyn;
+
+	return df_numeric_range(ctx, expr, precision, scale, &dyn) && dyn;
+}
 
 /*
  * D1: what keeps DataFusion from telling the arguments of aggregate 'agg'
@@ -1269,6 +1303,7 @@ df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid c
 				rp,
 				rs,
 				t;
+	bool		dyn;
 	const char *problem;
 
 	/* integers of two widths, or floats, compare in the wider one */
@@ -1276,7 +1311,9 @@ df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid c
 		df_reject(cxt, "%s on %s and %s", what, format_type_be(lt), format_type_be(rt));
 	else if (lt == NUMERICOID)
 	{
-		if (!df_numeric_ps(cxt->node, l, &lp, &ls) || !df_numeric_ps(cxt->node, r, &rp, &rs))
+		/* DN1: values of display scales of their own compare as values */
+		if (!df_numeric_range(cxt->node, l, &lp, &ls, &dyn) ||
+			!df_numeric_range(cxt->node, r, &rp, &rs, &dyn))
 			df_reject(cxt, "%s on numeric of unknown precision", what);
 		else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
 				 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
@@ -1506,7 +1543,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					int			p,
 								s;
 
-					if (!df_numeric_ps(cxt->node, node, &p, &s))
+					bool		dyn;
+
+					/* DN1: or one of display scales of its own, within bounds */
+					if (!df_numeric_range(cxt->node, node, &p, &s, &dyn))
 						df_reject(cxt, "numeric column without a precision of at most %d",
 								  DF_NUMERIC_MAX_PRECISION);
 				}
@@ -1592,8 +1632,13 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 									rp,
 									rs,
 									t;
+						bool		dyn;
 
-						/* comparisons at the larger scale (N2), + - * (N3) */
+						/*
+						 * comparisons at the larger scale (N2), + - * (N3), /
+						 * (DN1); values of display scales of their own (DN1)
+						 * at the largest they may have
+						 */
 						if (ltype != rtype)
 							df_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
@@ -1602,18 +1647,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							if (df_numeric_may_be_infinite(cxt->node, linitial(op->args)) ||
 								df_numeric_may_be_infinite(cxt->node, lsecond(op->args)))
 								df_reject(cxt, "operator %s on a numeric that may be infinite", name);
-							else if (!df_numeric_ps(cxt->node, node, &lp, &ls))
+							else if (!df_numeric_range(cxt->node, node, &lp, &ls, &dyn))
 								df_reject(cxt, "operator %s on numeric: %s", name,
-										  strcmp(name, "/") == 0 || strcmp(name, "%") == 0 ?
-										  "its scale depends on the values" :
+										  strcmp(name, "%") == 0 ? "not supported" :
 										  "of unknown precision or more than 76 digits");
 						}
 						else if (df_numeric_param_cmp(cxt->node, op, NULL, NULL))
 							/* IP1: the parameter, rounded to the other side's scale */
 							cxt->numeric_param_ok = IsA(linitial(op->args), Param) ?
 								linitial(op->args) : lsecond(op->args);
-						else if (!df_numeric_ps(cxt->node, linitial(op->args), &lp, &ls) ||
-								 !df_numeric_ps(cxt->node, lsecond(op->args), &rp, &rs))
+						else if (!df_numeric_range(cxt->node, linitial(op->args), &lp, &ls, &dyn) ||
+								 !df_numeric_range(cxt->node, lsecond(op->args), &rp, &rs, &dyn))
 							df_reject(cxt, "operator %s on numeric of unknown precision", name);
 						else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
 								 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
@@ -1682,11 +1726,6 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 					df_reject(cxt, "combining stage of aggregate %s", name);
-				else if (cxt->inner_agg &&
-						 df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED)
-					/* A1: finished where tuples are made, which those above cannot read */
-					df_reject(cxt, "aggregate %s returning numeric below a join or another aggregate",
-							  name);
 				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
 						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
@@ -1898,6 +1937,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				CaseExpr   *ce = (CaseExpr *) node;
 				List	   *results = NIL;
 				ListCell   *lc;
+				int			p,
+							s;
 
 				if (!df_type_supported(ce->casetype))
 				{
@@ -1913,8 +1954,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					results = lappend(results, lfirst_node(CaseWhen, lc)->result);
 				results = lappend(results, ce->defresult);
 				if (ce->casetype == NUMERICOID && node != cxt->mixed_scales_ok &&
-					!df_numeric_same_scale(cxt->node, results, -1))
+					!df_numeric_same_scale(cxt->node, results, -1) &&
+					!df_numeric_mixed(cxt->node, node, &p, &s))
 				{
+					/* DN1: branches of different scales, each value its own */
 					df_reject(cxt, "CASE returning numeric of different scales");
 					return true;
 				}
@@ -1928,6 +1971,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 		case T_CoalesceExpr:
 			{
 				CoalesceExpr *co = (CoalesceExpr *) node;
+				int			p,
+							s;
 
 				if (!df_type_supported(co->coalescetype))
 				{
@@ -1935,7 +1980,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					return true;
 				}
 				if (co->coalescetype == NUMERICOID && node != cxt->mixed_scales_ok &&
-					!df_numeric_same_scale(cxt->node, co->args, -1))
+					!df_numeric_same_scale(cxt->node, co->args, -1) &&
+					!df_numeric_mixed(cxt->node, node, &p, &s))
 				{
 					df_reject(cxt, "COALESCE of numeric of different scales");
 					return true;
@@ -3827,15 +3873,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 							df_motion_pg_state(motion, tle->resno);
 						int			p,
 									s;
+						bool		dyn;
 
 						/*
 						 * Tuples' numeric values are read into Decimal256's
-						 * 76 digits, as batches carry them (an avg, AVG1)
+						 * 76 digits, as batches carry them (an avg, AVG1); one
+						 * of display scales of their own with them (DN1),
+						 * which only tuples carry (df_motion_batchable)
 						 */
 						if (bms_is_member(tle->resno, needed) && !state &&
 							(!df_type_supported(type) ||
 							 (type == NUMERICOID &&
-							  (!df_numeric_ps(plan, (Node *) tle->expr, &p, &s) ||
+							  (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
 							   p > DF_NUMERIC_MAX_EXPR_PRECISION))))
 						{
 							df_reject(cxt, "receives a column of type %s", format_type_be(type));
@@ -4427,6 +4476,23 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 static bool
 df_motion_batchable(Motion *motion)
 {
+	ListCell   *lc;
+
+	/*
+	 * DN1: a numeric column of display scales of their own needs them
+	 * beside it, which tuples carry; MS1's partial sum passes its own
+	 */
+	foreach(lc, motion->plan.targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+		int			p,
+					s;
+
+		if (exprType((Node *) tle->expr) == NUMERICOID &&
+			df_numeric_dyn((Plan *) motion, (Node *) tle->expr, &p, &s) &&
+			df_motion_column_partial(motion, tle->resno, NULL) == NULL)
+			return false;
+	}
 	/* D5: a sorted Gather's receiver reading batches merges nothing */
 	if (motion->sendSorted && motion->motionType != MOTIONTYPE_GATHER &&
 		motion->motionType != MOTIONTYPE_GATHER_SINGLE)

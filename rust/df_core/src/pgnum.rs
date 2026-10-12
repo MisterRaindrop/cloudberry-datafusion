@@ -27,8 +27,10 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanArray, Decimal256Array};
-use datafusion::arrow::datatypes::{i256, DataType, Decimal256Type, Int64Type};
+use datafusion::arrow::array::{
+    Array, ArrayRef, AsArray, BooleanArray, Decimal256Array, PrimitiveArray,
+};
+use datafusion::arrow::datatypes::{i256, DataType, Decimal256Type, Int32Type, Int64Type};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
@@ -123,6 +125,45 @@ pub fn pg_avg_rscale(sum: i256, from: i8, count: i64) -> i32 {
     (16 - 4 * qweight).max(from as i32).clamp(0, 1000)
 }
 
+/// DN1: select_div_scale of `x` (an integer of scale `sx`, display scale
+/// `dx`) by `y` (of scale `sy`, display scale `dy`): at least 16
+/// significant digits of the quotient, not below either display scale.
+pub fn pg_div_rscale(x: i256, sx: i8, dx: i32, y: i256, sy: i8, dy: i32) -> i32 {
+    let (w1, d1) = weight_first(x, sx);
+    let (w2, d2) = weight_first(y, sy);
+    let qweight = w1 - w2 - i32::from(d1 <= d2);
+    (16 - 4 * qweight).max(dx).max(dy).max(0).min(1000)
+}
+
+/// DN1: numeric_div of `x` (an integer of scale `sx`) by nonzero `y` (of
+/// scale `sy`) as div_var computes it: the quotient rounded half away from
+/// zero to `rscale`, given at scale `to` (not below `rscale`).  None beyond
+/// Decimal256, which the planner hook's bounds rule out.
+pub fn pg_div(x: i256, sx: i8, y: i256, sy: i8, rscale: i32, to: i8) -> Option<i256> {
+    if rscale > to as i32 || y == i256::ZERO {
+        return None;
+    }
+    // |x| / |y| * 10^(rscale - sx + sy), exactly, then rounded
+    let e = rscale - sx as i32 + sy as i32;
+    let mut num = x.checked_abs()?;
+    let mut den = y.checked_abs()?;
+    if e >= 0 {
+        num = num.checked_mul(pow10(e as u32))?;
+    } else {
+        den = den.checked_mul(pow10((-e) as u32))?;
+    }
+    let mut q = num / den;
+    if (num % den).checked_mul(i256::from_i128(2))? >= den {
+        q = q.checked_add(i256::ONE)?;
+    }
+    let q = q.checked_mul(pow10((to as i32 - rscale) as u32))?;
+    Some(if (x < i256::ZERO) != (y < i256::ZERO) {
+        q.wrapping_neg()
+    } else {
+        q
+    })
+}
+
 /// AVG1: numeric_div(sum, count) as numeric_avg computes it, `sum` an
 /// integer of scale `from` and `count` > 0: the quotient rounded half away
 /// from zero to select_div_scale's scale, at least 16 significant digits
@@ -180,6 +221,12 @@ pub enum NumericFn {
     /// AVG1: avg of a sum x of scale `from` and a count y (pg_avg), at
     /// scale `to`; NULL for no rows, NaN for a NaN sum.
     Avg { from: i8, to: i8 },
+    /// DN1: x / y (pg_div), of arguments x, its display scale, y, its
+    /// display scale; x of scale `x`, y of scale `y`, the result at `to`.
+    /// NaN if either is; 22012 for a zero y.
+    Div { x: i8, y: i8, to: i8 },
+    /// DN1: the display scale of that quotient (pg_div_rscale), int4.
+    DivScale { x: i8, y: i8 },
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -192,6 +239,7 @@ impl PgNumeric {
     pub fn udf(f: NumericFn) -> ScalarUDF {
         let n = match f {
             NumericFn::NanIf | NumericFn::Arith { .. } | NumericFn::Avg { .. } => 2,
+            NumericFn::Div { .. } | NumericFn::DivScale { .. } => 4,
             _ => 1,
         };
         ScalarUDF::new_from_impl(PgNumeric {
@@ -212,6 +260,8 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::Arith { op: NumOp::Sub, .. } => "pg_numeric_sub",
             NumericFn::Arith { op: NumOp::Mul, .. } => "pg_numeric_mul",
             NumericFn::Avg { .. } => "pg_numeric_avg",
+            NumericFn::Div { .. } => "pg_numeric_div",
+            NumericFn::DivScale { .. } => "pg_numeric_div_scale",
         }
     }
 
@@ -223,8 +273,10 @@ impl ScalarUDFImpl for PgNumeric {
         Ok(match self.f {
             NumericFn::Rescale { to, .. }
             | NumericFn::Arith { to, .. }
-            | NumericFn::Avg { to, .. } => numeric_type(to),
+            | NumericFn::Avg { to, .. }
+            | NumericFn::Div { to, .. } => numeric_type(to),
             NumericFn::IsNan => DataType::Boolean,
+            NumericFn::DivScale { .. } => DataType::Int32,
             _ => arg_types[0].clone(),
         })
     }
@@ -315,6 +367,56 @@ impl ScalarUDFImpl for PgNumeric {
                     }));
                 }
                 Arc::new(Decimal256Array::from(values).with_data_type(numeric_type(to)))
+            }
+            NumericFn::Div { x: sx, y: sy, .. } | NumericFn::DivScale { x: sx, y: sy } => {
+                let dx = args.args[1].to_array(n)?;
+                let y = args.args[2].to_array(n)?;
+                let dy = args.args[3].to_array(n)?;
+                let ys = decimal(&y)?;
+                let int = |a: &ArrayRef| {
+                    a.as_primitive_opt::<Int32Type>().cloned().ok_or_else(|| {
+                        DataFusionError::Internal(format!("div: display scale of type {}", a.data_type()))
+                    })
+                };
+                let (dx, dy) = (int(&dx)?, int(&dy)?);
+                let scale_only = matches!(self.f, NumericFn::DivScale { .. });
+                let mut values = Vec::with_capacity(n);
+                let mut scales = Vec::with_capacity(n);
+                for r in 0..n {
+                    if xs.is_null(r) || ys.is_null(r) {
+                        values.push(None);
+                        scales.push(None);
+                        continue;
+                    }
+                    let (a, b) = (xs.value(r), ys.value(r));
+                    if a == NUMERIC_NAN || b == NUMERIC_NAN {
+                        values.push(Some(NUMERIC_NAN));
+                        scales.push(Some(0));
+                        continue;
+                    }
+                    if b == i256::ZERO {
+                        return Err(DataFusionError::ArrowError(
+                            Box::new(crate::pgfunc::division_by_zero()),
+                            None,
+                        ));
+                    }
+                    let d = |s: &PrimitiveArray<Int32Type>| if s.is_null(r) { 0 } else { s.value(r) };
+                    let rscale = pg_div_rscale(a, sx, d(&dx), b, sy, d(&dy));
+                    scales.push(Some(rscale));
+                    if !scale_only {
+                        let to = match self.f {
+                            NumericFn::Div { to, .. } => to,
+                            _ => unreachable!(),
+                        };
+                        values.push(Some(pg_div(a, sx, b, sy, rscale, to).ok_or_else(beyond).map_err(arrow)?));
+                    }
+                }
+                match self.f {
+                    NumericFn::Div { to, .. } => {
+                        Arc::new(Decimal256Array::from(values).with_data_type(numeric_type(to)))
+                    }
+                    _ => Arc::new(PrimitiveArray::<Int32Type>::from(scales)),
+                }
             }
         };
         Ok(ColumnarValue::Array(out))
@@ -486,6 +588,65 @@ mod tests {
 
     /// numeric_div(s::numeric(38, 2), c), as numeric_avg computes avg:
     /// SELECT (s::numeric(38,2) / c::numeric)::text.
+    /// "12.50" as (1250, 2)
+    fn dec(t: &str) -> (i256, i8) {
+        let neg = t.starts_with('-');
+        let t = t.trim_start_matches('-');
+        let (int, frac) = t.split_once('.').unwrap_or((t, ""));
+        let mut v = i256::ZERO;
+        for c in int.chars().chain(frac.chars()) {
+            v = v * i256::from_i128(10) + i256::from_i128(c.to_digit(10).unwrap() as i128);
+        }
+        (if neg { v.wrapping_neg() } else { v }, frac.len() as i8)
+    }
+
+    fn show(v: i256, scale: i32) -> String {
+        let neg = v < i256::ZERO;
+        let digits = v.wrapping_abs().to_string();
+        let digits = format!("{:0>width$}", digits, width = scale as usize + 1);
+        let (int, frac) = digits.split_at(digits.len() - scale as usize);
+        format!("{}{}{}{}", if neg { "-" } else { "" }, int, if scale > 0 { "." } else { "" }, frac)
+    }
+
+    /// numeric_div's values and display scales, from PostgreSQL itself;
+    /// the scale the operands are carried at does not matter.
+    #[test]
+    fn div_as_postgresql() {
+        let cases = [
+            ("1.00", "3.00", "0.33333333333333333333"),
+            ("10.00", "4.0", "2.5000000000000000"),
+            ("-7.5", "2", "-3.7500000000000000"),
+            ("2", "-3", "-0.66666666666666666667"),
+            ("1", "3", "0.33333333333333333333"),
+            ("0.00", "7.00", "0.00000000000000000000"),
+            ("123456789.12", "0.01", "12345678912.00000000"),
+            ("0.01", "123456789.12", "0.0000000000810000006583680054"),
+            ("99999.99", "0.01", "9999999.000000000000"),
+            ("-0.005", "3", "-0.00166666666666666667"),
+            ("5", "2", "2.5000000000000000"),
+            ("12345678901234567890.12", "3.3", "3741114818555929663.67"),
+            ("0.0001", "99999999.9999", "0.0000000000010000000000010000"),
+            ("1.5", "1.5", "1.00000000000000000000"),
+            ("9999", "10000", "0.99990000000000000000"),
+            ("1", "10000", "0.000100000000000000000000"),
+            ("-2.5", "-0.5", "5.0000000000000000"),
+            ("0.00000001", "3", "0.0000000033333333333333333333"),
+            ("100", "7", "14.2857142857142857"),
+            ("1.000000", "3", "0.33333333333333333333"),
+        ];
+        for (x, y, want) in cases {
+            let ((xv, xs), (yv, ys)) = (dec(x), dec(y));
+            for pad in [0i8, 3, 9] {
+                let k = pow10(pad as u32);
+                let (xc, yc) = (xv * k, yv * k);
+                let rscale = pg_div_rscale(xc, xs + pad, xs as i32, yc, ys + pad, ys as i32);
+                let q = pg_div(xc, xs + pad, yc, ys + pad, rscale, 40).unwrap();
+                let q = q / pow10((40 - rscale) as u32);
+                assert_eq!(show(q, rscale), want, "{x} / {y} carried {pad} digits finer");
+            }
+        }
+    }
+
     #[test]
     fn avg_as_postgresql() {
         let cases = [

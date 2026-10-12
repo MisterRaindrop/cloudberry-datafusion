@@ -228,6 +228,14 @@ extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
 extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
+extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);
+extern bool df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale);
+/*
+ * DN1: the scale of an input column that holds the display scales of a
+ * numeric column of the same input attribute (df_numeric_dscale).
+ */
+#define DF_SCALE_DSCALE (-1)
+extern int	df_numeric_dscale(Datum d);
 extern bool df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale);
 extern bool df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale);
 extern const char *df_extract_field(FuncExpr *fe);

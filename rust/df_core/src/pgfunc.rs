@@ -83,7 +83,7 @@ impl std::error::Error for PgError {}
 const DIVISION_BY_ZERO: &str = "22012";
 const OUT_OF_RANGE: &str = "22003";
 
-fn division_by_zero() -> ArrowError {
+pub(crate) fn division_by_zero() -> ArrowError {
     ArrowError::ExternalError(Box::new(PgError::new(DIVISION_BY_ZERO, "division by zero")))
 }
 

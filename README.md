@@ -495,6 +495,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | S2 | GPORCA's Result over the slice's Sort |
 | D7 | GroupAggregates whose order the slice's rows leave in, sorted after |
 | GS1 | GROUPING SETS, ROLLUP and CUBE; `GROUPING()`, `GROUP_ID()` |
+| DN1 | numeric of display scales of their own: `/`, CASE and COALESCE of mixed scales |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -892,8 +893,7 @@ aggregate's result below a Motion, and bounds arithmetic by the digits its
 operands may have, not by their values, so nothing can overflow at run
 time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
 + tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
-`numeric`, `/` and `%` (whose result scale depends on the values) and
-unary minus stay on PostgreSQL; the direct PAX reader reads numeric
+`numeric`, `%` and unary minus stay on PostgreSQL (`/` since DN1, below); the direct PAX reader reads numeric
 columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
@@ -902,8 +902,8 @@ against 2.31 s in PostgreSQL.
 A CASE or COALESCE whose branches have different scales (`CASE WHEN
 p_type LIKE 'PROMO%' THEN price * (1 - disc) ELSE 0 END` in TPC-H Q8 and
 Q14) returns values of different display scales, row by row, so it has no
-one Decimal256 scale; DataFusion runs it only as the argument of `sum`.
-PostgreSQL's sum shows the largest display scale of the values it adds
+one Decimal256 scale; DataFusion ran it only as the argument of `sum`
+(MS1), and since DN1 anywhere.  PostgreSQL's sum shows the largest display scale of the values it adds
 up: DataFusion adds the values at the largest scale of the branches and
 keeps, beside the sum, the largest scale of the branches the values came
 from (NULL values left out, as `sum` leaves them), split through batch
@@ -911,6 +911,44 @@ Motions as a second state column; the C side rounds the sum to that scale,
 which only drops zeros.  A group whose rows all took `ELSE 0` shows `0`,
 as in PostgreSQL, not `0.0000`.  `avg` of such an argument stays on
 PostgreSQL.
+
+### numeric of display scales of their own
+
+DN1: a numeric value carries its display scale, and some expressions
+give each row its own: a quotient, whose scale `select_div_scale` picks
+from the pair of values (16 significant digits, not below either
+operand's display scale); a CASE or COALESCE whose branches have
+different scales (TPC-DS Q67's `coalesce(price * quantity, 0)`); a sum of
+such values, which shows the largest display scale added up; and
+arithmetic on them.  DataFusion carries such a value at the largest scale
+it may have and keeps its display scale apart, as numeric.c gives it.
+
+The largest scale is bounded by the operands' precision and scale, not
+by their values: a quotient's is that of the smallest dividend, 10^-s1,
+over the largest divisor, below 10^(p2 - s2) (TPC-DS Q36's
+`sum(net_profit) / sum(ext_sales_price)` over `numeric(7,2)`, 44 digits
+after the point, 71 in all), and the planner hook keeps an expression
+whose bound passes 76 digits on PostgreSQL, so nothing overflows at run
+time.  df_core::pgnum::pg_div divides as div_var does, exactly and
+rounding half away from zero at that row's scale; 0 as a divisor raises
+PostgreSQL's 22012, and an AND or OR runs the division only on the rows
+its earlier arguments leave undecided, as PostgreSQL does.  Comparisons,
+sorting and join keys read the value only.  The display scale is computed
+only where it matters: where the value leaves DataFusion (beside it in an
+output column, from which the C side gives it the scale, as for MS1's
+sums), as an operand of `/`, and added up.  It follows numeric.c: the
+larger of the operands' for + and -, their sum for *, select_div_scale's
+for /, the branch's for a CASE or COALESCE, the largest of the values for
+a sum; a value received from a Motion brings its own, read from the
+tuple.  A Motion of such a column carries tuples; a sum's partial state
+passes the scale as MS1's does.  min, max, avg, GROUP BY and Redistribute
+keys of such a value stay on PostgreSQL.
+
+Over 20 million rows of `numeric(15,2)`, `sum(price) / sum(qty)` per
+group took 0.42 s against 0.92 s, `sum(disc / 3)` 1.17 s against 1.38 s,
+and a filter on `price / qty` 0.92 s against 1.07 s.  TPC-DS SF1:
+whole-slice runs 1558 -> 1572, queries wholly in DataFusion 84 -> 89 of
+206 executions, results unchanged apart from Q71's ties (205/206).
 
 An uncorrelated scalar subquery becomes an init plan whose value
 (`$0`) the rest of the plan reads: TPC-H Q11, Q15 and Q22 compare an
@@ -1000,12 +1038,9 @@ P1: an output column DataFusion cannot compute whole is split.  DataFusion
 computes its largest parts it can (columns, + - *, aggregates, also an
 avg returning numeric); PostgreSQL's expression machinery evaluates the
 rest over those values, row by row, as its own projection would.  That
-covers numeric division, whose result scale PostgreSQL picks from each
-pair of values (`select_div_scale`), so a fixed-scale column cannot hold
-it, and any function or operator DataFusion lacks (`round`, `abs`,
-`to_char`, casts to text, ...).  `CASE WHEN b = 0 THEN 0 ELSE a / b END`
-still divides only where b is not 0, and `a / 0` raises PostgreSQL's
-error.  Not finished this way: filters, HAVING, sort keys (DataFusion
+covers any function or operator DataFusion lacks (`round`, `abs`,
+`to_char`, casts to text, ...), and covered numeric division until
+DataFusion computed it (DN1).  Not finished this way: filters, HAVING, sort keys (DataFusion
 sorts by what it computes), output sent as Arrow batches, and parts
 needing more than the values (subplans, parameters, window or
 set-returning functions, a simple `CASE x WHEN` around such a part).

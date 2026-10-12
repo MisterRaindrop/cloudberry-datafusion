@@ -968,7 +968,11 @@ df_exec_fill(DfExec *x, DfInput *in)
 					break;
 				case INT4OID:
 				case DATEOID:
-					((int32 *) dst)[n] = isnull ? 0 : DatumGetInt32(d);
+					if (in->spec->scales[c] == DF_SCALE_DSCALE)
+						/* DN1: the display scale of the numeric value */
+						((int32 *) dst)[n] = isnull ? 0 : df_numeric_dscale(d);
+					else
+						((int32 *) dst)[n] = isnull ? 0 : DatumGetInt32(d);
 					break;
 				case INT8OID:
 				case TIMEOID:
