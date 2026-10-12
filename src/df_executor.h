@@ -303,6 +303,26 @@ extern Bitmapset *df_batch_motions(PlannedStmt *stmt);
 extern int	df_motion_state_columns(Motion *motion, AttrNumber resno);
 extern Aggref *df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg);
 extern AttrNumber df_output_of(Plan *plan, AttrNumber attno);
+
+/*
+ * GS1: the grouping of an Agg with grouping sets (ROLLUP, CUBE, GROUPING
+ * SETS), its own and its chain's.  Without them, one set of all columns.
+ */
+typedef struct DfAggGroups
+{
+	int			ncols;
+	AttrNumber *cols;			/* the child columns grouped by: the Agg's,
+								 * then its chain's not among them */
+	Oid		   *collations;
+	int			nsets;			/* grouping sets, 0 without them */
+	Bitmapset **sets;			/* each set's child columns, in the order
+								 * of their GROUPINGSET_ID() (nodeAgg.c) */
+	int		   *group_ids;		/* each set's GROUP_ID() */
+} DfAggGroups;
+
+extern void df_agg_groups(Agg *agg, DfAggGroups *g);
+extern int	df_agg_group_index(Agg *agg, AttrNumber attno);
+extern int	df_grouping_value(List *cols, Bitmapset *set);
 extern bool df_motion_pg_state(Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern uint64 df_motion_signature(Motion *motion);

@@ -90,6 +90,7 @@ typedef struct DfCheckContext
 {
 	PlannedStmt *stmt;
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
+	bool		agg_sets;		/* and that Agg has grouping sets (GS1) */
 	bool		agg_input;		/* checking the child of an Agg node */
 	bool		join_input;		/* checking an input of a join */
 	bool		inner_agg;		/* checking an Agg below a join or another
@@ -138,6 +139,7 @@ typedef struct DfCheckContext
 static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
 static bool df_check_expr(Node *node, DfCheckContext *cxt);
 static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
+static bool df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups);
 static bool df_name_in(const char *name, const char *const *list);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
@@ -1668,6 +1670,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "aggregate %s", name ? name : "?");
 				else if (agg->aggorder != NIL)
 					df_reject(cxt, "ORDER BY inside aggregate %s", name);
+				else if (agg->aggdistinct != NIL && cxt->agg_sets)
+					df_reject(cxt, "DISTINCT inside aggregate %s with grouping sets", name);
 				else if (agg->aggdistinct != NIL && agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
 						 df_distinct_problem(cxt, agg) != NULL)
 					df_reject(cxt, "DISTINCT inside aggregate %s %s", name,
@@ -2036,6 +2040,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					return true;
 				break;
 			}
+
+		case T_GroupingFunc:
+		case T_GroupingSetId:
+		case T_GroupId:
+			/*
+			 * GS1: GROUPING(), Cloudberry's GROUPINGSET_ID() and GROUP_ID():
+			 * each a number of the grouping set of the row
+			 * (df_core::query::build_node)
+			 */
+			if (!cxt->agg_sets)
+				df_reject(cxt, "%s outside an Aggregate with grouping sets",
+						  IsA(node, GroupingFunc) ? "GROUPING()" :
+						  IsA(node, GroupId) ? "GROUP_ID()" : "GROUPINGSET_ID()");
+			return cxt->failed;
 
 		default:
 			df_reject(cxt, "expression node type %d", (int) nodeTag(node));
@@ -2715,6 +2733,126 @@ df_output_of(Plan *plan, AttrNumber attno)
 }
 
 /*
+ * GS1: the grouping of 'agg' (DfAggGroups) as ExecInitAgg reads it: the
+ * Agg, then each Agg of its chain; a hashed one is one set of its columns,
+ * a sorted or plain one a set per entry of its groupingSets, that many of
+ * its first columns.  GROUP_ID() counts the sets equal to the one before,
+ * among the hashed ones or within one sorted Agg.
+ */
+void
+df_agg_groups(Agg *agg, DfAggGroups *g)
+{
+	bool		gsets = agg->groupingSets != NIL || agg->chain != NIL;
+	int			nnodes = 1 + list_length(agg->chain);
+	Bitmapset  *prev_hash = NULL;
+	int			prev_hash_id = 0;
+	int			max = 0;
+	int			nsets = 0;
+	int			n,
+				j,
+				k;
+
+	memset(g, 0, sizeof(*g));
+	for (n = 0; n < nnodes; n++)
+	{
+		Agg		   *a = n == 0 ? agg : list_nth_node(Agg, agg->chain, n - 1);
+
+		max += a->numCols;
+		nsets += (a->aggstrategy == AGG_HASHED || a->aggstrategy == AGG_MIXED) ?
+			1 : list_length(a->groupingSets);
+	}
+	g->cols = palloc(sizeof(AttrNumber) * Max(max, 1));
+	g->collations = palloc(sizeof(Oid) * Max(max, 1));
+	if (gsets)
+	{
+		g->sets = palloc0(sizeof(Bitmapset *) * Max(nsets, 1));
+		g->group_ids = palloc0(sizeof(int) * Max(nsets, 1));
+	}
+	for (n = 0; n < nnodes; n++)
+	{
+		Agg		   *a = n == 0 ? agg : list_nth_node(Agg, agg->chain, n - 1);
+		ListCell   *lc;
+		Bitmapset  *prev = NULL;
+		int			prev_id = 0;
+
+		for (j = 0; j < a->numCols; j++)
+		{
+			for (k = 0; k < g->ncols && g->cols[k] != a->grpColIdx[j]; k++)
+				;
+			if (k == g->ncols)
+			{
+				g->cols[g->ncols] = a->grpColIdx[j];
+				g->collations[g->ncols++] = a->grpCollations[j];
+			}
+		}
+		if (!gsets)
+			continue;
+		if (a->aggstrategy == AGG_HASHED || a->aggstrategy == AGG_MIXED)
+		{
+			Bitmapset  *set = NULL;
+
+			for (j = 0; j < a->numCols; j++)
+				set = bms_add_member(set, a->grpColIdx[j]);
+			g->group_ids[g->nsets] = prev_hash != NULL && bms_equal(set, prev_hash) ?
+				prev_hash_id + 1 : 0;
+			prev_hash_id = g->group_ids[g->nsets];
+			prev_hash = set;
+			g->sets[g->nsets++] = set;
+			continue;
+		}
+		foreach(lc, a->groupingSets)
+		{
+			Bitmapset  *set = NULL;
+
+			for (j = 0; j < list_length(lfirst(lc)); j++)
+				set = bms_add_member(set, a->grpColIdx[j]);
+			g->group_ids[g->nsets] = foreach_current_index(lc) > 0 && bms_equal(set, prev) ?
+				prev_id + 1 : 0;
+			prev_id = g->group_ids[g->nsets];
+			prev = set;
+			g->sets[g->nsets++] = set;
+		}
+	}
+}
+
+/* GS1: index of child column 'attno' among 'agg's grouping columns, or -1. */
+int
+df_agg_group_index(Agg *agg, AttrNumber attno)
+{
+	DfAggGroups g;
+	int			k;
+
+	if (agg->chain == NIL)
+	{
+		for (k = 0; k < agg->numCols; k++)
+			if (agg->grpColIdx[k] == attno)
+				return k;
+		return -1;
+	}
+	df_agg_groups(agg, &g);
+	for (k = 0; k < g.ncols; k++)
+		if (g.cols[k] == attno)
+			return k;
+	return -1;
+}
+
+/*
+ * GS1: GROUPING() of child columns 'cols' in grouping set 'set', as
+ * ExecEvalGroupingFunc: a bit per column, the first the highest, set when
+ * the set does not group by it.
+ */
+int
+df_grouping_value(List *cols, Bitmapset *set)
+{
+	ListCell   *lc;
+	int			v = 0;
+
+	foreach(lc, cols)
+		v = (v << 1) | (bms_is_member(lfirst_int(lc), set) ? 0 : 1);
+	return v;
+}
+
+/*
  * The order a GroupAggregate's input arrives in: the keys of 'plan', a
  * Sort below it or a sorted Motion it reads merged.  False for anything
  * else.
@@ -2778,6 +2916,14 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 		return false;
 	if (motion != NULL && (motion->numSortCols == 0 || ncols < motion->numSortCols))
 		return false;
+	/*
+	 * GS1: one sorted rollup, over its input sorted by its columns in turn,
+	 * gives a set's row after those of the longer sets it sums up: where
+	 * their NULLs sort last.  A tie with a NULL of the data goes to the
+	 * longer set first (df_emit_resort_by).
+	 */
+	if (agg->chain != NIL)
+		return false;
 	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
 	{
 		AttrNumber	col = df_output_of((Plan *) agg, cols[i]);
@@ -2788,6 +2934,8 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != cols[i]; k++)
 			;
 		if (tle == NULL || k == agg->numCols)
+			return false;
+		if (agg->groupingSets != NIL && (nulls[i] || cols[i] != agg->grpColIdx[i]))
 			return false;
 		groups = bms_add_member(groups, k);
 		type = exprType((Node *) tle->expr);
@@ -2820,6 +2968,39 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 	cxt->sort_keys = bms_union(cxt->sort_keys, keys);
 	cxt->tails.resort = motion;
 	cxt->tails.resort_by = input;
+	return true;
+}
+
+/*
+ * GS1: may DataFusion compute grouping sets 'groups' of 'agg'?  Its chain
+ * holds hashed, sorted and plain Aggs (create_groupingsets_plan), the sorted
+ * ones over a Sort it does not run.  DataFusion numbers the sets in an
+ * integer of 64 bits, a bit per column and the rest for repeated sets.
+ * DISTINCT aggregates run over a grouping by all columns first, which the
+ * sets would count again (df_check_expr).
+ */
+static bool
+df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups)
+{
+	ListCell   *lc;
+
+	foreach(lc, agg->chain)
+	{
+		Agg		   *a = lfirst_node(Agg, lc);
+
+		if (a->aggsplit != agg->aggsplit ||
+			(a->aggstrategy != AGG_HASHED && a->aggstrategy != AGG_SORTED &&
+			 a->aggstrategy != AGG_PLAIN))
+		{
+			df_reject(cxt, "grouping sets of an unknown form");
+			return false;
+		}
+	}
+	if (groups->ncols > 32 || groups->nsets > 1024)
+	{
+		df_reject(cxt, "grouping sets of more than 32 columns or 1024 sets");
+		return false;
+	}
 	return true;
 }
 
@@ -2983,17 +3164,26 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Agg		   *agg = (Agg *) plan;
 				Plan	   *child = outerPlan(plan);
 				Bitmapset  *child_needed = NULL;
+				DfAggGroups groups;
 				bool		inner;
 				ListCell   *lc;
 				int			i;
 
-				if (agg->groupingSets != NIL || agg->chain != NIL)
-				{
-					/* GROUPING SETS, ROLLUP, CUBE: grpColIdx names only one set */
-					df_reject(cxt, "grouping sets");
+				df_agg_groups(agg, &groups);
+				if (groups.nsets > 0 && !df_check_grouping_sets(cxt, agg, &groups))
 					return;
+				if (groups.nsets > 0 && (agg->aggstrategy != AGG_SORTED || agg->chain != NIL))
+				{
+					/*
+					 * GS1: grouping sets give their rows in no order unless
+					 * one sorted rollup computes them all (as
+					 * create_groupingsets_path says); DataFusion runs them
+					 * hashed, with no use for the Sort below.
+					 */
+					if (child != NULL && IsA(child, Sort))
+						cxt->skipped_sort = child;
 				}
-				if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
+				else if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free &&
 					child != NULL && IsA(child, Sort))
 				{
 					/*
@@ -3063,10 +3253,10 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "combining stage of a multi-stage aggregation");
 					return;
 				}
-				for (i = 0; i < agg->numCols && child != NULL; i++)
+				for (i = 0; i < groups.ncols && child != NULL; i++)
 				{
 					TargetEntry *tle = get_tle_by_resno(child->targetlist,
-														agg->grpColIdx[i]);
+														groups.cols[i]);
 
 					if (tle && !df_type_supported(exprType((Node *) tle->expr)))
 					{
@@ -3086,11 +3276,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						}
 					}
 					if (tle && df_type_is_string(exprType((Node *) tle->expr)) &&
-						df_string_compare_problem(cxt, "=", agg->grpCollations[i]) != NULL)
+						df_string_compare_problem(cxt, "=", groups.collations[i]) != NULL)
 					{
 						df_reject(cxt, "GROUP BY key of type %s %s",
 								  format_type_be(exprType((Node *) tle->expr)),
-								  df_string_compare_problem(cxt, "=", agg->grpCollations[i]));
+								  df_string_compare_problem(cxt, "=", groups.collations[i]));
 						return;
 					}
 				}
@@ -3108,6 +3298,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					IsA(outerPlan(df_below_sort(child)), Agg);
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
+				cxt->agg_sets = groups.nsets > 0;
 				cxt->inner_agg = inner;
 				cxt->whole_aggs = NIL;
 				foreach(lc, plan->targetlist)
@@ -3119,6 +3310,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				df_check_expr_list(plan->qual, cxt);
 				cxt->inner_agg = false;
 				cxt->allow_aggref = false;
+				cxt->agg_sets = false;
 				cxt->partial_states = false;
 				cxt->pg_states = false;
 				cxt->pg_final_states = false;
@@ -3128,8 +3320,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				/* The child must produce what the aggregate reads. */
 				df_collect_outer_refs((Node *) plan->targetlist, &child_needed);
 				df_collect_outer_refs((Node *) plan->qual, &child_needed);
-				for (i = 0; i < agg->numCols; i++)
-					child_needed = bms_add_member(child_needed, agg->grpColIdx[i]);
+				for (i = 0; i < groups.ncols; i++)
+					child_needed = bms_add_member(child_needed, groups.cols[i]);
 				/* count(*) alone reads no column; keep the set non-NULL. */
 				child_needed = bms_add_member(child_needed, 0);
 				cxt->agg_input = true;

@@ -168,8 +168,8 @@ DROP TABLE df_mg;
 -- order the rows leave in (D7, TPC-DS Q7): DataFusion groups hashed and
 -- sorts by the keys of its input, a merging Gather's or a Sort's, every
 -- grouping column among them.  One below a join, whose order no one reads
--- (D6, TPC-DS Q32), runs hashed.  Grouping sets stay on PostgreSQL: the
--- Agg names the columns of one set only.
+-- (D6, TPC-DS Q32), runs hashed.  Grouping sets once ran as a grouping by
+-- the Agg's own columns alone (see groupingsets for GS1).
 CREATE TABLE df_go (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
 INSERT INTO df_go SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
   'v' || (i % 17), (i % 211) * 0.75 FROM generate_series(1, 20000) i;

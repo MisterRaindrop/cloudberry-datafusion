@@ -34,7 +34,9 @@
 //!   "output":  [ {"expr": <expr>, "type": "int8"}, ... ],
 //!   "sort":    [ {"col": c, "desc": b, "nulls_first": b}, ... ],  (optional:
 //!                the order of the output, by output columns; floats as
-//!                PostgreSQL orders them, see pgfloat)
+//!                PostgreSQL orders them, see pgfloat; {"expr": <expr>}
+//!                instead of "col": a column of the plan the output
+//!                leaves out, as the top aggregate's "gset")
 //!   "limit":   {"skip": n, "fetch": m},   (optional, after the sort; no
 //!                "fetch": all rows)
 //!   "route":   ... }                                   (as below)
@@ -45,7 +47,10 @@
 //!                          "aggs": [...], "having": <expr> | null,
 //!                          "name": s}}   (name: an aggregate below a join
 //!                          or another aggregate, its columns s_g<i> and
-//!                          s_a<i>)
+//!                          s_a<i>; "sets": [[k, ...], ...], optional: the
+//!                          grouping sets, each by indexes into "group",
+//!                          and a column "gset" (s_gset) of each row's set,
+//!                          its place in "sets")
 //!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
 //!                with a column s of numbers unique to each, above n: Cloudberry's
 //!                RowIdExpr)
@@ -81,6 +86,8 @@
 //!
 //! <expr> := {"col": i} | {"group": i} | {"agg": i} | {"name": s}
 //!         | {"lit": {"type": t, "value": v}} | {"lit": {"type": t, "null": true}}
+//!         | {"per_set": [v, ...], "set": <expr>}   (int4 v of the set
+//!                                 <expr> names: GROUPING() and the like)
 //!         | {"op": "+", "type": t, "args": [<expr>, <expr>]}
 //!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
@@ -125,8 +132,10 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, bool_or, count, max, min, sum};
+use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::{
-    binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, LogicalPlanBuilder, Operator,
+    binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, GroupingSet, LogicalPlanBuilder,
+    Operator,
 };
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -447,6 +456,20 @@ fn expr(v: &Value) -> Result<Expr, String> {
     }
     if let Some(i) = v.get("agg") {
         return Ok(col(format!("a{}", index(i)?)));
+    }
+    if let Some(vals) = v.get("per_set") {
+        // GS1: a number per grouping set, of the set "set" names
+        let vals = vals.as_array().ok_or("plan spec: bad per_set")?;
+        let mut when_then = Vec::with_capacity(vals.len());
+        for (j, x) in vals.iter().enumerate() {
+            let x = x.as_i64().ok_or("plan spec: bad per_set value")?;
+            when_then.push((Box::new(lit(j as i32)), Box::new(lit(x as i32))));
+        }
+        return Ok(Expr::Case(Case::new(
+            Some(Box::new(expr(field(v, "set")?)?)),
+            when_then,
+            None,
+        )));
     }
     if let Some(l) = v.get("lit") {
         return literal(l);
@@ -773,6 +796,76 @@ fn distinct_arguments(aggs: &[Value]) -> Result<Vec<&Value>, String> {
         }
     }
     Ok(args)
+}
+
+/// GS1: an aggregate spec's "sets", each the indexes into its "group" of
+/// the keys it groups by; None without.
+fn grouping_sets(a: &Value, ngroups: usize) -> Result<Option<Vec<Vec<usize>>>, String> {
+    let Some(sets) = a.get("sets").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let sets = sets
+        .as_array()
+        .filter(|s| !s.is_empty())
+        .ok_or("plan spec: bad grouping sets")?;
+    sets.iter()
+        .map(|s| {
+            s.as_array()
+                .ok_or("plan spec: bad grouping set")?
+                .iter()
+                .map(|k| match index(k) {
+                    Ok(k) if k < ngroups => Ok(k),
+                    _ => Err("plan spec: bad grouping set key".to_string()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// GS1: the `__grouping_id` DataFusion gives the rows of each of `sets`, as
+/// its physical planner and aggregate number them
+/// (merge_grouping_set_physical_expr, group_id_array): a bit per key, in
+/// the order the sets first name them, the first the highest, set where
+/// the set does not group by it; above those bits, how many sets before
+/// were alike.
+fn grouping_ids(sets: &[Vec<usize>]) -> Vec<u64> {
+    let mut keys: Vec<usize> = Vec::new();
+    for k in sets.iter().flatten() {
+        if !keys.contains(k) {
+            keys.push(*k);
+        }
+    }
+    let mut seen: HashMap<Vec<bool>, u64> = HashMap::new();
+    sets.iter()
+        .map(|s| {
+            let nulls: Vec<bool> = keys.iter().map(|k| !s.contains(k)).collect();
+            let mask = nulls.iter().fold(0u64, |acc, &n| (acc << 1) | n as u64);
+            let ordinal = seen.entry(nulls).or_insert(0);
+            let id = mask | (*ordinal << keys.len());
+            *ordinal += 1;
+            id
+        })
+        .collect()
+}
+
+/// GS1: the place in `sets` of the set of the aggregate's row, from its
+/// `__grouping_id`: Cloudberry's GROUPINGSET_ID() when the sets come in
+/// that order.
+fn grouping_set_of(sets: &[Vec<usize>]) -> Expr {
+    let id = Expr::Cast(datafusion::logical_expr::Cast::new(
+        Box::new(col(datafusion::logical_expr::Aggregate::INTERNAL_GROUPING_ID)),
+        DataType::UInt64,
+    ));
+    Expr::Case(Case::new(
+        Some(Box::new(id)),
+        grouping_ids(sets)
+            .into_iter()
+            .enumerate()
+            .map(|(j, g)| (Box::new(lit(g)), Box::new(lit(j as i32))))
+            .collect(),
+        None,
+    ))
 }
 
 /// What the projection after an aggregate does to its result.
@@ -1459,6 +1552,7 @@ fn build_node(
         let mut b = build_node(field(a, "input")?, tables)?;
         let groups = field(a, "group")?.as_array().cloned().unwrap_or_default();
         let aggs = field(a, "aggs")?.as_array().cloned().unwrap_or_default();
+        let sets = grouping_sets(a, groups.len())?;
         // A float key groups by its PostgreSQL value (pgfloat); the group's
         // value is the smallest of its members (by their order keys), so
         // that a group of -0 alone shows -0.
@@ -1505,6 +1599,9 @@ fn build_node(
         let flag = |a: &Value| a.get("distinct").and_then(Value::as_bool).unwrap_or(false);
         // the argument of each aggregate: its distinct column, or None
         let mut over: Vec<Option<Expr>> = vec![None; aggs.len()];
+        if !dargs.is_empty() && sets.is_some() {
+            return Err("plan spec: DISTINCT aggregates with grouping sets".into());
+        }
         if !dargs.is_empty() {
             let float_d: Vec<bool> = dargs
                 .iter()
@@ -1633,27 +1730,51 @@ fn build_node(
             // to compute for it.
             agg_exprs.push(count(lit(1i64)).alias("a_rows"));
         }
+        if let Some(sets) = &sets {
+            // GS1: the keys as columns g<i>, grouped by in each set
+            let mut cols: Vec<Expr> =
+                b.schema().columns().into_iter().map(Expr::Column).collect();
+            cols.append(&mut group_exprs);
+            b = b.project(cols).map_err(df)?;
+            group_exprs = vec![Expr::GroupingSet(GroupingSet::GroupingSets(
+                sets.iter()
+                    .map(|s| s.iter().map(|k| col(format!("g{k}"))).collect())
+                    .collect(),
+            ))];
+        }
         b = b.aggregate(group_exprs, agg_exprs).map_err(df)?;
         // A combined count is 0, not NULL, when no partial count arrived;
         // a combined avg divides the sums, NULL without values (as
         // PostgreSQL's float8_avg).
-        if !float_groups.is_empty()
+        if sets.is_some()
+            || !float_groups.is_empty()
             || !bp_groups.is_empty()
             || post.iter().any(|p| *p != Post::None)
         {
-            let mut cols: Vec<Expr> = (0..ngroups)
-                .map(|i| {
-                    if float_groups.contains(&i) {
-                        FloatFn::FromOrderKey
-                            .apply(col(format!("g{i}_v")))
-                            .alias(format!("g{i}"))
-                    } else if bp_groups.contains(&i) {
-                        col(format!("g{i}_v")).alias(format!("g{i}"))
-                    } else {
-                        col(format!("g{i}"))
-                    }
-                })
-                .collect();
+            let mut cols: Vec<Expr> = Vec::with_capacity(ngroups + post.len() + 1);
+            for i in 0..ngroups {
+                let g = col(format!("g{i}"));
+                let v = if float_groups.contains(&i) {
+                    FloatFn::FromOrderKey.apply(col(format!("g{i}_v")))
+                } else if bp_groups.contains(&i) {
+                    col(format!("g{i}_v"))
+                } else {
+                    cols.push(g);
+                    continue;
+                };
+                // GS1: NULL in a set without the key, as g<i> is
+                let v = if sets.is_some() {
+                    when(g.is_null(), lit(ScalarValue::Null))
+                        .otherwise(v)
+                        .map_err(df)?
+                } else {
+                    v
+                };
+                cols.push(v.alias(format!("g{i}")));
+            }
+            if let Some(sets) = &sets {
+                cols.push(grouping_set_of(sets).alias("gset"));
+            }
             for (i, p) in post.iter().enumerate() {
                 let c = col(format!("a{i}"));
                 let n = col(format!("a{i}_n"));
@@ -1696,6 +1817,9 @@ fn build_node(
             cols.extend(
                 (0..aggs.len()).map(|i| col(format!("a{i}")).alias(format!("{name}_a{i}"))),
             );
+            if sets.is_some() {
+                cols.push(col("gset").alias(format!("{name}_gset")));
+            }
             if cols.is_empty() {
                 cols.push(col("a_rows").alias(format!("{name}_rows")));
             }
@@ -2078,11 +2202,16 @@ impl Query {
                 .as_array()
                 .ok_or_else(|| internal("bad sort keys".into()))?
             {
+                let flag = |name: &str| k.get(name).and_then(Value::as_bool).unwrap_or(false);
+                if let Some(e) = k.get("expr") {
+                    // GS1: a column of the plan the output leaves out
+                    sorts.push(expr(e).map_err(internal)?.sort(!flag("desc"), flag("nulls_first")));
+                    continue;
+                }
                 let c = index(field(k, "col").map_err(internal)?).map_err(internal)?;
                 let ty = out_types
                     .get(c)
                     .ok_or_else(|| internal(format!("sort key {c} is not an output")))?;
-                let flag = |name: &str| k.get(name).and_then(Value::as_bool).unwrap_or(false);
                 let e = col(format!("o{c}"));
                 let e = if is_float(&ty.arrow()) {
                     FloatFn::Key.apply(e)

@@ -807,11 +807,8 @@ df_collect_ungrouped(Node *node, DfUngrouped *c)
 		return false;
 	if (IsA(node, Var) && ((Var *) node)->varno == OUTER_VAR)
 	{
-		int			k;
-
-		for (k = 0; k < c->agg->numCols; k++)
-			if (c->agg->grpColIdx[k] == ((Var *) node)->varattno)
-				return false;
+		if (df_agg_group_index(c->agg, ((Var *) node)->varattno) >= 0)
+			return false;
 		c->vars = lappend(c->vars, node);
 		return false;
 	}
@@ -1076,21 +1073,54 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 								   df_scale_of(b->ctx, (Node *) var));
 				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
 				{
-					int			k;
+					int			k = df_agg_group_index(b->agg, var->varattno);
 
-					for (k = 0; k < b->agg->numCols; k++)
-						if (b->agg->grpColIdx[k] == var->varattno)
-							break;
-					if (k < b->agg->numCols && b->agg_named)
+					if (k >= 0 && b->agg_named)
 						appendStringInfo(out, "{\"name\":\"q%d_g%d\"}",
 										 b->agg->plan.plan_node_id, k);
-					else if (k < b->agg->numCols)
+					else if (k >= 0)
 						appendStringInfo(out, "{\"group\":%d}", k);
 					else
 						df_emit_ungrouped(b, out, var);
 				}
 				else
 					df_fail(b, "a column reference");
+				return;
+			}
+
+		case T_GroupingFunc:
+		case T_GroupingSetId:
+		case T_GroupId:
+			{
+				/*
+				 * GS1: a number of the row's grouping set, one per set of
+				 * the Agg's (df_agg_groups), picked by its "gset" column
+				 */
+				DfAggGroups g;
+				int			i;
+
+				if (level != DF_LEVEL_AGG || b->agg == NULL)
+				{
+					df_fail(b, "a grouping set function");
+					return;
+				}
+				df_agg_groups(b->agg, &g);
+				if (g.nsets == 0)
+				{
+					df_fail(b, "a grouping set function without grouping sets");
+					return;
+				}
+				appendStringInfoString(out, "{\"per_set\":[");
+				for (i = 0; i < g.nsets; i++)
+					appendStringInfo(out, "%s%d", i > 0 ? "," : "",
+									 IsA(node, GroupingFunc) ?
+									 df_grouping_value(((GroupingFunc *) node)->cols, g.sets[i]) :
+									 IsA(node, GroupId) ? g.group_ids[i] : i);
+				if (b->agg_named)
+					appendStringInfo(out, "],\"set\":{\"name\":\"q%d_gset\"}}",
+									 b->agg->plan.plan_node_id);
+				else
+					appendStringInfoString(out, "],\"set\":{\"name\":\"gset\"}}");
 				return;
 			}
 
@@ -1555,6 +1585,47 @@ df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
  * spec.  Inputs are added in the order they are met: a join's Hash side
  * first, which is the order they are fed in.
  */
+/*
+ * '"group": [...]' of Agg 'agg': its grouping columns, its own and its
+ * chain's (df_agg_groups); with grouping sets, '"sets": [[k, ...], ...]'
+ * after, each set's columns by their place in "group", in the order of
+ * their GROUPINGSET_ID() (GS1).
+ */
+static void
+df_emit_groups(DfBuilder *b, StringInfo out, Agg *agg)
+{
+	DfAggGroups g;
+	int			i,
+				k;
+
+	df_agg_groups(agg, &g);
+	appendStringInfoString(out, "\"group\":[");
+	for (k = 0; k < g.ncols; k++)
+	{
+		if (k > 0)
+			appendStringInfoChar(out, ',');
+		df_emit_grouped(b, out, outerPlan(agg), g.cols[k]);
+	}
+	appendStringInfoChar(out, ']');
+	if (g.nsets == 0)
+		return;
+	appendStringInfoString(out, ",\"sets\":[");
+	for (i = 0; i < g.nsets; i++)
+	{
+		bool		first = true;
+
+		appendStringInfoString(out, i > 0 ? ",[" : "[");
+		for (k = 0; k < g.ncols; k++)
+			if (bms_is_member(g.cols[k], g.sets[i]))
+			{
+				appendStringInfo(out, "%s%d", first ? "" : ",", k);
+				first = false;
+			}
+		appendStringInfoChar(out, ']');
+	}
+	appendStringInfoChar(out, ']');
+}
+
 static void
 df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 {
@@ -1684,7 +1755,6 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				Agg		   *saved = b->agg;
 				bool		named = b->agg_named;
 				ListCell   *lc;
-				int			i;
 
 				na->agg = agg;
 				df_collect_aggrefs((Node *) plan->targetlist, &calls);
@@ -1726,14 +1796,9 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				}
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
 				df_emit_node(b, out, outerPlan(plan));
-				appendStringInfoString(out, ",\"group\":[");
-				for (i = 0; i < agg->numCols; i++)
-				{
-					if (i > 0)
-						appendStringInfoChar(out, ',');
-					df_emit_grouped(b, out, outerPlan(plan), agg->grpColIdx[i]);
-				}
-				appendStringInfoString(out, "],\"aggs\":[");
+				appendStringInfoString(out, ",");
+				df_emit_groups(b, out, agg);
+				appendStringInfoString(out, ",\"aggs\":[");
 				df_emit_agg_calls(b, out, agg, na->aggrefs, na->aggfns);
 				b->named = lappend(b->named, na);
 				appendStringInfoString(out, "],\"having\":");
@@ -2434,6 +2499,13 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 						 i > 0 ? "," : "", c, desc ? "true" : "false",
 						 nulls[i] ? "true" : "false");
 	}
+	/*
+	 * GS1: a rollup's row ties with one of a longer set where the data has
+	 * NULLs; the rollup gives the longer set's first, its GROUPINGSET_ID()
+	 * the lower.
+	 */
+	if (agg->groupingSets != NIL)
+		appendStringInfoString(out, ",{\"expr\":{\"name\":\"gset\"}}");
 	appendStringInfoChar(out, ']');
 }
 
@@ -2545,14 +2617,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	{
 		b.agg = (Agg *) root;
 		df_emit_node(&b, &node, outerPlan(root));
-		appendStringInfoChar(&group, '[');
-		for (i = 0; i < b.agg->numCols; i++)
-		{
-			if (i > 0)
-				appendStringInfoChar(&group, ',');
-			df_emit_grouped(&b, &group, outerPlan(root), b.agg->grpColIdx[i]);
-		}
-		appendStringInfoChar(&group, ']');
+		df_emit_groups(&b, &group, b.agg);
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
 		values = df_output_values(root, tails, spec);
 		df_emit_outputs(&b, &outputs, values, DF_LEVEL_AGG, spec, root);
@@ -2625,7 +2690,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			StringInfoData a;
 
 			initStringInfo(&a);
-			appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,\"group\":%s,"
+			appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,%s,"
 							 "\"aggs\":[%s],\"having\":%s}}",
 							 node.data, group.data, aggs.data, having.data);
 			node = a;

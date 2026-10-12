@@ -494,6 +494,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | D6 | GroupAggregates below a Hash Join or Hash, whose order no one reads |
 | S2 | GPORCA's Result over the slice's Sort |
 | D7 | GroupAggregates whose order the slice's rows leave in, sorted after |
+| GS1 | GROUPING SETS, ROLLUP and CUBE; `GROUPING()`, `GROUP_ID()` |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1088,9 +1089,33 @@ and the slice sorts its output by the keys of its input, the merge's or
 the Sort's, then limits it; as D4, every grouping column must be among
 them.
 
-GROUPING SETS, ROLLUP and CUBE stay on PostgreSQL: their Agg names the
-grouping columns of one set only, and running that as a GROUP BY lost the
-other sets' rows.
+### Grouping sets
+
+GS1: GROUPING SETS, ROLLUP and CUBE.  Cloudberry's Agg computes the sets
+in phases: its own grouping and that of each Agg of its chain, a hashed
+one a set, a sorted one a rollup (a set per prefix of its columns) over a
+Sort of its own.  DataFusion groups by all the sets at once, hashed, so
+those Sorts go unused.  Where the slice's rows leave in a sorted rollup's
+order (D7, TPC-DS Q27 under its LIMIT), the slice sorts by the keys of the
+rollup's input: a set's row follows those of the longer sets it sums up
+where their NULLs sort last, and a tie with a NULL of the data goes to the
+longer set first, as the rollup gives them.
+
+Each row's set is DataFusion's `__grouping_id`, taken to its place among
+the sets in the order nodeAgg.c numbers them.  GROUPING(), GROUP_ID() and
+the GROUPINGSET_ID() that a two-stage plan groups its partial rows by are
+a number per set, which the C side computes as nodeAgg.c does.  An empty
+set gives its row with no input rows, as PostgreSQL's.  DISTINCT
+aggregates with grouping sets stay on PostgreSQL: DataFusion counts them
+over a grouping by all columns first, which the sets would count again.
+
+Over 30 million rows, a ROLLUP of two keys took 0.36 s against 1.8 s, and
+a CUBE of two 0.37 s against 2.0 s.  The grouping sets blocked eleven
+TPC-DS executions under the Postgres planner; none now.
+
+Before GS1 the plan check did not look at the sets.  Their Agg names the
+grouping columns of one set only, and running it as that GROUP BY lost
+the other sets' rows.
 
 ### Subtrees below PostgreSQL's nodes
 
