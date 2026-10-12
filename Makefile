@@ -82,7 +82,10 @@ endif
 df-rust:
 	cd rust && $(CARGO) build --profile $(DF_CARGO_PROFILE) -p df_ffi $(DF_CARGO_FLAGS)
 
+# The empty recipe makes make look at the library again after cargo has
+# run, so that a change to the Rust side alone relinks the module.
 $(DF_RUST_LIB): df-rust
+	@:
 $(shlib): $(DF_RUST_LIB)
 
 df-rust-test:
