@@ -496,6 +496,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | D7 | GroupAggregates whose order the slice's rows leave in, sorted after |
 | GS1 | GROUPING SETS, ROLLUP and CUBE; `GROUPING()`, `GROUP_ID()` |
 | DN1 | numeric of display scales of their own: `/`, CASE and COALESCE of mixed scales |
+| AV2 | avg returning numeric as a sort key and above its Agg, with its display scale |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -594,10 +595,10 @@ counts, a combining aggregate over a batch Motion below a join.  It
 computes every call of its target list.  Its columns are made below the
 join, so they may be on the side an outer join fills with NULLs; an
 expression over them in its target list may not (`coalesce(max(k), -1)`
-is NULL above an unmatched row, not -1).  An aggregate whose value
-PostgreSQL finishes where tuples are made (avg returning numeric, a sum of
-branches of different scales) stays on PostgreSQL there, and so does a
-partial stage, whose state only a batch Motion carries.
+is NULL above an unmatched row, not -1).  An avg returning numeric and a
+sum of branches of different scales go up with their display scale
+beside them (DN1, AV2); a partial stage, whose state only a batch Motion
+carries, stays on PostgreSQL there.
 
 SQ1: a Subquery Scan passes its plan's rows on, as the Postgres planner
 leaves one over a view or a subquery in FROM (TPC-H Q15): its columns
@@ -838,8 +839,8 @@ serialized state, so it stays on PostgreSQL unless batch Motions carry
 DataFusion's state instead (the exact sum, and the count for avg, as for
 avg of floats in M7d).  An avg returning numeric is divided where tuples
 are made, so it does not go into a batch Motion itself.  Computing on
-an avg's result (`avg(a) + 1`), whose scale depends on the values, stays
-on PostgreSQL.  Over 30 million heap rows, `sum(b), avg(a),
+an avg's result (`avg(a) + 1`), whose scale depends on the values, came
+with AVG1 and AV2, below.  Over 30 million heap rows, `sum(b), avg(a),
 avg(b)` took 0.26 s with batch Motions against 1.04 s in PostgreSQL, and
 grouped by a column 0.31 s against 1.46 s.
 
@@ -855,9 +856,10 @@ the same scale, rounds half away from zero as div_var does, and gives the
 value at the largest scale numeric_avg may pick, 36 + 4 * ceil(s / 4) for
 a sum of scale s (a dividend of at least 10^-s, a count below 10^20).
 Comparing, grouping and hashing by it read the value only.  Its display
-scale is not PostgreSQL's, so it leaves DataFusion only through a batch
-Motion: as an output column PostgreSQL finishes the expression over the
-avg the C side divides, or the slice stays on PostgreSQL.  A numeric
+scale is not PostgreSQL's, so it left DataFusion only through a batch
+Motion: as an output column PostgreSQL finished the expression over the
+avg the C side divides, or the slice stayed on PostgreSQL, until AV2
+gave it its display scale.  A numeric
 constant compared with it may have up to 76 digits.
 
 WT1: a numeric value received through a tuple Motion is read into all 76
@@ -912,6 +914,31 @@ which only drops zeros.  A group whose rows all took `ELSE 0` shows `0`,
 as in PostgreSQL, not `0.0000`.  `avg` of such an argument stays on
 PostgreSQL.
 
+An uncorrelated scalar subquery becomes an init plan whose value
+(`$0`) the rest of the plan reads: TPC-H Q11, Q15 and Q22 compare an
+aggregate or a column with one.  Its value is known before a slice starts
+(the coordinator computes it before dispatching, `preprocess_initplans`,
+and the segments receive it), so DataFusion takes it as a constant.  A
+numeric value has no declared scale, so it is only compared, with a
+numeric of known scale and at most 38 digits: the value is rounded to that
+scale (up for `<` and `>=`, down for `<=` and `>`; `=` and `<>` with a
+finer value are constant), and a value beyond every value of the other
+side becomes the infinity on its side, which keeps NaN above it as in
+PostgreSQL.  Whether a slice runs in DataFusion depends on the plan only,
+not on the value.  Other parameters (of a correlated subquery, a Nested
+Loop or a prepared statement) stay on PostgreSQL.
+
+IP2: an init plan has slices of its own.  Its top slice runs on the
+coordinator, on PostgreSQL's executor, when the coordinator sets the init
+plan's parameters before the query (`preprocess_initplans`): the executor
+hook never sees it, so it counts as a slice that does not run in
+DataFusion, and the Motion into it carries tuples.  The slices below it are
+like any other, found by the Motion they send through (`subplan_sliceIds`
+maps an init plan to its top slice, the one without a parent), and the
+Motions between them count when choosing batch Motions: TPC-H Q15's
+maximum revenue sums by supplier in DataFusion, the partial sums passing to
+the final ones as batches.  EXPLAIN lists these slices too.
+
 ### numeric of display scales of their own
 
 DN1: a numeric value carries its display scale, and some expressions
@@ -950,30 +977,27 @@ and a filter on `price / qty` 0.92 s against 1.07 s.  TPC-DS SF1:
 whole-slice runs 1558 -> 1572, queries wholly in DataFusion 84 -> 89 of
 206 executions, results unchanged apart from Q71's ties (205/206).
 
-An uncorrelated scalar subquery becomes an init plan whose value
-(`$0`) the rest of the plan reads: TPC-H Q11, Q15 and Q22 compare an
-aggregate or a column with one.  Its value is known before a slice starts
-(the coordinator computes it before dispatching, `preprocess_initplans`,
-and the segments receive it), so DataFusion takes it as a constant.  A
-numeric value has no declared scale, so it is only compared, with a
-numeric of known scale and at most 38 digits: the value is rounded to that
-scale (up for `<` and `>=`, down for `<=` and `>`; `=` and `<>` with a
-finer value are constant), and a value beyond every value of the other
-side becomes the infinity on its side, which keeps NaN above it as in
-PostgreSQL.  Whether a slice runs in DataFusion depends on the plan only,
-not on the value.  Other parameters (of a correlated subquery, a Nested
-Loop or a prepared statement) stay on PostgreSQL.
+### avg as a sort key and above its Agg
 
-IP2: an init plan has slices of its own.  Its top slice runs on the
-coordinator, on PostgreSQL's executor, when the coordinator sets the init
-plan's parameters before the query (`preprocess_initplans`): the executor
-hook never sees it, so it counts as a slice that does not run in
-DataFusion, and the Motion into it carries tuples.  The slices below it are
-like any other, found by the Motion they send through (`subplan_sliceIds`
-maps an init plan to its top slice, the one without a parent), and the
-Motions between them count when choosing batch Motions: TPC-H Q15's
-maximum revenue sums by supplier in DataFusion, the partial sums passing to
-the final ones as batches.  EXPLAIN lists these slices too.
+AV2: an avg returning numeric that DataFusion divides (AVG1) holds
+PostgreSQL's quotient at the largest scale numeric_avg may pick; its
+display scale, which numeric_avg picks from the sum and the count
+(df_core::pgnum::pg_avg_rscale), goes beside it as DN1's do, computed from
+the same sum and count.  So a sort by an avg runs in DataFusion, which
+divides it there instead of leaving it to the C side (TPC-DS Q22, Q85),
+and an avg leaves DataFusion above its Agg, through joins, a Subquery Scan
+or a Motion carrying tuples (TPC-DS Q9, Q28's avgs of six scalar
+subqueries joined by Nested Loops), as do expressions on it.  A value
+through a batch Motion has no display scale beside it: a slice that needs
+one from there does not run, and the Motion then carries tuples.
+
+Over 20 million rows, the ten groups of largest `avg(price)` took 1.03 s
+against 1.34 s, `avg(price) * 2, avg(price) - avg(disc)` per group 0.37 s
+against 1.18 s.  TPC-DS SF1: whole-slice runs 1572 -> 1578, queries wholly
+in DataFusion 89 -> 95 of 206 executions, results unchanged apart from
+Q71's ties (205/206).  A UNION's dedup over a quotient (Q49) still stays
+on PostgreSQL: rows of equal values and different display scales are one
+group, shown as whichever PostgreSQL meets first.
 
 ### Expressions
 
@@ -1203,9 +1227,9 @@ does not pass on keeps the slice on PostgreSQL.
 | numeric(p, s) | Decimal256; NaN, stored above every number, last |
 | text, varchar | bytes, under a C collation only |
 
-NULLS FIRST/LAST and DESC are DataFusion's.  A sort key ordered by
-another operator (`USING ~<~`), a sort by an avg returning numeric
-(divided on the C side, after DataFusion), LIMIT ... WITH TIES, a LIMIT
+NULLS FIRST/LAST and DESC are DataFusion's.  An avg returning numeric
+sorts as its value, divided in DataFusion (AV2).  A sort key ordered by
+another operator (`USING ~<~`), LIMIT ... WITH TIES, a LIMIT
 from a parameter and a Sort or Limit further down the slice stay on
 PostgreSQL.  A Sort's memory budget is the node's operator memory, as for
 PostgreSQL's Sort; DataFusion spills sorted runs to the backend's

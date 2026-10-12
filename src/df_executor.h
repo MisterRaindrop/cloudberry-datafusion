@@ -230,6 +230,9 @@ extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);
 extern bool df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale);
+/* AVG1: does it depend on an avg returning numeric (of an output column)? */
+extern bool df_numeric_varying(Plan *ctx, Node *expr);
+extern bool df_output_varying(Plan *ctx, Node *expr);
 /*
  * DN1: the scale of an input column that holds the display scales of a
  * numeric column of the same input attribute (df_numeric_dscale).

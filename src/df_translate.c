@@ -112,6 +112,7 @@ typedef struct DfBuilder
 								 * read both sides as they are */
 	int		   *out_col;		/* output column of each value
 								 * (df_emit_outputs) */
+	Bitmapset  *sort_values;	/* the values the slice sorts its output by */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -922,7 +923,7 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 
 	if (b->failed)
 		return;
-	if (df_numeric_ps(ctx, node, &p, &s))
+	if (df_numeric_ps(ctx, node, &p, &s) && !df_numeric_varying(ctx, node))
 	{
 		appendStringInfo(out, "{\"lit\":{\"type\":\"int4\",\"value\":%d}}", s);
 		return;
@@ -1061,7 +1062,22 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) node;
+				const char *sfn = NULL,
+						   *cfn = NULL;
 
+				if (level == DF_LEVEL_AGG && df_avg_parts(agg, &sfn, &cfn))
+				{
+					/* AV2: the scale numeric_avg picks from the sum and count */
+					appendStringInfoString(out, "{\"avg_numeric_scale\":[");
+					df_emit_call_ref(b, out, agg, sfn);
+					appendStringInfoChar(out, ',');
+					df_emit_call_ref(b, out, agg, cfn);
+					appendStringInfo(out, "],\"scale\":%d}",
+									 df_agg_state(agg) == DF_AGG_AVG_INT ? 0 :
+									 df_scale_of((Plan *) b->agg,
+												 (Node *) linitial_node(TargetEntry, agg->args)->expr));
+					return;
+				}
 				if (level != DF_LEVEL_AGG || !df_is_mixed_sum((Plan *) b->agg, node))
 				{
 					df_fail(b, "the display scale of an aggregate");
@@ -2310,16 +2326,19 @@ df_partial_ncols(DfBuilder *b, Plan *ctx, Node *expr)
  */
 /*
  * DN1: is output column 'expr' of node 'ctx' a numeric whose values have
- * display scales of their own (not MS1's whole sum, counted apart)?
+ * display scales of their own (not MS1's whole sum, counted apart)?  AV2:
+ * into tuples, so is one that depends on an avg below (in batches it
+ * passes as a value, at its scale).
  */
 static bool
-df_output_dyn(Plan *ctx, Node *expr)
+df_output_dyn(DfBuilder *b, Plan *ctx, Node *expr)
 {
 	int			p,
 				s;
 
 	return exprType(expr) == NUMERICOID && !df_is_mixed_sum(ctx, expr) &&
-		df_numeric_dyn(ctx, expr, &p, &s);
+		(df_numeric_dyn(ctx, expr, &p, &s) ||
+		 (b->tuples && df_output_varying(ctx, expr)));
 }
 
 static void
@@ -2341,7 +2360,7 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
 				  df_is_mixed_sum(ctx, expr)))
 			spec->nout += 2;	/* numeric sum and count, or display scale */
-		else if (df_output_dyn(ctx, expr))
+		else if (df_output_dyn(b, ctx, expr))
 			spec->nout += 2;	/* DN1: the value and its display scale */
 		else
 			spec->nout++;
@@ -2424,7 +2443,8 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 		}
 		if (level == DF_LEVEL_AGG && IsA(value, Aggref) &&
 			(df_agg_state((Aggref *) value) == DF_AGG_AVG_INT ||
-			 df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC))
+			 df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC) &&
+			!bms_is_member(foreach_current_index(lc), b->sort_values))
 		{
 			/* avg = numeric sum / count, divided on the C side (N1, N2) */
 			Aggref	   *agg = (Aggref *) value;
@@ -2451,11 +2471,15 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 			df_fail(b, "an output column");
 			return;
 		}
-		if (df_output_dyn(ctx, (Node *) value))
+		if (df_output_dyn(b, ctx, (Node *) value) ||
+			(level == DF_LEVEL_AGG && IsA(value, Aggref) &&
+			 (df_agg_state((Aggref *) value) == DF_AGG_AVG_INT ||
+			  df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC)))
 		{
 			/*
 			 * DN1: the value at the largest scale it may have, and its own
-			 * display scale, which the C side gives it (as MS1's sum)
+			 * display scale, which the C side gives it (as MS1's sum); AV2:
+			 * so is an avg the slice sorts by, which DataFusion divides
 			 */
 			int			scale = df_scale_of(ctx, (Node *) value);
 
@@ -2542,6 +2566,24 @@ df_tail_mutator(Node *node, DfTailContext *c)
  * The values DataFusion computes for the targetlist of 'body', and how each
  * of its columns is made of them (spec->col_value, col_tail).
  */
+static List *df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec);
+
+/* The values (spec->col_value) the slice's Sort 'sort' orders by. */
+static Bitmapset *
+df_sort_values(Sort *sort, DfSliceSpec *spec)
+{
+	Bitmapset  *values = NULL;
+	int			i;
+
+	for (i = 0; sort != NULL && i < sort->numCols; i++)
+	{
+		if (sort->sortColIdx[i] > 0 && sort->sortColIdx[i] <= spec->ncols &&
+			spec->col_value[sort->sortColIdx[i] - 1] >= 0)
+			values = bms_add_member(values, spec->col_value[sort->sortColIdx[i] - 1]);
+	}
+	return values;
+}
+
 static List *
 df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec)
 {
@@ -2827,6 +2869,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		df_emit_groups(&b, &group, b.agg);
 		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
 		values = df_output_values(root, tails, spec);
+		b.sort_values = df_sort_values(sort, spec);
 		df_emit_outputs(&b, &outputs, values, DF_LEVEL_AGG, spec, root);
 	}
 	else

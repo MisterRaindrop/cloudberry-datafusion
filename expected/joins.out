@@ -185,11 +185,6 @@ SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
  k  |  c  |  b  
 ----+-----+-----
-  6 | 1.5 |  30
- 10 | 2.5 |  50
- 14 | 3.5 |  70
- 28 |   7 | 140
- 32 |   8 | 160
   2 | 0.5 |  10
   4 |   1 |  20
   8 |   2 |  40
@@ -198,6 +193,11 @@ SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb
  22 | 5.5 | 110
  24 |   6 | 120
  34 | 8.5 | 170
+  6 | 1.5 |  30
+ 10 | 2.5 |  50
+ 14 | 3.5 |  70
+ 28 |   7 | 140
+ 32 |   8 | 160
  12 |   3 |  60
  20 |   5 | 100
  26 | 6.5 | 130
@@ -215,11 +215,11 @@ SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOI
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
  e | count |  sum   
 ---+-------+--------
- 0 |   200 | 502500
- 1 |   200 | 497600
  4 |   200 | 497900
  3 |   200 | 497800
  2 |   200 | 497700
+ 0 |   200 | 502500
+ 1 |   200 | 497600
 (5 rows)
 
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE ja.a + jb.e > 100;
@@ -262,25 +262,25 @@ SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
  k  |  c  |  b  
 ----+-----+-----
- 12 |   3 |  60
- 20 |   5 | 100
- 26 | 6.5 | 130
- 36 |   9 | 180
- 30 | 7.5 | 150
- 38 | 9.5 | 190
+  8 |   2 |  40
+ 16 |   4 |  80
+ 22 | 5.5 | 110
+ 24 |   6 | 120
+  2 | 0.5 |  10
+  4 |   1 |  20
+ 18 | 4.5 |  90
+ 34 | 8.5 | 170
   6 | 1.5 |  30
  14 | 3.5 |  70
  32 |   8 | 160
  10 | 2.5 |  50
  28 |   7 | 140
-  2 | 0.5 |  10
-  4 |   1 |  20
- 18 | 4.5 |  90
- 34 | 8.5 | 170
-  8 |   2 |  40
- 16 |   4 |  80
- 22 | 5.5 | 110
- 24 |   6 | 120
+ 30 | 7.5 | 150
+ 38 | 9.5 | 190
+ 12 |   3 |  60
+ 20 |   5 | 100
+ 26 | 6.5 | 130
+ 36 |   9 | 180
 (19 rows)
 
 SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -292,11 +292,11 @@ SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOI
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
  e | count |  sum   
 ---+-------+--------
+ 1 |   200 | 497600
+ 0 |   200 | 502500
  4 |   200 | 497900
  2 |   200 | 497700
  3 |   200 | 497800
- 0 |   200 | 502500
- 1 |   200 | 497600
 (5 rows)
 
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE ja.a + jb.e > 100;
@@ -331,7 +331,7 @@ SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
 
 -- An error in the join filter carries PostgreSQL's message.
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a / (jb.e - jb.e) > 0;
-ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=35042)
+ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=82858)
 -- With batch Motions, the joined rows' partial aggregates go out as batches.
 SET datafusion.motion_batches = on;
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
@@ -461,8 +461,8 @@ SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k
 SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
  ?column? | count |  max   
 ----------+-------+--------
-        0 |  1000 |   2500
         1 |  1000 |   2498
+        0 |  1000 |   2500
         3 |  1000 |   2499
         4 |  1000 | 2499.5
         2 |  1000 | 2498.5
@@ -498,7 +498,7 @@ SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
 (1 row)
 
 SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
-ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=35042)
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=82859)
 RESET datafusion.motion_batches;
 -- Outer, semi and anti joins, and keys of two types (J4).
 CREATE TABLE df_jf (k8 int8, f4 real, k int4) DISTRIBUTED BY (k);
@@ -568,9 +568,9 @@ SELECT ja.k, jb.b, jb.b IS NULL AS missing FROM df_ja ja LEFT JOIN df_jb jb ON j
 WHERE ja.k < 8 OR ja.k IS NULL;
  k | b  | missing 
 ---+----+---------
+ 1 |    | t
  6 | 30 | f
  5 |    | t
- 1 |    | t
  2 | 10 | f
  4 | 20 | f
    |    | t
@@ -638,11 +638,11 @@ WHERE ja.k < 8 OR ja.k IS NULL;
  k | b  | missing 
 ---+----+---------
  1 |    | t
+ 3 |    | t
  2 | 10 | f
  4 | 20 | f
  7 |    | t
    |    | t
- 3 |    | t
  5 |    | t
  6 | 30 | f
 (8 rows)
@@ -770,9 +770,8 @@ RESET datafusion.motion_batches;
 DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 -- Aggregates below a join or another aggregate (A1, TPC-H Q2, Q13, Q15
 -- and Q20): a node of the plan whose groups and calls the nodes above read
--- by name, also on the side an outer join fills with NULLs.  One whose
--- value is finished where tuples are made (avg returning numeric) stays on
--- PostgreSQL.
+-- by name, also on the side an outer join fills with NULLs.  An avg
+-- returning numeric goes up with its display scale beside it (AV2).
 CREATE TABLE df_ag1 (k int, g int, f float8, c char(5), n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_ag1 SELECT i, i % 37,
   CASE WHEN i % 101 = 0 THEN 'NaN' WHEN i % 103 = 0 THEN '-0' ELSE (i % 17) * 0.5 END,
@@ -813,8 +812,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(b.k) FROM df_ag2 b
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM df_ag1 GROUP BY g) x ON x.g = b.g;
-                                                           QUERY PLAN                                                           
---------------------------------------------------------------------------------------------------------------------------------
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Hash Join
          Hash Cond: (b.g = x.g)
@@ -831,8 +830,8 @@ EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM 
                                              ->  Seq Scan on df_ag1
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: avg returning numeric of an aggregate below in an output column
- DataFusion: slice 2 eligible below the top: Aggregate (above: avg returning numeric of an aggregate below in an output column)
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
  DataFusion: slice 3 eligible, sends Arrow batches
 (19 rows)
 
@@ -957,6 +956,39 @@ SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1
  3 | 0 |  
 (1 row)
 
+SELECT b.k, x.a, x.m FROM df_ag2 b JOIN (SELECT g, avg(k) a, avg(n) m FROM df_ag1 GROUP BY g) x ON x.g = b.g
+WHERE b.k % 100 = 7 ORDER BY 1;
+  k   |           a            |          m           
+------+------------------------+----------------------
+    7 |  9997.0000000000000000 | 626.3224299065420561
+  107 |  9996.5000000000000000 | 620.4439252336448598
+  207 |  9992.0000000000000000 | 632.2780373831775701
+  307 | 10010.0000000000000000 | 614.2607276119402985
+  507 | 10005.0000000000000000 | 618.5517723880597015
+  607 | 10004.5000000000000000 | 630.8878504672897196
+  707 | 10000.0000000000000000 | 625.1749067164179104
+  807 |  9999.5000000000000000 | 623.5163551401869159
+  907 |  9995.0000000000000000 | 629.4659514925373134
+ 1007 |  9994.5000000000000000 | 619.4124531835205993
+ 1107 | 10008.5000000000000000 | 634.9415887850467290
+ 1207 | 10008.0000000000000000 | 614.8714953271028037
+ 1307 | 10007.5000000000000000 | 633.3309925093632959
+ 1407 | 10003.0000000000000000 | 620.8271028037383178
+ 1507 | 10002.5000000000000000 | 629.9461610486891386
+ 1607 |  9998.0000000000000000 | 624.4462616822429907
+ 1707 |  9997.5000000000000000 | 621.8796816479400749
+ 1807 |  9993.0000000000000000 | 632.7383177570093458
+ 1907 |  9992.5000000000000000 | 616.1540262172284644
+ 2107 | 10006.0000000000000000 | 616.2873831775700935
+ 2207 | 10005.5000000000000000 | 631.8691588785046729
+ 2307 | 10001.0000000000000000 | 621.4925373134328358
+ 2407 | 10000.5000000000000000 | 624.4976635514018692
+ 2507 |  9996.0000000000000000 | 628.1156716417910448
+ 2607 |  9995.5000000000000000 | 619.4626168224299065
+ 2707 |  9991.0000000000000000 | 632.4067164179104478
+ 2807 | 10009.0000000000000000 | 613.2789179104477612
+(27 rows)
+
 SET optimizer = on;
 SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
   LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;
@@ -1062,6 +1094,39 @@ SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1
 ---+---+---
  3 | 0 |  
 (1 row)
+
+SELECT b.k, x.a, x.m FROM df_ag2 b JOIN (SELECT g, avg(k) a, avg(n) m FROM df_ag1 GROUP BY g) x ON x.g = b.g
+WHERE b.k % 100 = 7 ORDER BY 1;
+  k   |           a            |          m           
+------+------------------------+----------------------
+    7 |  9997.0000000000000000 | 626.3224299065420561
+  107 |  9996.5000000000000000 | 620.4439252336448598
+  207 |  9992.0000000000000000 | 632.2780373831775701
+  307 | 10010.0000000000000000 | 614.2607276119402985
+  507 | 10005.0000000000000000 | 618.5517723880597015
+  607 | 10004.5000000000000000 | 630.8878504672897196
+  707 | 10000.0000000000000000 | 625.1749067164179104
+  807 |  9999.5000000000000000 | 623.5163551401869159
+  907 |  9995.0000000000000000 | 629.4659514925373134
+ 1007 |  9994.5000000000000000 | 619.4124531835205993
+ 1107 | 10008.5000000000000000 | 634.9415887850467290
+ 1207 | 10008.0000000000000000 | 614.8714953271028037
+ 1307 | 10007.5000000000000000 | 633.3309925093632959
+ 1407 | 10003.0000000000000000 | 620.8271028037383178
+ 1507 | 10002.5000000000000000 | 629.9461610486891386
+ 1607 |  9998.0000000000000000 | 624.4462616822429907
+ 1707 |  9997.5000000000000000 | 621.8796816479400749
+ 1807 |  9993.0000000000000000 | 632.7383177570093458
+ 1907 |  9992.5000000000000000 | 616.1540262172284644
+ 2107 | 10006.0000000000000000 | 616.2873831775700935
+ 2207 | 10005.5000000000000000 | 631.8691588785046729
+ 2307 | 10001.0000000000000000 | 621.4925373134328358
+ 2407 | 10000.5000000000000000 | 624.4976635514018692
+ 2507 |  9996.0000000000000000 | 628.1156716417910448
+ 2607 |  9995.5000000000000000 | 619.4626168224299065
+ 2707 |  9991.0000000000000000 | 632.4067164179104478
+ 2807 | 10009.0000000000000000 | 613.2789179104477612
+(27 rows)
 
 SET optimizer = on;
 SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b

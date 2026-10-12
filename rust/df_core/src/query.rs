@@ -103,6 +103,8 @@
 //!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
 //!                                 (numeric_avg of a sum of scale s, rounded
 //!                                 as PostgreSQL does, at scale S; pgnum)
+//!         | {"avg_numeric_scale": [<sum>, <count>], "scale": s}   (its display
+//!                                 scale, int4; AV2)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -646,6 +648,16 @@ fn expr(v: &Value) -> Result<Expr, String> {
         }
         let (l, r) = (expr(&a[0])?, expr(&a[1])?);
         return when(l.clone().gt_eq(r.clone()), l).otherwise(r).map_err(|e| e.to_string());
+    }
+    if let Some(a) = v.get("avg_numeric_scale").and_then(Value::as_array) {
+        // AV2: the display scale numeric_avg gives a sum and a count
+        let from = field(v, "scale")?
+            .as_i64()
+            .ok_or("plan spec: bad avg scale")? as i8;
+        if a.len() != 2 {
+            return Err("plan spec: avg_numeric_scale takes a sum and a count".into());
+        }
+        return Ok(PgNumeric::udf(NumericFn::AvgScale { from }).call(vec![expr(&a[0])?, expr(&a[1])?]));
     }
     if let Some(a) = v.get("avg_numeric").and_then(Value::as_array) {
         // AVG1: numeric_avg of a sum and a count, at the type's scale

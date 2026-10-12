@@ -184,9 +184,8 @@ DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 
 -- Aggregates below a join or another aggregate (A1, TPC-H Q2, Q13, Q15
 -- and Q20): a node of the plan whose groups and calls the nodes above read
--- by name, also on the side an outer join fills with NULLs.  One whose
--- value is finished where tuples are made (avg returning numeric) stays on
--- PostgreSQL.
+-- by name, also on the side an outer join fills with NULLs.  An avg
+-- returning numeric goes up with its display scale beside it (AV2).
 CREATE TABLE df_ag1 (k int, g int, f float8, c char(5), n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_ag1 SELECT i, i % 37,
   CASE WHEN i % 101 = 0 THEN 'NaN' WHEN i % 103 = 0 THEN '-0' ELSE (i % 17) * 0.5 END,
@@ -219,6 +218,8 @@ SELECT sum(s), max(c), count(*) FROM (SELECT g, sum(n) s, count(*) c FROM df_ag1
 SELECT x.f, x.c FROM (SELECT f, count(*) c FROM df_ag1 GROUP BY f) x JOIN df_ag2 b ON b.k = x.c ORDER BY 1;
 SELECT x.ch, x.cnt FROM (SELECT c ch, count(*) cnt FROM df_ag1 GROUP BY c) x JOIN df_ag2 b ON b.k = x.cnt / 10 ORDER BY 2;
 SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1 WHERE k < 0) x ON x.c + 3 = b.k;
+SELECT b.k, x.a, x.m FROM df_ag2 b JOIN (SELECT g, avg(k) a, avg(n) m FROM df_ag1 GROUP BY g) x ON x.g = b.g
+WHERE b.k % 100 = 7 ORDER BY 1;
 SET optimizer = on;
 SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
   LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;
@@ -238,6 +239,8 @@ SELECT sum(s), max(c), count(*) FROM (SELECT g, sum(n) s, count(*) c FROM df_ag1
 SELECT x.f, x.c FROM (SELECT f, count(*) c FROM df_ag1 GROUP BY f) x JOIN df_ag2 b ON b.k = x.c ORDER BY 1;
 SELECT x.ch, x.cnt FROM (SELECT c ch, count(*) cnt FROM df_ag1 GROUP BY c) x JOIN df_ag2 b ON b.k = x.cnt / 10 ORDER BY 2;
 SELECT b.k, x.c, x.s FROM df_ag2 b JOIN (SELECT count(*) c, sum(n) s FROM df_ag1 WHERE k < 0) x ON x.c + 3 = b.k;
+SELECT b.k, x.a, x.m FROM df_ag2 b JOIN (SELECT g, avg(k) a, avg(n) m FROM df_ag1 GROUP BY g) x ON x.g = b.g
+WHERE b.k % 100 = 7 ORDER BY 1;
 SET optimizer = on;
 SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag2 b
   LEFT JOIN df_ag1 a ON a.g = b.g AND a.k < 400 GROUP BY b.k) s GROUP BY c ORDER BY 1;

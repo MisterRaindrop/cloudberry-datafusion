@@ -54,12 +54,13 @@ EXPLAIN (COSTS OFF) SELECT id, a FROM df_so ORDER BY a, id LIMIT 5;
 EXPLAIN (COSTS OFF) SELECT id, b FROM df_so WHERE id % 500 = 0 ORDER BY b, id;
 -- the top groups of a two-stage aggregation
 EXPLAIN (COSTS OFF) SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 DESC, 1 LIMIT 5;
+-- by an avg returning numeric, which DataFusion divides as numeric_avg (AV2)
+EXPLAIN (COSTS OFF) SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
 -- a single slice
 EXPLAIN (COSTS OFF) SELECT relnatts, count(*) FROM pg_class GROUP BY relnatts ORDER BY 2 DESC, 1 LIMIT 3;
 -- these stay on PostgreSQL, with the reason
 EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY a FETCH FIRST 3 ROWS WITH TIES;
 EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY t USING ~<~ LIMIT 3;
-EXPLAIN (COSTS OFF) SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2 LIMIT 3;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT a FROM df_so ORDER BY a LIMIT 5) s;
 
 -- a LIMIT from a parameter (a generic plan) stays on PostgreSQL
@@ -85,6 +86,8 @@ SELECT id, z FROM df_so ORDER BY z DESC NULLS LAST, id LIMIT 3;
 SELECT id, a + b AS s FROM df_so ORDER BY a + b, id LIMIT 3;
 SELECT id FROM df_so ORDER BY a * 2 DESC, b, id LIMIT 3;
 SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 DESC, 1 LIMIT 5;
+SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
+SELECT a % 7, avg(b), avg(n) FROM df_so GROUP BY 1 ORDER BY 3 DESC NULLS LAST, 1;
 SELECT f, count(*) FROM df_so WHERE f IS NULL OR f <> 0 GROUP BY f ORDER BY f NULLS FIRST LIMIT 4;
 SELECT relnatts, count(*) > 0 AS any FROM pg_class GROUP BY relnatts ORDER BY 1 LIMIT 3;
 SELECT x.id, y.id FROM df_so x JOIN df_so y ON x.id = y.a ORDER BY x.id, y.id LIMIT 5;
@@ -112,6 +115,8 @@ SELECT id, z FROM df_so ORDER BY z DESC NULLS LAST, id LIMIT 3;
 SELECT id, a + b AS s FROM df_so ORDER BY a + b, id LIMIT 3;
 SELECT id FROM df_so ORDER BY a * 2 DESC, b, id LIMIT 3;
 SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 DESC, 1 LIMIT 5;
+SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
+SELECT a % 7, avg(b), avg(n) FROM df_so GROUP BY 1 ORDER BY 3 DESC NULLS LAST, 1;
 SELECT f, count(*) FROM df_so WHERE f IS NULL OR f <> 0 GROUP BY f ORDER BY f NULLS FIRST LIMIT 4;
 SELECT relnatts, count(*) > 0 AS any FROM pg_class GROUP BY relnatts ORDER BY 1 LIMIT 3;
 SELECT x.id, y.id FROM df_so x JOIN df_so y ON x.id = y.a ORDER BY x.id, y.id LIMIT 5;

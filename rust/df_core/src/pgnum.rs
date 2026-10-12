@@ -221,6 +221,9 @@ pub enum NumericFn {
     /// AVG1: avg of a sum x of scale `from` and a count y (pg_avg), at
     /// scale `to`; NULL for no rows, NaN for a NaN sum.
     Avg { from: i8, to: i8 },
+    /// AV2: the display scale of that avg (pg_avg_rscale), int4; 0 for a
+    /// NaN sum, NULL for no rows.
+    AvgScale { from: i8 },
     /// DN1: x / y (pg_div), of arguments x, its display scale, y, its
     /// display scale; x of scale `x`, y of scale `y`, the result at `to`.
     /// NaN if either is; 22012 for a zero y.
@@ -238,7 +241,10 @@ pub struct PgNumeric {
 impl PgNumeric {
     pub fn udf(f: NumericFn) -> ScalarUDF {
         let n = match f {
-            NumericFn::NanIf | NumericFn::Arith { .. } | NumericFn::Avg { .. } => 2,
+            NumericFn::NanIf
+            | NumericFn::Arith { .. }
+            | NumericFn::Avg { .. }
+            | NumericFn::AvgScale { .. } => 2,
             NumericFn::Div { .. } | NumericFn::DivScale { .. } => 4,
             _ => 1,
         };
@@ -260,6 +266,7 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::Arith { op: NumOp::Sub, .. } => "pg_numeric_sub",
             NumericFn::Arith { op: NumOp::Mul, .. } => "pg_numeric_mul",
             NumericFn::Avg { .. } => "pg_numeric_avg",
+            NumericFn::AvgScale { .. } => "pg_numeric_avg_scale",
             NumericFn::Div { .. } => "pg_numeric_div",
             NumericFn::DivScale { .. } => "pg_numeric_div_scale",
         }
@@ -276,7 +283,7 @@ impl ScalarUDFImpl for PgNumeric {
             | NumericFn::Avg { to, .. }
             | NumericFn::Div { to, .. } => numeric_type(to),
             NumericFn::IsNan => DataType::Boolean,
-            NumericFn::DivScale { .. } => DataType::Int32,
+            NumericFn::DivScale { .. } | NumericFn::AvgScale { .. } => DataType::Int32,
             _ => arg_types[0].clone(),
         })
     }
@@ -345,6 +352,24 @@ impl ScalarUDFImpl for PgNumeric {
                     }));
                 }
                 Arc::new(Decimal256Array::from(values).with_data_type(numeric_type(to)))
+            }
+            NumericFn::AvgScale { from } => {
+                let y = args.args[1].to_array(n)?;
+                let counts = y.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+                    DataFusionError::Internal(format!("avg: count of type {}", y.data_type()))
+                })?;
+                let scales: PrimitiveArray<Int32Type> = (0..n)
+                    .map(|r| {
+                        if xs.is_null(r) || counts.is_null(r) || counts.value(r) == 0 {
+                            None
+                        } else if xs.value(r) == NUMERIC_NAN {
+                            Some(0)
+                        } else {
+                            Some(pg_avg_rscale(xs.value(r), from, counts.value(r)))
+                        }
+                    })
+                    .collect();
+                Arc::new(scales)
             }
             NumericFn::Avg { from, to } => {
                 let y = args.args[1].to_array(n)?;

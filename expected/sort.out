@@ -100,6 +100,29 @@ EXPLAIN (COSTS OFF) SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 
  DataFusion: slice 2 eligible, sends Arrow batches
 (17 rows)
 
+-- by an avg returning numeric, which DataFusion divides as numeric_avg (AV2)
+EXPLAIN (COSTS OFF) SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: (avg(b)), a
+         ->  Limit
+               ->  Sort
+                     Sort Key: (avg(b)), a
+                     ->  Finalize HashAggregate
+                           Group Key: a
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: a
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: a
+                                       ->  Seq Scan on df_so
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(17 rows)
+
 -- a single slice
 EXPLAIN (COSTS OFF) SELECT relnatts, count(*) FROM pg_class GROUP BY relnatts ORDER BY 2 DESC, 1 LIMIT 3;
                  QUERY PLAN                  
@@ -144,28 +167,6 @@ EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY t USING ~<~ LIMIT 3;
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 not eligible: sort key ordered by operator ~<~
 (10 rows)
-
-EXPLAIN (COSTS OFF) SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2 LIMIT 3;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
- Limit
-   ->  Gather Motion 3:1  (slice1; segments: 3)
-         Merge Key: (avg(b))
-         ->  Limit
-               ->  Sort
-                     Sort Key: (avg(b))
-                     ->  Finalize HashAggregate
-                           Group Key: a
-                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
-                                 Hash Key: a
-                                 ->  Streaming Partial HashAggregate
-                                       Group Key: a
-                                       ->  Seq Scan on df_so
- Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate (above: sort key avg returning numeric)
- DataFusion: slice 2 eligible, sends Arrow batches
-(17 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT a FROM df_so ORDER BY a LIMIT 5) s;
                              QUERY PLAN                             
@@ -418,6 +419,27 @@ SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 DESC, 1 LIMIT 5;
  693 |    18 | 152588
  696 |    18 | 148293
 (5 rows)
+
+SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
+  a  |          avg           
+-----+------------------------
+ 332 | -9456.1111111111111111
+ 320 | -8282.2631578947368421
+ 317 | -8093.8421052631578947
+(3 rows)
+
+SELECT a % 7, avg(b), avg(n) FROM df_so GROUP BY 1 ORDER BY 3 DESC NULLS LAST, 1;
+ ?column? |         avg          | avg 
+----------+----------------------+-----
+        0 | -59.8963595839524517 | NaN
+        1 |  77.0832404310665180 | NaN
+        2 | -68.9368499257057949 | NaN
+        3 |  62.1230026012634708 | NaN
+        4 | -18.3883314752879970 | NaN
+        5 | -15.2357089829250186 | NaN
+        6 |  -2.8245417134306023 | NaN
+          |   3.1658163265306122 | NaN
+(8 rows)
 
 SELECT f, count(*) FROM df_so WHERE f IS NULL OR f <> 0 GROUP BY f ORDER BY f NULLS FIRST LIMIT 4;
           f          | count 
@@ -708,6 +730,27 @@ SELECT a, count(*), sum(b) FROM df_so GROUP BY a ORDER BY 3 DESC, 1 LIMIT 5;
  693 |    18 | 152588
  696 |    18 | 148293
 (5 rows)
+
+SELECT a, avg(b) FROM df_so GROUP BY a ORDER BY 2, 1 LIMIT 3;
+  a  |          avg           
+-----+------------------------
+ 332 | -9456.1111111111111111
+ 320 | -8282.2631578947368421
+ 317 | -8093.8421052631578947
+(3 rows)
+
+SELECT a % 7, avg(b), avg(n) FROM df_so GROUP BY 1 ORDER BY 3 DESC NULLS LAST, 1;
+ ?column? |         avg          | avg 
+----------+----------------------+-----
+        0 | -59.8963595839524517 | NaN
+        1 |  77.0832404310665180 | NaN
+        2 | -68.9368499257057949 | NaN
+        3 |  62.1230026012634708 | NaN
+        4 | -18.3883314752879970 | NaN
+        5 | -15.2357089829250186 | NaN
+        6 |  -2.8245417134306023 | NaN
+          |   3.1658163265306122 | NaN
+(8 rows)
 
 SELECT f, count(*) FROM df_so WHERE f IS NULL OR f <> 0 GROUP BY f ORDER BY f NULLS FIRST LIMIT 4;
           f          | count 

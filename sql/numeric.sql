@@ -502,6 +502,55 @@ SET optimizer = off;
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
 SELECT sum(a / b) FROM df_dn;
+-- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
+-- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
+-- picked from the sum and the count, goes beside it, so it sorts in
+-- DataFusion and leaves it above its Agg, as DN1's values do.  Through
+-- batches it passes as a value only.
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT i, avg(a) FROM df_dn GROUP BY i ORDER BY avg(a) DESC NULLS LAST, i LIMIT 7;
+EXPLAIN (COSTS OFF) SELECT x.g, x.m, y.n FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT g, m, m * 3 FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i OFFSET 0) x ORDER BY m DESC, g;
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT i, avg(a), avg(c) FROM df_dn GROUP BY i ORDER BY 2, 1;
+SELECT i, avg(a) FROM df_dn GROUP BY i ORDER BY avg(a) DESC NULLS LAST, i LIMIT 7;
+SELECT i % 5, avg(k), count(*) FROM df_dn GROUP BY 1 ORDER BY 2;
+SELECT i, avg(a) * 2, avg(a) + avg(c), coalesce(avg(b), 0) FROM df_dn GROUP BY i ORDER BY 1;
+SELECT x.g, x.m, y.n FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT * FROM (SELECT avg(a) FROM df_dn WHERE i < 5) a, (SELECT avg(c), count(*) FROM df_dn WHERE i > 30) b, (SELECT avg(k) FROM df_dn) c;
+SELECT g, m, m * 3 FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i OFFSET 0) x ORDER BY m DESC, g;
+SELECT k % 7, avg(k::numeric(9,0) * 1000) FROM df_dn GROUP BY 1 ORDER BY 2;
+SET datafusion.mode = on;
+SELECT i, avg(a), avg(c) FROM df_dn GROUP BY i ORDER BY 2, 1;
+SELECT i, avg(a) FROM df_dn GROUP BY i ORDER BY avg(a) DESC NULLS LAST, i LIMIT 7;
+SELECT i % 5, avg(k), count(*) FROM df_dn GROUP BY 1 ORDER BY 2;
+SELECT i, avg(a) * 2, avg(a) + avg(c), coalesce(avg(b), 0) FROM df_dn GROUP BY i ORDER BY 1;
+SELECT x.g, x.m, y.n FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT * FROM (SELECT avg(a) FROM df_dn WHERE i < 5) a, (SELECT avg(c), count(*) FROM df_dn WHERE i > 30) b, (SELECT avg(k) FROM df_dn) c;
+SELECT g, m, m * 3 FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i OFFSET 0) x ORDER BY m DESC, g;
+SELECT k % 7, avg(k::numeric(9,0) * 1000) FROM df_dn GROUP BY 1 ORDER BY 2;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT i, avg(a), avg(c) FROM df_dn GROUP BY i ORDER BY 2, 1;
+SELECT i, avg(a) FROM df_dn GROUP BY i ORDER BY avg(a) DESC NULLS LAST, i LIMIT 7;
+SELECT i % 5, avg(k), count(*) FROM df_dn GROUP BY 1 ORDER BY 2;
+SELECT i, avg(a) * 2, avg(a) + avg(c), coalesce(avg(b), 0) FROM df_dn GROUP BY i ORDER BY 1;
+SELECT x.g, x.m, y.n FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT * FROM (SELECT avg(a) FROM df_dn WHERE i < 5) a, (SELECT avg(c), count(*) FROM df_dn WHERE i > 30) b, (SELECT avg(k) FROM df_dn) c;
+SELECT g, m, m * 3 FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i OFFSET 0) x ORDER BY m DESC, g;
+SELECT k % 7, avg(k::numeric(9,0) * 1000) FROM df_dn GROUP BY 1 ORDER BY 2;
+SET datafusion.mode = on;
+SELECT i, avg(a), avg(c) FROM df_dn GROUP BY i ORDER BY 2, 1;
+SELECT i, avg(a) FROM df_dn GROUP BY i ORDER BY avg(a) DESC NULLS LAST, i LIMIT 7;
+SELECT i % 5, avg(k), count(*) FROM df_dn GROUP BY 1 ORDER BY 2;
+SELECT i, avg(a) * 2, avg(a) + avg(c), coalesce(avg(b), 0) FROM df_dn GROUP BY i ORDER BY 1;
+SELECT x.g, x.m, y.n FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
+SELECT * FROM (SELECT avg(a) FROM df_dn WHERE i < 5) a, (SELECT avg(c), count(*) FROM df_dn WHERE i > 30) b, (SELECT avg(k) FROM df_dn) c;
+SELECT g, m, m * 3 FROM (SELECT i g, avg(a) m FROM df_dn GROUP BY i OFFSET 0) x ORDER BY m DESC, g;
+SELECT k % 7, avg(k::numeric(9,0) * 1000) FROM df_dn GROUP BY 1 ORDER BY 2;
+SET optimizer = off;
 SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_dn;

@@ -2461,7 +2461,7 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 	return expression_tree_walker(node, df_numeric_varying_walker, v);
 }
 
-static bool
+bool
 df_numeric_varying(Plan *ctx, Node *expr)
 {
 	DfVarying	v = {ctx, false};
@@ -2474,7 +2474,7 @@ df_numeric_varying(Plan *ctx, Node *expr)
  * The same for an output column of 'ctx': not an avg of the Agg itself,
  * whose value the C side divides as numeric_avg does (DF_OUT_NUMERIC_AVG).
  */
-static bool
+bool
 df_output_varying(Plan *ctx, Node *expr)
 {
 	if (IsA(ctx, Agg) && IsA(expr, Aggref) &&
@@ -2484,11 +2484,107 @@ df_output_varying(Plan *ctx, Node *expr)
 	return df_numeric_varying(ctx, expr);
 }
 
-/* Could DataFusion compute output value 'node' whole (P1, AVG1)? */
+/*
+ * AV2: can DataFusion give each value of numeric 'expr' of node 'ctx' its
+ * display scale (df_emit_dscale)?  One of one scale has that one, an avg
+ * returning numeric the scale numeric_avg picks from its sum and count, a
+ * value received from a Motion carrying tuples (not in 'batches') its own;
+ * operators, CASE and COALESCE as DN1 has them.
+ */
+static bool
+df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
+{
+	int			p,
+				s;
+
+	if (df_numeric_ps(ctx, expr, &p, &s) && !df_numeric_varying(ctx, expr))
+		return true;
+	switch (nodeTag(expr))
+	{
+		case T_Var:
+			{
+				Var		   *var = (Var *) expr;
+				Plan	   *child = NULL;
+				TargetEntry *tle;
+
+				if (IsA(ctx, Agg))
+					return false;	/* a grouping column */
+				if (var->varno == OUTER_VAR)
+					child = outerPlan(ctx);
+				else if (var->varno == INNER_VAR)
+					child = innerPlan(ctx);
+				else if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
+					child = ((SubqueryScan *) ctx)->subplan;
+				tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+				if (tle == NULL)
+					return false;
+				if (IsA(child, Motion))
+					return !bms_is_member(((Motion *) child)->motionID, batches);
+				return df_dscale_ok(child, (Node *) tle->expr, batches);
+			}
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) expr;
+				char	   *name = get_opname(op->opno);
+
+				return name != NULL && list_length(op->args) == 2 &&
+					(strcmp(name, "+") == 0 || strcmp(name, "-") == 0 ||
+					 strcmp(name, "*") == 0 || strcmp(name, "/") == 0) &&
+					df_dscale_ok(ctx, linitial(op->args), batches) &&
+					df_dscale_ok(ctx, lsecond(op->args), batches);
+			}
+		case T_CaseExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((CaseExpr *) expr)->args)
+				{
+					if (!df_dscale_ok(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
+						return false;
+				}
+				return df_dscale_ok(ctx, (Node *) ((CaseExpr *) expr)->defresult, batches);
+			}
+		case T_CoalesceExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((CoalesceExpr *) expr)->args)
+				{
+					if (!df_dscale_ok(ctx, lfirst(lc), batches))
+						return false;
+				}
+				return true;
+			}
+		case T_Const:
+			return ((Const *) expr)->constisnull;
+		case T_NullIfExpr:
+			return df_dscale_ok(ctx, linitial(((NullIfExpr *) expr)->args), batches);
+		case T_Aggref:
+			{
+				Aggref	   *agg = (Aggref *) expr;
+
+				if (!IsA(ctx, Agg))
+					return false;
+				if (df_agg_state_at(ctx, agg) == DF_AGG_SUM_NUMERIC_MIXED)
+					return true;	/* MS1 */
+				return (df_agg_state(agg) == DF_AGG_AVG_NUMERIC ||
+						df_agg_state(agg) == DF_AGG_AVG_INT) &&
+					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;
+			}
+		default:
+			return false;
+	}
+}
+
+/*
+ * Could DataFusion compute output value 'node' whole (P1, AVG1)?  One
+ * that depends on an avg below, with its display scale beside it (AV2).
+ */
 static bool
 df_value_ok(Node *node, DfCheckContext *cxt)
 {
-	return df_expr_ok(node, cxt) && !df_output_varying(cxt->node, node);
+	return df_expr_ok(node, cxt) &&
+		(!df_output_varying(cxt->node, node) || df_dscale_ok(cxt->node, node, cxt->batches));
 }
 
 static bool
@@ -2598,7 +2694,8 @@ df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 		if (needed != NULL && !bms_is_member(tle->resno, needed))
 			continue;
 		if (output && bms_is_member(tle->resno, cxt->sort_keys) &&
-			df_output_varying(cxt->node, (Node *) tle->expr))
+			df_output_varying(cxt->node, (Node *) tle->expr) &&
+			!df_dscale_ok(cxt->node, (Node *) tle->expr, cxt->batches))
 			df_reject(cxt, "sort key of an avg returning numeric");
 		else if (!output || bms_is_member(tle->resno, cxt->sort_keys) ||
 				 df_value_ok((Node *) tle->expr, cxt))
@@ -3147,9 +3244,20 @@ df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
 			(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
 			 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
 		{
-			/* the C side divides it, after DataFusion */
-			df_reject(cxt, "sort key avg returning numeric");
-			return false;
+			int			p,
+						s;
+			bool		dyn;
+
+			/*
+			 * AV2: DataFusion divides it (pg_avg) to sort by, and gives it
+			 * its display scale, within 76 digits
+			 */
+			if (!df_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
+			{
+				df_reject(cxt, "sort key avg returning numeric of more than %d digits",
+						  DF_NUMERIC_MAX_EXPR_PRECISION);
+				return false;
+			}
 		}
 	}
 	return true;
