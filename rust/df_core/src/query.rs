@@ -113,6 +113,8 @@
 //!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
 //!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
 //!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
+//!         | {"assert": <expr>, "detail": s}   (true, or GPORCA's Assert's
+//!                                 error where <expr> is false: AS1)
 //!         | {"numcmp": "<" | "<=" | "=" | "<>" | ">=" | ">", "left": <side>,
 //!            "right": <side>}   (exact, of any digits: pgnum::PgNumCmp)
 //!   <side> := {"value": <expr>, "scale": s}
@@ -176,7 +178,7 @@ use tokio::task::JoinHandle;
 use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
-use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
+use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
 use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
 use crate::pgstr::{bpchar_key, PgLike, PgStrFn, StrFn};
 use crate::runtime;
@@ -658,6 +660,11 @@ fn expr(v: &Value) -> Result<Expr, String> {
         args.extend(rargs);
         return Ok(PgNumCmp::udf(op, l, r).call(args));
     }
+    if let Some(e) = v.get("assert") {
+        // AS1: true, or the Assert's error
+        let detail = field(v, "detail")?.as_str().unwrap_or("").to_string();
+        return Ok(PgAssert::udf(detail).call(vec![expr(e)?]));
+    }
     if let Some(e) = v.get("numabs") {
         return Ok(PgNumeric::udf(NumericFn::Abs).call(vec![expr(e)?]));
     }
@@ -763,6 +770,7 @@ fn may_fail(v: &Value) -> bool {
             if map.contains_key("numdiv")
                 || map.contains_key("numdiv_scale")
                 || map.contains_key("numcmp")
+                || map.contains_key("assert")
             {
                 // DN1: numeric division by zero
                 return true;

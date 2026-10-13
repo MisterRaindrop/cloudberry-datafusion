@@ -501,6 +501,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | WIN2 | avg of numeric and of integers over a frame, with its display scale |
 | UA1 | UNION ALL (Append) |
 | SO1 | INTERSECT and EXCEPT (SetOp) |
+| AS1 | GPORCA's Assert of a scalar subquery's rows |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1304,6 +1305,17 @@ Postgres planner wholly in DataFusion (124 -> 126 of 206 executions by
 EXPLAIN), Q8, Q38 and Q87 giving PostgreSQL's results; Q38 and Q87 run
 slower than on PostgreSQL there (0.45 s and 0.64 s against 0.38 s and
 0.45 s).
+
+### GPORCA's Assert
+
+AS1: GPORCA checks that a scalar subquery gives at most one row with an
+Assert over its rows (`row_number() OVER () = 1`), which raises "one or
+more assertions failed" (P0003, the Assert's message as the detail) for a
+row whose condition is false.  DataFusion runs it as a filter keeping
+every row, whose predicate (df_core::pgfunc::PgAssert) raises the same
+error where the condition is false; other Asserts stay on PostgreSQL.
+TPC-DS Q6 under GPORCA runs wholly in DataFusion, 0.15 s against 0.38 s;
+Q6, Q14b and Q58 give PostgreSQL's results.
 
 ### Subtrees below PostgreSQL's nodes
 

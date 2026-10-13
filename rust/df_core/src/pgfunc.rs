@@ -81,6 +81,58 @@ impl fmt::Display for PgError {
 impl std::error::Error for PgError {}
 
 const DIVISION_BY_ZERO: &str = "22012";
+const TOO_MANY_ROWS: &str = "P0003";
+
+/// AS1: GPORCA's Assert over a scalar subquery's rows: true where its
+/// condition is true or NULL, and PostgreSQL's error (cardinality violation,
+/// with the Assert's message as its detail) where it is false, as
+/// CheckForAssertViolations raises it.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PgAssert {
+    detail: String,
+    signature: Signature,
+}
+
+impl PgAssert {
+    pub fn udf(detail: String) -> ScalarUDF {
+        ScalarUDF::new_from_impl(PgAssert {
+            detail,
+            signature: Signature::exact(vec![DataType::Boolean], Volatility::Volatile),
+        })
+    }
+}
+
+impl ScalarUDFImpl for PgAssert {
+    fn name(&self) -> &str {
+        "pg_assert"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let cond = args.args[0].to_array(n)?;
+        let cond = cond.as_boolean();
+        if (0..n).any(|r| !cond.is_null(r) && !cond.value(r)) {
+            return Err(DataFusionError::ArrowError(
+                Box::new(ArrowError::ExternalError(Box::new(
+                    PgError::new(TOO_MANY_ROWS, "one or more assertions failed")
+                        .with_detail(self.detail.clone()),
+                ))),
+                None,
+            ));
+        }
+        Ok(ColumnarValue::Array(std::sync::Arc::new(
+            datafusion::arrow::array::BooleanArray::from(vec![true; n]),
+        )))
+    }
+}
 const OUT_OF_RANGE: &str = "22003";
 
 pub(crate) fn division_by_zero() -> ArrowError {

@@ -4250,6 +4250,44 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_AssertOp:
+			{
+				/*
+				 * AS1: GPORCA's Assert over a scalar subquery's rows (at most
+				 * one: row_number() = 1), as a filter keeping every row whose
+				 * conditions are not false and raising its error for one
+				 * that is, as CheckForAssertViolations.  Only that error,
+				 * too many rows (P0003, GPORCA's ExmiSQLMaxOneRow).
+				 */
+				AssertOp   *ao = (AssertOp *) plan;
+				Bitmapset  *child_needed = NULL;
+				ListCell   *lc;
+
+				if (outerPlan(plan) == NULL || ao->errcode != ERRCODE_TOO_MANY_ROWS ||
+					list_length(ao->errmessage) < 1 || !IsA(linitial(ao->errmessage), String))
+				{
+					df_reject(cxt, "Assert other than of a scalar subquery's rows");
+					return;
+				}
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				df_check_expr_list(plan->qual, cxt);
+				if (cxt->failed)
+					return;
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+				}
+				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				child_needed = bms_add_member(child_needed, 0);
+				cxt->order_free = cxt->node_order_free; /* its child's order */
+				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				return;
+			}
+
 		case T_SetOp:
 			{
 				/*

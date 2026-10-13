@@ -131,6 +131,17 @@ SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT 
 SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
+
+-- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
+-- row passes, or the slice raises PostgreSQL's error (P0003).
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+SET datafusion.mode = off;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
+SET datafusion.mode = on;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
 RESET datafusion.mode;
 
 DROP TABLE df_u1, df_u2, df_up;

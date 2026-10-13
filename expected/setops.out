@@ -2772,6 +2772,53 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
     |   425
 (9 rows)
 
+-- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
+-- row passes, or the slice raises PostgreSQL's error (P0003).
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (df_u1.g = df_u2.g)
+                     ->  Seq Scan on df_u1
+                     ->  Hash
+                           ->  Assert
+                                 Assert Cond: ((row_number() OVER (?)) = 1)
+                                 ->  Broadcast Motion 1:3  (slice2)
+                                       ->  WindowAgg
+                                             ->  Gather Motion 3:1  (slice3; segments: 3)
+                                                   ->  Seq Scan on df_u2
+                                                         Filter: (k = 3)
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(19 rows)
+
+SET datafusion.mode = off;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+ count 
+-------
+   429
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
+ERROR:  one or more assertions failed  (seg1 slice1 172.17.0.3:40001 pid=11499)
+DETAIL:  Expected no more than one row to be returned by expression
+SET datafusion.mode = on;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
+ count 
+-------
+   429
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
+ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=11498)
+DETAIL:  Expected no more than one row to be returned by expression
 RESET datafusion.mode;
 DROP TABLE df_u1, df_u2, df_up;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

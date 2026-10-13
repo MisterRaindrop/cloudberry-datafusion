@@ -2239,6 +2239,26 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				return;
 			}
 
+		case T_AssertOp:
+			{
+				/*
+				 * AS1: its child's rows, each passing its conditions or
+				 * raising its error (df_core::pgfunc::PgAssert)
+				 */
+				const char *msg = strVal(linitial(((AssertOp *) plan)->errmessage));
+				char	   *detail = psprintf("%s\n", msg);
+
+				appendStringInfoString(out, "{\"filter\":{\"input\":");
+				df_emit_node(b, out, outerPlan(plan));
+				appendStringInfoString(out, ",\"pred\":{\"assert\":");
+				b->ctx = plan;
+				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				appendStringInfoString(out, ",\"detail\":");
+				df_emit_json_string(out, detail, strlen(detail));
+				appendStringInfoString(out, "}}}");
+				return;
+			}
+
 		case T_SetOp:
 			{
 				/*
