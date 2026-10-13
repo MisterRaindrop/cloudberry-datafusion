@@ -174,8 +174,8 @@ df_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
 	df_collect_init_params(stmt, innerPlan(plan), params);
 	if (IsA(plan, SubqueryScan))
 		df_collect_init_params(stmt, ((SubqueryScan *) plan)->subplan, params);
-	if (IsA(plan, Append))
-		foreach(lc, ((Append *) plan)->appendplans)
+	if (df_append_plans(plan) != NIL)
+		foreach(lc, df_append_plans(plan))
 			df_collect_init_params(stmt, lfirst(lc), params);
 }
 
@@ -570,10 +570,10 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *child;
 				TargetEntry *tle;
 
-				if (IsA(ctx, Append) && var->varno == OUTER_VAR)
+				if (df_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
 				{
 					/* UA1: any input's */
-					foreach(lc, ((Append *) ctx)->appendplans)
+					foreach(lc, df_append_plans(ctx))
 					{
 						child = lfirst(lc);
 						tle = get_tle_by_resno(child->targetlist, var->varattno);
@@ -1022,11 +1022,8 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
 					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
 				}
-				if (var->varno == OUTER_VAR && IsA(ctx, Append))
-					return df_numeric_append_range(((Append *) ctx)->appendplans, var->varattno,
-												   precision, scale, dyn);
-				if (var->varno == OUTER_VAR && IsA(ctx, MergeAppend))
-					return df_numeric_append_range(((MergeAppend *) ctx)->mergeplans, var->varattno,
+				if (var->varno == OUTER_VAR && df_append_plans(ctx) != NIL)
+					return df_numeric_append_range(df_append_plans(ctx), var->varattno,
 												   precision, scale, dyn);
 				if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
 				{
@@ -2415,7 +2412,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 
 	if (plan == NULL)
 		return false;
-	if (IsA(plan, Motion) || IsA(plan, Append))
+	if (IsA(plan, Motion) || df_append_plans(plan) != NIL)
 		return true;			/* UA1: an Append's are columns of its union */
 	if (IsA(plan, Result))
 	{
@@ -2553,8 +2550,8 @@ df_build_inputs(Plan *plan, bool *join, double *rows)
 		*rows = Max(*rows, plan->plan_rows);
 	df_build_inputs(outerPlan(plan), join, rows);
 	df_build_inputs(innerPlan(plan), join, rows);
-	if (IsA(plan, Append))
-		foreach(lc, ((Append *) plan)->appendplans)
+	if (df_append_plans(plan) != NIL)
+		foreach(lc, df_append_plans(plan))
 			df_build_inputs(lfirst(lc), join, rows);
 	if (IsA(plan, SubqueryScan))
 		df_build_inputs(((SubqueryScan *) plan)->subplan, join, rows);
@@ -2675,13 +2672,13 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 	}
 	if (IsA(node, WindowFunc) && df_window_avg((WindowFunc *) node))
 		return v->found = true; /* WIN2 */
-	if (IsA(node, Var) && IsA(v->ctx, Append) && ((Var *) node)->varno == OUTER_VAR)
+	if (IsA(node, Var) && df_append_plans(v->ctx) != NIL && ((Var *) node)->varno == OUTER_VAR)
 	{
 		/* UA1: any input's */
 		Plan	   *saved = v->ctx;
 		ListCell   *lc;
 
-		foreach(lc, ((Append *) saved)->appendplans)
+		foreach(lc, df_append_plans(saved))
 		{
 			TargetEntry *tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist,
 												((Var *) node)->varattno);
@@ -2767,12 +2764,12 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 
 				if (IsA(ctx, Agg))
 					return false;	/* a grouping column */
-				if (IsA(ctx, Append) && var->varno == OUTER_VAR)
+				if (df_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
 				{
 					/* UA1: each input gives its own beside the value */
 					ListCell   *lc;
 
-					foreach(lc, ((Append *) ctx)->appendplans)
+					foreach(lc, df_append_plans(ctx))
 					{
 						tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist, var->varattno);
 						if (tle == NULL || !df_dscale_ok(lfirst(lc), (Node *) tle->expr, batches))
@@ -3214,6 +3211,20 @@ df_sort_direction(Oid sortop, Oid type, bool *desc)
 		return false;
 	*desc = strategy == BTGreaterStrategyNumber;
 	return true;
+}
+
+/*
+ * UA1: the inputs of an Append or a Merge Append (which DataFusion runs as
+ * an Append where nothing reads its order), or NIL.
+ */
+List *
+df_append_plans(Plan *plan)
+{
+	if (plan != NULL && IsA(plan, Append))
+		return ((Append *) plan)->appendplans;
+	if (plan != NULL && IsA(plan, MergeAppend))
+		return ((MergeAppend *) plan)->mergeplans;
+	return NIL;
 }
 
 /* Is each output column of 'plan' a column of its child, as it is? */
@@ -3921,6 +3932,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (IsA(child, Sort))
 						cxt->skipped_sort = child;
 				}
+				else if (agg->aggstrategy == AGG_SORTED && cxt->node_order_free)
+				{
+					/*
+					 * D2: also over input in some other order (a Merge
+					 * Append of GroupAggregates, TPC-DS Q33), hashed.
+					 */
+				}
 				else if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
 				{
 					df_reject(cxt, "sorted or mixed aggregation");
@@ -4156,6 +4174,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			}
 
 		case T_Append:
+		case T_MergeAppend:
 			{
 				/*
 				 * UA1: UNION ALL, each input's rows in turn, as DataFusion's
@@ -4165,15 +4184,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * of display scales of their own, carries each value's
 				 * display scale beside it (DN1).
 				 */
-				Append	   *ap = (Append *) plan;
 				ListCell   *lc;
 
-				if (ap->part_prune_info != NULL)
+				if (IsA(plan, Append) ? ((Append *) plan)->part_prune_info != NULL :
+					((MergeAppend *) plan)->part_prune_info != NULL)
 				{
 					df_reject(cxt, "Append with run-time partition pruning");
 					return;
 				}
-				if (ap->appendplans == NIL || plan->qual != NIL)
+				if (df_append_plans(plan) == NIL || plan->qual != NIL)
 				{
 					df_reject(cxt, "Append without inputs or with a filter");
 					return;
@@ -4198,7 +4217,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						!df_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
 						df_reject(cxt, "Append of numeric of display scales of their own");
 				}
-				foreach(lc, ap->appendplans)
+				foreach(lc, df_append_plans(plan))
 				{
 					cxt->order_free = true;
 					df_check_plan(lfirst(lc), cxt, needed, false);
@@ -4989,7 +5008,7 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_fr
 			df_find_attach(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, points);
 			return;
 		case T_Append:
-			foreach(lc, ((Append *) plan)->appendplans)
+			foreach(lc, df_append_plans(plan))
 				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
 			return;
 		default:
@@ -5025,11 +5044,11 @@ df_plan_contains(Plan *plan, Plan *target)
 		return false;
 	if (IsA(plan, SubqueryScan) && df_plan_contains(((SubqueryScan *) plan)->subplan, target))
 		return true;
-	if (IsA(plan, Append))
+	if (df_append_plans(plan) != NIL)
 	{
 		ListCell   *lc;
 
-		foreach(lc, ((Append *) plan)->appendplans)
+		foreach(lc, df_append_plans(plan))
 			if (df_plan_contains(lfirst(lc), target))
 				return true;
 	}
@@ -5422,8 +5441,8 @@ df_list_motions(Plan *plan, List **motions)
 	df_list_motions(innerPlan(plan), motions);
 	if (IsA(plan, SubqueryScan))
 		df_list_motions(((SubqueryScan *) plan)->subplan, motions);
-	if (IsA(plan, Append))
-		foreach(lc, ((Append *) plan)->appendplans)
+	if (df_append_plans(plan) != NIL)
+		foreach(lc, df_append_plans(plan))
 			df_list_motions(lfirst(lc), motions);
 }
 

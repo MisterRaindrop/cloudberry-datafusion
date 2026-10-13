@@ -18,7 +18,9 @@
 --
 -- Set operations.  UA1: UNION ALL (Append), as DataFusion's union of its
 -- inputs, which keeps no order between them: an Append whose order a node
--- above reads stays on PostgreSQL.  Numeric of different scales, or of
+-- above reads stays on PostgreSQL; a Merge Append whose order nothing
+-- reads runs as one, and a GroupAggregate whose order nothing reads runs
+-- hashed whatever its input (TPC-DS Q33).  Numeric of different scales, or of
 -- display scales of their own, carries each value's display scale beside
 -- it.  Inputs that are Motions (GPORCA redistributes each branch below
 -- the Append) are read from their streams.  Each query runs with
@@ -46,12 +48,18 @@ EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT g, a FROM df_u1 
 EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a FROM df_u2) u LIMIT 5;
+SET enable_hashagg = off;
+EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+RESET enable_hashagg;
 SET datafusion.mode = off;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
 SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
 SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
 SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
 SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+SET enable_hashagg = off;
+SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+RESET enable_hashagg;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
 SET datafusion.mode = on;
@@ -60,6 +68,9 @@ SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL
 SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
 SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
 SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+SET enable_hashagg = off;
+SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+RESET enable_hashagg;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
 

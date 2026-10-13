@@ -1502,6 +1502,17 @@ df_find_state(PlanState *ps, Plan *leaf)
 				return found;
 		return NULL;
 	}
+	if (IsA(ps, MergeAppendState))
+	{
+		/* UA1: run as an Append where nothing reads its order */
+		MergeAppendState *ms = (MergeAppendState *) ps;
+		int			i;
+
+		for (i = 0; i < ms->ms_nplans; i++)
+			if ((found = df_find_state(ms->mergeplans[i], leaf)) != NULL)
+				return found;
+		return NULL;
+	}
 	found = df_find_state(outerPlanState(ps), leaf);
 	return found ? found : df_find_state(innerPlanState(ps), leaf);
 }

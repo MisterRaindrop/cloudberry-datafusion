@@ -852,7 +852,7 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
-	else if (IsA(child, Append))
+	else if (df_append_plans(child) != NIL)
 		/* UA1: a column of its union */
 		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
 	else if (IsA(child, Agg))
@@ -899,7 +899,7 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
-	else if (IsA(child, Append))
+	else if (df_append_plans(child) != NIL)
 	{
 		/* UA1: the display scale its union carries beside the value */
 		b->ctx = child;
@@ -962,7 +962,7 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Append))
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
 					/* UA1: the display scale its union carries beside it */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d_s\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
@@ -1243,7 +1243,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
 					return;
 				}
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Append))
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
 					/* UA1: a column of its union (df_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
@@ -2229,6 +2229,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			}
 
 		case T_Append:
+		case T_MergeAppend:
 			{
 				/*
 				 * UA1: the union of its inputs' rows, each projected to
@@ -2240,14 +2241,14 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				ListCell   *lt;
 
 				appendStringInfoString(out, "{\"union\":{\"inputs\":[");
-				foreach(lc, ((Append *) plan)->appendplans)
+				foreach(lc, df_append_plans(plan))
 				{
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
 					df_emit_node(b, out, lfirst(lc));
 				}
 				appendStringInfoString(out, "],\"columns\":[");
-				foreach(lc, ((Append *) plan)->appendplans)
+				foreach(lc, df_append_plans(plan))
 				{
 					Plan	   *child = lfirst(lc);
 					bool		first = true;
@@ -2938,11 +2939,11 @@ df_slice_width(Plan *plan)
 	width = plan->plan_width;
 	if (IsA(plan, Motion))
 		return width;			/* another slice below */
-	if (IsA(plan, Append))
+	if (df_append_plans(plan) != NIL)
 	{
 		ListCell   *lc;
 
-		foreach(lc, ((Append *) plan)->appendplans)
+		foreach(lc, df_append_plans(plan))
 			width = Max(width, df_slice_width(lfirst(lc)));
 		return width;
 	}

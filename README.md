@@ -1275,7 +1275,10 @@ different scales, or of display scales of their own, give each value its
 own (DN1), carried beside it as q<id>_c<k>_s.  DataFusion keeps no order
 between the inputs, so an Append whose order a node above reads (a Limit
 without a sort) stays on PostgreSQL, as does one with run-time partition
-pruning.
+pruning.  A Merge Append whose order nothing reads runs as an
+Append, and a GroupAggregate whose order nothing reads runs hashed over
+any input (D2), not only over a Sort: TPC-DS Q33, Q56 and Q60 group the
+GroupAggregates of a Merge Append again.
 
 TPC-DS SF1: queries wholly in DataFusion 112 -> 120 of 206 executions by
 EXPLAIN (Q2, Q5, Q76, Q77, Q80 under the Postgres planner, Q71 and Q76

@@ -18,7 +18,9 @@
 --
 -- Set operations.  UA1: UNION ALL (Append), as DataFusion's union of its
 -- inputs, which keeps no order between them: an Append whose order a node
--- above reads stays on PostgreSQL.  Numeric of different scales, or of
+-- above reads stays on PostgreSQL; a Merge Append whose order nothing
+-- reads runs as one, and a GroupAggregate whose order nothing reads runs
+-- hashed whatever its input (TPC-DS Q33).  Numeric of different scales, or of
 -- display scales of their own, carries each value's display scale beside
 -- it.  Inputs that are Motions (GPORCA redistributes each branch below
 -- the Append) are read from their streams.  Each query runs with
@@ -123,6 +125,41 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a 
  DataFusion: slice 1 not eligible: Append whose order of rows is read
 (9 rows)
 
+SET enable_hashagg = off;
+EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Sort
+   Sort Key: (sum((sum(df_u1.a)))), df_u1.g
+   ->  GroupAggregate
+         Group Key: df_u1.g
+         ->  Merge Append
+               Sort Key: df_u1.g
+               ->  Finalize GroupAggregate
+                     Group Key: df_u1.g
+                     ->  Gather Motion 3:1  (slice1; segments: 3)
+                           Merge Key: df_u1.g
+                           ->  Partial GroupAggregate
+                                 Group Key: df_u1.g
+                                 ->  Sort
+                                       Sort Key: df_u1.g
+                                       ->  Seq Scan on df_u1
+               ->  Finalize GroupAggregate
+                     Group Key: df_u2.g
+                     ->  Gather Motion 3:1  (slice2; segments: 3)
+                           Merge Key: df_u2.g
+                           ->  Partial GroupAggregate
+                                 Group Key: df_u2.g
+                                 ->  Sort
+                                       Sort Key: df_u2.g
+                                       ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(28 rows)
+
+RESET enable_hashagg;
 SET datafusion.mode = off;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
  g | count | sum |       sum       | count 
@@ -284,6 +321,20 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  7 |   124 | 31434.00
 (8 rows)
 
+SET enable_hashagg = off;
+SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+ g | sum 
+---+-----
+ 0 | NaN
+ 1 | NaN
+ 2 | NaN
+ 3 | NaN
+ 4 | NaN
+ 5 | NaN
+ 6 | NaN
+(7 rows)
+
+RESET enable_hashagg;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
  g | count | sum 
 ---+-------+-----
@@ -470,6 +521,20 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  7 |   124 | 31434.00
 (8 rows)
 
+SET enable_hashagg = off;
+SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
+ g | sum 
+---+-----
+ 0 | NaN
+ 1 | NaN
+ 2 | NaN
+ 3 | NaN
+ 4 | NaN
+ 5 | NaN
+ 6 | NaN
+(7 rows)
+
+RESET enable_hashagg;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
  g | count | sum 
 ---+-------+-----
