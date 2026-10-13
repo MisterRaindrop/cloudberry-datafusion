@@ -1156,6 +1156,10 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					case F_NUMERIC_INT8:
 						*precision = 19;
 						return true;
+					case F_ABS_NUMERIC:
+					case F_NUMERIC_ABS:
+						/* numeric_abs keeps the digits and display scale */
+						return df_numeric_range(ctx, linitial(fe->args), precision, scale, dyn);
 					case F_NUMERIC_NUMERIC_INT4:
 						{
 							/* coerced to numeric(p, s) (E2) */
@@ -1999,6 +2003,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				ListCell   *lc;
 				int			np,
 							ns;
+				bool		dyn;
 
 				foreach(lc, fe->args)
 				{
@@ -2015,6 +2020,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_check_expr(lsecond(fe->args), cxt);
 					return cxt->failed;
 				}
+				if ((fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS) &&
+					df_numeric_range(cxt->node, node, &np, &ns, &dyn))
+					break;		/* of numeric of any display scales (DN1) */
 				if (fe->funcresulttype == NUMERICOID && df_numeric_ps(cxt->node, node, &np, &ns))
 				{
 					/* an integer made numeric (N3), numeric(p, s) (E2) */
@@ -2757,6 +2765,10 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 			return ((Const *) expr)->constisnull;
 		case T_NullIfExpr:
 			return df_dscale_ok(ctx, linitial(((NullIfExpr *) expr)->args), batches);
+		case T_FuncExpr:
+			return (((FuncExpr *) expr)->funcid == F_ABS_NUMERIC ||
+					((FuncExpr *) expr)->funcid == F_NUMERIC_ABS) &&
+				df_dscale_ok(ctx, linitial(((FuncExpr *) expr)->args), batches);
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) expr;

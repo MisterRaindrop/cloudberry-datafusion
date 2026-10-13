@@ -1062,6 +1062,15 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			df_emit_dscale(b, out, linitial(((NullIfExpr *) node)->args), level);
 			return;
 
+		case T_FuncExpr:
+			/* numeric_abs keeps its argument's display scale */
+			if (((FuncExpr *) node)->funcid == F_ABS_NUMERIC ||
+				((FuncExpr *) node)->funcid == F_NUMERIC_ABS)
+				df_emit_dscale(b, out, linitial(((FuncExpr *) node)->args), level);
+			else
+				df_fail(b, "the display scale of a function");
+			return;
+
 		case T_WindowFunc:
 			{
 				/* WIN2: the scale numeric_avg picks from the frame's sum and count */
@@ -1621,6 +1630,14 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit(b, out, linitial(fe->args), level);
 					appendStringInfoString(out, strcmp(fn, "bpkey") == 0 ? "}" :
 										   strcmp(fn, "char_length") == 0 ? "}]}" : "]}");
+					return;
+				}
+				if (fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS)
+				{
+					/* numeric_abs, at its argument's scale */
+					appendStringInfoString(out, "{\"numabs\":");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfoChar(out, '}');
 					return;
 				}
 				if (df_extract_field(fe) != NULL)

@@ -109,6 +109,7 @@
 //!            "type": "numeric:S"}   (numeric_div, as pgnum::pg_div; DN1)
 //!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
 //!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
+//!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
 //!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
 //!                                 (numeric_avg of a sum of scale s, rounded
 //!                                 as PostgreSQL does, at scale S; pgnum)
@@ -625,6 +626,9 @@ fn expr(v: &Value) -> Result<Expr, String> {
             .and_then(crate::pgdate::DateField::parse)
             .ok_or("plan spec: bad extract field")?;
         return Ok(crate::pgdate::PgExtractDate::udf(f).call(vec![expr(e)?]));
+    }
+    if let Some(e) = v.get("numabs") {
+        return Ok(PgNumeric::udf(NumericFn::Abs).call(vec![expr(e)?]));
     }
     if let Some(e) = v.get("rescale") {
         let by = field(v, "by")?.as_i64().ok_or("plan spec: bad rescale")? as i8;

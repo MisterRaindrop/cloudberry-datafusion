@@ -211,6 +211,8 @@ pub enum NumericFn {
     Rescale { by: i8, to: i8 },
     /// x, with NaN as 0.
     NanToZero,
+    /// abs(x), as numeric_abs; NaN stays NaN.
+    Abs,
     /// x is NaN.
     IsNan,
     /// NaN where the second argument is true, else x.
@@ -260,6 +262,7 @@ impl ScalarUDFImpl for PgNumeric {
         match self.f {
             NumericFn::Rescale { .. } => "pg_numeric_rescale",
             NumericFn::NanToZero => "pg_numeric_nan_to_zero",
+            NumericFn::Abs => "pg_numeric_abs",
             NumericFn::IsNan => "pg_numeric_is_nan",
             NumericFn::NanIf => "pg_numeric_nan_if",
             NumericFn::Arith { op: NumOp::Add, .. } => "pg_numeric_add",
@@ -310,6 +313,12 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::NanToZero => {
                 let a: Decimal256Array =
                     xs.unary(|v| if v == NUMERIC_NAN { i256::ZERO } else { v });
+                Arc::new(a.with_data_type(x.data_type().clone()))
+            }
+            NumericFn::Abs => {
+                // within 76 digits, far from i256::MIN
+                let a: Decimal256Array =
+                    xs.unary(|v| if v == NUMERIC_NAN { v } else { v.wrapping_abs() });
                 Arc::new(a.with_data_type(x.data_type().clone()))
             }
             NumericFn::IsNan => Arc::new(BooleanArray::from_unary(xs, |v| v == NUMERIC_NAN)),

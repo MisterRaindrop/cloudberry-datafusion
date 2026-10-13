@@ -1935,7 +1935,7 @@ DROP TABLE df_ps;
 -- carried at the largest scale it may have, bounded by its operands'
 -- precision and scale, and compared, sorted and joined as a value; where
 -- it leaves DataFusion, or divides or is added up, its display scale goes
--- beside it, as numeric.c gives it.  A Motion of such a column carries
+-- beside it, as numeric.c gives it; abs keeps it.  A Motion of such a column carries
 -- tuples, which hold it; min, max, avg and GROUP BY of one stay on
 -- PostgreSQL.
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
@@ -2089,6 +2089,20 @@ EXPLAIN (COSTS OFF) SELECT a / b AS r, count(*) FROM df_dn WHERE b <> 0 GROUP BY
  DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
  DataFusion: slice 2 eligible
 (11 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, abs(a / b) FROM df_dn WHERE b <> 0 AND abs(a - b) > 100 ORDER BY abs(a - c), k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: (abs((a - c))), k
+   ->  Sort
+         Sort Key: (abs((a - c))), k
+         ->  Seq Scan on df_dn
+               Filter: ((b <> '0'::numeric) AND (abs((a - b)) > '100'::numeric))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(9 rows)
 
 SET datafusion.mode = off;
 SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
@@ -2380,6 +2394,31 @@ SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
  20001 |      NaN
  20002 |      NaN
 (2 rows)
+
+SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY abs(a - c), k;
+   k   |  abs   |   abs    |          abs           |        ?column?        
+-------+--------+----------+------------------------+------------------------
+ 20002 |   3.00 |   2.0000 |                    NaN |                    NaN
+  7985 |  32.15 |   7.3965 | 0.39858666005454996281 | 0.60141333994545003719
+ 11179 |  34.99 |  69.6449 |     7.1117886178861789 |     8.1117886178861789
+  4791 |  99.29 |  84.4379 |     1.4953313253012048 | 0.49533132530120481928
+ 14373 | 102.13 | 146.6863 |     5.3248175182481752 |     6.3248175182481752
+  1597 | 166.43 | 161.4793 |     3.1919831223628692 |     2.1919831223628692
+ 17567 | 169.27 | 223.7277 |     5.0619019138755981 |     6.0619019138755981
+ 19164 | 297.16 | 237.7516 |     3.4727123992053290 |     2.4727123992053290
+ 15970 | 364.30 | 314.7930 |     5.1086804094797364 |     4.1086804094797364
+ 12776 | 431.44 | 391.8344 |     7.5624890446976337 |     6.5624890446976337
+  9582 | 498.58 | 468.8758 |    11.6517878008880580 |    10.6517878008880580
+  6388 | 565.72 | 545.9172 |    19.8289519803715387 |    18.8289519803715387
+  3194 | 632.86 | 622.9586 |    44.3489838822704975 |    43.3489838822704975
+ 20001 |    NaN |      NaN |                    NaN |                    NaN
+(14 rows)
+
+SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
+ count 
+-------
+ 15347
+(1 row)
 
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
  k  |            r            |        ?column?         
@@ -2954,6 +2993,31 @@ SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
  20001 |      NaN
  20002 |      NaN
 (2 rows)
+
+SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY abs(a - c), k;
+   k   |  abs   |   abs    |          abs           |        ?column?        
+-------+--------+----------+------------------------+------------------------
+ 20002 |   3.00 |   2.0000 |                    NaN |                    NaN
+  7985 |  32.15 |   7.3965 | 0.39858666005454996281 | 0.60141333994545003719
+ 11179 |  34.99 |  69.6449 |     7.1117886178861789 |     8.1117886178861789
+  4791 |  99.29 |  84.4379 |     1.4953313253012048 | 0.49533132530120481928
+ 14373 | 102.13 | 146.6863 |     5.3248175182481752 |     6.3248175182481752
+  1597 | 166.43 | 161.4793 |     3.1919831223628692 |     2.1919831223628692
+ 17567 | 169.27 | 223.7277 |     5.0619019138755981 |     6.0619019138755981
+ 19164 | 297.16 | 237.7516 |     3.4727123992053290 |     2.4727123992053290
+ 15970 | 364.30 | 314.7930 |     5.1086804094797364 |     4.1086804094797364
+ 12776 | 431.44 | 391.8344 |     7.5624890446976337 |     6.5624890446976337
+  9582 | 498.58 | 468.8758 |    11.6517878008880580 |    10.6517878008880580
+  6388 | 565.72 | 545.9172 |    19.8289519803715387 |    18.8289519803715387
+  3194 | 632.86 | 622.9586 |    44.3489838822704975 |    43.3489838822704975
+ 20001 |    NaN |      NaN |                    NaN |                    NaN
+(14 rows)
+
+SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
+ count 
+-------
+ 15347
+(1 row)
 
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
  k  |            r            |        ?column?         
@@ -3703,9 +3767,9 @@ SET optimizer = off;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=83402)
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=43496)
 SELECT sum(a / b) FROM df_dn;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=83402)
+ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=43495)
 -- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
 -- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
 -- picked from the sum and the count, goes beside it, so it sorts in

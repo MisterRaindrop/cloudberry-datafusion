@@ -897,7 +897,9 @@ aggregate's result below a Motion, and bounds arithmetic by the digits its
 operands may have, not by their values, so nothing can overflow at run
 time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
 + tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
-`numeric`, `%` and unary minus stay on PostgreSQL (`/` since DN1, below); the direct PAX reader reads numeric
+`numeric`, `%` and unary minus stay on PostgreSQL (`/` since DN1, below;
+`abs`, which keeps its argument's digits and display scale, since WIN2's
+batch); the direct PAX reader reads numeric
 columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
