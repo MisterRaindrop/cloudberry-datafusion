@@ -909,7 +909,8 @@ time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
 + tax)` over `numeric(15,2)` may have 47 digits.  Columns of plain
 `numeric`, `%` and unary minus stay on PostgreSQL (`/` since DN1, below;
 `abs`, which keeps its argument's digits and display scale, since WIN2's
-batch); the direct PAX reader reads numeric
+batch, and `round(x, s)` of a constant s, RD1: numeric_round, half away
+from zero at scale s, its display scale); the direct PAX reader reads numeric
 columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions

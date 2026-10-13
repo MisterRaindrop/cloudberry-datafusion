@@ -441,7 +441,8 @@ DROP TABLE df_ps;
 -- carried at the largest scale it may have, bounded by its operands'
 -- precision and scale, and compared, sorted and joined as a value; where
 -- it leaves DataFusion, or divides or is added up, its display scale goes
--- beside it, as numeric.c gives it; abs keeps it.  A comparison of
+-- beside it, as numeric.c gives it; abs keeps it, round gives its own
+-- scale (RD1).  A comparison of
 -- values beyond 76 digits at a common scale (a quotient of an avg, of the
 -- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
 -- computes it, in arbitrary precision.  An Append of inputs of different
@@ -465,6 +466,7 @@ EXPLAIN (COSTS OFF) SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / 
 EXPLAIN (COSTS OFF) SELECT i, max(a / b) FROM df_dn WHERE b <> 0 GROUP BY i;
 EXPLAIN (COSTS OFF) SELECT a / b AS r, count(*) FROM df_dn WHERE b <> 0 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT k, abs(a / b) FROM df_dn WHERE b <> 0 AND abs(a - b) > 100 ORDER BY abs(a - c), k;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(round(a / 7, 2)) FROM df_dn WHERE round(a / 7, 2) > 10;
 EXPLAIN (COSTS OFF) SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
 SET datafusion.mode = off;
@@ -480,6 +482,8 @@ SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM
 SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
 SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY abs(a - c), k;
 SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
+SELECT k, round(a, 1), round(a / b, 3), round(c), round(a * 1.005, 2), round(a) FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY round(a / b, 3), k;
+SELECT count(*), sum(round(a / 7, 2)) FROM df_dn WHERE round(a / 7, 2) > 10;
 SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
 SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
 SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
@@ -499,6 +503,8 @@ SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM
 SELECT k, a / b FROM df_dn WHERE k IN (20001, 20002) ORDER BY k;
 SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY abs(a - c), k;
 SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
+SELECT k, round(a, 1), round(a / b, 3), round(c), round(a * 1.005, 2), round(a) FROM df_dn WHERE b <> 0 AND (k % 1597 = 0 OR k IN (20001, 20002)) ORDER BY round(a / b, 3), k;
+SELECT count(*), sum(round(a / 7, 2)) FROM df_dn WHERE round(a / 7, 2) > 10;
 SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
 SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
 SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;

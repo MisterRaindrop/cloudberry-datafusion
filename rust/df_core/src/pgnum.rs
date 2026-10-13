@@ -195,6 +195,25 @@ pub fn pg_avg(sum: i256, from: i8, count: i64, to: i8) -> Option<i256> {
     })
 }
 
+/// RD1: numeric_round of `v`, of scale `from`, at scale `to`: round_var's
+/// rounding half away from zero; NaN stays NaN.  None beyond Decimal256,
+/// which the planner hook's bounds rule out.
+pub fn pg_round(v: i256, from: i8, to: i8) -> Option<i256> {
+    if v == NUMERIC_NAN {
+        return Some(v);
+    }
+    if to >= from {
+        return v.checked_mul(pow10((to - from) as u32));
+    }
+    let d = pow10((from - to) as u32);
+    let (q, r) = (v / d, v % d);
+    if r.wrapping_abs().checked_mul(i256::from_i128(2))? >= d {
+        q.checked_add(if v < i256::ZERO { i256::MINUS_ONE } else { i256::ONE })
+    } else {
+        Some(q)
+    }
+}
+
 fn beyond() -> ArrowError {
     // The planner hook bounds every result within 76 digits.
     ArrowError::ComputeError("numeric result beyond 76 digits".into())
@@ -215,6 +234,9 @@ pub enum NumericFn {
     NanToZero,
     /// abs(x), as numeric_abs; NaN stays NaN.
     Abs,
+    /// RD1: round(x, to), as numeric_round: x of scale `from`, rounded half
+    /// away from zero at scale `to` (not below 0); NaN stays NaN.
+    Round { from: i8, to: i8 },
     /// x is NaN.
     IsNan,
     /// NaN where the second argument is true, else x.
@@ -265,6 +287,7 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::Rescale { .. } => "pg_numeric_rescale",
             NumericFn::NanToZero => "pg_numeric_nan_to_zero",
             NumericFn::Abs => "pg_numeric_abs",
+            NumericFn::Round { .. } => "pg_numeric_round",
             NumericFn::IsNan => "pg_numeric_is_nan",
             NumericFn::NanIf => "pg_numeric_nan_if",
             NumericFn::Arith { op: NumOp::Add, .. } => "pg_numeric_add",
@@ -284,6 +307,7 @@ impl ScalarUDFImpl for PgNumeric {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(match self.f {
             NumericFn::Rescale { to, .. }
+            | NumericFn::Round { to, .. }
             | NumericFn::Arith { to, .. }
             | NumericFn::Avg { to, .. }
             | NumericFn::Div { to, .. } => numeric_type(to),
@@ -322,6 +346,12 @@ impl ScalarUDFImpl for PgNumeric {
                 let a: Decimal256Array =
                     xs.unary(|v| if v == NUMERIC_NAN { v } else { v.wrapping_abs() });
                 Arc::new(a.with_data_type(x.data_type().clone()))
+            }
+            NumericFn::Round { from, to } => {
+                let a: Decimal256Array = xs
+                    .try_unary(|v| pg_round(v, from, to).ok_or_else(beyond))
+                    .map_err(arrow)?;
+                Arc::new(a.with_data_type(numeric_type(to)))
             }
             NumericFn::IsNan => Arc::new(BooleanArray::from_unary(xs, |v| v == NUMERIC_NAN)),
             NumericFn::NanIf => {
@@ -1095,6 +1125,19 @@ mod tests {
             ColumnarValue::Array(a) => a,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn round_is_numeric_round() {
+        let i = |v: i128| i256::from_i128(v);
+        // 12.345 -> 12.35, -12.345 -> -12.35, 12.344 -> 12.34, 1.5 -> 2, 7 -> 7.00
+        assert_eq!(pg_round(i(12345), 3, 2), Some(i(1235)));
+        assert_eq!(pg_round(i(-12345), 3, 2), Some(i(-1235)));
+        assert_eq!(pg_round(i(12344), 3, 2), Some(i(1234)));
+        assert_eq!(pg_round(i(15), 1, 0), Some(i(2)));
+        assert_eq!(pg_round(i(-25), 1, 0), Some(i(-3)));
+        assert_eq!(pg_round(i(7), 0, 2), Some(i(700)));
+        assert_eq!(pg_round(NUMERIC_NAN, 3, 1), Some(NUMERIC_NAN));
     }
 
     #[test]

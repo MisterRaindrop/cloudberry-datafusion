@@ -1695,6 +1695,18 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 										   strcmp(fn, "char_length") == 0 ? "}]}" : "]}");
 					return;
 				}
+				if (df_round_scale(fe) >= 0)
+				{
+					/* RD1: numeric_round (df_core::pgnum::pg_round) */
+					Plan	   *ctx = df_level_ctx(b, level);
+
+					appendStringInfoString(out, "{\"numround\":");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfo(out, ",\"from\":%d,\"type\":\"%s\"}",
+									 df_scale_of(ctx, linitial(fe->args)),
+									 df_tag(NUMERICOID, df_round_scale(fe)));
+					return;
+				}
 				if (fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS)
 				{
 					/* numeric_abs, at its argument's scale */

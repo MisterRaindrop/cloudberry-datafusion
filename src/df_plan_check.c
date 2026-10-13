@@ -1179,6 +1179,26 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					case F_NUMERIC_ABS:
 						/* numeric_abs keeps the digits and display scale */
 						return df_numeric_range(ctx, linitial(fe->args), precision, scale, dyn);
+					case F_ROUND_NUMERIC:
+					case F_ROUND_NUMERIC_INT4:
+						{
+							/*
+							 * RD1: numeric_round at a constant scale s, its
+							 * display scale; a digit more where rounding up
+							 * carries
+							 */
+							int			to = df_round_scale(fe);
+							int			ap,
+										as;
+							bool		adyn;
+
+							if (to < 0 ||
+								!df_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn))
+								return false;
+							*scale = to;
+							*precision = ap - as + 1 + to;
+							return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+						}
 					case F_NUMERIC_NUMERIC_INT4:
 						{
 							/* coerced to numeric(p, s) (E2) */
@@ -3243,6 +3263,26 @@ df_setop_group(SetOp *setop, AttrNumber attno)
 		if (setop->dupColIdx[k] == attno)
 			return k;
 	return -1;
+}
+
+/*
+ * RD1: the scale round(numeric[, s]) rounds 'fe' at: its constant s, from 0
+ * to 1000, or 0; -1 for any other.
+ */
+int
+df_round_scale(FuncExpr *fe)
+{
+	Const	   *c;
+
+	if (fe->funcid == F_ROUND_NUMERIC)
+		return 0;
+	if (fe->funcid != F_ROUND_NUMERIC_INT4 || list_length(fe->args) != 2 ||
+		!IsA(lsecond(fe->args), Const))
+		return -1;
+	c = (Const *) lsecond(fe->args);
+	if (c->constisnull || DatumGetInt32(c->constvalue) < 0 || DatumGetInt32(c->constvalue) > 1000)
+		return -1;
+	return DatumGetInt32(c->constvalue);
 }
 
 /* Is each output column of 'plan' a column of its child, as it is? */

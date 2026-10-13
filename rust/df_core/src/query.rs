@@ -113,6 +113,8 @@
 //!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
 //!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
 //!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
+//!         | {"numround": <expr>, "from": s, "type": "numeric:S"}   (round of a
+//!                                 numeric of scale s to S, as numeric_round; RD1)
 //!         | {"dateadd": [<date>, <int4>], "sign": 1 | -1}   (date_pli,
 //!                                 date_mii: 22008 beyond the dates; DT3)
 //!         | {"assert": <expr>, "detail": s}   (true, or GPORCA's Assert's
@@ -674,6 +676,15 @@ fn expr(v: &Value) -> Result<Expr, String> {
         // AS1: true, or the Assert's error
         let detail = field(v, "detail")?.as_str().unwrap_or("").to_string();
         return Ok(PgAssert::udf(detail).call(vec![expr(e)?]));
+    }
+    if let Some(e) = v.get("numround") {
+        // RD1: numeric_round at the type's scale
+        let from = field(v, "from")?.as_i64().ok_or("plan spec: bad round scale")? as i8;
+        let to = match PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+            PgType::Numeric(s) => s,
+            _ => return Err("plan spec: round to a non-numeric type".into()),
+        };
+        return Ok(PgNumeric::udf(NumericFn::Round { from, to }).call(vec![expr(e)?]));
     }
     if let Some(e) = v.get("numabs") {
         return Ok(PgNumeric::udf(NumericFn::Abs).call(vec![expr(e)?]));
