@@ -3216,6 +3216,22 @@ df_sort_direction(Oid sortop, Oid type, bool *desc)
 	return true;
 }
 
+/* Is each output column of 'plan' a column of its child, as it is? */
+static bool
+df_plain_columns(Plan *plan)
+{
+	ListCell   *lc;
+
+	foreach(lc, plan->targetlist)
+	{
+		Var		   *var = (Var *) lfirst_node(TargetEntry, lc)->expr;
+
+		if (!IsA(var, Var) || var->varno != OUTER_VAR)
+			return false;
+	}
+	return true;
+}
+
 /*
  * Does 'plan' pass its child's rows through unchanged: no filter, and
  * output column i is the child's column i, as Sort and Limit build them?
@@ -4039,6 +4055,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				{
 					df_reject(cxt, "Result without a child or with a one-time filter");
 					return;
+				}
+				if (plan == cxt->top && IsA(outerPlan(plan), Limit) && plan->qual == NIL &&
+					outerPlan(outerPlan(plan)) != NULL &&
+					IsA(outerPlan(outerPlan(plan)), Motion) && df_plain_columns(plan))
+				{
+					/*
+					 * GPORCA's Result over the coordinator's Limit over a
+					 * Gather Motion, passing columns on: the Limit is the
+					 * slice's top, as without the Result, and the slice has
+					 * nothing to compute on the rows it receives.
+					 */
+					cxt->top = outerPlan(plan);
 				}
 				if (plan == cxt->top && IsA(outerPlan(plan), Sort))
 				{
