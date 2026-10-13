@@ -2571,7 +2571,8 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					}
 					return;
 				}
-				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
+				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",%s\"left\":", type,
+								 hj->hashqualclauses != NIL ? "\"null_equal\":true," : "");
 				df_emit_node(b, out, innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
 				df_emit_node(b, out, outerPlan(plan));

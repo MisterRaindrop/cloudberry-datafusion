@@ -3285,6 +3285,40 @@ df_round_scale(FuncExpr *fe)
 	return DatumGetInt32(c->constvalue);
 }
 
+/*
+ * NE1: is each hash clause of 'hj' paired with a hash qual clause NOT (x IS
+ * DISTINCT FROM y) of its operands (GPORCA's join for INTERSECT), so the
+ * join matches NULL keys, every one of them?
+ */
+bool
+df_null_equal_join(HashJoin *hj)
+{
+	ListCell   *lh,
+			   *lq;
+
+	if (list_length(hj->hashclauses) != list_length(hj->hashqualclauses))
+		return false;
+	forboth(lh, hj->hashclauses, lq, hj->hashqualclauses)
+	{
+		OpExpr	   *eq = (OpExpr *) lfirst(lh);
+		BoolExpr   *not = (BoolExpr *) lfirst(lq);
+		DistinctExpr *d;
+
+		if (!IsA(eq, OpExpr) || list_length(eq->args) != 2 ||
+			!IsA(not, BoolExpr) || not->boolop != NOT_EXPR ||
+			!IsA(linitial(not->args), DistinctExpr))
+			return false;
+		d = (DistinctExpr *) linitial(not->args);
+		if (list_length(d->args) != 2 ||
+			!((equal(linitial(d->args), linitial(eq->args)) &&
+			   equal(lsecond(d->args), lsecond(eq->args))) ||
+			  (equal(linitial(d->args), lsecond(eq->args)) &&
+			   equal(lsecond(d->args), linitial(eq->args)))))
+			return false;
+	}
+	return true;
+}
+
 /* Is each output column of 'plan' a column of its child, as it is? */
 static bool
 df_plain_columns(Plan *plan)
@@ -4469,8 +4503,10 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				/*
 				 * An equi-join, DataFusion's hash table on PostgreSQL's Hash
 				 * side: inner, outer, semi or anti (J4).  NOT IN anti joins
-				 * (LASJ) and IS NOT DISTINCT FROM joins (hashqualclauses)
-				 * treat NULLs their own way and stay on PostgreSQL.
+				 * (LASJ) treat NULLs their own way (NJ1); a join on IS NOT
+				 * DISTINCT FROM keys (hashqualclauses: GPORCA's INTERSECT)
+				 * matches NULLs, as DataFusion's NullEqualsNull, when every
+				 * key is one (NE1).
 				 */
 				if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 					join->jointype != JOIN_RIGHT && join->jointype != JOIN_FULL &&
@@ -4487,9 +4523,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "NOT IN anti join on several columns or with a join filter");
 					return;
 				}
-				if (hj != NULL && hj->hashqualclauses != NIL)
+				if (hj != NULL && hj->hashqualclauses != NIL && !df_null_equal_join(hj))
 				{
-					df_reject(cxt, "IS NOT DISTINCT FROM join");
+					df_reject(cxt, "join on IS NOT DISTINCT FROM and = keys together");
 					return;
 				}
 				if (hj != NULL && (inner == NULL || !IsA(inner, Hash) || outer == NULL))

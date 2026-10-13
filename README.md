@@ -1308,7 +1308,11 @@ group's row is any of its members', so only columns whose equal values
 look alike: integers, bool, date, timestamp, text and varchar, and
 character(n), which holds every value padded to n; not floats (-0 and 0),
 numeric (1.0 and 1.00) or character without a length.  The ALL forms,
-which repeat rows, stay on PostgreSQL.  TPC-DS SF1: Q8 and Q87 under the
+which repeat rows, stay on PostgreSQL.  GPORCA plans INTERSECT and
+EXCEPT as joins on IS NOT DISTINCT FROM keys (a Hash Join's
+hashqualclauses): DataFusion's hash join matches NULL keys there
+(NullEqualsNull, NE1) when every key is such, as in those plans.  TPC-DS
+SF1: Q8 and Q87 under the
 Postgres planner wholly in DataFusion (124 -> 126 of 206 executions by
 EXPLAIN), Q8, Q38 and Q87 giving PostgreSQL's results; Q38 and Q87 run
 slower than on PostgreSQL there (0.45 s and 0.64 s against 0.38 s and

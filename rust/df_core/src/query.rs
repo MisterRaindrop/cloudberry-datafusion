@@ -72,7 +72,8 @@
 //!                     "on": [[<left expr>, <right expr>], ...],
 //!                     "filter": <expr> | null}}
 //!           (an equi-join; DataFusion builds its hash table on the left,
-//!           NULL keys match nothing; "null_aware": true with "leftanti" and
+//!           NULL keys match nothing, or each other with "null_equal": true
+//!           (IS NOT DISTINCT FROM keys, NE1); "null_aware": true with "leftanti" and
 //!           one key is NOT IN)
 //! ```
 //!
@@ -2154,6 +2155,14 @@ fn build_node(
         let joined = left
             .join_with_expr_keys(right, join_type, (lkeys, rkeys), filter)
             .map_err(df)?;
+        if j.get("null_equal").and_then(Value::as_bool) == Some(true) {
+            // NE1: IS NOT DISTINCT FROM keys, NULL matching NULL
+            let mut plan = joined.build().map_err(df)?;
+            if let datafusion::logical_expr::LogicalPlan::Join(ref mut join) = plan {
+                join.null_equality = datafusion::common::NullEquality::NullEqualsNull;
+            }
+            return Ok(LogicalPlanBuilder::from(plan));
+        }
         if j.get("null_aware").and_then(Value::as_bool) == Some(true) {
             // NOT IN: no row if the right side has a NULL key; a left row
             // with a NULL key only if the right side is empty

@@ -2807,7 +2807,7 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 (1 row)
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-ERROR:  one or more assertions failed  (seg1 slice1 172.17.0.3:40001 pid=11499)
+ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=30876)
 DETAIL:  Expected no more than one row to be returned by expression
 SET datafusion.mode = on;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
@@ -2817,7 +2817,7 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 (1 row)
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=11498)
+ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=30876)
 DETAIL:  Expected no more than one row to be returned by expression
 RESET datafusion.mode;
 DROP TABLE df_u1, df_u2, df_up;
