@@ -1708,6 +1708,23 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
 			return;
 
+		case T_WindowFunc:
+			{
+				/* WIN1: a column of the WindowAgg's node (df_emit_plan_node) */
+				ListCell   *lc;
+
+				if (level == DF_LEVEL_SCAN && b->ctx != NULL && IsA(b->ctx, WindowAgg))
+					foreach(lc, df_window_funcs((WindowAgg *) b->ctx))
+						if (equal(lfirst(lc), node))
+						{
+							appendStringInfo(out, "{\"name\":\"q%d_w%d\"}",
+											 b->ctx->plan_node_id, foreach_current_index(lc));
+							return;
+						}
+				df_fail(b, "a window function");
+				return;
+			}
+
 		default:
 			df_fail(b, "an expression");
 			return;
@@ -1784,6 +1801,25 @@ df_emit_groups(DfBuilder *b, StringInfo out, Agg *agg)
 		appendStringInfoChar(out, ']');
 	}
 	appendStringInfoChar(out, ']');
+}
+
+/*
+ * WIN1: column 'col' of WindowAgg child 'child' as a key it partitions or
+ * orders by, compared as PostgreSQL compares it (df_emit_compared).
+ */
+static void
+df_emit_window_key(DfBuilder *b, StringInfo out, Plan *child, AttrNumber col)
+{
+	TargetEntry *tle = get_tle_by_resno(child->targetlist, col);
+	Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
+	const char *key = type == FLOAT4OID || type == FLOAT8OID ? "floatkey" :
+		type == BPCHAROID ? "bpkey" : NULL;
+
+	if (key != NULL)
+		appendStringInfo(out, "{\"%s\":", key);
+	df_emit_output_of(b, out, child, col);
+	if (key != NULL)
+		appendStringInfoChar(out, '}');
 }
 
 static void
@@ -1984,6 +2020,81 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				b->agg = saved;
 				b->agg_named = named;
 				appendStringInfo(out, ",\"name\":\"q%d\"}}", plan->plan_node_id);
+				return;
+			}
+
+		case T_WindowAgg:
+			{
+				/*
+				 * WIN1: its child's rows with a column q<plan_node_id>_w<k>
+				 * for each window function (df_window_funcs), the top
+				 * one's filter and run condition over them
+				 */
+				WindowAgg  *wa = (WindowAgg *) plan;
+				Plan	   *child = outerPlan(plan);
+				List	   *filter = list_concat(list_copy(plan->qual),
+												 df_window_run_condition(wa));
+				ListCell   *lc;
+				int			i;
+
+				if (filter != NIL)
+					appendStringInfoString(out, "{\"filter\":{\"input\":");
+				appendStringInfoString(out, "{\"window\":{\"input\":");
+				df_emit_node(b, out, child);
+				appendStringInfoString(out, ",\"partition\":[");
+				for (i = 0; i < wa->partNumCols; i++)
+				{
+					if (i > 0)
+						appendStringInfoChar(out, ',');
+					df_emit_window_key(b, out, child, wa->partColIdx[i]);
+				}
+				appendStringInfoString(out, "],\"order\":[");
+				for (i = 0; i < wa->ordNumCols; i++)
+				{
+					TargetEntry *tle = get_tle_by_resno(child->targetlist, wa->ordColIdx[i]);
+					Oid			sortop,
+								coll;
+					bool		nulls_first,
+								desc;
+
+					if (tle == NULL ||
+						!df_window_order(child, wa->ordColIdx[i], &sortop, &nulls_first, &coll) ||
+						!df_sort_direction(sortop, exprType((Node *) tle->expr), &desc))
+					{
+						df_fail(b, "a window order key");
+						return;
+					}
+					appendStringInfoString(out, i > 0 ? ",{\"expr\":" : "{\"expr\":");
+					df_emit_window_key(b, out, child, wa->ordColIdx[i]);
+					appendStringInfo(out, ",\"desc\":%s,\"nulls_first\":%s}",
+									 desc ? "true" : "false", nulls_first ? "true" : "false");
+				}
+				appendStringInfo(out, "],\"frame\":\"%s\",\"funcs\":[", df_window_frame(wa));
+				foreach(lc, df_window_funcs(wa))
+				{
+					WindowFunc *wf = lfirst_node(WindowFunc, lc);
+
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					/*
+					 * an aggregate as a plain Agg's call; its argument reads
+					 * the child as through the WindowAgg, which is all the
+					 * Agg it is given serves for
+					 */
+					if (wf->winagg)
+						df_emit_agg_calls(b, out, (Agg *) plan,
+										  list_make1(df_window_aggref(wf)), NULL);
+					else
+						appendStringInfo(out, "{\"fn\":\"%s\"}", get_func_name(wf->winfnoid));
+				}
+				appendStringInfo(out, "],\"name\":\"q%d\"}}", plan->plan_node_id);
+				if (filter != NIL)
+				{
+					appendStringInfoString(out, ",\"pred\":");
+					b->ctx = plan;
+					df_emit_qual(b, out, filter, DF_LEVEL_SCAN);
+					appendStringInfoString(out, "}}");
+				}
 				return;
 			}
 
@@ -2791,6 +2902,54 @@ df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSlice
 }
 
 /*
+ * WIN1: the order of the rows of the WindowAgg at the top of the slice, as
+ * they come from 'input' below it, a Sort or merging Motion: the spec's
+ * "sort" by its keys, columns of the plan (a Limit applies after it).
+ */
+static void
+df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
+{
+	int			ncols;
+	AttrNumber *cols;
+	Oid		   *ops;
+	bool	   *nulls;
+	int			i;
+
+	input = df_window_order_input(input);
+	if (IsA(input, Sort))
+	{
+		ncols = ((Sort *) input)->numCols;
+		cols = ((Sort *) input)->sortColIdx;
+		ops = ((Sort *) input)->sortOperators;
+		nulls = ((Sort *) input)->nullsFirst;
+	}
+	else
+	{
+		ncols = ((Motion *) input)->numSortCols;
+		cols = ((Motion *) input)->sortColIdx;
+		ops = ((Motion *) input)->sortOperators;
+		nulls = ((Motion *) input)->nullsFirst;
+	}
+	appendStringInfoString(out, ",\"sort\":[");
+	for (i = 0; i < ncols; i++)
+	{
+		TargetEntry *tle = get_tle_by_resno(input->targetlist, cols[i]);
+		bool		desc;
+
+		if (tle == NULL || !df_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
+		{
+			df_fail(b, "a sort key of the WindowAgg");
+			return;
+		}
+		appendStringInfoString(out, i > 0 ? ",{\"expr\":" : "{\"expr\":");
+		df_emit_window_key(b, out, input, cols[i]);
+		appendStringInfo(out, ",\"desc\":%s,\"nulls_first\":%s}",
+						 desc ? "true" : "false", nulls[i] ? "true" : "false");
+	}
+	appendStringInfoChar(out, ']');
+}
+
+/*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
  */
@@ -2880,6 +3039,13 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		df_emit_outputs(&b, &outputs, values, DF_LEVEL_SCAN, spec, root);
 	}
 	initStringInfo(&sortlimit);
+	if (!b.failed && tails != NULL && tails->window_order != NULL)
+	{
+		if (sort != NULL)
+			df_fail(&b, "a Sort above a WindowAgg whose order is read");
+		else
+			df_emit_window_order(&b, &sortlimit, tails->window_order);
+	}
 	if (!b.failed)
 		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
 	if (!b.failed && tails != NULL && (tails->resort != NULL || tails->resort_by != NULL))

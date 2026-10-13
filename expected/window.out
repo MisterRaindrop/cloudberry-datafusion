@@ -1,0 +1,2171 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Window functions (WIN1): row_number, rank, dense_rank, and count, sum,
+-- min and max over the whole partition, up to the current row's peers, or
+-- up to the current row.  DataFusion sorts the rows by the partition and
+-- order keys itself, in the order PostgreSQL sorts them by.  Each query runs
+-- with datafusion.mode off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+-- g and a with NULLs, a with ties; f with -0, 0 and NaN; m with NaN; c of
+-- one value padded two ways, as an expression without a length makes it.
+CREATE TABLE df_w (k int, g int, a int, b int8, n numeric(10,2), m numeric(10,2),
+  f float8, t text) DISTRIBUTED BY (k);
+INSERT INTO df_w SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+  CASE WHEN i % 17 = 0 THEN NULL ELSE i % 3 END, 4000000000000000000 + i,
+  (i % 211) * 0.75, CASE WHEN i % 97 = 0 THEN 'NaN' ELSE (i % 89) * 0.5 END,
+  CASE i % 5 WHEN 0 THEN '-0'::float8 WHEN 1 THEN 0 WHEN 2 THEN 'NaN' ELSE i % 3 END,
+  'v' || (i % 4)
+  FROM generate_series(1, 3000) i;
+ANALYZE df_w;
+-- Supported: a Sort below the WindowAgg is left out, and where its rows
+-- leave in their order (to a merging Motion, or the result), DataFusion
+-- sorts them by its keys; a window below a join is a node of the plan; the
+-- top WindowAgg leaves out the rows that fail its run condition.
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w ORDER BY 1, 2, 3;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, a, k
+   ->  Sort
+         Sort Key: g, a, k
+         ->  WindowAgg
+               Partition By: g
+               Order By: a
+               ->  Sort
+                     Sort Key: g, a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(16 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, a
+   ->  Sort
+         Sort Key: g, a
+         ->  WindowAgg
+               Partition By: g
+               ->  Sort
+                     Sort Key: g
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Finalize HashAggregate
+                                 Group Key: g, a
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: g, a
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: g, a
+                                             ->  Seq Scan on df_w
+                                                   Filter: (a < 3)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(23 rows)
+
+EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Sort
+   Sort Key: df_w.k
+   ->  Hash Join
+         Hash Cond: ((rank() OVER (?)) = y.r)
+         ->  WindowAgg
+               Order By: df_w.a, df_w.k
+               ->  Gather Motion 3:1  (slice1; segments: 3)
+                     Merge Key: df_w.a, df_w.k
+                     ->  Sort
+                           Sort Key: df_w.a, df_w.k
+                           ->  Seq Scan on df_w
+                                 Filter: (k < 40)
+         ->  Hash
+               ->  Subquery Scan on y
+                     ->  WindowAgg
+                           Order By: df_w_1.b
+                           ->  Gather Motion 3:1  (slice2; segments: 3)
+                                 Merge Key: df_w_1.b
+                                 ->  Sort
+                                       Sort Key: df_w_1.b DESC
+                                       ->  Seq Scan on df_w df_w_1
+                                             Filter: (k < 40)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(26 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: s.g, s.r, s.k
+   ->  Sort
+         Sort Key: s.g, s.r, s.k
+         ->  Subquery Scan on s
+               ->  WindowAgg
+                     Run Condition: (rank() OVER (?) <= 3)
+                     Partition By: df_w.g
+                     Order By: df_w.a, df_w.k
+                     ->  Sort
+                           Sort Key: df_w.g, df_w.a DESC, df_w.k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: df_w.g
+                                 ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(18 rows)
+
+SET datafusion.mode = off;
+SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
+ g | a | k  | rank | dense_rank | row_number 
+---+---+----+------+------------+------------
+ 0 | 0 | 21 |    1 |          1 |          1
+ 0 | 1 |  7 |    2 |          2 |          2
+ 0 | 1 | 28 |    2 |          2 |          3
+ 0 | 2 | 14 |    4 |          3 |          4
+ 1 | 0 | 15 |    1 |          1 |          1
+ 1 | 1 |  1 |    2 |          2 |          2
+ 1 | 1 | 22 |    2 |          2 |          3
+ 1 | 2 |  8 |    4 |          3 |          4
+ 1 | 2 | 29 |    4 |          3 |          5
+ 2 | 0 |  9 |    1 |          1 |          1
+ 2 | 0 | 30 |    1 |          1 |          2
+ 2 | 1 | 16 |    3 |          2 |          3
+ 2 | 2 |  2 |    4 |          3 |          4
+ 2 | 2 | 23 |    4 |          3 |          5
+ 3 | 0 |  3 |    1 |          1 |          1
+ 3 | 0 | 24 |    1 |          1 |          2
+ 3 | 1 | 10 |    3 |          2 |          3
+ 3 |   | 17 |    4 |          3 |          4
+ 4 | 0 | 18 |    1 |          1 |          1
+ 4 | 1 |  4 |    2 |          2 |          2
+ 4 | 1 | 25 |    2 |          2 |          3
+ 4 | 2 | 11 |    4 |          3 |          4
+ 5 | 0 | 12 |    1 |          1 |          1
+ 5 | 1 | 19 |    2 |          2 |          2
+ 5 | 2 |  5 |    3 |          3 |          3
+ 6 | 0 |  6 |    1 |          1 |          1
+ 6 | 0 | 27 |    1 |          1 |          2
+ 6 | 2 | 20 |    3 |          2 |          3
+   | 1 | 13 |    1 |          1 |          1
+   | 2 | 26 |    2 |          2 |          2
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | rank | rank 
+---+---+----+------+------
+ 0 | 0 | 21 |    4 |    1
+ 0 | 1 |  7 |    2 |    2
+ 0 | 1 | 28 |    2 |    2
+ 0 | 2 | 14 |    1 |    4
+ 1 | 0 | 15 |    5 |    1
+ 1 | 1 |  1 |    3 |    2
+ 1 | 1 | 22 |    3 |    2
+ 1 | 2 |  8 |    1 |    4
+ 1 | 2 | 29 |    1 |    4
+ 2 | 0 |  9 |    4 |    1
+ 2 | 0 | 30 |    4 |    1
+ 2 | 1 | 16 |    3 |    3
+ 2 | 2 |  2 |    1 |    4
+ 2 | 2 | 23 |    1 |    4
+ 3 | 0 |  3 |    2 |    2
+ 3 | 0 | 24 |    2 |    2
+ 3 | 1 | 10 |    1 |    4
+ 3 |   | 17 |    4 |    1
+ 4 | 0 | 18 |    4 |    1
+ 4 | 1 |  4 |    2 |    2
+ 4 | 1 | 25 |    2 |    2
+ 4 | 2 | 11 |    1 |    4
+ 5 | 0 | 12 |    3 |    1
+ 5 | 1 | 19 |    2 |    2
+ 5 | 2 |  5 |    1 |    3
+ 6 | 0 |  6 |    2 |    1
+ 6 | 0 | 27 |    2 |    1
+ 6 | 2 | 20 |    1 |    3
+   | 1 | 13 |    2 |    1
+   | 2 | 26 |    1 |    2
+(30 rows)
+
+SELECT k, f, rank() OVER (ORDER BY f), dense_rank() OVER (ORDER BY f DESC), count(*) OVER (PARTITION BY f) FROM df_w WHERE k <= 30 ORDER BY 3, 1;
+ k  |  f  | rank | dense_rank | count 
+----+-----+------+------------+-------
+  1 |   0 |    1 |          4 |    16
+  3 |   0 |    1 |          4 |    16
+  5 |  -0 |    1 |          4 |    16
+  6 |   0 |    1 |          4 |    16
+  9 |   0 |    1 |          4 |    16
+ 10 |  -0 |    1 |          4 |    16
+ 11 |   0 |    1 |          4 |    16
+ 15 |  -0 |    1 |          4 |    16
+ 16 |   0 |    1 |          4 |    16
+ 18 |   0 |    1 |          4 |    16
+ 20 |  -0 |    1 |          4 |    16
+ 21 |   0 |    1 |          4 |    16
+ 24 |   0 |    1 |          4 |    16
+ 25 |  -0 |    1 |          4 |    16
+ 26 |   0 |    1 |          4 |    16
+ 30 |  -0 |    1 |          4 |    16
+  4 |   1 |   17 |          3 |     4
+ 13 |   1 |   17 |          3 |     4
+ 19 |   1 |   17 |          3 |     4
+ 28 |   1 |   17 |          3 |     4
+  8 |   2 |   21 |          2 |     4
+ 14 |   2 |   21 |          2 |     4
+ 23 |   2 |   21 |          2 |     4
+ 29 |   2 |   21 |          2 |     4
+  2 | NaN |   25 |          1 |     6
+  7 | NaN |   25 |          1 |     6
+ 12 | NaN |   25 |          1 |     6
+ 17 | NaN |   25 |          1 |     6
+ 22 | NaN |   25 |          1 |     6
+ 27 | NaN |   25 |          1 |     6
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w WHERE k <= 30 ORDER BY g, a, k DESC;
+ g | a | k  | rank 
+---+---+----+------
+ 0 | 0 | 21 |    1
+ 0 | 1 | 28 |    2
+ 0 | 1 |  7 |    2
+ 0 | 2 | 14 |    4
+ 1 | 0 | 15 |    1
+ 1 | 1 | 22 |    2
+ 1 | 1 |  1 |    2
+ 1 | 2 | 29 |    4
+ 1 | 2 |  8 |    4
+ 2 | 0 | 30 |    1
+ 2 | 0 |  9 |    1
+ 2 | 1 | 16 |    3
+ 2 | 2 | 23 |    4
+ 2 | 2 |  2 |    4
+ 3 | 0 | 24 |    1
+ 3 | 0 |  3 |    1
+ 3 | 1 | 10 |    3
+ 3 |   | 17 |    4
+ 4 | 0 | 18 |    1
+ 4 | 1 | 25 |    2
+ 4 | 1 |  4 |    2
+ 4 | 2 | 11 |    4
+ 5 | 0 | 12 |    1
+ 5 | 1 | 19 |    2
+ 5 | 2 |  5 |    3
+ 6 | 0 | 27 |    1
+ 6 | 0 |  6 |    1
+ 6 | 2 | 20 |    3
+   | 1 | 13 |    1
+   | 2 | 26 |    2
+(30 rows)
+
+SELECT t, k, rank() OVER (PARTITION BY t ORDER BY k % 5 DESC) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+ t  | k  | rank 
+----+----+------
+ v0 |  4 |    1
+ v0 |  8 |    3
+ v0 | 12 |    5
+ v0 | 16 |    6
+ v0 | 20 |    7
+ v0 | 24 |    1
+ v0 | 28 |    3
+ v1 |  1 |    5
+ v1 |  5 |    7
+ v1 |  9 |    1
+ v1 | 13 |    3
+ v1 | 17 |    4
+ v1 | 21 |    5
+ v1 | 25 |    7
+ v1 | 29 |    1
+ v2 |  2 |    3
+ v2 |  6 |    5
+ v2 | 10 |    7
+ v2 | 14 |    1
+ v2 | 18 |    2
+ v2 | 22 |    3
+ v2 | 26 |    5
+ v2 | 30 |    7
+ v3 |  3 |    2
+ v3 |  7 |    4
+ v3 | 11 |    6
+ v3 | 15 |    7
+ v3 | 19 |    1
+ v3 | 23 |    2
+ v3 | 27 |    4
+(30 rows)
+
+SELECT g, a, k, sum(a) OVER (PARTITION BY g ORDER BY a), count(*) OVER (PARTITION BY g), count(a) OVER (PARTITION BY g ORDER BY a), sum(a) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | sum | count | count | sum 
+---+---+----+-----+-------+-------+-----
+ 0 | 0 | 21 |   0 |     4 |     1 |   0
+ 0 | 1 |  7 |   2 |     4 |     3 |   1
+ 0 | 1 | 28 |   2 |     4 |     3 |   2
+ 0 | 2 | 14 |   4 |     4 |     4 |   4
+ 1 | 0 | 15 |   0 |     5 |     1 |   0
+ 1 | 1 |  1 |   2 |     5 |     3 |   1
+ 1 | 1 | 22 |   2 |     5 |     3 |   2
+ 1 | 2 |  8 |   6 |     5 |     5 |   4
+ 1 | 2 | 29 |   6 |     5 |     5 |   6
+ 2 | 0 |  9 |   0 |     5 |     2 |   0
+ 2 | 0 | 30 |   0 |     5 |     2 |   0
+ 2 | 1 | 16 |   1 |     5 |     3 |   1
+ 2 | 2 |  2 |   5 |     5 |     5 |   3
+ 2 | 2 | 23 |   5 |     5 |     5 |   5
+ 3 | 0 |  3 |   0 |     4 |     2 |   0
+ 3 | 0 | 24 |   0 |     4 |     2 |   0
+ 3 | 1 | 10 |   1 |     4 |     3 |   1
+ 3 |   | 17 |   1 |     4 |     3 |   1
+ 4 | 0 | 18 |   0 |     4 |     1 |   0
+ 4 | 1 |  4 |   2 |     4 |     3 |   1
+ 4 | 1 | 25 |   2 |     4 |     3 |   2
+ 4 | 2 | 11 |   4 |     4 |     4 |   4
+ 5 | 0 | 12 |   0 |     3 |     1 |   0
+ 5 | 1 | 19 |   1 |     3 |     2 |   1
+ 5 | 2 |  5 |   3 |     3 |     3 |   3
+ 6 | 0 |  6 |   0 |     3 |     2 |   0
+ 6 | 0 | 27 |   0 |     3 |     2 |   0
+ 6 | 2 | 20 |   2 |     3 |     3 |   2
+   | 1 | 13 |   1 |     2 |     1 |   1
+   | 2 | 26 |   3 |     2 |     2 |   3
+(30 rows)
+
+SELECT g, k, sum(b) OVER (PARTITION BY g), sum(b) OVER (PARTITION BY g ORDER BY k), sum(n) OVER (PARTITION BY g ORDER BY k), sum(m) OVER (PARTITION BY g ORDER BY k) FROM df_w WHERE k <= 100 AND g IN (1, 2) ORDER BY 1, 2;
+ g |  k  |         sum          |         sum          |  sum   |  sum   
+---+-----+----------------------+----------------------+--------+--------
+ 1 |   1 | 56000000000000000672 |  4000000000000000001 |   0.75 |   0.50
+ 1 |   8 | 56000000000000000672 |  8000000000000000009 |   6.75 |   4.50
+ 1 |  15 | 56000000000000000672 | 12000000000000000024 |  18.00 |  12.00
+ 1 |  22 | 56000000000000000672 | 16000000000000000046 |  34.50 |  23.00
+ 1 |  29 | 56000000000000000672 | 20000000000000000075 |  56.25 |  37.50
+ 1 |  36 | 56000000000000000672 | 24000000000000000111 |  83.25 |  55.50
+ 1 |  43 | 56000000000000000672 | 28000000000000000154 | 115.50 |  77.00
+ 1 |  50 | 56000000000000000672 | 32000000000000000204 | 153.00 | 102.00
+ 1 |  57 | 56000000000000000672 | 36000000000000000261 | 195.75 | 130.50
+ 1 |  64 | 56000000000000000672 | 40000000000000000325 | 243.75 | 162.50
+ 1 |  71 | 56000000000000000672 | 44000000000000000396 | 297.00 | 198.00
+ 1 |  85 | 56000000000000000672 | 48000000000000000481 | 360.75 | 240.50
+ 1 |  92 | 56000000000000000672 | 52000000000000000573 | 429.75 | 242.00
+ 1 |  99 | 56000000000000000672 | 56000000000000000672 | 504.00 | 247.00
+ 2 |   2 | 56000000000000000700 |  4000000000000000002 |   1.50 |   1.00
+ 2 |   9 | 56000000000000000700 |  8000000000000000011 |   8.25 |   5.50
+ 2 |  16 | 56000000000000000700 | 12000000000000000027 |  20.25 |  13.50
+ 2 |  23 | 56000000000000000700 | 16000000000000000050 |  37.50 |  25.00
+ 2 |  30 | 56000000000000000700 | 20000000000000000080 |  60.00 |  40.00
+ 2 |  37 | 56000000000000000700 | 24000000000000000117 |  87.75 |  58.50
+ 2 |  44 | 56000000000000000700 | 28000000000000000161 | 120.75 |  80.50
+ 2 |  51 | 56000000000000000700 | 32000000000000000212 | 159.00 | 106.00
+ 2 |  58 | 56000000000000000700 | 36000000000000000270 | 202.50 | 135.00
+ 2 |  72 | 56000000000000000700 | 40000000000000000342 | 256.50 | 171.00
+ 2 |  79 | 56000000000000000700 | 44000000000000000421 | 315.75 | 210.50
+ 2 |  86 | 56000000000000000700 | 48000000000000000507 | 380.25 | 253.50
+ 2 |  93 | 56000000000000000700 | 52000000000000000600 | 450.00 | 255.50
+ 2 | 100 | 56000000000000000700 | 56000000000000000700 | 525.00 | 261.00
+(28 rows)
+
+SELECT g, k, f, min(t) OVER (PARTITION BY g), max(n) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING), min(k) OVER (PARTITION BY g ORDER BY f) FROM df_w WHERE k <= 24 ORDER BY 1, 2;
+ g | k  |  f  | min |  max  | min 
+---+----+-----+-----+-------+-----
+ 0 |  7 | NaN | v1  |  5.25 |   7
+ 0 | 14 |   2 | v1  | 10.50 |  14
+ 0 | 21 |   0 | v1  | 15.75 |  21
+ 1 |  1 |   0 | v0  |  0.75 |   1
+ 1 |  8 |   2 | v0  |  6.00 |   1
+ 1 | 15 |  -0 | v0  | 11.25 |   1
+ 1 | 22 | NaN | v0  | 16.50 |   1
+ 2 |  2 | NaN | v0  |  1.50 |   2
+ 2 |  9 |   0 | v0  |  6.75 |   9
+ 2 | 16 |   0 | v0  | 12.00 |   9
+ 2 | 23 |   2 | v0  | 17.25 |   9
+ 3 |  3 |   0 | v0  |  2.25 |   3
+ 3 | 10 |  -0 | v0  |  7.50 |   3
+ 3 | 17 | NaN | v0  | 12.75 |   3
+ 3 | 24 |   0 | v0  | 18.00 |   3
+ 4 |  4 |   1 | v0  |  3.00 |   4
+ 4 | 11 |   0 | v0  |  8.25 |  11
+ 4 | 18 |   0 | v0  | 13.50 |  11
+ 5 |  5 |  -0 | v0  |  3.75 |   5
+ 5 | 12 | NaN | v0  |  9.00 |   5
+ 5 | 19 |   1 | v0  | 14.25 |   5
+ 6 |  6 |   0 | v0  |  4.50 |   6
+ 6 | 20 |  -0 | v0  | 15.00 |   6
+   | 13 |   1 | v1  |  9.75 |  13
+(24 rows)
+
+SELECT k, count(*) OVER (), sum(a) OVER (), sum(f) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM df_w WHERE k <= 10 AND f = f ORDER BY 1;
+ k  | count | sum | sum 
+----+-------+-----+-----
+  1 |    10 |  10 | NaN
+  2 |    10 |  10 | NaN
+  3 |    10 |  10 | NaN
+  4 |    10 |  10 | NaN
+  5 |    10 |  10 | NaN
+  6 |    10 |  10 | NaN
+  7 |    10 |  10 | NaN
+  8 |    10 |  10 | NaN
+  9 |    10 |  10 | NaN
+ 10 |    10 |  10 | NaN
+(10 rows)
+
+SELECT c, k, count(*) OVER (PARTITION BY c), rank() OVER (ORDER BY c) FROM (SELECT k, CASE WHEN k % 2 = 0 THEN 'ab'::bpchar ELSE 'ab  '::bpchar END c FROM df_w WHERE k <= 6) s ORDER BY 2;
+  c   | k | count | rank 
+------+---+-------+------
+ ab   | 1 |     6 |    1
+ ab   | 2 |     6 |    1
+ ab   | 3 |     6 |    1
+ ab   | 4 |     6 |    1
+ ab   | 5 |     6 |    1
+ ab   | 6 |     6 |    1
+(6 rows)
+
+SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g), sum(sum(n)) OVER (PARTITION BY g ORDER BY a ROWS UNBOUNDED PRECEDING) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+ g | a |      ?column?       |   sum    
+---+---+---------------------+----------
+ 0 | 0 | 34.6505425071859544 | 10035.75
+ 0 | 1 | 33.2910376259160473 | 19677.75
+ 0 | 2 | 32.0584198668979983 | 28962.75
+ 1 | 0 | 32.9948175679212689 |  9454.50
+ 1 | 1 | 34.1045909019525729 | 19227.00
+ 1 | 2 | 32.9005915301261582 | 28654.50
+ 2 | 0 | 32.8370554177005790 |  9528.00
+ 2 | 1 | 33.5323614557485525 | 19257.75
+ 2 | 2 | 33.6305831265508685 | 29016.00
+ 3 | 0 | 34.0144665461121157 |  9875.25
+ 3 | 1 | 33.0767243606303281 | 19478.25
+ 3 | 2 | 32.9088090932575562 | 29032.50
+ 4 | 0 | 33.6143199084191903 |  9690.00
+ 4 | 1 | 33.6923717348319284 | 19402.50
+ 4 | 2 | 32.6933083567488813 | 28827.00
+ 5 | 0 | 32.4883600620796689 |  9420.00
+ 5 | 1 | 33.1143300569063632 | 19021.50
+ 5 | 2 | 34.3973098810139679 | 28995.00
+ 6 | 0 | 33.2164744988054430 |  9593.25
+ 6 | 1 | 32.5127246286485925 | 18983.25
+ 6 | 2 | 34.2708008725459645 | 28881.00
+   | 0 | 33.2770123906073997 |  5760.75
+   | 1 | 33.2163590676717789 | 11511.00
+   | 2 | 33.5066285417208214 | 17311.50
+(24 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+ g |  k  | r 
+---+-----+---
+ 0 | 119 | 1
+ 0 | 238 | 2
+ 0 | 357 | 3
+ 1 |  85 | 1
+ 1 | 204 | 2
+ 1 | 323 | 3
+ 2 |  51 | 1
+ 2 | 170 | 2
+ 2 | 289 | 3
+ 3 |  17 | 1
+ 3 | 136 | 2
+ 3 | 255 | 3
+ 4 | 102 | 1
+ 4 | 340 | 2
+ 4 | 459 | 3
+ 5 |  68 | 1
+ 5 | 187 | 2
+ 5 | 306 | 3
+ 6 |  34 | 1
+ 6 | 153 | 2
+ 6 | 272 | 3
+   | 221 | 1
+   | 442 | 2
+   | 663 | 3
+(24 rows)
+
+SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
+ k  | a | r 
+----+---+---
+  2 | 2 | 1
+  5 | 2 | 2
+  8 | 2 | 3
+ 11 | 2 | 4
+(4 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
+ g | k  | r | s 
+---+----+---+---
+ 0 |  7 | 1 | 1
+ 0 | 14 | 2 | 3
+ 1 |  1 | 1 | 1
+ 1 |  8 | 2 | 3
+ 2 |  2 | 1 | 2
+ 2 |  9 | 2 | 2
+ 3 |  3 | 1 | 0
+ 3 | 10 | 2 | 1
+ 4 |  4 | 1 | 1
+ 4 | 11 | 2 | 3
+ 5 |  5 | 1 | 2
+ 5 | 12 | 2 | 2
+ 6 |  6 | 1 | 0
+ 6 | 20 | 2 | 2
+   | 13 | 1 | 1
+   | 26 | 2 | 3
+(16 rows)
+
+SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+ k  | r  | k  | r  
+----+----+----+----
+  1 | 14 | 26 | 14
+  2 | 26 | 14 | 26
+  3 |  1 | 39 |  1
+  4 | 15 | 25 | 15
+  5 | 27 | 13 | 27
+  6 |  2 | 38 |  2
+  7 | 16 | 24 | 16
+  8 | 28 | 12 | 28
+  9 |  3 | 37 |  3
+ 10 | 17 | 23 | 17
+ 11 | 29 | 11 | 29
+ 12 |  4 | 36 |  4
+ 13 | 18 | 22 | 18
+ 14 | 30 | 10 | 30
+ 15 |  5 | 35 |  5
+ 16 | 19 | 21 | 19
+ 17 | 38 |  2 | 38
+ 18 |  6 | 34 |  6
+ 19 | 20 | 20 | 20
+ 20 | 31 |  9 | 31
+ 21 |  7 | 33 |  7
+ 22 | 21 | 19 | 21
+ 23 | 32 |  8 | 32
+ 24 |  8 | 32 |  8
+ 25 | 22 | 18 | 22
+ 26 | 33 |  7 | 33
+ 27 |  9 | 31 |  9
+ 28 | 23 | 17 | 23
+ 29 | 34 |  6 | 34
+ 30 | 10 | 30 | 10
+ 31 | 24 | 16 | 24
+ 32 | 35 |  5 | 35
+ 33 | 11 | 29 | 11
+ 34 | 39 |  1 | 39
+ 35 | 36 |  4 | 36
+ 36 | 12 | 28 | 12
+ 37 | 25 | 15 | 25
+ 38 | 37 |  3 | 37
+ 39 | 13 | 27 | 13
+(39 rows)
+
+SET datafusion.mode = on;
+SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
+ g | a | k  | rank | dense_rank | row_number 
+---+---+----+------+------------+------------
+ 0 | 0 | 21 |    1 |          1 |          1
+ 0 | 1 |  7 |    2 |          2 |          2
+ 0 | 1 | 28 |    2 |          2 |          3
+ 0 | 2 | 14 |    4 |          3 |          4
+ 1 | 0 | 15 |    1 |          1 |          1
+ 1 | 1 |  1 |    2 |          2 |          2
+ 1 | 1 | 22 |    2 |          2 |          3
+ 1 | 2 |  8 |    4 |          3 |          4
+ 1 | 2 | 29 |    4 |          3 |          5
+ 2 | 0 |  9 |    1 |          1 |          1
+ 2 | 0 | 30 |    1 |          1 |          2
+ 2 | 1 | 16 |    3 |          2 |          3
+ 2 | 2 |  2 |    4 |          3 |          4
+ 2 | 2 | 23 |    4 |          3 |          5
+ 3 | 0 |  3 |    1 |          1 |          1
+ 3 | 0 | 24 |    1 |          1 |          2
+ 3 | 1 | 10 |    3 |          2 |          3
+ 3 |   | 17 |    4 |          3 |          4
+ 4 | 0 | 18 |    1 |          1 |          1
+ 4 | 1 |  4 |    2 |          2 |          2
+ 4 | 1 | 25 |    2 |          2 |          3
+ 4 | 2 | 11 |    4 |          3 |          4
+ 5 | 0 | 12 |    1 |          1 |          1
+ 5 | 1 | 19 |    2 |          2 |          2
+ 5 | 2 |  5 |    3 |          3 |          3
+ 6 | 0 |  6 |    1 |          1 |          1
+ 6 | 0 | 27 |    1 |          1 |          2
+ 6 | 2 | 20 |    3 |          2 |          3
+   | 1 | 13 |    1 |          1 |          1
+   | 2 | 26 |    2 |          2 |          2
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | rank | rank 
+---+---+----+------+------
+ 0 | 0 | 21 |    4 |    1
+ 0 | 1 |  7 |    2 |    2
+ 0 | 1 | 28 |    2 |    2
+ 0 | 2 | 14 |    1 |    4
+ 1 | 0 | 15 |    5 |    1
+ 1 | 1 |  1 |    3 |    2
+ 1 | 1 | 22 |    3 |    2
+ 1 | 2 |  8 |    1 |    4
+ 1 | 2 | 29 |    1 |    4
+ 2 | 0 |  9 |    4 |    1
+ 2 | 0 | 30 |    4 |    1
+ 2 | 1 | 16 |    3 |    3
+ 2 | 2 |  2 |    1 |    4
+ 2 | 2 | 23 |    1 |    4
+ 3 | 0 |  3 |    2 |    2
+ 3 | 0 | 24 |    2 |    2
+ 3 | 1 | 10 |    1 |    4
+ 3 |   | 17 |    4 |    1
+ 4 | 0 | 18 |    4 |    1
+ 4 | 1 |  4 |    2 |    2
+ 4 | 1 | 25 |    2 |    2
+ 4 | 2 | 11 |    1 |    4
+ 5 | 0 | 12 |    3 |    1
+ 5 | 1 | 19 |    2 |    2
+ 5 | 2 |  5 |    1 |    3
+ 6 | 0 |  6 |    2 |    1
+ 6 | 0 | 27 |    2 |    1
+ 6 | 2 | 20 |    1 |    3
+   | 1 | 13 |    2 |    1
+   | 2 | 26 |    1 |    2
+(30 rows)
+
+SELECT k, f, rank() OVER (ORDER BY f), dense_rank() OVER (ORDER BY f DESC), count(*) OVER (PARTITION BY f) FROM df_w WHERE k <= 30 ORDER BY 3, 1;
+ k  |  f  | rank | dense_rank | count 
+----+-----+------+------------+-------
+  1 |   0 |    1 |          4 |    16
+  3 |   0 |    1 |          4 |    16
+  5 |  -0 |    1 |          4 |    16
+  6 |   0 |    1 |          4 |    16
+  9 |   0 |    1 |          4 |    16
+ 10 |  -0 |    1 |          4 |    16
+ 11 |   0 |    1 |          4 |    16
+ 15 |  -0 |    1 |          4 |    16
+ 16 |   0 |    1 |          4 |    16
+ 18 |   0 |    1 |          4 |    16
+ 20 |  -0 |    1 |          4 |    16
+ 21 |   0 |    1 |          4 |    16
+ 24 |   0 |    1 |          4 |    16
+ 25 |  -0 |    1 |          4 |    16
+ 26 |   0 |    1 |          4 |    16
+ 30 |  -0 |    1 |          4 |    16
+  4 |   1 |   17 |          3 |     4
+ 13 |   1 |   17 |          3 |     4
+ 19 |   1 |   17 |          3 |     4
+ 28 |   1 |   17 |          3 |     4
+  8 |   2 |   21 |          2 |     4
+ 14 |   2 |   21 |          2 |     4
+ 23 |   2 |   21 |          2 |     4
+ 29 |   2 |   21 |          2 |     4
+  2 | NaN |   25 |          1 |     6
+  7 | NaN |   25 |          1 |     6
+ 12 | NaN |   25 |          1 |     6
+ 17 | NaN |   25 |          1 |     6
+ 22 | NaN |   25 |          1 |     6
+ 27 | NaN |   25 |          1 |     6
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w WHERE k <= 30 ORDER BY g, a, k DESC;
+ g | a | k  | rank 
+---+---+----+------
+ 0 | 0 | 21 |    1
+ 0 | 1 | 28 |    2
+ 0 | 1 |  7 |    2
+ 0 | 2 | 14 |    4
+ 1 | 0 | 15 |    1
+ 1 | 1 | 22 |    2
+ 1 | 1 |  1 |    2
+ 1 | 2 | 29 |    4
+ 1 | 2 |  8 |    4
+ 2 | 0 | 30 |    1
+ 2 | 0 |  9 |    1
+ 2 | 1 | 16 |    3
+ 2 | 2 | 23 |    4
+ 2 | 2 |  2 |    4
+ 3 | 0 | 24 |    1
+ 3 | 0 |  3 |    1
+ 3 | 1 | 10 |    3
+ 3 |   | 17 |    4
+ 4 | 0 | 18 |    1
+ 4 | 1 | 25 |    2
+ 4 | 1 |  4 |    2
+ 4 | 2 | 11 |    4
+ 5 | 0 | 12 |    1
+ 5 | 1 | 19 |    2
+ 5 | 2 |  5 |    3
+ 6 | 0 | 27 |    1
+ 6 | 0 |  6 |    1
+ 6 | 2 | 20 |    3
+   | 1 | 13 |    1
+   | 2 | 26 |    2
+(30 rows)
+
+SELECT t, k, rank() OVER (PARTITION BY t ORDER BY k % 5 DESC) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+ t  | k  | rank 
+----+----+------
+ v0 |  4 |    1
+ v0 |  8 |    3
+ v0 | 12 |    5
+ v0 | 16 |    6
+ v0 | 20 |    7
+ v0 | 24 |    1
+ v0 | 28 |    3
+ v1 |  1 |    5
+ v1 |  5 |    7
+ v1 |  9 |    1
+ v1 | 13 |    3
+ v1 | 17 |    4
+ v1 | 21 |    5
+ v1 | 25 |    7
+ v1 | 29 |    1
+ v2 |  2 |    3
+ v2 |  6 |    5
+ v2 | 10 |    7
+ v2 | 14 |    1
+ v2 | 18 |    2
+ v2 | 22 |    3
+ v2 | 26 |    5
+ v2 | 30 |    7
+ v3 |  3 |    2
+ v3 |  7 |    4
+ v3 | 11 |    6
+ v3 | 15 |    7
+ v3 | 19 |    1
+ v3 | 23 |    2
+ v3 | 27 |    4
+(30 rows)
+
+SELECT g, a, k, sum(a) OVER (PARTITION BY g ORDER BY a), count(*) OVER (PARTITION BY g), count(a) OVER (PARTITION BY g ORDER BY a), sum(a) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | sum | count | count | sum 
+---+---+----+-----+-------+-------+-----
+ 0 | 0 | 21 |   0 |     4 |     1 |   0
+ 0 | 1 |  7 |   2 |     4 |     3 |   1
+ 0 | 1 | 28 |   2 |     4 |     3 |   2
+ 0 | 2 | 14 |   4 |     4 |     4 |   4
+ 1 | 0 | 15 |   0 |     5 |     1 |   0
+ 1 | 1 |  1 |   2 |     5 |     3 |   1
+ 1 | 1 | 22 |   2 |     5 |     3 |   2
+ 1 | 2 |  8 |   6 |     5 |     5 |   4
+ 1 | 2 | 29 |   6 |     5 |     5 |   6
+ 2 | 0 |  9 |   0 |     5 |     2 |   0
+ 2 | 0 | 30 |   0 |     5 |     2 |   0
+ 2 | 1 | 16 |   1 |     5 |     3 |   1
+ 2 | 2 |  2 |   5 |     5 |     5 |   3
+ 2 | 2 | 23 |   5 |     5 |     5 |   5
+ 3 | 0 |  3 |   0 |     4 |     2 |   0
+ 3 | 0 | 24 |   0 |     4 |     2 |   0
+ 3 | 1 | 10 |   1 |     4 |     3 |   1
+ 3 |   | 17 |   1 |     4 |     3 |   1
+ 4 | 0 | 18 |   0 |     4 |     1 |   0
+ 4 | 1 |  4 |   2 |     4 |     3 |   1
+ 4 | 1 | 25 |   2 |     4 |     3 |   2
+ 4 | 2 | 11 |   4 |     4 |     4 |   4
+ 5 | 0 | 12 |   0 |     3 |     1 |   0
+ 5 | 1 | 19 |   1 |     3 |     2 |   1
+ 5 | 2 |  5 |   3 |     3 |     3 |   3
+ 6 | 0 |  6 |   0 |     3 |     2 |   0
+ 6 | 0 | 27 |   0 |     3 |     2 |   0
+ 6 | 2 | 20 |   2 |     3 |     3 |   2
+   | 1 | 13 |   1 |     2 |     1 |   1
+   | 2 | 26 |   3 |     2 |     2 |   3
+(30 rows)
+
+SELECT g, k, sum(b) OVER (PARTITION BY g), sum(b) OVER (PARTITION BY g ORDER BY k), sum(n) OVER (PARTITION BY g ORDER BY k), sum(m) OVER (PARTITION BY g ORDER BY k) FROM df_w WHERE k <= 100 AND g IN (1, 2) ORDER BY 1, 2;
+ g |  k  |         sum          |         sum          |  sum   |  sum   
+---+-----+----------------------+----------------------+--------+--------
+ 1 |   1 | 56000000000000000672 |  4000000000000000001 |   0.75 |   0.50
+ 1 |   8 | 56000000000000000672 |  8000000000000000009 |   6.75 |   4.50
+ 1 |  15 | 56000000000000000672 | 12000000000000000024 |  18.00 |  12.00
+ 1 |  22 | 56000000000000000672 | 16000000000000000046 |  34.50 |  23.00
+ 1 |  29 | 56000000000000000672 | 20000000000000000075 |  56.25 |  37.50
+ 1 |  36 | 56000000000000000672 | 24000000000000000111 |  83.25 |  55.50
+ 1 |  43 | 56000000000000000672 | 28000000000000000154 | 115.50 |  77.00
+ 1 |  50 | 56000000000000000672 | 32000000000000000204 | 153.00 | 102.00
+ 1 |  57 | 56000000000000000672 | 36000000000000000261 | 195.75 | 130.50
+ 1 |  64 | 56000000000000000672 | 40000000000000000325 | 243.75 | 162.50
+ 1 |  71 | 56000000000000000672 | 44000000000000000396 | 297.00 | 198.00
+ 1 |  85 | 56000000000000000672 | 48000000000000000481 | 360.75 | 240.50
+ 1 |  92 | 56000000000000000672 | 52000000000000000573 | 429.75 | 242.00
+ 1 |  99 | 56000000000000000672 | 56000000000000000672 | 504.00 | 247.00
+ 2 |   2 | 56000000000000000700 |  4000000000000000002 |   1.50 |   1.00
+ 2 |   9 | 56000000000000000700 |  8000000000000000011 |   8.25 |   5.50
+ 2 |  16 | 56000000000000000700 | 12000000000000000027 |  20.25 |  13.50
+ 2 |  23 | 56000000000000000700 | 16000000000000000050 |  37.50 |  25.00
+ 2 |  30 | 56000000000000000700 | 20000000000000000080 |  60.00 |  40.00
+ 2 |  37 | 56000000000000000700 | 24000000000000000117 |  87.75 |  58.50
+ 2 |  44 | 56000000000000000700 | 28000000000000000161 | 120.75 |  80.50
+ 2 |  51 | 56000000000000000700 | 32000000000000000212 | 159.00 | 106.00
+ 2 |  58 | 56000000000000000700 | 36000000000000000270 | 202.50 | 135.00
+ 2 |  72 | 56000000000000000700 | 40000000000000000342 | 256.50 | 171.00
+ 2 |  79 | 56000000000000000700 | 44000000000000000421 | 315.75 | 210.50
+ 2 |  86 | 56000000000000000700 | 48000000000000000507 | 380.25 | 253.50
+ 2 |  93 | 56000000000000000700 | 52000000000000000600 | 450.00 | 255.50
+ 2 | 100 | 56000000000000000700 | 56000000000000000700 | 525.00 | 261.00
+(28 rows)
+
+SELECT g, k, f, min(t) OVER (PARTITION BY g), max(n) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING), min(k) OVER (PARTITION BY g ORDER BY f) FROM df_w WHERE k <= 24 ORDER BY 1, 2;
+ g | k  |  f  | min |  max  | min 
+---+----+-----+-----+-------+-----
+ 0 |  7 | NaN | v1  |  5.25 |   7
+ 0 | 14 |   2 | v1  | 10.50 |  14
+ 0 | 21 |   0 | v1  | 15.75 |  21
+ 1 |  1 |   0 | v0  |  0.75 |   1
+ 1 |  8 |   2 | v0  |  6.00 |   1
+ 1 | 15 |  -0 | v0  | 11.25 |   1
+ 1 | 22 | NaN | v0  | 16.50 |   1
+ 2 |  2 | NaN | v0  |  1.50 |   2
+ 2 |  9 |   0 | v0  |  6.75 |   9
+ 2 | 16 |   0 | v0  | 12.00 |   9
+ 2 | 23 |   2 | v0  | 17.25 |   9
+ 3 |  3 |   0 | v0  |  2.25 |   3
+ 3 | 10 |  -0 | v0  |  7.50 |   3
+ 3 | 17 | NaN | v0  | 12.75 |   3
+ 3 | 24 |   0 | v0  | 18.00 |   3
+ 4 |  4 |   1 | v0  |  3.00 |   4
+ 4 | 11 |   0 | v0  |  8.25 |  11
+ 4 | 18 |   0 | v0  | 13.50 |  11
+ 5 |  5 |  -0 | v0  |  3.75 |   5
+ 5 | 12 | NaN | v0  |  9.00 |   5
+ 5 | 19 |   1 | v0  | 14.25 |   5
+ 6 |  6 |   0 | v0  |  4.50 |   6
+ 6 | 20 |  -0 | v0  | 15.00 |   6
+   | 13 |   1 | v1  |  9.75 |  13
+(24 rows)
+
+SELECT k, count(*) OVER (), sum(a) OVER (), sum(f) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM df_w WHERE k <= 10 AND f = f ORDER BY 1;
+ k  | count | sum | sum 
+----+-------+-----+-----
+  1 |    10 |  10 | NaN
+  2 |    10 |  10 | NaN
+  3 |    10 |  10 | NaN
+  4 |    10 |  10 | NaN
+  5 |    10 |  10 | NaN
+  6 |    10 |  10 | NaN
+  7 |    10 |  10 | NaN
+  8 |    10 |  10 | NaN
+  9 |    10 |  10 | NaN
+ 10 |    10 |  10 | NaN
+(10 rows)
+
+SELECT c, k, count(*) OVER (PARTITION BY c), rank() OVER (ORDER BY c) FROM (SELECT k, CASE WHEN k % 2 = 0 THEN 'ab'::bpchar ELSE 'ab  '::bpchar END c FROM df_w WHERE k <= 6) s ORDER BY 2;
+  c   | k | count | rank 
+------+---+-------+------
+ ab   | 1 |     6 |    1
+ ab   | 2 |     6 |    1
+ ab   | 3 |     6 |    1
+ ab   | 4 |     6 |    1
+ ab   | 5 |     6 |    1
+ ab   | 6 |     6 |    1
+(6 rows)
+
+SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g), sum(sum(n)) OVER (PARTITION BY g ORDER BY a ROWS UNBOUNDED PRECEDING) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+ g | a |      ?column?       |   sum    
+---+---+---------------------+----------
+ 0 | 0 | 34.6505425071859544 | 10035.75
+ 0 | 1 | 33.2910376259160473 | 19677.75
+ 0 | 2 | 32.0584198668979983 | 28962.75
+ 1 | 0 | 32.9948175679212689 |  9454.50
+ 1 | 1 | 34.1045909019525729 | 19227.00
+ 1 | 2 | 32.9005915301261582 | 28654.50
+ 2 | 0 | 32.8370554177005790 |  9528.00
+ 2 | 1 | 33.5323614557485525 | 19257.75
+ 2 | 2 | 33.6305831265508685 | 29016.00
+ 3 | 0 | 34.0144665461121157 |  9875.25
+ 3 | 1 | 33.0767243606303281 | 19478.25
+ 3 | 2 | 32.9088090932575562 | 29032.50
+ 4 | 0 | 33.6143199084191903 |  9690.00
+ 4 | 1 | 33.6923717348319284 | 19402.50
+ 4 | 2 | 32.6933083567488813 | 28827.00
+ 5 | 0 | 32.4883600620796689 |  9420.00
+ 5 | 1 | 33.1143300569063632 | 19021.50
+ 5 | 2 | 34.3973098810139679 | 28995.00
+ 6 | 0 | 33.2164744988054430 |  9593.25
+ 6 | 1 | 32.5127246286485925 | 18983.25
+ 6 | 2 | 34.2708008725459645 | 28881.00
+   | 0 | 33.2770123906073997 |  5760.75
+   | 1 | 33.2163590676717789 | 11511.00
+   | 2 | 33.5066285417208214 | 17311.50
+(24 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+ g |  k  | r 
+---+-----+---
+ 0 | 119 | 1
+ 0 | 238 | 2
+ 0 | 357 | 3
+ 1 |  85 | 1
+ 1 | 204 | 2
+ 1 | 323 | 3
+ 2 |  51 | 1
+ 2 | 170 | 2
+ 2 | 289 | 3
+ 3 |  17 | 1
+ 3 | 136 | 2
+ 3 | 255 | 3
+ 4 | 102 | 1
+ 4 | 340 | 2
+ 4 | 459 | 3
+ 5 |  68 | 1
+ 5 | 187 | 2
+ 5 | 306 | 3
+ 6 |  34 | 1
+ 6 | 153 | 2
+ 6 | 272 | 3
+   | 221 | 1
+   | 442 | 2
+   | 663 | 3
+(24 rows)
+
+SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
+ k  | a | r 
+----+---+---
+  2 | 2 | 1
+  5 | 2 | 2
+  8 | 2 | 3
+ 11 | 2 | 4
+(4 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
+ g | k  | r | s 
+---+----+---+---
+ 0 |  7 | 1 | 1
+ 0 | 14 | 2 | 3
+ 1 |  1 | 1 | 1
+ 1 |  8 | 2 | 3
+ 2 |  2 | 1 | 2
+ 2 |  9 | 2 | 2
+ 3 |  3 | 1 | 0
+ 3 | 10 | 2 | 1
+ 4 |  4 | 1 | 1
+ 4 | 11 | 2 | 3
+ 5 |  5 | 1 | 2
+ 5 | 12 | 2 | 2
+ 6 |  6 | 1 | 0
+ 6 | 20 | 2 | 2
+   | 13 | 1 | 1
+   | 26 | 2 | 3
+(16 rows)
+
+SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+ k  | r  | k  | r  
+----+----+----+----
+  1 | 14 | 26 | 14
+  2 | 26 | 14 | 26
+  3 |  1 | 39 |  1
+  4 | 15 | 25 | 15
+  5 | 27 | 13 | 27
+  6 |  2 | 38 |  2
+  7 | 16 | 24 | 16
+  8 | 28 | 12 | 28
+  9 |  3 | 37 |  3
+ 10 | 17 | 23 | 17
+ 11 | 29 | 11 | 29
+ 12 |  4 | 36 |  4
+ 13 | 18 | 22 | 18
+ 14 | 30 | 10 | 30
+ 15 |  5 | 35 |  5
+ 16 | 19 | 21 | 19
+ 17 | 38 |  2 | 38
+ 18 |  6 | 34 |  6
+ 19 | 20 | 20 | 20
+ 20 | 31 |  9 | 31
+ 21 |  7 | 33 |  7
+ 22 | 21 | 19 | 21
+ 23 | 32 |  8 | 32
+ 24 |  8 | 32 |  8
+ 25 | 22 | 18 | 22
+ 26 | 33 |  7 | 33
+ 27 |  9 | 31 |  9
+ 28 | 23 | 17 | 23
+ 29 | 34 |  6 | 34
+ 30 | 10 | 30 | 10
+ 31 | 24 | 16 | 24
+ 32 | 35 |  5 | 35
+ 33 | 11 | 29 | 11
+ 34 | 39 |  1 | 39
+ 35 | 36 |  4 | 36
+ 36 | 12 | 28 | 12
+ 37 | 25 | 15 | 25
+ 38 | 37 |  3 | 37
+ 39 | 13 | 27 | 13
+(39 rows)
+
+-- GPORCA's plans
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w ORDER BY 1, 2, 3;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, a, k
+   ->  Sort
+         Sort Key: g, a, k
+         ->  WindowAgg
+               Partition By: g
+               Order By: a
+               ->  Sort
+                     Sort Key: g, a
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Seq Scan on df_w
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(16 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, a
+   ->  Result
+         ->  Sort
+               Sort Key: g, a
+               ->  WindowAgg
+                     Partition By: g
+                     ->  Sort
+                           Sort Key: g
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: g
+                                 ->  Finalize HashAggregate
+                                       Group Key: g, a
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: g, a
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: g, a
+                                                   ->  Seq Scan on df_w
+                                                         Filter: (a < 3)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(24 rows)
+
+EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Sort
+   Sort Key: df_w.k
+   ->  Hash Join
+         Hash Cond: ((rank() OVER (?)) = (rank() OVER (?)))
+         ->  WindowAgg
+               Order By: df_w.a, df_w.k
+               ->  Gather Motion 3:1  (slice1; segments: 3)
+                     Merge Key: df_w.a, df_w.k
+                     ->  Sort
+                           Sort Key: df_w.a, df_w.k
+                           ->  Seq Scan on df_w
+                                 Filter: (k < 40)
+         ->  Hash
+               ->  WindowAgg
+                     Order By: df_w_1.b
+                     ->  Gather Motion 3:1  (slice2; segments: 3)
+                           Merge Key: df_w_1.b
+                           ->  Sort
+                                 Sort Key: df_w_1.b DESC
+                                 ->  Seq Scan on df_w df_w_1
+                                       Filter: (k < 40)
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(25 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, (rank() OVER (?)), k
+   ->  Sort
+         Sort Key: g, (rank() OVER (?)), k
+         ->  Result
+               Filter: ((rank() OVER (?)) <= 3)
+               ->  WindowAgg
+                     Partition By: g
+                     Order By: a, k
+                     ->  Sort
+                           Sort Key: g, a DESC, k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: g
+                                 ->  Seq Scan on df_w
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(18 rows)
+
+SET datafusion.mode = off;
+SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
+ g | a | k  | rank | dense_rank | row_number 
+---+---+----+------+------------+------------
+ 0 | 0 | 21 |    1 |          1 |          1
+ 0 | 1 |  7 |    2 |          2 |          2
+ 0 | 1 | 28 |    2 |          2 |          3
+ 0 | 2 | 14 |    4 |          3 |          4
+ 1 | 0 | 15 |    1 |          1 |          1
+ 1 | 1 |  1 |    2 |          2 |          2
+ 1 | 1 | 22 |    2 |          2 |          3
+ 1 | 2 |  8 |    4 |          3 |          4
+ 1 | 2 | 29 |    4 |          3 |          5
+ 2 | 0 |  9 |    1 |          1 |          1
+ 2 | 0 | 30 |    1 |          1 |          2
+ 2 | 1 | 16 |    3 |          2 |          3
+ 2 | 2 |  2 |    4 |          3 |          4
+ 2 | 2 | 23 |    4 |          3 |          5
+ 3 | 0 |  3 |    1 |          1 |          1
+ 3 | 0 | 24 |    1 |          1 |          2
+ 3 | 1 | 10 |    3 |          2 |          3
+ 3 |   | 17 |    4 |          3 |          4
+ 4 | 0 | 18 |    1 |          1 |          1
+ 4 | 1 |  4 |    2 |          2 |          2
+ 4 | 1 | 25 |    2 |          2 |          3
+ 4 | 2 | 11 |    4 |          3 |          4
+ 5 | 0 | 12 |    1 |          1 |          1
+ 5 | 1 | 19 |    2 |          2 |          2
+ 5 | 2 |  5 |    3 |          3 |          3
+ 6 | 0 |  6 |    1 |          1 |          1
+ 6 | 0 | 27 |    1 |          1 |          2
+ 6 | 2 | 20 |    3 |          2 |          3
+   | 1 | 13 |    1 |          1 |          1
+   | 2 | 26 |    2 |          2 |          2
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | rank | rank 
+---+---+----+------+------
+ 0 | 0 | 21 |    4 |    1
+ 0 | 1 |  7 |    2 |    2
+ 0 | 1 | 28 |    2 |    2
+ 0 | 2 | 14 |    1 |    4
+ 1 | 0 | 15 |    5 |    1
+ 1 | 1 |  1 |    3 |    2
+ 1 | 1 | 22 |    3 |    2
+ 1 | 2 |  8 |    1 |    4
+ 1 | 2 | 29 |    1 |    4
+ 2 | 0 |  9 |    4 |    1
+ 2 | 0 | 30 |    4 |    1
+ 2 | 1 | 16 |    3 |    3
+ 2 | 2 |  2 |    1 |    4
+ 2 | 2 | 23 |    1 |    4
+ 3 | 0 |  3 |    2 |    2
+ 3 | 0 | 24 |    2 |    2
+ 3 | 1 | 10 |    1 |    4
+ 3 |   | 17 |    4 |    1
+ 4 | 0 | 18 |    4 |    1
+ 4 | 1 |  4 |    2 |    2
+ 4 | 1 | 25 |    2 |    2
+ 4 | 2 | 11 |    1 |    4
+ 5 | 0 | 12 |    3 |    1
+ 5 | 1 | 19 |    2 |    2
+ 5 | 2 |  5 |    1 |    3
+ 6 | 0 |  6 |    2 |    1
+ 6 | 0 | 27 |    2 |    1
+ 6 | 2 | 20 |    1 |    3
+   | 1 | 13 |    2 |    1
+   | 2 | 26 |    1 |    2
+(30 rows)
+
+SELECT k, f, rank() OVER (ORDER BY f), dense_rank() OVER (ORDER BY f DESC), count(*) OVER (PARTITION BY f) FROM df_w WHERE k <= 30 ORDER BY 3, 1;
+ k  |  f  | rank | dense_rank | count 
+----+-----+------+------------+-------
+  1 |   0 |    1 |          4 |    16
+  3 |   0 |    1 |          4 |    16
+  5 |  -0 |    1 |          4 |    16
+  6 |   0 |    1 |          4 |    16
+  9 |   0 |    1 |          4 |    16
+ 10 |  -0 |    1 |          4 |    16
+ 11 |   0 |    1 |          4 |    16
+ 15 |  -0 |    1 |          4 |    16
+ 16 |   0 |    1 |          4 |    16
+ 18 |   0 |    1 |          4 |    16
+ 20 |  -0 |    1 |          4 |    16
+ 21 |   0 |    1 |          4 |    16
+ 24 |   0 |    1 |          4 |    16
+ 25 |  -0 |    1 |          4 |    16
+ 26 |   0 |    1 |          4 |    16
+ 30 |  -0 |    1 |          4 |    16
+  4 |   1 |   17 |          3 |     4
+ 13 |   1 |   17 |          3 |     4
+ 19 |   1 |   17 |          3 |     4
+ 28 |   1 |   17 |          3 |     4
+  8 |   2 |   21 |          2 |     4
+ 14 |   2 |   21 |          2 |     4
+ 23 |   2 |   21 |          2 |     4
+ 29 |   2 |   21 |          2 |     4
+  2 | NaN |   25 |          1 |     6
+  7 | NaN |   25 |          1 |     6
+ 12 | NaN |   25 |          1 |     6
+ 17 | NaN |   25 |          1 |     6
+ 22 | NaN |   25 |          1 |     6
+ 27 | NaN |   25 |          1 |     6
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w WHERE k <= 30 ORDER BY g, a, k DESC;
+ g | a | k  | rank 
+---+---+----+------
+ 0 | 0 | 21 |    1
+ 0 | 1 | 28 |    2
+ 0 | 1 |  7 |    2
+ 0 | 2 | 14 |    4
+ 1 | 0 | 15 |    1
+ 1 | 1 | 22 |    2
+ 1 | 1 |  1 |    2
+ 1 | 2 | 29 |    4
+ 1 | 2 |  8 |    4
+ 2 | 0 | 30 |    1
+ 2 | 0 |  9 |    1
+ 2 | 1 | 16 |    3
+ 2 | 2 | 23 |    4
+ 2 | 2 |  2 |    4
+ 3 | 0 | 24 |    1
+ 3 | 0 |  3 |    1
+ 3 | 1 | 10 |    3
+ 3 |   | 17 |    4
+ 4 | 0 | 18 |    1
+ 4 | 1 | 25 |    2
+ 4 | 1 |  4 |    2
+ 4 | 2 | 11 |    4
+ 5 | 0 | 12 |    1
+ 5 | 1 | 19 |    2
+ 5 | 2 |  5 |    3
+ 6 | 0 | 27 |    1
+ 6 | 0 |  6 |    1
+ 6 | 2 | 20 |    3
+   | 1 | 13 |    1
+   | 2 | 26 |    2
+(30 rows)
+
+SELECT t, k, rank() OVER (PARTITION BY t ORDER BY k % 5 DESC) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+ t  | k  | rank 
+----+----+------
+ v0 |  4 |    1
+ v0 |  8 |    3
+ v0 | 12 |    5
+ v0 | 16 |    6
+ v0 | 20 |    7
+ v0 | 24 |    1
+ v0 | 28 |    3
+ v1 |  1 |    5
+ v1 |  5 |    7
+ v1 |  9 |    1
+ v1 | 13 |    3
+ v1 | 17 |    4
+ v1 | 21 |    5
+ v1 | 25 |    7
+ v1 | 29 |    1
+ v2 |  2 |    3
+ v2 |  6 |    5
+ v2 | 10 |    7
+ v2 | 14 |    1
+ v2 | 18 |    2
+ v2 | 22 |    3
+ v2 | 26 |    5
+ v2 | 30 |    7
+ v3 |  3 |    2
+ v3 |  7 |    4
+ v3 | 11 |    6
+ v3 | 15 |    7
+ v3 | 19 |    1
+ v3 | 23 |    2
+ v3 | 27 |    4
+(30 rows)
+
+SELECT g, a, k, sum(a) OVER (PARTITION BY g ORDER BY a), count(*) OVER (PARTITION BY g), count(a) OVER (PARTITION BY g ORDER BY a), sum(a) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | sum | count | count | sum 
+---+---+----+-----+-------+-------+-----
+ 0 | 0 | 21 |   0 |     4 |     1 |   0
+ 0 | 1 |  7 |   2 |     4 |     3 |   1
+ 0 | 1 | 28 |   2 |     4 |     3 |   2
+ 0 | 2 | 14 |   4 |     4 |     4 |   4
+ 1 | 0 | 15 |   0 |     5 |     1 |   0
+ 1 | 1 |  1 |   2 |     5 |     3 |   1
+ 1 | 1 | 22 |   2 |     5 |     3 |   2
+ 1 | 2 |  8 |   6 |     5 |     5 |   4
+ 1 | 2 | 29 |   6 |     5 |     5 |   6
+ 2 | 0 |  9 |   0 |     5 |     2 |   0
+ 2 | 0 | 30 |   0 |     5 |     2 |   0
+ 2 | 1 | 16 |   1 |     5 |     3 |   1
+ 2 | 2 |  2 |   5 |     5 |     5 |   3
+ 2 | 2 | 23 |   5 |     5 |     5 |   5
+ 3 | 0 |  3 |   0 |     4 |     2 |   0
+ 3 | 0 | 24 |   0 |     4 |     2 |   0
+ 3 | 1 | 10 |   1 |     4 |     3 |   1
+ 3 |   | 17 |   1 |     4 |     3 |   1
+ 4 | 0 | 18 |   0 |     4 |     1 |   0
+ 4 | 1 |  4 |   2 |     4 |     3 |   1
+ 4 | 1 | 25 |   2 |     4 |     3 |   2
+ 4 | 2 | 11 |   4 |     4 |     4 |   4
+ 5 | 0 | 12 |   0 |     3 |     1 |   0
+ 5 | 1 | 19 |   1 |     3 |     2 |   1
+ 5 | 2 |  5 |   3 |     3 |     3 |   3
+ 6 | 0 |  6 |   0 |     3 |     2 |   0
+ 6 | 0 | 27 |   0 |     3 |     2 |   0
+ 6 | 2 | 20 |   2 |     3 |     3 |   2
+   | 1 | 13 |   1 |     2 |     1 |   1
+   | 2 | 26 |   3 |     2 |     2 |   3
+(30 rows)
+
+SELECT g, k, sum(b) OVER (PARTITION BY g), sum(b) OVER (PARTITION BY g ORDER BY k), sum(n) OVER (PARTITION BY g ORDER BY k), sum(m) OVER (PARTITION BY g ORDER BY k) FROM df_w WHERE k <= 100 AND g IN (1, 2) ORDER BY 1, 2;
+ g |  k  |         sum          |         sum          |  sum   |  sum   
+---+-----+----------------------+----------------------+--------+--------
+ 1 |   1 | 56000000000000000672 |  4000000000000000001 |   0.75 |   0.50
+ 1 |   8 | 56000000000000000672 |  8000000000000000009 |   6.75 |   4.50
+ 1 |  15 | 56000000000000000672 | 12000000000000000024 |  18.00 |  12.00
+ 1 |  22 | 56000000000000000672 | 16000000000000000046 |  34.50 |  23.00
+ 1 |  29 | 56000000000000000672 | 20000000000000000075 |  56.25 |  37.50
+ 1 |  36 | 56000000000000000672 | 24000000000000000111 |  83.25 |  55.50
+ 1 |  43 | 56000000000000000672 | 28000000000000000154 | 115.50 |  77.00
+ 1 |  50 | 56000000000000000672 | 32000000000000000204 | 153.00 | 102.00
+ 1 |  57 | 56000000000000000672 | 36000000000000000261 | 195.75 | 130.50
+ 1 |  64 | 56000000000000000672 | 40000000000000000325 | 243.75 | 162.50
+ 1 |  71 | 56000000000000000672 | 44000000000000000396 | 297.00 | 198.00
+ 1 |  85 | 56000000000000000672 | 48000000000000000481 | 360.75 | 240.50
+ 1 |  92 | 56000000000000000672 | 52000000000000000573 | 429.75 | 242.00
+ 1 |  99 | 56000000000000000672 | 56000000000000000672 | 504.00 | 247.00
+ 2 |   2 | 56000000000000000700 |  4000000000000000002 |   1.50 |   1.00
+ 2 |   9 | 56000000000000000700 |  8000000000000000011 |   8.25 |   5.50
+ 2 |  16 | 56000000000000000700 | 12000000000000000027 |  20.25 |  13.50
+ 2 |  23 | 56000000000000000700 | 16000000000000000050 |  37.50 |  25.00
+ 2 |  30 | 56000000000000000700 | 20000000000000000080 |  60.00 |  40.00
+ 2 |  37 | 56000000000000000700 | 24000000000000000117 |  87.75 |  58.50
+ 2 |  44 | 56000000000000000700 | 28000000000000000161 | 120.75 |  80.50
+ 2 |  51 | 56000000000000000700 | 32000000000000000212 | 159.00 | 106.00
+ 2 |  58 | 56000000000000000700 | 36000000000000000270 | 202.50 | 135.00
+ 2 |  72 | 56000000000000000700 | 40000000000000000342 | 256.50 | 171.00
+ 2 |  79 | 56000000000000000700 | 44000000000000000421 | 315.75 | 210.50
+ 2 |  86 | 56000000000000000700 | 48000000000000000507 | 380.25 | 253.50
+ 2 |  93 | 56000000000000000700 | 52000000000000000600 | 450.00 | 255.50
+ 2 | 100 | 56000000000000000700 | 56000000000000000700 | 525.00 | 261.00
+(28 rows)
+
+SELECT g, k, f, min(t) OVER (PARTITION BY g), max(n) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING), min(k) OVER (PARTITION BY g ORDER BY f) FROM df_w WHERE k <= 24 ORDER BY 1, 2;
+ g | k  |  f  | min |  max  | min 
+---+----+-----+-----+-------+-----
+ 0 |  7 | NaN | v1  |  5.25 |   7
+ 0 | 14 |   2 | v1  | 10.50 |  14
+ 0 | 21 |   0 | v1  | 15.75 |  21
+ 1 |  1 |   0 | v0  |  0.75 |   1
+ 1 |  8 |   2 | v0  |  6.00 |   1
+ 1 | 15 |  -0 | v0  | 11.25 |   1
+ 1 | 22 | NaN | v0  | 16.50 |   1
+ 2 |  2 | NaN | v0  |  1.50 |   2
+ 2 |  9 |   0 | v0  |  6.75 |   9
+ 2 | 16 |   0 | v0  | 12.00 |   9
+ 2 | 23 |   2 | v0  | 17.25 |   9
+ 3 |  3 |   0 | v0  |  2.25 |   3
+ 3 | 10 |  -0 | v0  |  7.50 |   3
+ 3 | 17 | NaN | v0  | 12.75 |   3
+ 3 | 24 |   0 | v0  | 18.00 |   3
+ 4 |  4 |   1 | v0  |  3.00 |   4
+ 4 | 11 |   0 | v0  |  8.25 |  11
+ 4 | 18 |   0 | v0  | 13.50 |  11
+ 5 |  5 |  -0 | v0  |  3.75 |   5
+ 5 | 12 | NaN | v0  |  9.00 |   5
+ 5 | 19 |   1 | v0  | 14.25 |   5
+ 6 |  6 |   0 | v0  |  4.50 |   6
+ 6 | 20 |  -0 | v0  | 15.00 |   6
+   | 13 |   1 | v1  |  9.75 |  13
+(24 rows)
+
+SELECT k, count(*) OVER (), sum(a) OVER (), sum(f) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM df_w WHERE k <= 10 AND f = f ORDER BY 1;
+ k  | count | sum | sum 
+----+-------+-----+-----
+  1 |    10 |  10 | NaN
+  2 |    10 |  10 | NaN
+  3 |    10 |  10 | NaN
+  4 |    10 |  10 | NaN
+  5 |    10 |  10 | NaN
+  6 |    10 |  10 | NaN
+  7 |    10 |  10 | NaN
+  8 |    10 |  10 | NaN
+  9 |    10 |  10 | NaN
+ 10 |    10 |  10 | NaN
+(10 rows)
+
+SELECT c, k, count(*) OVER (PARTITION BY c), rank() OVER (ORDER BY c) FROM (SELECT k, CASE WHEN k % 2 = 0 THEN 'ab'::bpchar ELSE 'ab  '::bpchar END c FROM df_w WHERE k <= 6) s ORDER BY 2;
+  c   | k | count | rank 
+------+---+-------+------
+ ab   | 1 |     6 |    1
+ ab   | 2 |     6 |    1
+ ab   | 3 |     6 |    1
+ ab   | 4 |     6 |    1
+ ab   | 5 |     6 |    1
+ ab   | 6 |     6 |    1
+(6 rows)
+
+SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g), sum(sum(n)) OVER (PARTITION BY g ORDER BY a ROWS UNBOUNDED PRECEDING) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+ g | a |      ?column?       |   sum    
+---+---+---------------------+----------
+ 0 | 0 | 34.6505425071859544 | 10035.75
+ 0 | 1 | 33.2910376259160473 | 19677.75
+ 0 | 2 | 32.0584198668979983 | 28962.75
+ 1 | 0 | 32.9948175679212689 |  9454.50
+ 1 | 1 | 34.1045909019525729 | 19227.00
+ 1 | 2 | 32.9005915301261582 | 28654.50
+ 2 | 0 | 32.8370554177005790 |  9528.00
+ 2 | 1 | 33.5323614557485525 | 19257.75
+ 2 | 2 | 33.6305831265508685 | 29016.00
+ 3 | 0 | 34.0144665461121157 |  9875.25
+ 3 | 1 | 33.0767243606303281 | 19478.25
+ 3 | 2 | 32.9088090932575562 | 29032.50
+ 4 | 0 | 33.6143199084191903 |  9690.00
+ 4 | 1 | 33.6923717348319284 | 19402.50
+ 4 | 2 | 32.6933083567488813 | 28827.00
+ 5 | 0 | 32.4883600620796689 |  9420.00
+ 5 | 1 | 33.1143300569063632 | 19021.50
+ 5 | 2 | 34.3973098810139679 | 28995.00
+ 6 | 0 | 33.2164744988054430 |  9593.25
+ 6 | 1 | 32.5127246286485925 | 18983.25
+ 6 | 2 | 34.2708008725459645 | 28881.00
+   | 0 | 33.2770123906073997 |  5760.75
+   | 1 | 33.2163590676717789 | 11511.00
+   | 2 | 33.5066285417208214 | 17311.50
+(24 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+ g |  k  | r 
+---+-----+---
+ 0 | 119 | 1
+ 0 | 238 | 2
+ 0 | 357 | 3
+ 1 |  85 | 1
+ 1 | 204 | 2
+ 1 | 323 | 3
+ 2 |  51 | 1
+ 2 | 170 | 2
+ 2 | 289 | 3
+ 3 |  17 | 1
+ 3 | 136 | 2
+ 3 | 255 | 3
+ 4 | 102 | 1
+ 4 | 340 | 2
+ 4 | 459 | 3
+ 5 |  68 | 1
+ 5 | 187 | 2
+ 5 | 306 | 3
+ 6 |  34 | 1
+ 6 | 153 | 2
+ 6 | 272 | 3
+   | 221 | 1
+   | 442 | 2
+   | 663 | 3
+(24 rows)
+
+SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
+ k  | a | r 
+----+---+---
+  2 | 2 | 1
+  5 | 2 | 2
+  8 | 2 | 3
+ 11 | 2 | 4
+(4 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
+ g | k  | r | s 
+---+----+---+---
+ 0 |  7 | 1 | 1
+ 0 | 14 | 2 | 3
+ 1 |  1 | 1 | 1
+ 1 |  8 | 2 | 3
+ 2 |  2 | 1 | 2
+ 2 |  9 | 2 | 2
+ 3 |  3 | 1 | 0
+ 3 | 10 | 2 | 1
+ 4 |  4 | 1 | 1
+ 4 | 11 | 2 | 3
+ 5 |  5 | 1 | 2
+ 5 | 12 | 2 | 2
+ 6 |  6 | 1 | 0
+ 6 | 20 | 2 | 2
+   | 13 | 1 | 1
+   | 26 | 2 | 3
+(16 rows)
+
+SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+ k  | r  | k  | r  
+----+----+----+----
+  1 | 14 | 26 | 14
+  2 | 26 | 14 | 26
+  3 |  1 | 39 |  1
+  4 | 15 | 25 | 15
+  5 | 27 | 13 | 27
+  6 |  2 | 38 |  2
+  7 | 16 | 24 | 16
+  8 | 28 | 12 | 28
+  9 |  3 | 37 |  3
+ 10 | 17 | 23 | 17
+ 11 | 29 | 11 | 29
+ 12 |  4 | 36 |  4
+ 13 | 18 | 22 | 18
+ 14 | 30 | 10 | 30
+ 15 |  5 | 35 |  5
+ 16 | 19 | 21 | 19
+ 17 | 38 |  2 | 38
+ 18 |  6 | 34 |  6
+ 19 | 20 | 20 | 20
+ 20 | 31 |  9 | 31
+ 21 |  7 | 33 |  7
+ 22 | 21 | 19 | 21
+ 23 | 32 |  8 | 32
+ 24 |  8 | 32 |  8
+ 25 | 22 | 18 | 22
+ 26 | 33 |  7 | 33
+ 27 |  9 | 31 |  9
+ 28 | 23 | 17 | 23
+ 29 | 34 |  6 | 34
+ 30 | 10 | 30 | 10
+ 31 | 24 | 16 | 24
+ 32 | 35 |  5 | 35
+ 33 | 11 | 29 | 11
+ 34 | 39 |  1 | 39
+ 35 | 36 |  4 | 36
+ 36 | 12 | 28 | 12
+ 37 | 25 | 15 | 25
+ 38 | 37 |  3 | 37
+ 39 | 13 | 27 | 13
+(39 rows)
+
+SET datafusion.mode = on;
+SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
+ g | a | k  | rank | dense_rank | row_number 
+---+---+----+------+------------+------------
+ 0 | 0 | 21 |    1 |          1 |          1
+ 0 | 1 |  7 |    2 |          2 |          2
+ 0 | 1 | 28 |    2 |          2 |          3
+ 0 | 2 | 14 |    4 |          3 |          4
+ 1 | 0 | 15 |    1 |          1 |          1
+ 1 | 1 |  1 |    2 |          2 |          2
+ 1 | 1 | 22 |    2 |          2 |          3
+ 1 | 2 |  8 |    4 |          3 |          4
+ 1 | 2 | 29 |    4 |          3 |          5
+ 2 | 0 |  9 |    1 |          1 |          1
+ 2 | 0 | 30 |    1 |          1 |          2
+ 2 | 1 | 16 |    3 |          2 |          3
+ 2 | 2 |  2 |    4 |          3 |          4
+ 2 | 2 | 23 |    4 |          3 |          5
+ 3 | 0 |  3 |    1 |          1 |          1
+ 3 | 0 | 24 |    1 |          1 |          2
+ 3 | 1 | 10 |    3 |          2 |          3
+ 3 |   | 17 |    4 |          3 |          4
+ 4 | 0 | 18 |    1 |          1 |          1
+ 4 | 1 |  4 |    2 |          2 |          2
+ 4 | 1 | 25 |    2 |          2 |          3
+ 4 | 2 | 11 |    4 |          3 |          4
+ 5 | 0 | 12 |    1 |          1 |          1
+ 5 | 1 | 19 |    2 |          2 |          2
+ 5 | 2 |  5 |    3 |          3 |          3
+ 6 | 0 |  6 |    1 |          1 |          1
+ 6 | 0 | 27 |    1 |          1 |          2
+ 6 | 2 | 20 |    3 |          2 |          3
+   | 1 | 13 |    1 |          1 |          1
+   | 2 | 26 |    2 |          2 |          2
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | rank | rank 
+---+---+----+------+------
+ 0 | 0 | 21 |    4 |    1
+ 0 | 1 |  7 |    2 |    2
+ 0 | 1 | 28 |    2 |    2
+ 0 | 2 | 14 |    1 |    4
+ 1 | 0 | 15 |    5 |    1
+ 1 | 1 |  1 |    3 |    2
+ 1 | 1 | 22 |    3 |    2
+ 1 | 2 |  8 |    1 |    4
+ 1 | 2 | 29 |    1 |    4
+ 2 | 0 |  9 |    4 |    1
+ 2 | 0 | 30 |    4 |    1
+ 2 | 1 | 16 |    3 |    3
+ 2 | 2 |  2 |    1 |    4
+ 2 | 2 | 23 |    1 |    4
+ 3 | 0 |  3 |    2 |    2
+ 3 | 0 | 24 |    2 |    2
+ 3 | 1 | 10 |    1 |    4
+ 3 |   | 17 |    4 |    1
+ 4 | 0 | 18 |    4 |    1
+ 4 | 1 |  4 |    2 |    2
+ 4 | 1 | 25 |    2 |    2
+ 4 | 2 | 11 |    1 |    4
+ 5 | 0 | 12 |    3 |    1
+ 5 | 1 | 19 |    2 |    2
+ 5 | 2 |  5 |    1 |    3
+ 6 | 0 |  6 |    2 |    1
+ 6 | 0 | 27 |    2 |    1
+ 6 | 2 | 20 |    1 |    3
+   | 1 | 13 |    2 |    1
+   | 2 | 26 |    1 |    2
+(30 rows)
+
+SELECT k, f, rank() OVER (ORDER BY f), dense_rank() OVER (ORDER BY f DESC), count(*) OVER (PARTITION BY f) FROM df_w WHERE k <= 30 ORDER BY 3, 1;
+ k  |  f  | rank | dense_rank | count 
+----+-----+------+------------+-------
+  1 |   0 |    1 |          4 |    16
+  3 |   0 |    1 |          4 |    16
+  5 |  -0 |    1 |          4 |    16
+  6 |   0 |    1 |          4 |    16
+  9 |   0 |    1 |          4 |    16
+ 10 |  -0 |    1 |          4 |    16
+ 11 |   0 |    1 |          4 |    16
+ 15 |  -0 |    1 |          4 |    16
+ 16 |   0 |    1 |          4 |    16
+ 18 |   0 |    1 |          4 |    16
+ 20 |  -0 |    1 |          4 |    16
+ 21 |   0 |    1 |          4 |    16
+ 24 |   0 |    1 |          4 |    16
+ 25 |  -0 |    1 |          4 |    16
+ 26 |   0 |    1 |          4 |    16
+ 30 |  -0 |    1 |          4 |    16
+  4 |   1 |   17 |          3 |     4
+ 13 |   1 |   17 |          3 |     4
+ 19 |   1 |   17 |          3 |     4
+ 28 |   1 |   17 |          3 |     4
+  8 |   2 |   21 |          2 |     4
+ 14 |   2 |   21 |          2 |     4
+ 23 |   2 |   21 |          2 |     4
+ 29 |   2 |   21 |          2 |     4
+  2 | NaN |   25 |          1 |     6
+  7 | NaN |   25 |          1 |     6
+ 12 | NaN |   25 |          1 |     6
+ 17 | NaN |   25 |          1 |     6
+ 22 | NaN |   25 |          1 |     6
+ 27 | NaN |   25 |          1 |     6
+(30 rows)
+
+SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w WHERE k <= 30 ORDER BY g, a, k DESC;
+ g | a | k  | rank 
+---+---+----+------
+ 0 | 0 | 21 |    1
+ 0 | 1 | 28 |    2
+ 0 | 1 |  7 |    2
+ 0 | 2 | 14 |    4
+ 1 | 0 | 15 |    1
+ 1 | 1 | 22 |    2
+ 1 | 1 |  1 |    2
+ 1 | 2 | 29 |    4
+ 1 | 2 |  8 |    4
+ 2 | 0 | 30 |    1
+ 2 | 0 |  9 |    1
+ 2 | 1 | 16 |    3
+ 2 | 2 | 23 |    4
+ 2 | 2 |  2 |    4
+ 3 | 0 | 24 |    1
+ 3 | 0 |  3 |    1
+ 3 | 1 | 10 |    3
+ 3 |   | 17 |    4
+ 4 | 0 | 18 |    1
+ 4 | 1 | 25 |    2
+ 4 | 1 |  4 |    2
+ 4 | 2 | 11 |    4
+ 5 | 0 | 12 |    1
+ 5 | 1 | 19 |    2
+ 5 | 2 |  5 |    3
+ 6 | 0 | 27 |    1
+ 6 | 0 |  6 |    1
+ 6 | 2 | 20 |    3
+   | 1 | 13 |    1
+   | 2 | 26 |    2
+(30 rows)
+
+SELECT t, k, rank() OVER (PARTITION BY t ORDER BY k % 5 DESC) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+ t  | k  | rank 
+----+----+------
+ v0 |  4 |    1
+ v0 |  8 |    3
+ v0 | 12 |    5
+ v0 | 16 |    6
+ v0 | 20 |    7
+ v0 | 24 |    1
+ v0 | 28 |    3
+ v1 |  1 |    5
+ v1 |  5 |    7
+ v1 |  9 |    1
+ v1 | 13 |    3
+ v1 | 17 |    4
+ v1 | 21 |    5
+ v1 | 25 |    7
+ v1 | 29 |    1
+ v2 |  2 |    3
+ v2 |  6 |    5
+ v2 | 10 |    7
+ v2 | 14 |    1
+ v2 | 18 |    2
+ v2 | 22 |    3
+ v2 | 26 |    5
+ v2 | 30 |    7
+ v3 |  3 |    2
+ v3 |  7 |    4
+ v3 | 11 |    6
+ v3 | 15 |    7
+ v3 | 19 |    1
+ v3 | 23 |    2
+ v3 | 27 |    4
+(30 rows)
+
+SELECT g, a, k, sum(a) OVER (PARTITION BY g ORDER BY a), count(*) OVER (PARTITION BY g), count(a) OVER (PARTITION BY g ORDER BY a), sum(a) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
+ g | a | k  | sum | count | count | sum 
+---+---+----+-----+-------+-------+-----
+ 0 | 0 | 21 |   0 |     4 |     1 |   0
+ 0 | 1 |  7 |   2 |     4 |     3 |   1
+ 0 | 1 | 28 |   2 |     4 |     3 |   2
+ 0 | 2 | 14 |   4 |     4 |     4 |   4
+ 1 | 0 | 15 |   0 |     5 |     1 |   0
+ 1 | 1 |  1 |   2 |     5 |     3 |   1
+ 1 | 1 | 22 |   2 |     5 |     3 |   2
+ 1 | 2 |  8 |   6 |     5 |     5 |   4
+ 1 | 2 | 29 |   6 |     5 |     5 |   6
+ 2 | 0 |  9 |   0 |     5 |     2 |   0
+ 2 | 0 | 30 |   0 |     5 |     2 |   0
+ 2 | 1 | 16 |   1 |     5 |     3 |   1
+ 2 | 2 |  2 |   5 |     5 |     5 |   3
+ 2 | 2 | 23 |   5 |     5 |     5 |   5
+ 3 | 0 |  3 |   0 |     4 |     2 |   0
+ 3 | 0 | 24 |   0 |     4 |     2 |   0
+ 3 | 1 | 10 |   1 |     4 |     3 |   1
+ 3 |   | 17 |   1 |     4 |     3 |   1
+ 4 | 0 | 18 |   0 |     4 |     1 |   0
+ 4 | 1 |  4 |   2 |     4 |     3 |   1
+ 4 | 1 | 25 |   2 |     4 |     3 |   2
+ 4 | 2 | 11 |   4 |     4 |     4 |   4
+ 5 | 0 | 12 |   0 |     3 |     1 |   0
+ 5 | 1 | 19 |   1 |     3 |     2 |   1
+ 5 | 2 |  5 |   3 |     3 |     3 |   3
+ 6 | 0 |  6 |   0 |     3 |     2 |   0
+ 6 | 0 | 27 |   0 |     3 |     2 |   0
+ 6 | 2 | 20 |   2 |     3 |     3 |   2
+   | 1 | 13 |   1 |     2 |     1 |   1
+   | 2 | 26 |   3 |     2 |     2 |   3
+(30 rows)
+
+SELECT g, k, sum(b) OVER (PARTITION BY g), sum(b) OVER (PARTITION BY g ORDER BY k), sum(n) OVER (PARTITION BY g ORDER BY k), sum(m) OVER (PARTITION BY g ORDER BY k) FROM df_w WHERE k <= 100 AND g IN (1, 2) ORDER BY 1, 2;
+ g |  k  |         sum          |         sum          |  sum   |  sum   
+---+-----+----------------------+----------------------+--------+--------
+ 1 |   1 | 56000000000000000672 |  4000000000000000001 |   0.75 |   0.50
+ 1 |   8 | 56000000000000000672 |  8000000000000000009 |   6.75 |   4.50
+ 1 |  15 | 56000000000000000672 | 12000000000000000024 |  18.00 |  12.00
+ 1 |  22 | 56000000000000000672 | 16000000000000000046 |  34.50 |  23.00
+ 1 |  29 | 56000000000000000672 | 20000000000000000075 |  56.25 |  37.50
+ 1 |  36 | 56000000000000000672 | 24000000000000000111 |  83.25 |  55.50
+ 1 |  43 | 56000000000000000672 | 28000000000000000154 | 115.50 |  77.00
+ 1 |  50 | 56000000000000000672 | 32000000000000000204 | 153.00 | 102.00
+ 1 |  57 | 56000000000000000672 | 36000000000000000261 | 195.75 | 130.50
+ 1 |  64 | 56000000000000000672 | 40000000000000000325 | 243.75 | 162.50
+ 1 |  71 | 56000000000000000672 | 44000000000000000396 | 297.00 | 198.00
+ 1 |  85 | 56000000000000000672 | 48000000000000000481 | 360.75 | 240.50
+ 1 |  92 | 56000000000000000672 | 52000000000000000573 | 429.75 | 242.00
+ 1 |  99 | 56000000000000000672 | 56000000000000000672 | 504.00 | 247.00
+ 2 |   2 | 56000000000000000700 |  4000000000000000002 |   1.50 |   1.00
+ 2 |   9 | 56000000000000000700 |  8000000000000000011 |   8.25 |   5.50
+ 2 |  16 | 56000000000000000700 | 12000000000000000027 |  20.25 |  13.50
+ 2 |  23 | 56000000000000000700 | 16000000000000000050 |  37.50 |  25.00
+ 2 |  30 | 56000000000000000700 | 20000000000000000080 |  60.00 |  40.00
+ 2 |  37 | 56000000000000000700 | 24000000000000000117 |  87.75 |  58.50
+ 2 |  44 | 56000000000000000700 | 28000000000000000161 | 120.75 |  80.50
+ 2 |  51 | 56000000000000000700 | 32000000000000000212 | 159.00 | 106.00
+ 2 |  58 | 56000000000000000700 | 36000000000000000270 | 202.50 | 135.00
+ 2 |  72 | 56000000000000000700 | 40000000000000000342 | 256.50 | 171.00
+ 2 |  79 | 56000000000000000700 | 44000000000000000421 | 315.75 | 210.50
+ 2 |  86 | 56000000000000000700 | 48000000000000000507 | 380.25 | 253.50
+ 2 |  93 | 56000000000000000700 | 52000000000000000600 | 450.00 | 255.50
+ 2 | 100 | 56000000000000000700 | 56000000000000000700 | 525.00 | 261.00
+(28 rows)
+
+SELECT g, k, f, min(t) OVER (PARTITION BY g), max(n) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING), min(k) OVER (PARTITION BY g ORDER BY f) FROM df_w WHERE k <= 24 ORDER BY 1, 2;
+ g | k  |  f  | min |  max  | min 
+---+----+-----+-----+-------+-----
+ 0 |  7 | NaN | v1  |  5.25 |   7
+ 0 | 14 |   2 | v1  | 10.50 |  14
+ 0 | 21 |   0 | v1  | 15.75 |  21
+ 1 |  1 |   0 | v0  |  0.75 |   1
+ 1 |  8 |   2 | v0  |  6.00 |   1
+ 1 | 15 |  -0 | v0  | 11.25 |   1
+ 1 | 22 | NaN | v0  | 16.50 |   1
+ 2 |  2 | NaN | v0  |  1.50 |   2
+ 2 |  9 |   0 | v0  |  6.75 |   9
+ 2 | 16 |   0 | v0  | 12.00 |   9
+ 2 | 23 |   2 | v0  | 17.25 |   9
+ 3 |  3 |   0 | v0  |  2.25 |   3
+ 3 | 10 |  -0 | v0  |  7.50 |   3
+ 3 | 17 | NaN | v0  | 12.75 |   3
+ 3 | 24 |   0 | v0  | 18.00 |   3
+ 4 |  4 |   1 | v0  |  3.00 |   4
+ 4 | 11 |   0 | v0  |  8.25 |  11
+ 4 | 18 |   0 | v0  | 13.50 |  11
+ 5 |  5 |  -0 | v0  |  3.75 |   5
+ 5 | 12 | NaN | v0  |  9.00 |   5
+ 5 | 19 |   1 | v0  | 14.25 |   5
+ 6 |  6 |   0 | v0  |  4.50 |   6
+ 6 | 20 |  -0 | v0  | 15.00 |   6
+   | 13 |   1 | v1  |  9.75 |  13
+(24 rows)
+
+SELECT k, count(*) OVER (), sum(a) OVER (), sum(f) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM df_w WHERE k <= 10 AND f = f ORDER BY 1;
+ k  | count | sum | sum 
+----+-------+-----+-----
+  1 |    10 |  10 | NaN
+  2 |    10 |  10 | NaN
+  3 |    10 |  10 | NaN
+  4 |    10 |  10 | NaN
+  5 |    10 |  10 | NaN
+  6 |    10 |  10 | NaN
+  7 |    10 |  10 | NaN
+  8 |    10 |  10 | NaN
+  9 |    10 |  10 | NaN
+ 10 |    10 |  10 | NaN
+(10 rows)
+
+SELECT c, k, count(*) OVER (PARTITION BY c), rank() OVER (ORDER BY c) FROM (SELECT k, CASE WHEN k % 2 = 0 THEN 'ab'::bpchar ELSE 'ab  '::bpchar END c FROM df_w WHERE k <= 6) s ORDER BY 2;
+  c   | k | count | rank 
+------+---+-------+------
+ ab   | 1 |     6 |    1
+ ab   | 2 |     6 |    1
+ ab   | 3 |     6 |    1
+ ab   | 4 |     6 |    1
+ ab   | 5 |     6 |    1
+ ab   | 6 |     6 |    1
+(6 rows)
+
+SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g), sum(sum(n)) OVER (PARTITION BY g ORDER BY a ROWS UNBOUNDED PRECEDING) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
+ g | a |      ?column?       |   sum    
+---+---+---------------------+----------
+ 0 | 0 | 34.6505425071859544 | 10035.75
+ 0 | 1 | 33.2910376259160473 | 19677.75
+ 0 | 2 | 32.0584198668979983 | 28962.75
+ 1 | 0 | 32.9948175679212689 |  9454.50
+ 1 | 1 | 34.1045909019525729 | 19227.00
+ 1 | 2 | 32.9005915301261582 | 28654.50
+ 2 | 0 | 32.8370554177005790 |  9528.00
+ 2 | 1 | 33.5323614557485525 | 19257.75
+ 2 | 2 | 33.6305831265508685 | 29016.00
+ 3 | 0 | 34.0144665461121157 |  9875.25
+ 3 | 1 | 33.0767243606303281 | 19478.25
+ 3 | 2 | 32.9088090932575562 | 29032.50
+ 4 | 0 | 33.6143199084191903 |  9690.00
+ 4 | 1 | 33.6923717348319284 | 19402.50
+ 4 | 2 | 32.6933083567488813 | 28827.00
+ 5 | 0 | 32.4883600620796689 |  9420.00
+ 5 | 1 | 33.1143300569063632 | 19021.50
+ 5 | 2 | 34.3973098810139679 | 28995.00
+ 6 | 0 | 33.2164744988054430 |  9593.25
+ 6 | 1 | 32.5127246286485925 | 18983.25
+ 6 | 2 | 34.2708008725459645 | 28881.00
+   | 0 | 33.2770123906073997 |  5760.75
+   | 1 | 33.2163590676717789 | 11511.00
+   | 2 | 33.5066285417208214 | 17311.50
+(24 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+ g |  k  | r 
+---+-----+---
+ 0 | 119 | 1
+ 0 | 238 | 2
+ 0 | 357 | 3
+ 1 |  85 | 1
+ 1 | 204 | 2
+ 1 | 323 | 3
+ 2 |  51 | 1
+ 2 | 170 | 2
+ 2 | 289 | 3
+ 3 |  17 | 1
+ 3 | 136 | 2
+ 3 | 255 | 3
+ 4 | 102 | 1
+ 4 | 340 | 2
+ 4 | 459 | 3
+ 5 |  68 | 1
+ 5 | 187 | 2
+ 5 | 306 | 3
+ 6 |  34 | 1
+ 6 | 153 | 2
+ 6 | 272 | 3
+   | 221 | 1
+   | 442 | 2
+   | 663 | 3
+(24 rows)
+
+SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
+ k  | a | r 
+----+---+---
+  2 | 2 | 1
+  5 | 2 | 2
+  8 | 2 | 3
+ 11 | 2 | 4
+(4 rows)
+
+SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
+ g | k  | r | s 
+---+----+---+---
+ 0 |  7 | 1 | 1
+ 0 | 14 | 2 | 3
+ 1 |  1 | 1 | 1
+ 1 |  8 | 2 | 3
+ 2 |  2 | 1 | 2
+ 2 |  9 | 2 | 2
+ 3 |  3 | 1 | 0
+ 3 | 10 | 2 | 1
+ 4 |  4 | 1 | 1
+ 4 | 11 | 2 | 3
+ 5 |  5 | 1 | 2
+ 5 | 12 | 2 | 2
+ 6 |  6 | 1 | 0
+ 6 | 20 | 2 | 2
+   | 13 | 1 | 1
+   | 26 | 2 | 3
+(16 rows)
+
+SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+ k  | r  | k  | r  
+----+----+----+----
+  1 | 14 | 26 | 14
+  2 | 26 | 14 | 26
+  3 |  1 | 39 |  1
+  4 | 15 | 25 | 15
+  5 | 27 | 13 | 27
+  6 |  2 | 38 |  2
+  7 | 16 | 24 | 16
+  8 | 28 | 12 | 28
+  9 |  3 | 37 |  3
+ 10 | 17 | 23 | 17
+ 11 | 29 | 11 | 29
+ 12 |  4 | 36 |  4
+ 13 | 18 | 22 | 18
+ 14 | 30 | 10 | 30
+ 15 |  5 | 35 |  5
+ 16 | 19 | 21 | 19
+ 17 | 38 |  2 | 38
+ 18 |  6 | 34 |  6
+ 19 | 20 | 20 | 20
+ 20 | 31 |  9 | 31
+ 21 |  7 | 33 |  7
+ 22 | 21 | 19 | 21
+ 23 | 32 |  8 | 32
+ 24 |  8 | 32 |  8
+ 25 | 22 | 18 | 22
+ 26 | 33 |  7 | 33
+ 27 |  9 | 31 |  9
+ 28 | 23 | 17 | 23
+ 29 | 34 |  6 | 34
+ 30 | 10 | 30 | 10
+ 31 | 24 | 16 | 24
+ 32 | 35 |  5 | 35
+ 33 | 11 | 29 | 11
+ 34 | 39 |  1 | 39
+ 35 | 36 |  4 | 36
+ 36 | 12 | 28 | 12
+ 37 | 25 | 15 | 25
+ 38 | 37 |  3 | 37
+ 39 | 13 | 27 | 13
+(39 rows)
+
+-- Not supported: avg, other window functions, min and max of floats (of
+-- -0 and 0, PostgreSQL's keep the later), other frames, FILTER; a run
+-- condition below the top WindowAgg.
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, avg(n) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, (avg(n) OVER (?))
+   ->  Sort
+         Sort Key: g, (avg(n) OVER (?))
+         ->  WindowAgg
+               Partition By: g
+               ->  Sort
+                     Sort Key: g
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window function avg
+ DataFusion: slice 2 eligible
+(15 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, ntile(3) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  WindowAgg
+         Partition By: g
+         Order By: k
+         ->  Sort
+               Sort Key: g, k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g
+                     ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window function ntile
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, lag(k) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  WindowAgg
+         Partition By: g
+         Order By: k
+         ->  Sort
+               Sort Key: g, k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g
+                     ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window function lag
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, max(f) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  WindowAgg
+         Partition By: g
+         Order By: k
+         ->  Sort
+               Sort Key: g, k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g
+                     ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window function max of double precision
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM df_w ORDER BY 1, 2;
+                                                          QUERY PLAN                                                          
+------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  WindowAgg
+         Partition By: g
+         Order By: k
+         ->  Sort
+               Sort Key: g, k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g
+                     ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window frame other than from the first row of the partition to the current row or the last
+ DataFusion: slice 2 eligible
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, count(*) FILTER (WHERE a > 3) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  Sort
+         Sort Key: g, k
+         ->  WindowAgg
+               Partition By: g
+               ->  Sort
+                     Sort Key: g
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: FILTER clause on window function count
+ DataFusion: slice 2 eligible
+(15 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, count(*) OVER (PARTITION BY g ORDER BY k, a) c FROM df_w) x WHERE c < 3 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: x.g, x.k
+   ->  Subquery Scan on x
+         ->  WindowAgg
+               Filter: ((count(*) OVER (?)) < 3)
+               Partition By: df_w.g
+               Order By: df_w.k
+               ->  WindowAgg
+                     Run Condition: (count(*) OVER (?) < 3)
+                     Partition By: df_w.g
+                     Order By: df_w.k, df_w.a
+                     ->  Sort
+                           Sort Key: df_w.g, df_w.k, df_w.a
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: df_w.g
+                                 ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: run condition of a WindowAgg below another
+ DataFusion: slice 2 eligible
+(20 rows)
+
+-- A window over whole partitions holds all its rows, within work_mem by
+-- the planner's estimate; one up to the current row does not.
+SET work_mem = '64kB';
+EXPLAIN (COSTS OFF) SELECT g, k, t, n, m, f, b, sum(a) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  Sort
+         Sort Key: g, k
+         ->  WindowAgg
+               Partition By: g
+               ->  Sort
+                     Sort Key: g
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: g
+                           ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: window over whole partitions of about 88 kB exceeds its 64 kB
+ DataFusion: slice 2 eligible
+(15 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, k, t, n, m, f, b, sum(a) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, k
+   ->  WindowAgg
+         Partition By: g
+         Order By: k
+         ->  Sort
+               Sort Key: g, k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g
+                     ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+RESET work_mem;
+RESET datafusion.mode;
+DROP TABLE df_w;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

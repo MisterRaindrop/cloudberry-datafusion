@@ -497,6 +497,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | GS1 | GROUPING SETS, ROLLUP and CUBE; `GROUPING()`, `GROUP_ID()` |
 | DN1 | numeric of display scales of their own: `/`, CASE and COALESCE of mixed scales |
 | AV2 | avg returning numeric as a sort key and above its Agg, with its display scale |
+| WIN1 | Window functions: row_number, rank, dense_rank; count, sum, min, max over a frame |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1175,6 +1176,65 @@ TPC-DS executions under the Postgres planner; none now.
 Before GS1 the plan check did not look at the sets.  Their Agg names the
 grouping columns of one set only, and running it as that GROUP BY lost
 the other sets' rows.
+
+### Window functions
+
+WIN1: `row_number`, `rank` and `dense_rank`, and `count`, `sum`, `min` and
+`max` over a frame from the partition's first row to the current row
+(ROWS), to its last peer (RANGE, the default with an ORDER BY) or to the
+partition's last row (the default without).  DataFusion sorts the rows by
+the partition and order keys itself, in the directions of the Sort or
+merging Motion that ordered PostgreSQL's rows, found through the nodes
+that keep their order (a GroupAggregate, Subquery Scan, Result, another
+WindowAgg); the keys compare as PostgreSQL compares them (floats through
+`pg_float_key`, character values without trailing blanks, strings under a
+C collation).  The Sort below goes unused.  An aggregate over a frame is
+checked and built as over a group: `sum(int8)` is numeric, `sum` of
+numeric exact and NaN if any value is; ranks are int8.  The window
+functions are columns of the WindowAgg's node, which the nodes above read
+by name, so that a WindowAgg runs below a join as well (TPC-DS Q44).
+
+Where the WindowAgg's rows leave the slice in the order they came in (to
+a merging Gather when the ORDER BY is the window's, or to the client),
+the slice sorts its output by the keys of the Sort below, the order
+PostgreSQL's rows have.  The top WindowAgg's run condition (a subquery's
+`WHERE r <= 3` over `rank()`): PostgreSQL returns a partition's rows up
+to the first that fails it, the planner admits only a condition that
+then fails for the rest, and DataFusion filters by it.  A run condition
+of a WindowAgg below another, which passes the rows on with its
+functions NULL, stays on PostgreSQL.
+
+DataFusion's window operators reserve nothing from the memory pool and do
+not spill.  One over whole partitions (WindowAggExec) holds all its input
+before it computes: it runs only where the planner's estimate of that
+input fits the WindowAgg's budget, min(operatorMemKB, work_mem), as a
+Nested Loop's build side does.  One up to the current row
+(BoundedWindowAggExec) holds a partition's rows up to the current row's
+peers, and runs whatever the estimate.  Their sorts spill as any.
+
+TPC-DS SF1: whole-slice runs 1578 -> 1615, queries wholly in DataFusion
+95 -> 105 of 206 executions (Q12, Q20, Q98 under both planners; Q36, Q67,
+Q70, Q86 under the Postgres planner), results unchanged apart from Q71's
+ties, now under both planners (204/206).  Over 20 million rows, the three
+largest per group by `rank()` and a running `sum` did not finish in
+DataFusion: ten partitions sort under the slice's 65 MB, partitions that
+end their input early merge their spilled runs with as many buffers as the
+pool grants, and a partition still sorting then finds no memory left
+(DataFusion 55.2.0; apache/datafusion#25804, finding 9).  A plain sort
+does the same under 64 MB.  apache/datafusion#26264 proposes the fix;
+these queries wait for a DataFusion release that has it.
+
+A sum over a frame adds 19 digits to its argument's bound, as a sum over
+a group does; a sum of the sums of an Agg's groups (TPC-DS Q12, Q20, Q98:
+`sum(x) * 100 / sum(sum(x)) OVER (PARTITION BY ...)`) adds up each row
+below at most once and keeps its argument's bound, which leaves the
+division above it within 76 digits.
+
+Not done: `avg` (TPC-DS Q47, Q53, Q57, Q63, Q89 average over partitions);
+`min` and `max` of floats (of -0 and 0, PostgreSQL's keep the later
+value, which the window's order determines); `ntile`, `lag`, `lead` and
+the other window functions; frames with offsets, GROUPS or EXCLUDE;
+FILTER and DISTINCT.
 
 ### Subtrees below PostgreSQL's nodes
 

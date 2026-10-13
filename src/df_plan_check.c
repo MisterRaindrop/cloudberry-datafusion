@@ -44,6 +44,7 @@
 
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/pg_aggregate.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation_d.h"
@@ -93,6 +94,10 @@ typedef struct DfCheckContext
 	bool		agg_sets;		/* and that Agg has grouping sets (GS1) */
 	bool		agg_input;		/* checking the child of an Agg node */
 	bool		join_input;		/* checking an input of a join */
+	bool		window_input;	/* checking the child of a WindowAgg (WIN1) */
+	WindowAgg  *window;			/* the WindowAgg whose expressions are
+								 * checked, which computes their window
+								 * functions (WIN1) */
 	bool		inner_agg;		/* checking an Agg below a join or another
 								 * Agg, whose values others read (A1) */
 	bool		projection_input;	/* checking the plan below a Subquery
@@ -589,6 +594,9 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 			return false;
 		case T_NullIfExpr:
 			return df_numeric_may_be_infinite(ctx, linitial(((NullIfExpr *) expr)->args));
+		case T_WindowFunc:
+			return ((WindowFunc *) expr)->winagg &&
+				df_numeric_may_be_infinite(ctx, (Node *) df_window_aggref((WindowFunc *) expr));
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) expr;
@@ -889,6 +897,52 @@ df_pg_partial_readable(Plan *ctx, Aggref *agg)
 		!df_numeric_may_be_infinite(pctx, arg);
 }
 
+/*
+ * WIN1: is 'expr' of node 'ctx' a sum returning numeric of an Agg without
+ * grouping sets, not a partial one, through nodes that pass the column on
+ * without making more rows of one: each row a group of its own, whose
+ * rows no other group has.
+ */
+static bool
+df_sums_groups(Plan *ctx, Node *expr)
+{
+	for (;;)
+	{
+		Var		   *var;
+		Plan	   *child;
+		TargetEntry *tle;
+
+		if (IsA(ctx, Agg))
+		{
+			Aggref	   *agg = (Aggref *) expr;
+			char	   *name;
+
+			if (!IsA(expr, Aggref) || ((Agg *) ctx)->groupingSets != NIL ||
+				((Agg *) ctx)->chain != NIL || agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ||
+				agg->aggtype != NUMERICOID)
+				return false;
+			name = get_func_name(agg->aggfnoid);
+			return name != NULL && strcmp(name, "sum") == 0;
+		}
+		if (!IsA(expr, Var))
+			return false;
+		var = (Var *) expr;
+		if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
+			child = ((SubqueryScan *) ctx)->subplan;
+		else if (var->varno == OUTER_VAR &&
+				 (IsA(ctx, WindowAgg) || IsA(ctx, Sort) || IsA(ctx, Motion) ||
+				  IsA(ctx, Result) || IsA(ctx, Material)))
+			child = outerPlan(ctx);
+		else
+			return false;
+		tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+		if (tle == NULL)
+			return false;
+		ctx = child;
+		expr = (Node *) tle->expr;
+	}
+}
+
 /* a / b rounded down, b > 0 */
 static int
 df_floor_div(int a, int b)
@@ -1118,6 +1172,22 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					default:
 						return false;
 				}
+			}
+		case T_WindowFunc:
+			{
+				/* WIN1: an aggregate over a frame, as over a group */
+				WindowFunc *wf = (WindowFunc *) expr;
+				char	   *name = get_func_name(wf->winfnoid);
+
+				/*
+				 * A sum of sums of distinct groups adds up each of their
+				 * rows at most once: within the digits of a sum of those.
+				 */
+				if (wf->winagg && name != NULL && strcmp(name, "sum") == 0 &&
+					list_length(wf->args) == 1 && df_sums_groups(ctx, linitial(wf->args)))
+					return df_numeric_range(ctx, linitial(wf->args), precision, scale, dyn);
+				return wf->winagg &&
+					df_numeric_range(ctx, (Node *) df_window_aggref(wf), precision, scale, dyn);
 			}
 		case T_Aggref:
 			{
@@ -1835,6 +1905,71 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				return df_check_expr((Node *) agg->args, cxt);
 			}
 
+		case T_WindowFunc:
+			{
+				/*
+				 * WIN1: row_number, rank and dense_rank, and the aggregates
+				 * DataFusion computes over a group, over a frame
+				 */
+				static const char *const ranks[] =
+				{"row_number", "rank", "dense_rank", NULL};
+				WindowFunc *wf = (WindowFunc *) node;
+				char	   *name = get_func_name(wf->winfnoid);
+				Aggref	   *agg;
+				bool		saved;
+				int			np,
+							ns;
+
+				if (cxt->window == NULL || wf->winref != cxt->window->winref)
+					df_reject(cxt, "window function outside its WindowAgg");
+				else if (wf->winfnoid >= FirstGenbkiObjectId)
+					df_reject(cxt, "user-defined window function %s", name ? name : "?");
+				else if (wf->aggfilter != NULL)
+					df_reject(cxt, "FILTER clause on window function %s", name);
+				else if (wf->windistinct)
+					df_reject(cxt, "DISTINCT inside window function %s", name);
+				else if (!wf->winagg)
+				{
+					if (name == NULL || !df_name_in(name, ranks) || wf->args != NIL)
+						df_reject(cxt, "window function %s", name ? name : "?");
+					return cxt->failed;
+				}
+				if (cxt->failed)
+					return true;
+				agg = df_window_aggref(wf);
+				if ((strcmp(name, "min") == 0 || strcmp(name, "max") == 0) &&
+					(wf->wintype == FLOAT4OID || wf->wintype == FLOAT8OID))
+				{
+					/*
+					 * Of -0 and 0, float8smaller and float8larger keep the
+					 * later value, which the window's order determines;
+					 * DataFusion keeps the smaller or larger order key
+					 * (pgfloat).
+					 */
+					df_reject(cxt, "window function %s of %s", name, format_type_be(wf->wintype));
+					return true;
+				}
+				if (df_agg_state(agg) == DF_AGG_AVG_FLOAT || df_agg_state(agg) == DF_AGG_AVG_INT ||
+					df_agg_state(agg) == DF_AGG_AVG_NUMERIC)
+				{
+					df_reject(cxt, "window function avg");
+					return true;
+				}
+				if (df_agg_state(agg) == DF_AGG_SUM_NUMERIC &&
+					!df_numeric_ps(cxt->node, (Node *) linitial(wf->args), &np, &ns))
+				{
+					/* not one whose values have display scales of their own (DN1) */
+					df_reject(cxt, "window function sum of numeric of unknown precision or "
+							  "of display scales of their own");
+					return true;
+				}
+				saved = cxt->allow_aggref;
+				cxt->allow_aggref = true;
+				df_check_expr((Node *) agg, cxt);
+				cxt->allow_aggref = saved;
+				return cxt->failed;
+			}
+
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) node;
@@ -2255,6 +2390,26 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 		}
 		return df_plain_outputs(((SubqueryScan *) plan)->subplan, sub);
 	}
+	if (IsA(plan, WindowAgg))
+	{
+		/*
+		 * WIN1: its window functions are columns of its node, below the
+		 * join; its child's columns pass through it (and any Sort).
+		 */
+		Bitmapset  *sub = NULL;
+
+		foreach(lc, plan->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+			if (!bms_is_member(tle->resno, attnos) || IsA(tle->expr, WindowFunc))
+				continue;
+			if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varno != OUTER_VAR)
+				return false;
+			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
+		}
+		return sub == NULL || df_plain_outputs(df_below_sort(outerPlan(plan)), sub);
+	}
 	if (IsA(plan, Agg))
 	{
 		/*
@@ -2380,6 +2535,27 @@ df_hash_budget(Plan *hash)
 	if (hash->operatorMemKB > 0 && hash->operatorMemKB < kb)
 		kb = hash->operatorMemKB;
 	return kb * hash_mem_multiplier * 1024.0;
+}
+
+/*
+ * WIN1: bytes a WindowAgg's input is estimated to take in DataFusion, as a
+ * Hash node's table (df_hash_estimate), and the bytes PostgreSQL would
+ * give its WindowAgg's tuplestore: min(operatorMemKB, work_mem).
+ */
+static double
+df_window_estimate(Plan *input)
+{
+	return input->plan_rows * (input->plan_width + 48.0);
+}
+
+static double
+df_window_budget(Plan *plan)
+{
+	double		kb = work_mem;
+
+	if (plan->operatorMemKB > 0 && plan->operatorMemKB < kb)
+		kb = plan->operatorMemKB;
+	return kb * 1024.0;
 }
 
 /*
@@ -3148,6 +3324,104 @@ df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups)
 }
 
 /*
+ * WIN1: the node whose order the rows of a WindowAgg over 'input' come in:
+ * 'input', or the child of the WindowAggs it is.
+ */
+Plan *
+df_window_order_input(Plan *input)
+{
+	while (input != NULL && IsA(input, WindowAgg))
+		input = outerPlan(input);
+	return input;
+}
+
+/*
+ * WIN1: can DataFusion sort a slice's rows by key 'col' of 'plan', ordered by
+ * 'sortop' under 'collation', as PostgreSQL does?
+ */
+static bool
+df_check_order_key(DfCheckContext *cxt, Plan *plan, AttrNumber col, Oid sortop, Oid collation)
+{
+	TargetEntry *tle = get_tle_by_resno(plan->targetlist, col);
+	Oid			type;
+	bool		desc,
+				dyn;
+	int			p,
+				s;
+
+	if (tle == NULL)
+		return false;
+	type = exprType((Node *) tle->expr);
+	if (!df_type_supported(type) || !df_sort_direction(sortop, type, &desc) ||
+		(type == NUMERICOID &&
+		 (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
+		  p > DF_NUMERIC_MAX_EXPR_PRECISION)))
+		return false;
+	if (df_type_is_string(type) && df_string_compare_problem(cxt, "<", collation) != NULL)
+	{
+		df_reject(cxt, "sort key of type %s %s", format_type_be(type),
+				  df_string_compare_problem(cxt, "<", collation));
+		return false;
+	}
+	return true;
+}
+
+/*
+ * WIN1: is 'input', a Sort or a merging Motion below the WindowAgg, or
+ * below the WindowAggs between (each keeps its rows in the order they
+ * come in, and its child's columns), sorted in a way DataFusion can sort
+ * the WindowAgg's rows by?
+ */
+static bool
+df_check_window_order(DfCheckContext *cxt, Plan *input)
+{
+	int			i;
+
+	input = df_window_order_input(input);
+
+	if (IsA(input, Sort) && df_passes_through(input))
+	{
+		Sort	   *sort = (Sort *) input;
+
+		for (i = 0; i < sort->numCols; i++)
+			if (!df_check_order_key(cxt, input, sort->sortColIdx[i], sort->sortOperators[i],
+									sort->collations[i]))
+				return false;
+		return true;
+	}
+	if (IsA(input, Motion) && ((Motion *) input)->sendSorted)
+	{
+		Motion	   *motion = (Motion *) input;
+
+		for (i = 0; i < motion->numSortCols; i++)
+			if (!df_check_order_key(cxt, input, motion->sortColIdx[i], motion->sortOperators[i],
+									motion->collations[i]))
+				return false;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * WIN1: is 'plan' reached from 'from' through Subquery Scans and Results,
+ * which keep their child's rows in order?
+ */
+static bool
+df_order_path(Plan *from, Plan *plan)
+{
+	while (from != NULL && from != plan)
+	{
+		if (IsA(from, SubqueryScan))
+			from = ((SubqueryScan *) from)->subplan;
+		else if (IsA(from, Result))
+			from = outerPlan(from);
+		else
+			return false;
+	}
+	return from != NULL;
+}
+
+/*
  * D3: may the slice below sorted Motion 'motion' run its GroupAggregate
  * hashed and sort the result by the Motion's keys?  The keys must be the
  * Agg's grouping columns, in its default order.  Records it.
@@ -3162,6 +3436,19 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 	if (agg != NULL && IsA(agg, Limit))
 		return df_passes_through((Plan *) agg) &&
 			df_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
+	if (agg != NULL)
+	{
+		/*
+		 * WIN1: a WindowAgg below, its rows in the order the Motion merges
+		 * by: DataFusion gives them in that order (cxt->tails.window_order)
+		 */
+		Plan	   *below = (Plan *) agg;
+
+		while (IsA(below, SubqueryScan) || IsA(below, Result))
+			below = IsA(below, SubqueryScan) ? ((SubqueryScan *) below)->subplan : outerPlan(below);
+		if (below != NULL && IsA(below, WindowAgg))
+			return true;
+	}
 	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
 		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) || motion->numSortCols == 0)
 		return false;
@@ -3379,7 +3666,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * the plan, which those above read by name: not a partial
 				 * stage, whose state only a batch Motion carries.
 				 */
-				inner = cxt->join_input || cxt->agg_input || cxt->projection_input;
+				inner = cxt->join_input || cxt->agg_input || cxt->projection_input ||
+					cxt->window_input;
 				if (inner && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 				{
 					df_reject(cxt, "partial aggregate below a join or another aggregate");
@@ -3829,6 +4117,169 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_WindowAgg:
+			{
+				/*
+				 * WIN1: DataFusion's window over the child's rows, which it
+				 * sorts by the partition and order keys itself, in the
+				 * order PostgreSQL sorted them by (df_window_order): a Sort
+				 * below is left out, a merging Motion read unmerged.  Its
+				 * window functions are columns of its node, which the
+				 * nodes above read by name, as an Agg's calls (A1).
+				 */
+				WindowAgg  *wa = (WindowAgg *) plan;
+				Plan	   *child = outerPlan(plan);
+				Bitmapset  *child_needed = NULL;
+				const char *frame = df_window_frame(wa);
+				WindowAgg  *saved_window = cxt->window;
+				bool		saved_input = cxt->window_input;
+				bool		whole = false;
+				List	   *funcs;
+				ListCell   *lc;
+				int			i;
+
+				if (child == NULL || innerPlan(plan) != NULL)
+				{
+					df_reject(cxt, "WindowAgg without a child");
+					return;
+				}
+				if (frame == NULL)
+				{
+					df_reject(cxt, "window frame other than from the first row of the partition "
+							  "to the current row or the last");
+					return;
+				}
+				if (wa->runCondition != NIL && !wa->topWindow)
+				{
+					/*
+					 * The top WindowAgg leaves out the rows that fail its run
+					 * condition (df_window_run_condition); one below passes
+					 * them on with its window functions NULL.
+					 */
+					df_reject(cxt, "run condition of a WindowAgg below another");
+					return;
+				}
+				if (wa->runCondition != NIL && df_window_run_condition(wa) == NIL)
+				{
+					df_reject(cxt, "run condition of the WindowAgg");
+					return;
+				}
+				if (!cxt->node_order_free)
+				{
+					/*
+					 * Its rows leave the slice in the order they came in
+					 * (through Subquery Scans and Results), which the result
+					 * or a merging Motion above keeps: DataFusion sorts the
+					 * slice's output by the keys of the Sort or merging
+					 * Motion below.
+					 */
+					if (!df_order_path(cxt->output, plan) || cxt->tails.resort != NULL ||
+						cxt->tails.resort_by != NULL || !df_check_window_order(cxt, child))
+					{
+						if (!cxt->failed)
+							df_reject(cxt, "WindowAgg whose order of rows is read");
+						return;
+					}
+					cxt->tails.window_order = child;
+				}
+				for (i = 0; i < wa->partNumCols + wa->ordNumCols; i++)
+				{
+					bool		part = i < wa->partNumCols;
+					AttrNumber	col = part ? wa->partColIdx[i] : wa->ordColIdx[i - wa->partNumCols];
+					TargetEntry *tle = get_tle_by_resno(child->targetlist, col);
+					Oid			type,
+								sortop,
+								coll;
+					bool		nulls_first,
+								desc,
+								dyn;
+					int			p,
+								sc;
+
+					if (tle == NULL)
+					{
+						df_reject(cxt, "window key outside the target list");
+						return;
+					}
+					type = exprType((Node *) tle->expr);
+					if (!df_type_supported(type))
+					{
+						df_reject(cxt, "window key of type %s", format_type_be(type));
+						return;
+					}
+					if (type == NUMERICOID &&
+						(!df_numeric_range(child, (Node *) tle->expr, &p, &sc, &dyn) ||
+						 p > DF_NUMERIC_MAX_EXPR_PRECISION))
+					{
+						df_reject(cxt, "window key of numeric of unknown precision");
+						return;
+					}
+					if (part)
+						coll = wa->partCollations[i];
+					else if (!df_window_order(child, col, &sortop, &nulls_first, &coll) ||
+							 !df_sort_direction(sortop, type, &desc))
+					{
+						df_reject(cxt, "window order key without the Sort that orders by it");
+						return;
+					}
+					if (df_type_is_string(type) &&
+						df_string_compare_problem(cxt, part ? "=" : "<", coll) != NULL)
+					{
+						df_reject(cxt, "window key of type %s %s", format_type_be(type),
+								  df_string_compare_problem(cxt, part ? "=" : "<", coll));
+						return;
+					}
+					child_needed = bms_add_member(child_needed, col);
+				}
+				/*
+				 * DataFusion holds all the rows of a window over whole
+				 * partitions (WindowAggExec), outside its memory pool and
+				 * without spilling: within the budget PostgreSQL's
+				 * WindowAgg has, by the planner's estimate, as a Nested
+				 * Loop's build side.  The others hold a partition's rows up
+				 * to the current one's peers (BoundedWindowAggExec).
+				 */
+				funcs = df_window_funcs(wa);
+				foreach(lc, funcs)
+					if (((WindowFunc *) lfirst(lc))->winagg && strcmp(frame, "partition") == 0)
+						whole = true;
+				if (whole && df_window_estimate(child) > df_window_budget(plan))
+				{
+					df_reject(cxt, "window over whole partitions of about %.0f kB exceeds its %.0f kB",
+							  df_window_estimate(child) / 1024, df_window_budget(plan) / 1024);
+					return;
+				}
+				cxt->window = wa;
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				df_check_expr_list(plan->qual, cxt);
+				if (wa->runCondition != NIL)
+					df_check_expr_list(df_window_run_condition(wa), cxt);
+				/* all of them are computed, those of columns no one reads too */
+				foreach(lc, funcs)
+					df_check_expr(lfirst(lc), cxt);
+				cxt->window = saved_window;
+				if (cxt->failed)
+					return;
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+					if (needed == NULL || bms_is_member(tle->resno, needed))
+						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+				}
+				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				df_collect_outer_refs((Node *) funcs, &child_needed);
+				child_needed = bms_add_member(child_needed, 0);
+				if (IsA(child, Sort))
+					cxt->skipped_sort = child;
+				cxt->order_free = true; /* DataFusion sorts its rows */
+				cxt->window_input = true;
+				df_check_plan(child, cxt, child_needed, false);
+				cxt->window_input = saved_input;
+				return;
+			}
+
 		case T_Hash:
 		case T_Material:
 			{
@@ -3953,7 +4404,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * Motion's targetlist is evaluated by the sending slice;
 					 * here only the types of the columns read matter.
 					 */
-					if (!cxt->agg_input && !cxt->join_input)
+					if (!cxt->agg_input && !cxt->join_input && !cxt->window_input)
 					{
 						df_reject(cxt, "receives rows from a %s with nothing to compute on them",
 								  df_plan_name(plan));
@@ -4796,6 +5247,213 @@ df_agg_state(Aggref *agg)
 	if (argtype == NUMERICOID && strcmp(name, "avg") == 0)
 		return DF_AGG_AVG_NUMERIC;
 	return DF_AGG_PLAIN;
+}
+
+/* ---------------------------------------------------------------------
+ * WIN1: window functions
+ * ---------------------------------------------------------------------
+ */
+
+static bool
+df_window_funcs_walker(Node *node, List **funcs)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, WindowFunc))
+	{
+		*funcs = list_append_unique(*funcs, node);
+		return false;
+	}
+	return expression_tree_walker(node, df_window_funcs_walker, funcs);
+}
+
+/*
+ * The window functions WindowAgg 'wa' computes, each once, in the order its
+ * targetlist and then its filter name them: DataFusion's columns
+ * <name>_w<k> (df_emit_plan_node).
+ */
+List *
+df_window_funcs(WindowAgg *wa)
+{
+	List	   *funcs = NIL;
+
+	(void) df_window_funcs_walker((Node *) wa->plan.targetlist, &funcs);
+	(void) df_window_funcs_walker((Node *) wa->plan.qual, &funcs);
+	return funcs;
+}
+
+/*
+ * An aggregate used as window function 'wf', as the Aggref of a plain
+ * Aggregate with the same call: what DataFusion computes over each frame
+ * is what it computes over each group, checked and built as that.
+ */
+Aggref *
+df_window_aggref(WindowFunc *wf)
+{
+	Aggref	   *agg = makeNode(Aggref);
+	ListCell   *lc;
+
+	agg->aggfnoid = wf->winfnoid;
+	agg->aggtype = wf->wintype;
+	agg->aggcollid = wf->wincollid;
+	agg->inputcollid = wf->inputcollid;
+	foreach(lc, wf->args)
+	{
+		agg->aggargtypes = lappend_oid(agg->aggargtypes, exprType(lfirst(lc)));
+		agg->args = lappend(agg->args,
+							makeTargetEntry(lfirst(lc), foreach_current_index(lc) + 1,
+											NULL, false));
+	}
+	agg->aggfilter = wf->aggfilter;
+	agg->aggstar = wf->winstar;
+	agg->aggkind = AGGKIND_NORMAL;
+	agg->aggsplit = AGGSPLIT_SIMPLE;
+	agg->aggno = -1;
+	agg->aggtransno = -1;
+	agg->location = wf->location;
+	return agg;
+}
+
+typedef struct DfRunCondition
+{
+	WindowAgg  *wa;
+	bool		ok;
+} DfRunCondition;
+
+static Node *
+df_run_condition_mutator(Node *node, DfRunCondition *c)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		TargetEntry *tle = !IS_SPECIAL_VARNO(((Var *) node)->varno) ?
+			get_tle_by_resno(c->wa->plan.targetlist, ((Var *) node)->varattno) : NULL;
+
+		if (tle == NULL)
+		{
+			c->ok = false;
+			return node;
+		}
+		return copyObject((Node *) tle->expr);
+	}
+	return expression_tree_mutator(node, df_run_condition_mutator, c);
+}
+
+/*
+ * The run condition of the top WindowAgg 'wa' over its window functions:
+ * its references to them (Vars of the WindowAgg's output columns, as
+ * set_windowagg_runcondition_references made them, of varno 0 plus the
+ * range table offset fix_scan_list adds; the executor reads them from the
+ * output row whatever the varno) become the functions again.  NULL if one is not such a reference.  The top WindowAgg returns
+ * a partition's rows up to the first that fails the condition and none
+ * after, and the condition, as the planner chose it, fails for every row
+ * after that one too: the rows that pass it.
+ */
+List *
+df_window_run_condition(WindowAgg *wa)
+{
+	DfRunCondition c = {wa, true};
+	List	   *cond = (List *) df_run_condition_mutator((Node *) wa->runCondition, &c);
+
+	return c.ok ? cond : NULL;
+}
+
+/*
+ * The frame of WindowAgg 'wa' as DataFusion's: "partition" (the whole
+ * partition), "range" (up to the current row and its peers) or "rows" (up
+ * to the current row), always from the partition's first row; NULL for
+ * another.  The default frame, RANGE up to the current row, is the whole
+ * partition without an order: every row is a peer.  (Columns of the ORDER
+ * BY that the PARTITION BY has as well are left out of ordColIdx: each
+ * partition holds one value of them.)
+ */
+const char *
+df_window_frame(WindowAgg *wa)
+{
+	int			opts = wa->frameOptions;
+
+	if ((opts & (FRAMEOPTION_GROUPS | FRAMEOPTION_START_OFFSET | FRAMEOPTION_END_OFFSET |
+				 FRAMEOPTION_EXCLUSION | FRAMEOPTION_START_CURRENT_ROW)) ||
+		!(opts & FRAMEOPTION_START_UNBOUNDED_PRECEDING))
+		return NULL;
+	if (opts & FRAMEOPTION_END_UNBOUNDED_FOLLOWING)
+		return "partition";
+	if (!(opts & FRAMEOPTION_END_CURRENT_ROW))
+		return NULL;
+	if (opts & FRAMEOPTION_ROWS)
+		return "rows";
+	return wa->ordNumCols == 0 ? "partition" : "range";
+}
+
+/*
+ * The order PostgreSQL's rows reach a WindowAgg in, by column 'col' of its
+ * child 'plan': the key of the Sort or merging Motion that orders them by
+ * it, found through the nodes that keep their child's order and pass the
+ * column on (a GroupAggregate, Result, Subquery Scan, Materialize, a
+ * WindowAgg below).  DataFusion sorts its rows itself, in that order.
+ */
+bool
+df_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls_first, Oid *collation)
+{
+	int			i;
+
+	while (plan != NULL)
+	{
+		TargetEntry *tle;
+		Var		   *var;
+
+		if (IsA(plan, Sort))
+		{
+			Sort	   *sort = (Sort *) plan;
+
+			for (i = 0; i < sort->numCols; i++)
+				if (sort->sortColIdx[i] == col)
+				{
+					*sortop = sort->sortOperators[i];
+					*nulls_first = sort->nullsFirst[i];
+					*collation = sort->collations[i];
+					return true;
+				}
+			return false;
+		}
+		if (IsA(plan, Motion))
+		{
+			Motion	   *motion = (Motion *) plan;
+
+			for (i = 0; motion->sendSorted && i < motion->numSortCols; i++)
+				if (motion->sortColIdx[i] == col)
+				{
+					*sortop = motion->sortOperators[i];
+					*nulls_first = motion->nullsFirst[i];
+					*collation = motion->collations[i];
+					return true;
+				}
+			return false;
+		}
+		if (!(IsA(plan, Agg) && ((Agg *) plan)->aggstrategy == AGG_SORTED) &&
+			!IsA(plan, Result) && !IsA(plan, SubqueryScan) && !IsA(plan, Material) &&
+			!IsA(plan, WindowAgg))
+			return false;
+		tle = get_tle_by_resno(plan->targetlist, col);
+		if (tle == NULL || !IsA(tle->expr, Var))
+			return false;
+		var = (Var *) tle->expr;
+		if (IsA(plan, SubqueryScan))
+		{
+			if (var->varno != ((Scan *) plan)->scanrelid)
+				return false;
+			plan = ((SubqueryScan *) plan)->subplan;
+		}
+		else
+		{
+			if (var->varno != OUTER_VAR)
+				return false;
+			plan = outerPlan(plan);
+		}
+		col = var->varattno;
+	}
+	return false;
 }
 
 /* Columns its state takes in a batch stream (0 for a plain aggregate). */

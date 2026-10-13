@@ -51,6 +51,12 @@
 //!                          grouping sets, each by indexes into "group",
 //!                          and a column "gset" (s_gset) of each row's set,
 //!                          its place in "sets")
+//!         | {"window": {"input": <node>, "partition": [<expr>...],
+//!                       "order": [{"expr": <expr>, "desc": b, "nulls_first": b}...],
+//!                       "frame": "partition" | "range" | "rows",
+//!                       "funcs": [{"fn": "rank"} | <aggregate spec>...],
+//!                       "name": s}}   (its rows with a column s_w<i> for
+//!                       each function; see `window`)
 //!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
 //!                with a column s of numbers unique to each, above n: Cloudberry's
 //!                RowIdExpr)
@@ -138,10 +144,12 @@ use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, bool_or, count, max, min, sum};
+use datafusion::functions_window::expr_fn::{dense_rank, rank, row_number};
 use datafusion::logical_expr::expr::Case;
+use datafusion::logical_expr::expr::WindowFunction;
 use datafusion::logical_expr::{
     binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, GroupingSet, LogicalPlanBuilder,
-    Operator,
+    Operator, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
 };
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1536,7 +1544,7 @@ fn has_full_sort(spec: &Value) -> bool {
 /// The operators of plan `node` that hold a partition's share of the
 /// memory budget: a grouped aggregate (partial and final), one more for
 /// the grouping below DISTINCT aggregates (D1, D3), each grouping below
-/// another aggregate (D2).  Each needs MIN_PARTITION_MEMORY per partition.
+/// another aggregate (D2), the sort of a window (WIN1).  Each needs MIN_PARTITION_MEMORY per partition.
 fn memory_consumers(node: &Value) -> usize {
     if let Some(a) = node.get("aggregate") {
         let grouped = a
@@ -1554,11 +1562,114 @@ fn memory_consumers(node: &Value) -> usize {
     if let Some(f) = node.get("filter").or_else(|| node.get("rowid")) {
         return f.get("input").map_or(0, memory_consumers);
     }
+    if let Some(w) = node.get("window") {
+        // WIN1: the sort by its partitions and order
+        return 1 + w.get("input").map_or(0, memory_consumers);
+    }
     if let Some(j) = node.get("join") {
         return j.get("left").map_or(0, memory_consumers)
             + j.get("right").map_or(0, memory_consumers);
     }
     0
+}
+
+/// WIN1: a window node, its input's rows with a column `<name>_w<i>` for
+/// each of its "funcs", over the rows of the partition the "partition"
+/// keys make, sorted by the "order" keys, in its "frame": "partition" (all
+/// of the partition's rows), "range" (from the first to the current row's
+/// last peer) or "rows" (to the current row).  A function is row_number,
+/// rank, dense_rank, or an aggregate spec as an aggregate's, computed over
+/// the frame instead of a group.  PostgreSQL's ranks are int8.
+fn window(
+    w: &Value,
+    tables: &mut Vec<Option<StreamingTable>>,
+) -> Result<LogicalPlanBuilder, String> {
+    let df = |e: DataFusionError| e.to_string();
+    let b = build_node(field(w, "input")?, tables)?;
+    let name = field(w, "name")?.as_str().ok_or("plan spec: window name")?;
+    let list = |key: &str| -> Result<Vec<Value>, String> {
+        Ok(field(w, key)?.as_array().cloned().unwrap_or_default())
+    };
+    let partition_by = list("partition")?
+        .iter()
+        .map(expr)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut order_by = Vec::new();
+    for k in list("order")? {
+        let flag = |n: &str| k.get(n).and_then(Value::as_bool).unwrap_or(false);
+        order_by.push(expr(field(&k, "expr")?)?.sort(!flag("desc"), flag("nulls_first")));
+    }
+    let unbounded = || ScalarValue::UInt64(None);
+    let frame = match field(w, "frame")?.as_str() {
+        Some("partition") => WindowFrame::new_bounds(
+            WindowFrameUnits::Rows,
+            WindowFrameBound::Preceding(unbounded()),
+            WindowFrameBound::Following(unbounded()),
+        ),
+        Some("rows") => WindowFrame::new_bounds(
+            WindowFrameUnits::Rows,
+            WindowFrameBound::Preceding(unbounded()),
+            WindowFrameBound::CurrentRow,
+        ),
+        Some("range") => WindowFrame::new_bounds(
+            WindowFrameUnits::Range,
+            WindowFrameBound::Preceding(unbounded()),
+            WindowFrameBound::CurrentRow,
+        ),
+        other => return Err(format!("plan spec: window frame {other:?}")),
+    };
+    let over = |f: Expr| -> Result<Expr, String> {
+        let f = match f {
+            Expr::AggregateFunction(a) => Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(a.func),
+                a.params.args,
+            )),
+            f => f,
+        };
+        f.partition_by(partition_by.clone())
+            .order_by(order_by.clone())
+            .window_frame(frame.clone())
+            .build()
+            .map_err(df)
+    };
+    let mut cols: Vec<Expr> = b.schema().columns().into_iter().map(Expr::Column).collect();
+    let mut calls = Vec::new();
+    for (i, f) in list("funcs")?.iter().enumerate() {
+        let v = format!("{name}_v{i}");
+        let fname = field(f, "fn")?.as_str().unwrap_or("");
+        let value = match fname {
+            "row_number" | "rank" | "dense_rank" => {
+                let call = match fname {
+                    "row_number" => row_number(),
+                    "rank" => rank(),
+                    _ => dense_rank(),
+                };
+                calls.push(over(call)?.alias(&v));
+                Expr::Cast(datafusion::logical_expr::Cast::new(
+                    Box::new(col(&v)),
+                    DataType::Int64,
+                ))
+            }
+            _ => {
+                calls.push(over(aggregate(f, b.schema(), None)?)?.alias(&v));
+                if let Some(e) = aggregate_extra(f, None)? {
+                    calls.push(over(e)?.alias(format!("{v}_n")));
+                }
+                if float_min_max(f, b.schema(), None)? {
+                    FloatFn::FromOrderKey.apply(col(&v))
+                } else {
+                    match Post::of(f)? {
+                        Post::None => col(&v),
+                        Post::NanIf => PgNumeric::udf(NumericFn::NanIf)
+                            .call(vec![col(&v), col(format!("{v}_n"))]),
+                        _ => return Err(format!("plan spec: window function {fname}")),
+                    }
+                }
+            }
+        };
+        cols.push(value.alias(format!("{name}_w{i}")));
+    }
+    b.window(calls).map_err(df)?.project(cols).map_err(df)
 }
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
@@ -1593,6 +1704,9 @@ fn build_node(
         let mut cols: Vec<Expr> = b.schema().columns().into_iter().map(Expr::Column).collect();
         cols.push(crate::rowid::RowId::udf(base).call(vec![]).alias(name));
         return b.project(cols).map_err(df);
+    }
+    if let Some(w) = node.get("window") {
+        return window(w, tables);
     }
     if let Some(a) = node.get("aggregate") {
         let mut b = build_node(field(a, "input")?, tables)?;
@@ -3046,6 +3160,44 @@ mod tests {
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"}]}"#;
         let rows = run(spec, vec![(vec![1, 2, 3, 0], vec![0, 0, 0, 1])], 4).unwrap();
         assert_eq!(rows, vec![vec![Some(5), Some(2)]]);
+    }
+
+    /// WIN1: rank and aggregates up to the current row's peers, partitioned
+    /// and ordered descending with NULLs first; the output sorted as given.
+    #[test]
+    fn window_up_to_peers() {
+        let spec = r#"{"inputs":[{"columns":[{"type":"int4"},{"type":"int4"}]}],
+            "plan":{"window":{"input":{"input":0},"partition":[{"col":0}],
+                "order":[{"expr":{"col":1},"desc":true,"nulls_first":true}],
+                "frame":"range",
+                "funcs":[{"fn":"rank"},{"fn":"sum","arg":{"col":1}},{"fn":"count","arg":null}],
+                "name":"q1"}},
+            "output":[{"expr":{"col":0},"type":"int8"},{"expr":{"col":1},"type":"int8"},
+                {"expr":{"name":"q1_w0"},"type":"int8"},{"expr":{"name":"q1_w1"},"type":"int8"},
+                {"expr":{"name":"q1_w2"},"type":"int8"}],
+            "sort":[{"col":0,"desc":false,"nulls_first":false},
+                {"col":1,"desc":true,"nulls_first":true}]}"#;
+        let rows = run(
+            spec,
+            vec![
+                (vec![1, 1, 1, 1, 2, 2], vec![0; 6]),
+                (vec![5, 3, 5, 0, 7, 7], vec![0, 0, 0, 1, 0, 0]),
+            ],
+            6,
+        )
+        .unwrap();
+        let row = |g, v: Option<i64>, r, s: Option<i64>, n| vec![Some(g), v, Some(r), s, Some(n)];
+        assert_eq!(
+            rows,
+            vec![
+                row(1, None, 1, None, 1),
+                row(1, Some(5), 2, Some(10), 3),
+                row(1, Some(5), 2, Some(10), 3),
+                row(1, Some(3), 4, Some(13), 4),
+                row(2, Some(7), 1, Some(14), 2),
+                row(2, Some(7), 1, Some(14), 2),
+            ]
+        );
     }
 
     #[test]

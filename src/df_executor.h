@@ -91,6 +91,10 @@ typedef struct DfTails
 								 * the GroupAggregate, its order (D4); or so
 								 * at the top of the slice, with no Motion
 								 * (D7) */
+	Plan	   *window_order;	/* or by the keys of this Sort or merging
+								 * Motion below the WindowAgg at the top of
+								 * the slice, the order its rows leave in
+								 * (WIN1) */
 } DfTails;
 
 /*
@@ -354,6 +358,14 @@ extern Oid	df_join_key_type(Oid a, Oid b);
 extern bool df_limit_value(Node *expr, int64 *value);
 extern bool df_sort_direction(Oid sortop, Oid type, bool *desc);
 extern bool df_passes_through(Plan *plan);
+/* WIN1: window functions */
+extern List *df_window_funcs(WindowAgg *wa);
+extern Aggref *df_window_aggref(WindowFunc *wf);
+extern const char *df_window_frame(WindowAgg *wa);
+extern List *df_window_run_condition(WindowAgg *wa);
+extern Plan *df_window_order_input(Plan *input);
+extern bool df_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls_first,
+							Oid *collation);
 extern Node *df_semi_key_for(HashJoin *hj, Var *var);
 extern bool df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left);
 
