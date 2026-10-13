@@ -27,7 +27,9 @@
 -- hashed whatever its input (TPC-DS Q33).  Numeric of different scales, or of
 -- display scales of their own, carries each value's display scale beside
 -- it.  Inputs that are Motions (GPORCA redistributes each branch below
--- the Append) are read from their streams.  Each query runs with
+-- the Append) are read from their streams; an input the planner proves
+-- empty (a Result with a one-time filter, OF1) gives no rows, or an Agg's
+-- one row on the segment its filter picks.  Each query runs with
 -- datafusion.mode off, then on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -52,6 +54,8 @@ EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT g, a FROM df_u1 
 EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a FROM df_u2) u LIMIT 5;
+EXPLAIN (COSTS OFF) SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, a FROM df_u1 INTERSECT SELECT g, a FROM df_u2) s;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g FROM df_u1 INTERSECT ALL SELECT g FROM df_u2) s;
@@ -72,6 +76,9 @@ SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s
 SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;
+SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
 SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
 SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
@@ -90,6 +97,9 @@ SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s
 SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;
+SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
 SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
 SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;

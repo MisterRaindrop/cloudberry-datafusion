@@ -27,7 +27,9 @@
 -- hashed whatever its input (TPC-DS Q33).  Numeric of different scales, or of
 -- display scales of their own, carries each value's display scale beside
 -- it.  Inputs that are Motions (GPORCA redistributes each branch below
--- the Append) are read from their streams.  Each query runs with
+-- the Append) are read from their streams; an input the planner proves
+-- empty (a Result with a one-time filter, OF1) gives no rows, or an Agg's
+-- one row on the segment its filter picks.  Each query runs with
 -- datafusion.mode off, then on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
@@ -128,6 +130,77 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a 
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 not eligible: Append whose order of rows is read
 (9 rows)
+
+EXPLAIN (COSTS OFF) SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_u1.g, (sum(df_u1.a))
+   ->  Sort
+         Sort Key: df_u1.g, (sum(df_u1.a))
+         ->  Hash Join
+               Hash Cond: (x.k = (df_u1.g + 1))
+               ->  Seq Scan on df_u1 x
+               ->  Hash
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: (df_u1.g + 1)
+                           ->  Append
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_u1.g
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: df_u1.g
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_u1.g
+                                                   ->  Seq Scan on df_u1
+                                 ->  Result
+                                       One-Time Filter: (gp_execution_segment() = 2)
+                                       ->  HashAggregate
+                                             Group Key: g
+                                             ->  Result
+                                                   One-Time Filter: false
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+(29 rows)
+
+EXPLAIN (COSTS OFF) SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_u1.g, (avg(df_u1.a))
+   ->  Sort
+         Sort Key: df_u1.g, (avg(df_u1.a))
+         ->  Hash Join
+               Hash Cond: (x.k = (df_u1.g + 1))
+               ->  Seq Scan on df_u1 x
+               ->  Hash
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: (df_u1.g + 1)
+                           ->  Append
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_u1.g
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: df_u1.g
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_u1.g
+                                                   ->  Seq Scan on df_u1
+                                                         Filter: (a <> 'NaN'::numeric)
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_u2.g
+                                       ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                             Hash Key: df_u2.g
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_u2.g
+                                                   ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+(32 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
                                          QUERY PLAN                                         
@@ -581,6 +654,41 @@ SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
  t3
  t4
 (5 rows)
+
+SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+ g |  s  
+---+-----
+ 0 | NaN
+ 1 | NaN
+ 2 | NaN
+ 3 | NaN
+ 4 | NaN
+ 5 | NaN
+ 6 | NaN
+(7 rows)
+
+SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;
+ count | count |    sum    
+-------+-------+-----------
+     2 |     1 | 554868.75
+(1 row)
+
+SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+ g |          v           |       ?column?       
+---+----------------------+----------------------
+ 0 |  28.2142862500000000 |  28.2142862500000000
+ 0 | 187.0636792452830189 | 187.0636792452830189
+ 1 |  28.3571425000000000 |  14.1785712500000000
+ 1 | 186.3794117647058824 |  93.1897058823529412
+ 2 |  28.5000000000000000 |   9.5000000000000000
+ 2 | 187.0176470588235294 |  62.3392156862745098
+ 3 |  28.6428575000000000 |   7.1607143750000000
+ 3 | 187.6558823529411765 |  46.9139705882352941
+ 4 |  28.7857137500000000 |   5.7571427500000000
+ 4 | 186.5294117647058824 |  37.3058823529411765
+ 5 | 186.5425531914893617 |  31.0904255319148936
+ 6 | 186.5809692671394799 |  26.6544241810199257
+(12 rows)
 
 SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
  x  | y 
@@ -1195,6 +1303,41 @@ SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
  t3
  t4
 (5 rows)
+
+SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+ g |  s  
+---+-----
+ 0 | NaN
+ 1 | NaN
+ 2 | NaN
+ 3 | NaN
+ 4 | NaN
+ 5 | NaN
+ 6 | NaN
+(7 rows)
+
+SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;
+ count | count |    sum    
+-------+-------+-----------
+     2 |     1 | 554868.75
+(1 row)
+
+SELECT u.g, u.v, u.v / x.k FROM (SELECT g, avg(a) v FROM df_u1 WHERE a <> 'NaN' GROUP BY g UNION ALL SELECT g, avg(a) FROM df_u2 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
+ g |          v           |       ?column?       
+---+----------------------+----------------------
+ 0 |  28.2142862500000000 |  28.2142862500000000
+ 0 | 187.0636792452830189 | 187.0636792452830189
+ 1 |  28.3571425000000000 |  14.1785712500000000
+ 1 | 186.3794117647058824 |  93.1897058823529412
+ 2 |  28.5000000000000000 |   9.5000000000000000
+ 2 | 187.0176470588235294 |  62.3392156862745098
+ 3 |  28.6428575000000000 |   7.1607143750000000
+ 3 | 187.6558823529411765 |  46.9139705882352941
+ 4 |  28.7857137500000000 |   5.7571427500000000
+ 4 | 186.5294117647058824 |  37.3058823529411765
+ 5 | 186.5425531914893617 |  31.0904255319148936
+ 6 | 186.5809692671394799 |  26.6544241810199257
+(12 rows)
 
 SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
  x  | y 
@@ -2807,7 +2950,7 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 (1 row)
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=30876)
+ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=43419)
 DETAIL:  Expected no more than one row to be returned by expression
 SET datafusion.mode = on;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
@@ -2817,7 +2960,7 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 (1 row)
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=30876)
+ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=43419)
 DETAIL:  Expected no more than one row to be returned by expression
 RESET datafusion.mode;
 DROP TABLE df_u1, df_u2, df_up;

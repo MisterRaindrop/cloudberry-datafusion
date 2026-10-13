@@ -2435,7 +2435,8 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 
 	if (plan == NULL)
 		return false;
-	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp))
+	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp) ||
+		df_empty_result(plan))
 		return true;			/* UA1, SO1: columns of its union or grouping */
 	if (IsA(plan, Result))
 	{
@@ -3319,6 +3320,63 @@ df_null_equal_join(HashJoin *hj)
 	return true;
 }
 
+/*
+ * OF1: a Result's one-time filter of the kinds the planner leaves on a
+ * provably empty UNION ALL branch: true and false constants, and
+ * gp_execution_segment() = n (an Agg of no groups making its row on one
+ * segment).  1 or 0 where 'evaluate' (on the segment running the slice),
+ * 2 for one known only there, -1 for any other.
+ */
+int
+df_one_time_value(Node *qual, bool evaluate)
+{
+	ListCell   *lc;
+	int			v = 1;
+
+	if (qual == NULL)
+		return 1;
+	if (!IsA(qual, List))
+		qual = (Node *) list_make1(qual);
+	foreach(lc, (List *) qual)
+	{
+		Node	   *q = lfirst(lc);
+
+		if (IsA(q, Const) && ((Const *) q)->consttype == BOOLOID)
+		{
+			if (((Const *) q)->constisnull || !DatumGetBool(((Const *) q)->constvalue))
+				return 0;
+		}
+		else if (IsA(q, OpExpr) && ((OpExpr *) q)->opfuncid == F_INT4EQ &&
+				 list_length(((OpExpr *) q)->args) == 2)
+		{
+			Node	   *l = linitial(((OpExpr *) q)->args);
+			Node	   *r = lsecond(((OpExpr *) q)->args);
+			Node	   *f = IsA(l, FuncExpr) ? l : r;
+			Node	   *c = IsA(l, FuncExpr) ? r : l;
+
+			if (!IsA(f, FuncExpr) || ((FuncExpr *) f)->funcid != F_GP_EXECUTION_SEGMENT ||
+				!IsA(c, Const) || ((Const *) c)->constisnull)
+				return -1;
+			if (!evaluate)
+				v = 2;
+			else if (GpIdentity.segindex != DatumGetInt32(((Const *) c)->constvalue))
+				return 0;
+		}
+		else
+			return -1;
+	}
+	return v;
+}
+
+/* OF1: is 'plan' a Result without a child that never gives a row? */
+bool
+df_empty_result(Plan *plan)
+{
+	return plan != NULL && IsA(plan, Result) && outerPlan(plan) == NULL &&
+		innerPlan(plan) == NULL &&
+		df_one_time_value(((Result *) plan)->resconstantqual, false) == 0;
+}
+
 /* Is each output column of 'plan' a column of its child, as it is? */
 static bool
 df_plain_columns(Plan *plan)
@@ -4170,8 +4228,28 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				bool		saved = cxt->projection_input;
 				ListCell   *lc;
 
+				if (df_empty_result(plan))
+				{
+					/* OF1: no rows, its columns of no value (df_emit_output_of) */
+					foreach(lc, plan->targetlist)
+					{
+						Node	   *e = (Node *) lfirst_node(TargetEntry, lc)->expr;
+						Oid			type = exprType(e);
+						int			p,
+									sc;
+
+						if (!df_type_supported(type) ||
+							(type == NUMERICOID && !df_numeric_ps(plan, e, &p, &sc)))
+						{
+							df_reject(cxt, "empty Result with a column of type %s",
+									  format_type_be(type));
+							return;
+						}
+					}
+					return;
+				}
 				if (outerPlan(plan) == NULL || innerPlan(plan) != NULL ||
-					((Result *) plan)->resconstantqual != NULL)
+					df_one_time_value(((Result *) plan)->resconstantqual, false) < 0)
 				{
 					df_reject(cxt, "Result without a child or with a one-time filter");
 					return;
@@ -4315,7 +4393,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (cxt->failed)
 						return;
 					if ((needed == NULL || bms_is_member(tle->resno, needed)) &&
-						df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) &&
+						exprType((Node *) tle->expr) == NUMERICOID &&
+						(df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
+						 df_numeric_varying(plan, (Node *) tle->expr)) &&
 						!df_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
 						df_reject(cxt, "Append of numeric of display scales of their own");
 				}

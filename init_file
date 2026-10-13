@@ -28,6 +28,9 @@ s/\.c:\d+\)/.c:XXX)/
 # An error raised on a segment names the segment, slice, address and pid.
 m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
 s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+# The planner picks a random segment for an Agg of no groups (OF1).
+m/gp_execution_segment\(\) = \d+/
+s/gp_execution_segment\(\) = \d+/gp_execution_segment() = N/
 
 # EXPLAIN ANALYZE figures of a DataFusion run vary from run to run.
 m/^ DataFusion: \d+ partitions, memory limit \d+ kB, peak \d+ kB, spilled \d+ kB in \d+ files$/

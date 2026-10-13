@@ -852,6 +852,12 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
+	else if (df_empty_result(child))
+		/* OF1: a column of no rows, of no value */
+		appendStringInfo(out, "{\"lit\":{\"type\":\"%s\",\"null\":true}}",
+						 exprType((Node *) tle->expr) == NUMERICOID ?
+						 df_tag(NUMERICOID, df_scale_of(child, (Node *) tle->expr)) :
+						 df_type_tag(exprType((Node *) tle->expr)));
 	else if (df_append_plans(child) != NIL)
 		/* UA1: a column of its union */
 		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
@@ -2144,18 +2150,40 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			}
 
 		case T_Result:
-			/* R1: its child's rows, its filter over them */
-			if (plan->qual == NIL)
+			if (df_empty_result(plan))
 			{
-				df_emit_node(b, out, outerPlan(plan));
+				/* OF1: no rows */
+				appendStringInfoString(out, "{\"empty\":{}}");
 				return;
 			}
-			appendStringInfoString(out, "{\"filter\":{\"input\":");
-			df_emit_node(b, out, outerPlan(plan));
-			appendStringInfoString(out, ",\"pred\":");
-			b->ctx = plan;
-			df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
-			appendStringInfoString(out, "}}");
+			if (((Result *) plan)->resconstantqual != NULL)
+			{
+				/* OF1: its one-time filter, known on this segment */
+				int			v = df_one_time_value(((Result *) plan)->resconstantqual, true);
+
+				if (v < 0)
+				{
+					df_fail(b, "a one-time filter");
+					return;
+				}
+				appendStringInfoString(out, "{\"filter\":{\"input\":");
+			}
+			/* R1: its child's rows, its filter over them */
+			if (plan->qual == NIL)
+				df_emit_node(b, out, outerPlan(plan));
+			else
+			{
+				appendStringInfoString(out, "{\"filter\":{\"input\":");
+				df_emit_node(b, out, outerPlan(plan));
+				appendStringInfoString(out, ",\"pred\":");
+				b->ctx = plan;
+				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				appendStringInfoString(out, "}}");
+			}
+			if (((Result *) plan)->resconstantqual != NULL)
+				appendStringInfo(out, ",\"pred\":{\"lit\":{\"type\":\"bool\",\"value\":%s}}}}",
+								 df_one_time_value(((Result *) plan)->resconstantqual, true) == 1 ?
+								 "true" : "false");
 			return;
 
 		case T_SubqueryScan:
@@ -2385,8 +2413,10 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						else
 							df_emit_output_of(b, out, child, tle->resno);
 						if (exprType((Node *) tle->expr) == NUMERICOID &&
-							df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc))
+							(df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
+							 df_numeric_varying(plan, (Node *) tle->expr)))
 						{
+							/* DN1, AV2: its display scale, as those above read it */
 							appendStringInfoString(out, ",\"dscale\":");
 							df_emit_dscale_output_of(b, out, child, tle->resno);
 						}

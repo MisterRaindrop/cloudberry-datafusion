@@ -60,6 +60,7 @@
 //!                       "name": s}}   (its rows with a column s_w<i> for
 //!                       each function, and s_w<i>_n for an avg's count: an
 //!                       avg's s_w<i> is its sum, WIN2; see `window`)
+//!         | {"empty": {}}   (no rows: OF1)
 //!         | {"union": {"inputs": [<node>...], "columns": [[{"expr": <expr>,
 //!                     "dscale": <expr>}...]...], "name": s}}   (UNION ALL: each
 //!                input's rows as columns s_c<k>, and s_c<k>_s for a "dscale")
@@ -1804,6 +1805,10 @@ fn build_node(
     }
     if let Some(w) = node.get("window") {
         return window(w, tables);
+    }
+    if node.get("empty").is_some() {
+        // OF1: no rows, its columns literals of those above
+        return Ok(LogicalPlanBuilder::empty(false));
     }
     if let Some(u) = node.get("union") {
         // UA1: each input's rows projected to columns <name>_c<k> (and a

@@ -373,6 +373,8 @@ extern bool df_numcmp_needed(Plan *ctx, OpExpr *op);
 extern List *df_append_plans(Plan *plan);
 extern int	df_round_scale(FuncExpr *fe);
 extern bool df_null_equal_join(HashJoin *hj);
+extern int	df_one_time_value(Node *qual, bool evaluate);
+extern bool df_empty_result(Plan *plan);
 extern int	df_setop_group(SetOp *setop, AttrNumber attno);
 
 /* IP1: init plan values for the translation of a slice that starts, or NULL */
