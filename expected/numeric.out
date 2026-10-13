@@ -1938,7 +1938,8 @@ DROP TABLE df_ps;
 -- beside it, as numeric.c gives it; abs keeps it.  A comparison of
 -- values beyond 76 digits at a common scale (a quotient of an avg, of the
 -- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
--- computes it, in arbitrary precision.  A Motion of such a column carries
+-- computes it, in arbitrary precision.  An Append of inputs of different
+-- scales gives such values too.  A Motion of such a column carries
 -- tuples, which hold it; min, max, avg and GROUP BY of one stay on
 -- PostgreSQL.
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
@@ -2128,6 +2129,52 @@ EXPLAIN (COSTS OFF) SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a
  DataFusion: slice 1 eligible
  DataFusion: slice 2 eligible, sends Arrow batches
 (17 rows)
+
+EXPLAIN (COSTS OFF) SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_dn.i, (sum(df_dn.a))
+   ->  Sort
+         Sort Key: df_dn.i, (sum(df_dn.a))
+         ->  Hash Join
+               Hash Cond: ((df_dn.i + 1) = y.i)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: (df_dn.i + 1)
+                     ->  Append
+                           ->  Finalize HashAggregate
+                                 Group Key: df_dn.i
+                                 Filter: (sum(df_dn.a) > '100'::numeric)
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: df_dn.i
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_dn.i
+                                             ->  Seq Scan on df_dn
+                           ->  Finalize HashAggregate
+                                 Group Key: df_dn_1.i
+                                 Filter: (sum(df_dn_1.c) > '100'::numeric)
+                                 ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                       Hash Key: df_dn_1.i
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_dn_1.i
+                                             ->  Seq Scan on df_dn df_dn_1
+               ->  Hash
+                     ->  Subquery Scan on y
+                           ->  Finalize HashAggregate
+                                 Group Key: df_dn_2.i
+                                 ->  Redistribute Motion 3:3  (slice5; segments: 3)
+                                       Hash Key: df_dn_2.i
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_dn_2.i
+                                             ->  Seq Scan on df_dn df_dn_2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible below the top: Aggregate, Aggregate (above: Append is not supported)
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+ DataFusion: slice 5 eligible, sends Arrow batches
+(41 rows)
 
 SET datafusion.mode = off;
 SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
@@ -2481,6 +2528,98 @@ SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) 
  34
  36
 (19 rows)
+
+SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
+ i  |     v      |       ?column?       
+----+------------+----------------------
+  0 | 16754.2290 |  30.9118616236162362
+  0 |  106444.65 | 196.3923431734317343
+  1 | 16756.9061 |  30.9168009225092251
+  1 |        NaN |                  NaN
+  2 | 16758.5832 |  30.9770484288354898
+  2 |  106157.33 | 196.2242698706099815
+  3 | 16759.2603 |  30.9783000000000000
+  3 |  107201.22 | 198.1538262476894640
+  4 | 16760.9374 |  30.9814000000000000
+  4 |  106248.11 | 196.3920702402957486
+  5 | 16762.6145 |  30.9845000000000000
+  5 |  107295.00 | 198.3271719038817006
+  6 | 16764.2916 |  30.9876000000000000
+  6 |  104656.54 | 193.4501663585951941
+  7 | 16765.9687 |  30.9907000000000000
+  7 |  105304.68 | 194.6482070240295749
+  8 | 16767.6458 |  30.9938000000000000
+  8 |  106351.57 | 196.5833086876155268
+  9 | 16769.3229 |  30.9969000000000000
+  9 |  105398.46 | 194.8215526802218115
+ 10 | 16771.0000 |  31.0000000000000000
+ 10 |  105445.35 | 194.9082255083179298
+ 11 | 16772.6771 |  31.0031000000000000
+ 11 |  106201.03 | 196.3050462107208872
+ 12 | 16774.3542 |  31.0062000000000000
+ 12 |  106455.03 | 196.7745471349353050
+ 13 | 16776.0313 |  31.0093000000000000
+ 13 |  105501.92 | 195.0127911275415896
+ 14 | 16777.7084 |  31.0124000000000000
+ 14 |  106548.81 | 196.9478927911275416
+ 15 | 16779.3855 |  31.0155000000000000
+ 15 |  106595.70 | 197.0345656192236599
+ 16 | 16781.0626 |  31.0186000000000000
+ 16 |  106745.52 | 197.3114972273567468
+ 17 | 16782.7397 |  31.0217000000000000
+ 17 |  107605.38 | 198.9008872458410351
+ 18 | 16784.4168 |  31.0248000000000000
+ 18 |  105652.27 | 195.2907024029574861
+ 19 | 16786.0939 |  31.0279000000000000
+ 19 |  104699.16 | 193.5289463955637708
+ 20 | 16787.7710 |  31.0884648148148148
+ 20 |  106746.05 | 197.6778703703703704
+ 21 | 16727.4450 |  30.9767500000000000
+ 21 |  105213.75 | 194.8402777777777778
+ 22 | 16729.1190 |  30.9798500000000000
+ 22 |  105299.03 | 194.9982037037037037
+ 23 | 16730.7930 |  30.9829500000000000
+ 23 |  106065.05 | 196.4167592592592593
+ 24 | 16732.4670 |  30.9860500000000000
+ 24 |  106032.75 | 196.3569444444444444
+ 25 | 16734.1410 |  30.9891500000000000
+ 25 |  106000.45 | 196.2971296296296296
+ 26 | 16735.8150 |  30.9922500000000000
+ 26 |  105968.15 | 196.2373148148148148
+ 27 | 16737.4890 |  30.9953500000000000
+ 27 |  106447.57 | 197.1251296296296296
+ 28 | 16739.1630 |  30.9984500000000000
+ 28 |  106819.45 | 197.8137962962962963
+ 29 | 16740.8370 |  31.0015500000000000
+ 29 |  106787.15 | 197.7539814814814815
+ 30 | 16742.5110 |  31.0046500000000000
+ 30 |  105754.85 | 195.8423148148148148
+ 31 | 16744.1850 |  31.0077500000000000
+ 31 |  104722.55 | 193.9306481481481481
+ 32 | 16745.8590 |  31.0108500000000000
+ 32 |  105596.11 | 195.5483518518518519
+ 33 | 16747.5330 |  31.0139500000000000
+ 33 |  105573.85 | 195.5071296296296296
+ 34 | 16749.2070 |  31.0170500000000000
+ 34 |  105541.55 | 195.4473148148148148
+ 35 | 16750.8810 |  31.0201500000000000
+ 35 |  104509.25 | 193.5356481481481481
+(72 rows)
+
+SELECT t.i, t.v FROM (SELECT i, sum(a / 3) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 ORDER BY 2 DESC, 1 LIMIT 10;
+ i  |             v              
+----+----------------------------
+  1 |                        NaN
+ 17 | 35868.46000000000000009999
+  5 | 35764.99999999999999993334
+  3 | 35733.74000000000000000001
+ 28 | 35606.48333333333333343333
+ 29 | 35595.71666666666666663334
+ 20 | 35582.01666666666666660000
+ 16 | 35581.83999999999999986666
+ 15 | 35531.89999999999999996666
+ 14 | 35516.26999999999999993333
+(10 rows)
 
 SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
  i 
@@ -3123,6 +3262,98 @@ SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) 
  34
  36
 (19 rows)
+
+SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
+ i  |     v      |       ?column?       
+----+------------+----------------------
+  0 | 16754.2290 |  30.9118616236162362
+  0 |  106444.65 | 196.3923431734317343
+  1 | 16756.9061 |  30.9168009225092251
+  1 |        NaN |                  NaN
+  2 | 16758.5832 |  30.9770484288354898
+  2 |  106157.33 | 196.2242698706099815
+  3 | 16759.2603 |  30.9783000000000000
+  3 |  107201.22 | 198.1538262476894640
+  4 | 16760.9374 |  30.9814000000000000
+  4 |  106248.11 | 196.3920702402957486
+  5 | 16762.6145 |  30.9845000000000000
+  5 |  107295.00 | 198.3271719038817006
+  6 | 16764.2916 |  30.9876000000000000
+  6 |  104656.54 | 193.4501663585951941
+  7 | 16765.9687 |  30.9907000000000000
+  7 |  105304.68 | 194.6482070240295749
+  8 | 16767.6458 |  30.9938000000000000
+  8 |  106351.57 | 196.5833086876155268
+  9 | 16769.3229 |  30.9969000000000000
+  9 |  105398.46 | 194.8215526802218115
+ 10 | 16771.0000 |  31.0000000000000000
+ 10 |  105445.35 | 194.9082255083179298
+ 11 | 16772.6771 |  31.0031000000000000
+ 11 |  106201.03 | 196.3050462107208872
+ 12 | 16774.3542 |  31.0062000000000000
+ 12 |  106455.03 | 196.7745471349353050
+ 13 | 16776.0313 |  31.0093000000000000
+ 13 |  105501.92 | 195.0127911275415896
+ 14 | 16777.7084 |  31.0124000000000000
+ 14 |  106548.81 | 196.9478927911275416
+ 15 | 16779.3855 |  31.0155000000000000
+ 15 |  106595.70 | 197.0345656192236599
+ 16 | 16781.0626 |  31.0186000000000000
+ 16 |  106745.52 | 197.3114972273567468
+ 17 | 16782.7397 |  31.0217000000000000
+ 17 |  107605.38 | 198.9008872458410351
+ 18 | 16784.4168 |  31.0248000000000000
+ 18 |  105652.27 | 195.2907024029574861
+ 19 | 16786.0939 |  31.0279000000000000
+ 19 |  104699.16 | 193.5289463955637708
+ 20 | 16787.7710 |  31.0884648148148148
+ 20 |  106746.05 | 197.6778703703703704
+ 21 | 16727.4450 |  30.9767500000000000
+ 21 |  105213.75 | 194.8402777777777778
+ 22 | 16729.1190 |  30.9798500000000000
+ 22 |  105299.03 | 194.9982037037037037
+ 23 | 16730.7930 |  30.9829500000000000
+ 23 |  106065.05 | 196.4167592592592593
+ 24 | 16732.4670 |  30.9860500000000000
+ 24 |  106032.75 | 196.3569444444444444
+ 25 | 16734.1410 |  30.9891500000000000
+ 25 |  106000.45 | 196.2971296296296296
+ 26 | 16735.8150 |  30.9922500000000000
+ 26 |  105968.15 | 196.2373148148148148
+ 27 | 16737.4890 |  30.9953500000000000
+ 27 |  106447.57 | 197.1251296296296296
+ 28 | 16739.1630 |  30.9984500000000000
+ 28 |  106819.45 | 197.8137962962962963
+ 29 | 16740.8370 |  31.0015500000000000
+ 29 |  106787.15 | 197.7539814814814815
+ 30 | 16742.5110 |  31.0046500000000000
+ 30 |  105754.85 | 195.8423148148148148
+ 31 | 16744.1850 |  31.0077500000000000
+ 31 |  104722.55 | 193.9306481481481481
+ 32 | 16745.8590 |  31.0108500000000000
+ 32 |  105596.11 | 195.5483518518518519
+ 33 | 16747.5330 |  31.0139500000000000
+ 33 |  105573.85 | 195.5071296296296296
+ 34 | 16749.2070 |  31.0170500000000000
+ 34 |  105541.55 | 195.4473148148148148
+ 35 | 16750.8810 |  31.0201500000000000
+ 35 |  104509.25 | 193.5356481481481481
+(72 rows)
+
+SELECT t.i, t.v FROM (SELECT i, sum(a / 3) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 ORDER BY 2 DESC, 1 LIMIT 10;
+ i  |             v              
+----+----------------------------
+  1 |                        NaN
+ 17 | 35868.46000000000000009999
+  5 | 35764.99999999999999993334
+  3 | 35733.74000000000000000001
+ 28 | 35606.48333333333333343333
+ 29 | 35595.71666666666666663334
+ 20 | 35582.01666666666666660000
+ 16 | 35581.83999999999999986666
+ 15 | 35531.89999999999999996666
+ 14 | 35516.26999999999999993333
+(10 rows)
 
 SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
  i 
@@ -3878,9 +4109,9 @@ SET optimizer = off;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=51128)
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=59861)
 SELECT sum(a / b) FROM df_dn;
-ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=51126)
+ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=59860)
 -- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
 -- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
 -- picked from the sum and the count, goes beside it, so it sorts in

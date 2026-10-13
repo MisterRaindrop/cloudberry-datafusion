@@ -848,29 +848,36 @@ df_share_producer(ShareInputScan *consumer)
 /*
  * Precision and scale of output column 'attno' of the inputs 'plans' of an
  * Append: all of one scale, the widest precision.  Inputs of different
- * scales give each value the scale of its input.
+ * scales give each value the scale of its input: values of display scales
+ * of their own (DN1), carried at the largest, with the most integer digits,
+ * as are inputs of such values.
  */
 static bool
-df_numeric_append_ps(List *plans, AttrNumber attno, int *precision, int *scale)
+df_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scale, bool *dyn)
 {
 	ListCell   *lc;
 	bool		found = false;
+	int			digits = 0;
 
+	*dyn = false;
 	foreach(lc, plans)
 	{
 		Plan	   *child = lfirst(lc);
 		TargetEntry *tle = get_tle_by_resno(child->targetlist, attno);
 		int			p,
 					s;
+		bool		cdyn;
 
-		if (tle == NULL || !df_numeric_ps(child, (Node *) tle->expr, &p, &s) ||
-			(found && s != *scale))
+		if (tle == NULL || !df_numeric_range(child, (Node *) tle->expr, &p, &s, &cdyn))
 			return false;
-		*precision = found ? Max(*precision, p) : p;
-		*scale = s;
+		if (cdyn || (found && s != *scale))
+			*dyn = true;
+		digits = Max(digits, p - s);
+		*scale = found ? Max(*scale, s) : s;
 		found = true;
 	}
-	return found;
+	*precision = digits + *scale;
+	return found && *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 }
 
 /*
@@ -1004,11 +1011,11 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
 				}
 				if (var->varno == OUTER_VAR && IsA(ctx, Append))
-					return df_numeric_append_ps(((Append *) ctx)->appendplans, var->varattno,
-												precision, scale);
+					return df_numeric_append_range(((Append *) ctx)->appendplans, var->varattno,
+												   precision, scale, dyn);
 				if (var->varno == OUTER_VAR && IsA(ctx, MergeAppend))
-					return df_numeric_append_ps(((MergeAppend *) ctx)->mergeplans, var->varattno,
-												precision, scale);
+					return df_numeric_append_range(((MergeAppend *) ctx)->mergeplans, var->varattno,
+												   precision, scale, dyn);
 				if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
 				{
 					/* GPORCA's Sequence returns its last input's rows */

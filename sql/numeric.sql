@@ -444,7 +444,8 @@ DROP TABLE df_ps;
 -- beside it, as numeric.c gives it; abs keeps it.  A comparison of
 -- values beyond 76 digits at a common scale (a quotient of an avg, of the
 -- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
--- computes it, in arbitrary precision.  A Motion of such a column carries
+-- computes it, in arbitrary precision.  An Append of inputs of different
+-- scales gives such values too.  A Motion of such a column carries
 -- tuples, which hold it; min, max, avg and GROUP BY of one stay on
 -- PostgreSQL.
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
@@ -465,6 +466,7 @@ EXPLAIN (COSTS OFF) SELECT i, max(a / b) FROM df_dn WHERE b <> 0 GROUP BY i;
 EXPLAIN (COSTS OFF) SELECT a / b AS r, count(*) FROM df_dn WHERE b <> 0 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT k, abs(a / b) FROM df_dn WHERE b <> 0 AND abs(a - b) > 100 ORDER BY abs(a - c), k;
 EXPLAIN (COSTS OFF) SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
+EXPLAIN (COSTS OFF) SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
 SET datafusion.mode = off;
 SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
 SELECT k, a / b FROM df_dn WHERE b <> 0 ORDER BY a / b DESC, k LIMIT 7;
@@ -480,6 +482,8 @@ SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0
 SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
 SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
 SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
+SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
+SELECT t.i, t.v FROM (SELECT i, sum(a / 3) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 ORDER BY 2 DESC, 1 LIMIT 10;
 SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
 SET datafusion.mode = on;
@@ -497,6 +501,8 @@ SELECT k, abs(a), abs(a - c), abs(a / b), abs(b - a) / b FROM df_dn WHERE b <> 0
 SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
 SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
 SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
+SELECT t.i, t.v, t.v / y.n FROM (SELECT i, sum(a) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 WHERE t.v > 100 ORDER BY 1, 2;
+SELECT t.i, t.v FROM (SELECT i, sum(a / 3) v FROM df_dn GROUP BY i UNION ALL SELECT i, sum(c) FROM df_dn GROUP BY i) t JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = t.i + 1 ORDER BY 2 DESC, 1 LIMIT 10;
 SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
 SET optimizer = on;
