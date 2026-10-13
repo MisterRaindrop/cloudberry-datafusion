@@ -18,8 +18,10 @@
 -- Window functions (WIN1): row_number, rank, dense_rank, and count, sum,
 -- min and max over the whole partition, up to the current row's peers, or
 -- up to the current row.  DataFusion sorts the rows by the partition and
--- order keys itself, in the order PostgreSQL sorts them by.  Each query runs
--- with datafusion.mode off, then on; the two results must match.
+-- order keys itself, in the order PostgreSQL sorts them by.  avg of numeric
+-- and of integers (WIN2), as numeric_avg divides the frame's sum by its
+-- count, with its display scale.  Each query runs with datafusion.mode off,
+-- then on; the two results must match.
 --
 CREATE EXTENSION datafusion_executor;
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
@@ -49,6 +51,7 @@ EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM
 EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w ORDER BY 3, 1, 2;
 SET datafusion.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
 SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
@@ -65,6 +68,9 @@ SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FR
 SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
 SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
 SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
+SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
 SET datafusion.mode = on;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
 SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
@@ -81,6 +87,9 @@ SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FR
 SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
 SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
 SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
+SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
 
 -- GPORCA's plans
 SET optimizer = on;
@@ -89,6 +98,7 @@ EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM
 EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
+EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w ORDER BY 3, 1, 2;
 SET datafusion.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
 SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
@@ -105,6 +115,9 @@ SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FR
 SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
 SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
 SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
+SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
 SET datafusion.mode = on;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
 SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
@@ -121,13 +134,16 @@ SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FR
 SELECT * FROM (SELECT k, a, rank() OVER (ORDER BY a DESC NULLS LAST, k) r FROM df_w) s WHERE r < 5 ORDER BY 3;
 SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, sum(a) OVER (PARTITION BY g ORDER BY k, a) s FROM df_w) x WHERE r < 3 ORDER BY 1, 2;
 SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
+SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
+SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
+SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
 
--- Not supported: avg, other window functions, min and max of floats (of
--- -0 and 0, PostgreSQL's keep the later), other frames, FILTER; a run
--- condition below the top WindowAgg.
+-- Not supported: avg of floats (summed in another order), other window
+-- functions, min and max of floats (of -0 and 0, PostgreSQL's keep the
+-- later), other frames, FILTER; a run condition below the top WindowAgg.
 SET optimizer = off;
 SET datafusion.mode = explain;
-EXPLAIN (COSTS OFF) SELECT g, avg(n) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT g, avg(f) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, k, ntile(3) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, k, lag(k) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, k, max(f) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;

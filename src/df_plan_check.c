@@ -1949,19 +1949,39 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "window function %s of %s", name, format_type_be(wf->wintype));
 					return true;
 				}
-				if (df_agg_state(agg) == DF_AGG_AVG_FLOAT || df_agg_state(agg) == DF_AGG_AVG_INT ||
-					df_agg_state(agg) == DF_AGG_AVG_NUMERIC)
+				if (df_agg_state(agg) == DF_AGG_AVG_FLOAT)
 				{
-					df_reject(cxt, "window function avg");
+					/*
+					 * float8_accum adds the frame's values one by one;
+					 * DataFusion adds a batch's in another order, which may
+					 * give other last digits
+					 */
+					df_reject(cxt, "window function avg of %s", format_type_be(wf->wintype));
 					return true;
 				}
-				if (df_agg_state(agg) == DF_AGG_SUM_NUMERIC &&
+				if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
+					 df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
 					!df_numeric_ps(cxt->node, (Node *) linitial(wf->args), &np, &ns))
 				{
 					/* not one whose values have display scales of their own (DN1) */
-					df_reject(cxt, "window function sum of numeric of unknown precision or "
-							  "of display scales of their own");
+					df_reject(cxt, "window function %s of numeric of unknown precision or "
+							  "of display scales of their own", name);
 					return true;
+				}
+				if (df_window_avg(wf))
+				{
+					bool		dyn;
+
+					/*
+					 * WIN2: numeric_avg of the frame's sum and count, at the
+					 * largest scale it may pick (AVG1), within 76 digits
+					 */
+					if (!df_numeric_range(cxt->node, node, &np, &ns, &dyn))
+					{
+						df_reject(cxt, "window function avg returning numeric of more than %d digits",
+								  DF_NUMERIC_MAX_EXPR_PRECISION);
+						return true;
+					}
 				}
 				saved = cxt->allow_aggref;
 				cxt->allow_aggref = true;
@@ -2611,6 +2631,8 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 			agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 			return v->found = true;
 	}
+	if (IsA(node, WindowFunc) && df_window_avg((WindowFunc *) node))
+		return v->found = true; /* WIN2 */
 	if (IsA(node, Var))
 	{
 		Var		   *var = (Var *) node;
@@ -2747,6 +2769,9 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 						df_agg_state(agg) == DF_AGG_AVG_INT) &&
 					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;
 			}
+		case T_WindowFunc:
+			/* WIN2: as an avg of an Agg, over its frame */
+			return IsA(ctx, WindowAgg) && df_window_avg((WindowFunc *) expr);
 		default:
 			return false;
 	}
@@ -5312,6 +5337,21 @@ df_window_aggref(WindowFunc *wf)
 	agg->aggtransno = -1;
 	agg->location = wf->location;
 	return agg;
+}
+
+/*
+ * WIN2: is 'wf' an avg returning numeric (of numeric or of integers), which
+ * DataFusion computes from the frame's sum and count as an Agg's (AVG1)?
+ */
+bool
+df_window_avg(WindowFunc *wf)
+{
+	DfAggState	state;
+
+	if (!wf->winagg)
+		return false;
+	state = df_agg_state(df_window_aggref(wf));
+	return state == DF_AGG_AVG_NUMERIC || state == DF_AGG_AVG_INT;
 }
 
 typedef struct DfRunCondition

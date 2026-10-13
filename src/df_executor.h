@@ -361,6 +361,7 @@ extern bool df_passes_through(Plan *plan);
 /* WIN1: window functions */
 extern List *df_window_funcs(WindowAgg *wa);
 extern Aggref *df_window_aggref(WindowFunc *wf);
+extern bool df_window_avg(WindowFunc *wf);
 extern const char *df_window_frame(WindowAgg *wa);
 extern List *df_window_run_condition(WindowAgg *wa);
 extern Plan *df_window_order_input(Plan *input);

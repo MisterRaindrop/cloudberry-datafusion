@@ -122,6 +122,9 @@ static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
 static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
 static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
 static void df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
+static void df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k,
+							   bool dscale);
+static int	df_window_index(DfBuilder *b, Node *node);
 static bool df_is_mixed_sum(Plan *ctx, Node *node);
 static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
 static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
@@ -1059,6 +1062,18 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			df_emit_dscale(b, out, linitial(((NullIfExpr *) node)->args), level);
 			return;
 
+		case T_WindowFunc:
+			{
+				/* WIN2: the scale numeric_avg picks from the frame's sum and count */
+				int			k = level == DF_LEVEL_SCAN ? df_window_index(b, node) : -1;
+
+				if (k < 0 || !df_window_avg((WindowFunc *) node))
+					df_fail(b, "the display scale of a window function");
+				else
+					df_emit_window_avg(b, out, (WindowFunc *) node, k, true);
+				return;
+			}
+
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) node;
@@ -1711,17 +1726,14 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_WindowFunc:
 			{
 				/* WIN1: a column of the WindowAgg's node (df_emit_plan_node) */
-				ListCell   *lc;
+				int			k = level == DF_LEVEL_SCAN ? df_window_index(b, node) : -1;
 
-				if (level == DF_LEVEL_SCAN && b->ctx != NULL && IsA(b->ctx, WindowAgg))
-					foreach(lc, df_window_funcs((WindowAgg *) b->ctx))
-						if (equal(lfirst(lc), node))
-						{
-							appendStringInfo(out, "{\"name\":\"q%d_w%d\"}",
-											 b->ctx->plan_node_id, foreach_current_index(lc));
-							return;
-						}
-				df_fail(b, "a window function");
+				if (k < 0)
+					df_fail(b, "a window function");
+				else if (df_window_avg((WindowFunc *) node))
+					df_emit_window_avg(b, out, (WindowFunc *) node, k, false);
+				else
+					appendStringInfo(out, "{\"name\":\"q%d_w%d\"}", b->ctx->plan_node_id, k);
 				return;
 			}
 
@@ -1729,6 +1741,40 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			df_fail(b, "an expression");
 			return;
 	}
+}
+
+/*
+ * WIN2: an avg over a frame: numeric_avg (or, 'dscale', its display scale)
+ * of window column q<id>_w<k>, the frame's sum, and q<id>_w<k>_n, its
+ * count (df_emit_plan_node)
+ */
+static void
+df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k, bool dscale)
+{
+	int			id = b->ctx->plan_node_id;
+	int			from = df_agg_state(df_window_aggref(wf)) == DF_AGG_AVG_INT ? 0 :
+		df_scale_of(b->ctx, (Node *) linitial(wf->args));
+
+	appendStringInfo(out, "{\"%s\":[{\"name\":\"q%d_w%d\"},{\"name\":\"q%d_w%d_n\"}],"
+					 "\"scale\":%d", dscale ? "avg_numeric_scale" : "avg_numeric",
+					 id, k, id, k, from);
+	if (!dscale)
+		appendStringInfo(out, ",\"type\":\"%s\"", df_tag(NUMERICOID, df_avg_scale(from)));
+	appendStringInfoChar(out, '}');
+}
+
+/* The index of window function 'node' among b->ctx's (a WindowAgg), or -1. */
+static int
+df_window_index(DfBuilder *b, Node *node)
+{
+	ListCell   *lc;
+
+	if (b->ctx == NULL || !IsA(b->ctx, WindowAgg))
+		return -1;
+	foreach(lc, df_window_funcs((WindowAgg *) b->ctx))
+		if (equal(lfirst(lc), node))
+			return foreach_current_index(lc);
+	return -1;
 }
 
 /* A join key, cast to 'type' if it has another (numeric: to 'scale'). */
@@ -2081,7 +2127,21 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					 * the child as through the WindowAgg, which is all the
 					 * Agg it is given serves for
 					 */
-					if (wf->winagg)
+					if (df_window_avg(wf))
+					{
+						/* WIN2: an avg's sum and count, as an Agg's (AVG1) */
+						Aggref	   *agg = df_window_aggref(wf);
+
+						appendStringInfoString(out, "{\"fn\":\"avg_parts\",\"sum\":");
+						df_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
+										  list_make1(df_agg_state(agg) == DF_AGG_AVG_NUMERIC ?
+													 "sum_decimal" : "sum_numeric"));
+						appendStringInfoString(out, ",\"count\":");
+						df_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
+										  list_make1("count"));
+						appendStringInfoChar(out, '}');
+					}
+					else if (wf->winagg)
 						df_emit_agg_calls(b, out, (Agg *) plan,
 										  list_make1(df_window_aggref(wf)), NULL);
 					else

@@ -498,6 +498,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | DN1 | numeric of display scales of their own: `/`, CASE and COALESCE of mixed scales |
 | AV2 | avg returning numeric as a sort key and above its Agg, with its display scale |
 | WIN1 | Window functions: row_number, rank, dense_rank; count, sum, min, max over a frame |
+| WIN2 | avg of numeric and of integers over a frame, with its display scale |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1230,8 +1231,17 @@ a group does; a sum of the sums of an Agg's groups (TPC-DS Q12, Q20, Q98:
 below at most once and keeps its argument's bound, which leaves the
 division above it within 76 digits.
 
-Not done: `avg` (TPC-DS Q47, Q53, Q57, Q63, Q89 average over partitions);
-`min` and `max` of floats (of -0 and 0, PostgreSQL's keep the later
+WIN2: `avg` of numeric and of integers over a frame is numeric_avg of the
+frame's sum and count, which DataFusion computes as two window columns
+(an exact sum, NaN if any value is, and a count) and divides as an Agg's
+avg (AVG1, df_core::pgnum::pg_avg), with the display scale numeric_avg
+picks beside it where the value leaves DataFusion or is divided (AV2).  So
+an avg over partitions (TPC-DS Q47, Q53, Q57, Q63, Q89) runs in DataFusion,
+as do expressions on it and a sort by it.  avg of floats stays on
+PostgreSQL: float8_accum adds the frame's values one by one, DataFusion a
+batch's in another order, which may give other last digits.
+
+Not done: `avg` of floats; `min` and `max` of floats (of -0 and 0, PostgreSQL's keep the later
 value, which the window's order determines); `ntile`, `lag`, `lead` and
 the other window functions; frames with offsets, GROUPS or EXCLUDE;
 FILTER and DISTINCT.

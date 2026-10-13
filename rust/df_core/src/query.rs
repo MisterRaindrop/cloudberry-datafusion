@@ -54,9 +54,12 @@
 //!         | {"window": {"input": <node>, "partition": [<expr>...],
 //!                       "order": [{"expr": <expr>, "desc": b, "nulls_first": b}...],
 //!                       "frame": "partition" | "range" | "rows",
-//!                       "funcs": [{"fn": "rank"} | <aggregate spec>...],
+//!                       "funcs": [{"fn": "rank"} | <aggregate spec>
+//!                                 | {"fn": "avg_parts", "sum": <aggregate spec>,
+//!                                    "count": <aggregate spec>}...],
 //!                       "name": s}}   (its rows with a column s_w<i> for
-//!                       each function; see `window`)
+//!                       each function, and s_w<i>_n for an avg's count: an
+//!                       avg's s_w<i> is its sum, WIN2; see `window`)
 //!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
 //!                with a column s of numbers unique to each, above n: Cloudberry's
 //!                RowIdExpr)
@@ -1649,6 +1652,24 @@ fn window(
                     Box::new(col(&v)),
                     DataType::Int64,
                 ))
+            }
+            "avg_parts" => {
+                // WIN2: an avg's frame sum, as w<i>, and count, as w<i>_n,
+                // which pg_avg divides above (AVG1)
+                let sum_call = field(f, "sum")?;
+                calls.push(over(aggregate(sum_call, b.schema(), None)?)?.alias(&v));
+                if let Some(e) = aggregate_extra(sum_call, None)? {
+                    calls.push(over(e)?.alias(format!("{v}_n")));
+                }
+                let n = format!("{v}_c");
+                calls.push(over(aggregate(field(f, "count")?, b.schema(), None)?)?.alias(&n));
+                cols.push(col(&n).alias(format!("{name}_w{i}_n")));
+                match Post::of(sum_call)? {
+                    Post::None => col(&v),
+                    Post::NanIf => PgNumeric::udf(NumericFn::NanIf)
+                        .call(vec![col(&v), col(format!("{v}_n"))]),
+                    _ => return Err("plan spec: avg_parts sum".into()),
+                }
             }
             _ => {
                 calls.push(over(aggregate(f, b.schema(), None)?)?.alias(&v));
