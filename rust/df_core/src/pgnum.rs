@@ -25,6 +25,7 @@
 //! sums, which a NaN makes NaN (`sum_decimal` in query.rs adds the others
 //! and marks the group with these functions).
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
@@ -37,6 +38,7 @@ use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
+use num_bigint::BigUint;
 
 /// NaN of a numeric value (i256::MAX, beyond 10^76).
 pub const NUMERIC_NAN: i256 = i256::MAX;
@@ -454,6 +456,215 @@ impl ScalarUDFImpl for PgNumeric {
             }
         };
         Ok(ColumnarValue::Array(out))
+    }
+}
+
+/// A side of an exact comparison (PgNumCmp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpSide {
+    /// a value of scale `scale`
+    Value { scale: i8 },
+    /// numeric_div of x, of scale `x`, by y, of scale `y`, as pg_div
+    /// computes it, of arguments x, its display scale, y, its display scale
+    Div { x: i8, y: i8 },
+}
+
+impl CmpSide {
+    fn nargs(self) -> usize {
+        match self {
+            CmpSide::Value { .. } => 1,
+            CmpSide::Div { .. } => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CmpOp {
+    Lt,
+    Le,
+    Eq,
+    Ne,
+    Ge,
+    Gt,
+}
+
+impl CmpOp {
+    pub fn from_pg(op: &str) -> Option<CmpOp> {
+        Some(match op {
+            "<" => CmpOp::Lt,
+            "<=" => CmpOp::Le,
+            "=" => CmpOp::Eq,
+            "<>" => CmpOp::Ne,
+            ">=" => CmpOp::Ge,
+            ">" => CmpOp::Gt,
+            _ => return None,
+        })
+    }
+
+    fn holds(self, o: Ordering) -> bool {
+        match self {
+            CmpOp::Lt => o == Ordering::Less,
+            CmpOp::Le => o != Ordering::Greater,
+            CmpOp::Eq => o == Ordering::Equal,
+            CmpOp::Ne => o != Ordering::Equal,
+            CmpOp::Ge => o != Ordering::Less,
+            CmpOp::Gt => o == Ordering::Greater,
+        }
+    }
+}
+
+/// A side's value exactly: NaN, or a sign, magnitude and scale.
+#[derive(Debug, PartialEq)]
+enum Exact {
+    Nan,
+    Num { neg: bool, mag: BigUint, scale: i32 },
+}
+
+fn magnitude(v: i256) -> BigUint {
+    BigUint::from_bytes_be(&v.wrapping_abs().to_be_bytes())
+}
+
+fn ten(k: i32) -> BigUint {
+    BigUint::from(10u32).pow(k as u32)
+}
+
+impl Exact {
+    fn value(v: i256, scale: i8) -> Exact {
+        if v == NUMERIC_NAN {
+            return Exact::Nan;
+        }
+        Exact::Num { neg: v < i256::ZERO, mag: magnitude(v), scale: scale as i32 }
+    }
+
+    /// pg_div's quotient, without its bound on digits: rounded half away
+    /// from zero at pg_div_rscale's scale.  None for a zero divisor.
+    fn quotient(x: i256, sx: i8, dx: i32, y: i256, sy: i8, dy: i32) -> Option<Exact> {
+        if x == NUMERIC_NAN || y == NUMERIC_NAN {
+            return Some(Exact::Nan);
+        }
+        if y == i256::ZERO {
+            return None;
+        }
+        let rscale = pg_div_rscale(x, sx, dx, y, sy, dy);
+        let e = rscale - sx as i32 + sy as i32;
+        let (mut num, mut den) = (magnitude(x), magnitude(y));
+        if e >= 0 {
+            num *= ten(e);
+        } else {
+            den *= ten(-e);
+        }
+        let mut q = &num / &den;
+        if (num % &den) * 2u32 >= den {
+            q += 1u32;
+        }
+        Some(Exact::Num { neg: (x < i256::ZERO) != (y < i256::ZERO), mag: q, scale: rscale })
+    }
+
+    /// As PostgreSQL orders numeric: NaN above every number, equal to NaN.
+    fn compare(&self, other: &Exact) -> Ordering {
+        match (self, other) {
+            (Exact::Nan, Exact::Nan) => Ordering::Equal,
+            (Exact::Nan, _) => Ordering::Greater,
+            (_, Exact::Nan) => Ordering::Less,
+            (
+                Exact::Num { neg: na, mag: ma, scale: sa },
+                Exact::Num { neg: nb, mag: mb, scale: sb },
+            ) => {
+                // -0 is 0
+                let na = *na && ma.bits() > 0;
+                let nb = *nb && mb.bits() > 0;
+                if na != nb {
+                    return if na { Ordering::Less } else { Ordering::Greater };
+                }
+                let s = (*sa).max(*sb);
+                let o = (ma * ten(s - sa)).cmp(&(mb * ten(s - sb)));
+                if na {
+                    o.reverse()
+                } else {
+                    o
+                }
+            }
+        }
+    }
+}
+
+/// An exact comparison of two numeric values, either of which may be a
+/// quotient whose digits no fixed scale holds (DN1's bound beyond 76): the
+/// sides are computed as PostgreSQL computes them, in arbitrary precision,
+/// and compared.  NULL if any value is; 22012 for a zero divisor.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PgNumCmp {
+    op: CmpOp,
+    l: CmpSide,
+    r: CmpSide,
+    signature: Signature,
+}
+
+impl PgNumCmp {
+    pub fn udf(op: CmpOp, l: CmpSide, r: CmpSide) -> ScalarUDF {
+        ScalarUDF::new_from_impl(PgNumCmp {
+            op,
+            l,
+            r,
+            signature: Signature::any(l.nargs() + r.nargs(), Volatility::Immutable),
+        })
+    }
+}
+
+impl ScalarUDFImpl for PgNumCmp {
+    fn name(&self) -> &str {
+        "pg_numeric_cmp"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let arrays = args
+            .args
+            .iter()
+            .map(|a| a.to_array(n))
+            .collect::<Result<Vec<_>>>()?;
+        let side = |kind: CmpSide, a: &[ArrayRef], r: usize| -> Result<Option<Exact>> {
+            match kind {
+                CmpSide::Value { scale } => {
+                    let v = decimal(&a[0])?;
+                    Ok((!v.is_null(r)).then(|| Exact::value(v.value(r), scale)))
+                }
+                CmpSide::Div { x: sx, y: sy } => {
+                    let (x, y) = (decimal(&a[0])?, decimal(&a[2])?);
+                    if x.is_null(r) || y.is_null(r) {
+                        return Ok(None);
+                    }
+                    let d = |a: &ArrayRef| -> Result<i32> {
+                        let s = a.as_primitive_opt::<Int32Type>().ok_or_else(|| {
+                            DataFusionError::Internal(format!("cmp: display scale of type {}", a.data_type()))
+                        })?;
+                        Ok(if s.is_null(r) { 0 } else { s.value(r) })
+                    };
+                    Exact::quotient(x.value(r), sx, d(&a[1])?, y.value(r), sy, d(&a[3])?)
+                        .map(Some)
+                        .ok_or_else(|| {
+                            DataFusionError::ArrowError(Box::new(crate::pgfunc::division_by_zero()), None)
+                        })
+                }
+            }
+        };
+        let (la, ra) = arrays.split_at(self.l.nargs());
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            out.push(match (side(self.l, la, r)?, side(self.r, ra, r)?) {
+                (Some(a), Some(b)) => Some(self.op.holds(a.compare(&b))),
+                _ => None,
+            });
+        }
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(out))))
     }
 }
 
@@ -884,6 +1095,44 @@ mod tests {
             ColumnarValue::Array(a) => a,
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn exact_quotients_are_pg_divs_without_a_bound() {
+        let i = |v: i128| i256::from_i128(v);
+        // where pg_div fits, the same quotient at the same scale
+        for (x, sx, dx, y, sy, dy) in [
+            (150, 2, 2, 7, 0, 0),
+            (-1, 0, 0, 3, 0, 0),
+            (123456789, 4, 4, -98765, 2, 2),
+            (5, 3, 3, 2, 0, 0),
+            (-25, 1, 1, -10, 1, 1),
+        ] {
+            let r = pg_div_rscale(i(x), sx, dx, i(y), sy, dy);
+            let q = pg_div(i(x), sx, i(y), sy, r, r as i8).unwrap();
+            assert_eq!(
+                Exact::quotient(i(x), sx, dx, i(y), sy, dy).unwrap(),
+                Exact::value(q, r as i8),
+                "{x}e-{sx} / {y}e-{sy}"
+            );
+        }
+        // a quotient beyond 76 digits: 10^60 / 10^-40 at scale 40 (the
+        // larger display scale), and one more digit than its neighbour
+        let big = pow10(60);
+        let tiny = i(1);
+        let q = Exact::quotient(big, 0, 0, tiny, 40, 40).unwrap();
+        let below = Exact::value(i256::MAX.wrapping_sub(i(1)), 0);
+        assert_eq!(q.compare(&below), Ordering::Greater);
+        assert_eq!(Exact::quotient(i(1), 0, 0, i256::ZERO, 0, 0), None);
+        // NaN above every number and equal to NaN; -0 is 0
+        let nan = Exact::value(NUMERIC_NAN, 2);
+        assert_eq!(nan.compare(&q), Ordering::Greater);
+        assert_eq!(nan.compare(&Exact::quotient(NUMERIC_NAN, 0, 0, i(0), 0, 0).unwrap()), Ordering::Equal);
+        let neg_zero = Exact::Num { neg: true, mag: BigUint::from(0u32), scale: 3 };
+        assert_eq!(neg_zero.compare(&Exact::value(i256::ZERO, 0)), Ordering::Equal);
+        // values of different scales: 1.50 = 1.5, -2 < -1.99
+        assert_eq!(Exact::value(i(150), 2).compare(&Exact::value(i(15), 1)), Ordering::Equal);
+        assert_eq!(Exact::value(i(-2), 0).compare(&Exact::value(i(-199), 2)), Ordering::Less);
     }
 
     #[test]

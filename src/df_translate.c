@@ -125,6 +125,8 @@ static void df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel lev
 static void df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k,
 							   bool dscale);
 static int	df_window_index(DfBuilder *b, Node *node);
+static void df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r,
+						   DfLevel level);
 static bool df_is_mixed_sum(Plan *ctx, Node *node);
 static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
 static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
@@ -1324,6 +1326,12 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit_numeric_param_cmp(b, out, op, level);
 					return;
 				}
+				if (df_numcmp_needed(df_level_ctx(b, level), op))
+				{
+					/* exactly, each side as PostgreSQL computes it (PgNumCmp) */
+					df_emit_numcmp(b, out, name, linitial(op->args), lsecond(op->args), level);
+					return;
+				}
 				if (df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
 				{
 					/* a date against a timestamp constant, as dates (DT1) */
@@ -1777,6 +1785,109 @@ df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k, bool dsc
 					 id, k, id, k, from);
 	if (!dscale)
 		appendStringInfo(out, ",\"type\":\"%s\"", df_tag(NUMERICOID, df_avg_scale(from)));
+	appendStringInfoChar(out, '}');
+}
+
+/*
+ * A side of an exact comparison (df_numcmp_term): a quotient as its
+ * operands and their display scales, abs of one as abs of its operands,
+ * or a value at its scale.
+ */
+static void
+df_emit_numcmp_side(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
+{
+	Plan	   *ctx = df_level_ctx(b, level);
+	Plan	   *saved = b->ctx;
+	bool		abs = IsA(node, FuncExpr);
+	Node	   *q = abs ? linitial(((FuncExpr *) node)->args) : node;
+
+	if (IsA(q, OpExpr) && strcmp(get_opname(((OpExpr *) q)->opno), "/") == 0)
+	{
+		Node	   *x = linitial(((OpExpr *) q)->args);
+		Node	   *y = lsecond(((OpExpr *) q)->args);
+		int			i;
+
+		appendStringInfoString(out, "{\"div\":[");
+		for (i = 0; i < 2; i++)
+		{
+			Node	   *e = i == 0 ? x : y;
+
+			if (i > 0)
+				appendStringInfoChar(out, ',');
+			appendStringInfoString(out, abs ? "{\"numabs\":" : "");
+			df_emit(b, out, e, level);
+			b->ctx = saved;
+			appendStringInfoString(out, abs ? "}," : ",");
+			df_emit_dscale(b, out, e, level);
+			b->ctx = saved;
+		}
+		appendStringInfo(out, "],\"scales\":[%d,%d]}", df_scale_of(ctx, x), df_scale_of(ctx, y));
+		return;
+	}
+	appendStringInfoString(out, "{\"value\":");
+	df_emit(b, out, node, level);
+	b->ctx = saved;
+	appendStringInfo(out, ",\"scale\":%d}", df_scale_of(ctx, node));
+}
+
+/*
+ * 'l' op 'r' exactly (df_numcmp_needed): a CASE's comparison is its
+ * branch's, NULL where the branch is; the rest PgNumCmp's.
+ */
+static void
+df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, DfLevel level)
+{
+	Plan	   *saved = b->ctx;
+	bool		left = IsA(l, CaseExpr);
+
+	if (left || IsA(r, CaseExpr))
+	{
+		CaseExpr   *ce = (CaseExpr *) (left ? l : r);
+		int			i;
+
+		appendStringInfoString(out, "{\"case\":[");
+		for (i = 0; i <= list_length(ce->args); i++)
+		{
+			Node	   *res;
+
+			if (i < list_length(ce->args))
+			{
+				CaseWhen   *w = list_nth_node(CaseWhen, ce->args, i);
+
+				appendStringInfoString(out, i > 0 ? ",{\"when\":" : "{\"when\":");
+				df_emit(b, out, (Node *) w->expr, level);
+				b->ctx = saved;
+				appendStringInfoString(out, ",\"then\":");
+				res = (Node *) w->result;
+			}
+			else
+			{
+				appendStringInfoString(out, "],\"else\":");
+				res = (Node *) ce->defresult;
+			}
+			if (IsA(res, Const) && ((Const *) res)->constisnull)
+				appendStringInfoString(out, "{\"lit\":{\"type\":\"bool\",\"null\":true}}");
+			else if (left)
+				df_emit_numcmp(b, out, op, res, r, level);
+			else
+				df_emit_numcmp(b, out, op, l, res, level);
+			b->ctx = saved;
+			if (i < list_length(ce->args))
+				appendStringInfoChar(out, '}');
+		}
+		appendStringInfoChar(out, '}');
+		return;
+	}
+	if ((IsA(l, Const) && ((Const *) l)->constisnull) ||
+		(IsA(r, Const) && ((Const *) r)->constisnull))
+	{
+		appendStringInfoString(out, "{\"lit\":{\"type\":\"bool\",\"null\":true}}");
+		return;
+	}
+	appendStringInfo(out, "{\"numcmp\":\"%s\",\"left\":", op);
+	df_emit_numcmp_side(b, out, l, level);
+	appendStringInfoString(out, ",\"right\":");
+	df_emit_numcmp_side(b, out, r, level);
 	appendStringInfoChar(out, '}');
 }
 

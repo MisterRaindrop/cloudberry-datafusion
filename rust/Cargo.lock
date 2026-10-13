@@ -1010,6 +1010,7 @@ dependencies = [
  "datafusion",
  "futures",
  "libc",
+ "num-bigint",
  "serde_json",
  "tokio",
 ]

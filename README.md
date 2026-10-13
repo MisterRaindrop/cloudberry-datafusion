@@ -981,6 +981,21 @@ and a filter on `price / qty` 0.92 s against 1.07 s.  TPC-DS SF1:
 whole-slice runs 1558 -> 1572, queries wholly in DataFusion 84 -> 89 of
 206 executions, results unchanged apart from Q71's ties (205/206).
 
+A comparison whose sides have no common scale within 76 digits is
+exact instead (df_numcmp_needed): an avg is carried at the largest scale
+numeric_avg may pick (40 for a sum of scale 2), and a quotient by one may
+need 84 digits after the point, so `CASE WHEN avg_sales > 0 THEN
+abs(sales - avg_sales) / avg_sales END > 0.1` (TPC-DS Q47, Q53, Q57,
+Q63, Q89) and a quotient compared with another (Q4, Q74) stayed on
+PostgreSQL.  df_core::pgnum::PgNumCmp computes each side as PostgreSQL
+does, a quotient as pg_div at select_div_scale's scale, in arbitrary
+precision (num-bigint), and compares them, NaN above every number; a
+CASE's comparison is that of the branch taken, abs of a quotient that of
+abs(x) / abs(y).  TPC-DS SF1 with WIN2 and abs: queries wholly in
+DataFusion 105 -> 112 of 206 executions by EXPLAIN (Q47, Q57 and Q89
+under the Postgres planner, Q53 and Q63 under both), their results
+unchanged.
+
 ### avg as a sort key and above its Agg
 
 AV2: an avg returning numeric that DataFusion divides (AVG1) holds

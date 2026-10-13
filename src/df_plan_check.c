@@ -146,6 +146,9 @@ static bool df_check_expr(Node *node, DfCheckContext *cxt);
 static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
 static bool df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups);
 static bool df_name_in(const char *name, const char *const *list);
+static bool df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches);
+static bool df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
+static void df_check_numcmp_term(Node *node, DfCheckContext *cxt);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
 static void df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
@@ -1730,6 +1733,18 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							/* IP1: the parameter, rounded to the other side's scale */
 							cxt->numeric_param_ok = IsA(linitial(op->args), Param) ?
 								linitial(op->args) : lsecond(op->args);
+						else if (df_numcmp_needed(cxt->node, op) &&
+								 df_numcmp_term(cxt->node, linitial(op->args), cxt->batches) &&
+								 df_numcmp_term(cxt->node, lsecond(op->args), cxt->batches))
+						{
+							/*
+							 * compared exactly, as PostgreSQL computes each
+							 * side (df_numcmp_term); their parts checked here
+							 */
+							df_check_numcmp_term(linitial(op->args), cxt);
+							df_check_numcmp_term(lsecond(op->args), cxt);
+							return cxt->failed;
+						}
 						else if (!df_numeric_range(cxt->node, linitial(op->args), &lp, &ls, &dyn) ||
 								 !df_numeric_range(cxt->node, lsecond(op->args), &rp, &rs, &dyn))
 							df_reject(cxt, "operator %s on numeric of unknown precision", name);
@@ -2786,6 +2801,153 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 			return IsA(ctx, WindowAgg) && df_window_avg((WindowFunc *) expr);
 		default:
 			return false;
+	}
+}
+
+/*
+ * Is comparison 'op' of node 'ctx' one of numeric values that cannot be
+ * compared at a common scale within 76 digits: a side of unknown digits
+ * or beyond them?  A quotient's bound (DN1) can be: a value of the
+ * largest scale an avg may pick divided by another.  df_core's PgNumCmp
+ * then computes each side exactly, as PostgreSQL does, and compares them
+ * (df_numcmp_term).
+ */
+bool
+df_numcmp_needed(Plan *ctx, OpExpr *op)
+{
+	static const char *const cmps[] = {"<", "<=", "=", "<>", ">=", ">", NULL};
+	char	   *name = get_opname(op->opno);
+	int			lp,
+				ls,
+				rp,
+				rs,
+				t;
+	bool		dyn;
+
+	if (name == NULL || !df_name_in(name, cmps) || op->opresulttype != BOOLOID ||
+		op->opno >= FirstGenbkiObjectId || list_length(op->args) != 2 ||
+		exprType(linitial(op->args)) != NUMERICOID ||
+		exprType(lsecond(op->args)) != NUMERICOID)
+		return false;
+	if (!df_numeric_range(ctx, linitial(op->args), &lp, &ls, &dyn) ||
+		!df_numeric_range(ctx, lsecond(op->args), &rp, &rs, &dyn))
+		return true;
+	t = Max(ls, rs);
+	return lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
+		rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION;
+}
+
+/*
+ * A side of such a comparison: a numeric value of known digits, a quotient
+ * of two of them with their display scales (DN1), abs of one (abs(x / y)
+ * is abs(x) / abs(y): div_var rounds half away from zero), or a searched
+ * CASE of those and NULLs, whose comparison is the branch's.  None that
+ * may be infinite.
+ */
+static bool
+df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
+{
+	int			p,
+				s;
+	bool		dyn;
+
+	if (node == NULL || exprType(node) != NUMERICOID)
+		return false;
+	if (IsA(node, Const) && ((Const *) node)->constisnull)
+		return true;
+	if (df_numeric_range(ctx, node, &p, &s, &dyn))
+		return !df_numeric_may_be_infinite(ctx, node);
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+			{
+				OpExpr	   *op = (OpExpr *) node;
+				char	   *name = get_opname(op->opno);
+				Node	   *x,
+						   *y;
+				int			xp,
+							xs,
+							yp,
+							ys;
+
+				if (name == NULL || strcmp(name, "/") != 0 || op->opno >= FirstGenbkiObjectId ||
+					list_length(op->args) != 2)
+					return false;
+				x = linitial(op->args);
+				y = lsecond(op->args);
+				return exprType(x) == NUMERICOID && exprType(y) == NUMERICOID &&
+					df_numeric_range(ctx, x, &xp, &xs, &dyn) &&
+					df_numeric_range(ctx, y, &yp, &ys, &dyn) &&
+					!df_numeric_may_be_infinite(ctx, x) &&
+					!df_numeric_may_be_infinite(ctx, y) &&
+					df_dscale_ok(ctx, x, batches) && df_dscale_ok(ctx, y, batches);
+			}
+		case T_FuncExpr:
+			{
+				FuncExpr   *fe = (FuncExpr *) node;
+
+				return (fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS) &&
+					IsA(linitial(fe->args), OpExpr) &&
+					df_numcmp_term(ctx, linitial(fe->args), batches);
+			}
+		case T_CaseExpr:
+			{
+				CaseExpr   *ce = (CaseExpr *) node;
+				ListCell   *lc;
+
+				if (ce->arg != NULL)
+					return false;
+				foreach(lc, ce->args)
+				{
+					if (!df_numcmp_term(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
+						return false;
+				}
+				return df_numcmp_term(ctx, (Node *) ce->defresult, batches);
+			}
+		default:
+			return false;
+	}
+}
+
+/* The parts of df_numcmp_term 'node' that DataFusion evaluates as usual. */
+static void
+df_check_numcmp_term(Node *node, DfCheckContext *cxt)
+{
+	int			p,
+				s;
+	bool		dyn;
+
+	if (cxt->failed || (IsA(node, Const) && ((Const *) node)->constisnull))
+		return;
+	if (df_numeric_range(cxt->node, node, &p, &s, &dyn))
+	{
+		df_check_expr(node, cxt);
+		return;
+	}
+	switch (nodeTag(node))
+	{
+		case T_OpExpr:
+			df_check_expr(linitial(((OpExpr *) node)->args), cxt);
+			df_check_expr(lsecond(((OpExpr *) node)->args), cxt);
+			return;
+		case T_FuncExpr:
+			df_check_numcmp_term(linitial(((FuncExpr *) node)->args), cxt);
+			return;
+		case T_CaseExpr:
+			{
+				ListCell   *lc;
+
+				foreach(lc, ((CaseExpr *) node)->args)
+				{
+					df_check_expr((Node *) lfirst_node(CaseWhen, lc)->expr, cxt);
+					df_check_numcmp_term((Node *) lfirst_node(CaseWhen, lc)->result, cxt);
+				}
+				df_check_numcmp_term((Node *) ((CaseExpr *) node)->defresult, cxt);
+				return;
+			}
+		default:
+			df_reject(cxt, "a side of an exact numeric comparison");
+			return;
 	}
 }
 

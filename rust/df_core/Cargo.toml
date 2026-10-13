@@ -28,6 +28,8 @@ tokio.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+# exact comparison of numeric quotients of any digits (pgnum::PgNumCmp)
+num-bigint = "0.5"
 
 [dev-dependencies]
 # SpillFile::read_stream's chunks (tests/repartition_spill.rs)

@@ -369,6 +369,7 @@ extern bool df_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls
 							Oid *collation);
 extern Node *df_semi_key_for(HashJoin *hj, Var *var);
 extern bool df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left);
+extern bool df_numcmp_needed(Plan *ctx, OpExpr *op);
 
 /* IP1: init plan values for the translation of a slice that starts, or NULL */
 extern ParamExecData *df_param_values;

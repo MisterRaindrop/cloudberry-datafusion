@@ -110,6 +110,10 @@
 //!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
 //!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
 //!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
+//!         | {"numcmp": "<" | "<=" | "=" | "<>" | ">=" | ">", "left": <side>,
+//!            "right": <side>}   (exact, of any digits: pgnum::PgNumCmp)
+//!   <side> := {"value": <expr>, "scale": s}
+//!           | {"div": [<x>, <x's display scale>, <y>, <y's>], "scales": [sx, sy]}
 //!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
 //!                                 (numeric_avg of a sum of scale s, rounded
 //!                                 as PostgreSQL does, at scale S; pgnum)
@@ -170,7 +174,7 @@ use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgError};
-use crate::pgnum::{NumOp, NumericFn, PgNumeric};
+use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
 use crate::pgstr::{bpchar_key, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
@@ -627,6 +631,30 @@ fn expr(v: &Value) -> Result<Expr, String> {
             .ok_or("plan spec: bad extract field")?;
         return Ok(crate::pgdate::PgExtractDate::udf(f).call(vec![expr(e)?]));
     }
+    if let Some(op) = v.get("numcmp") {
+        // an exact comparison of numeric values and quotients (pgnum::PgNumCmp)
+        let op = op
+            .as_str()
+            .and_then(CmpOp::from_pg)
+            .ok_or("plan spec: bad numcmp operator")?;
+        let side = |key: &str| -> Result<(CmpSide, Vec<Expr>), String> {
+            let s = field(v, key)?;
+            let scale = |x: &Value| x.as_i64().ok_or("plan spec: bad numcmp scale").map(|x| x as i8);
+            if let Some(e) = s.get("value") {
+                return Ok((CmpSide::Value { scale: scale(field(s, "scale")?)? }, vec![expr(e)?]));
+            }
+            let a = field(s, "div")?.as_array().filter(|a| a.len() == 4).ok_or("plan spec: bad numcmp div")?;
+            let sc = field(s, "scales")?.as_array().filter(|a| a.len() == 2).ok_or("plan spec: bad numcmp scales")?;
+            Ok((
+                CmpSide::Div { x: scale(&sc[0])?, y: scale(&sc[1])? },
+                a.iter().map(expr).collect::<Result<Vec<_>, _>>()?,
+            ))
+        };
+        let (l, mut args) = side("left")?;
+        let (r, rargs) = side("right")?;
+        args.extend(rargs);
+        return Ok(PgNumCmp::udf(op, l, r).call(args));
+    }
     if let Some(e) = v.get("numabs") {
         return Ok(PgNumeric::udf(NumericFn::Abs).call(vec![expr(e)?]));
     }
@@ -729,7 +757,10 @@ fn may_fail(v: &Value) -> bool {
                     return true;
                 }
             }
-            if map.contains_key("numdiv") || map.contains_key("numdiv_scale") {
+            if map.contains_key("numdiv")
+                || map.contains_key("numdiv_scale")
+                || map.contains_key("numcmp")
+            {
                 // DN1: numeric division by zero
                 return true;
             }

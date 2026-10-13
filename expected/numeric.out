@@ -1935,7 +1935,10 @@ DROP TABLE df_ps;
 -- carried at the largest scale it may have, bounded by its operands'
 -- precision and scale, and compared, sorted and joined as a value; where
 -- it leaves DataFusion, or divides or is added up, its display scale goes
--- beside it, as numeric.c gives it; abs keeps it.  A Motion of such a column carries
+-- beside it, as numeric.c gives it; abs keeps it.  A comparison of
+-- values beyond 76 digits at a common scale (a quotient of an avg, of the
+-- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
+-- computes it, in arbitrary precision.  A Motion of such a column carries
 -- tuples, which hold it; min, max, avg and GROUP BY of one stay on
 -- PostgreSQL.
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
@@ -2103,6 +2106,28 @@ EXPLAIN (COSTS OFF) SELECT k, abs(a / b) FROM df_dn WHERE b <> 0 AND abs(a - b) 
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 eligible
 (9 rows)
+
+EXPLAIN (COSTS OFF) SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
+                                                                                        QUERY PLAN                                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: x.i
+   ->  Sort
+         Sort Key: x.i
+         ->  Subquery Scan on x
+               ->  Finalize HashAggregate
+                     Group Key: df_dn.i
+                     Filter: (CASE WHEN (avg(df_dn.a) <> '0'::numeric) THEN (abs((sum(df_dn.a) - avg(df_dn.a))) / avg(df_dn.a)) ELSE NULL::numeric END > ((count(df_dn.a) - 1))::numeric)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: df_dn.i
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: df_dn.i
+                                 ->  Seq Scan on df_dn
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(17 rows)
 
 SET datafusion.mode = off;
 SELECT k, a / b, c / 3, (a / b) / 3, a / (b / 3), a / b + c, (a / b) * 2 FROM df_dn WHERE b <> 0 AND k % 797 = 1 ORDER BY k;
@@ -2418,6 +2443,49 @@ SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
  count 
 -------
  15347
+(1 row)
+
+SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
+ i  |     s     |          av          
+----+-----------+----------------------
+  1 |       NaN |                  NaN
+  4 | 106248.11 | 200.0906026365348399
+  5 | 107295.00 | 202.0621468926553672
+ 11 | 106201.03 | 200.3793018867924528
+ 13 | 105501.92 | 198.6853483992467043
+ 14 | 106548.81 | 200.6568926553672316
+ 30 | 105754.85 | 199.5374528301886792
+ 35 | 104509.25 | 197.1872641509433962
+(8 rows)
+
+SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
+ i  
+----
+  0
+  2
+  3
+  6
+  9
+ 10
+ 12
+ 18
+ 19
+ 20
+ 22
+ 25
+ 26
+ 27
+ 28
+ 29
+ 33
+ 34
+ 36
+(19 rows)
+
+SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
+ i 
+---
+ 1
 (1 row)
 
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
@@ -3017,6 +3085,49 @@ SELECT count(*) FROM df_dn WHERE abs(a - b) > 100;
  count 
 -------
  15347
+(1 row)
+
+SELECT i, s, av FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > (n - 1)::numeric ORDER BY 1;
+ i  |     s     |          av          
+----+-----------+----------------------
+  1 |       NaN |                  NaN
+  4 | 106248.11 | 200.0906026365348399
+  5 | 107295.00 | 202.0621468926553672
+ 11 | 106201.03 | 200.3793018867924528
+ 13 | 105501.92 | 198.6853483992467043
+ 14 | 106548.81 | 200.6568926553672316
+ 30 | 105754.85 | 199.5374528301886792
+ 35 | 104509.25 | 197.1872641509433962
+(8 rows)
+
+SELECT i FROM (SELECT i, sum(a) s, avg(a) av, count(a) n FROM df_dn GROUP BY i) x WHERE (s - av) / av = (n - 1)::numeric ORDER BY 1;
+ i  
+----
+  0
+  2
+  3
+  6
+  9
+ 10
+ 12
+ 18
+ 19
+ 20
+ 22
+ 25
+ 26
+ 27
+ 28
+ 29
+ 33
+ 34
+ 36
+(19 rows)
+
+SELECT i FROM (SELECT i, avg(a) x1, avg(c) x2, sum(a) s1, sum(c) s2 FROM df_dn GROUP BY i) x WHERE CASE WHEN x1 > 0 THEN s1 / x1 END >= CASE WHEN x2 > 0 THEN s2 / x2 END ORDER BY 1;
+ i 
+---
+ 1
 (1 row)
 
 SELECT y.k, x.r, x.r + y.c FROM df_dn y JOIN (SELECT i, a / b r FROM df_dn WHERE b <> 0 AND k < 300 OFFSET 0) x ON x.i = y.k ORDER BY 1, 2;
@@ -3767,9 +3878,9 @@ SET optimizer = off;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=43496)
+ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=51128)
 SELECT sum(a / b) FROM df_dn;
-ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=43495)
+ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=51126)
 -- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
 -- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
 -- picked from the sum and the count, goes beside it, so it sorts in
