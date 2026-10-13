@@ -500,6 +500,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | WIN1 | Window functions: row_number, rank, dense_rank; count, sum, min, max over a frame |
 | WIN2 | avg of numeric and of integers over a frame, with its display scale |
 | UA1 | UNION ALL (Append) |
+| SO1 | INTERSECT and EXCEPT (SetOp) |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1285,6 +1286,24 @@ EXPLAIN (Q2, Q5, Q76, Q77, Q80 under the Postgres planner, Q71 and Q76
 under GPORCA too); the 44 executions of the queries with a UNION ALL give
 PostgreSQL's results, Q71's in another order of rows tied on its ORDER BY
 keys, as before.
+
+### INTERSECT and EXCEPT
+
+SO1: a SetOp (INTERSECT, EXCEPT) reads its child's rows each flagged 0
+(left) or 1 (right), and nodeSetOp.c keeps a group of equal rows by the
+counts of each side's.  DataFusion runs it as a grouping by the columns
+the SetOp tells duplicates by, named q<id>_g<k>, counting each side's rows,
+with the same test on the counts (INTERSECT: both above 0; EXCEPT: the
+left above 0 and the right 0); NULLs are equal, as in the SetOp.  A
+group's row is any of its members', so only columns whose equal values
+look alike: integers, bool, date, timestamp, text and varchar, and
+character(n), which holds every value padded to n; not floats (-0 and 0),
+numeric (1.0 and 1.00) or character without a length.  The ALL forms,
+which repeat rows, stay on PostgreSQL.  TPC-DS SF1: Q8 and Q87 under the
+Postgres planner wholly in DataFusion (124 -> 126 of 206 executions by
+EXPLAIN), Q8, Q38 and Q87 giving PostgreSQL's results; Q38 and Q87 run
+slower than on PostgreSQL there (0.45 s and 0.64 s against 0.38 s and
+0.45 s).
 
 ### Subtrees below PostgreSQL's nodes
 

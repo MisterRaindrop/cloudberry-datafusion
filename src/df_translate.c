@@ -855,6 +855,13 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 	else if (df_append_plans(child) != NIL)
 		/* UA1: a column of its union */
 		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
+	else if (IsA(child, SetOp))
+	{
+		/* SO1: its output column, a column it groups by */
+		b->ctx = child;
+		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		b->ctx = saved;
+	}
 	else if (IsA(child, Agg))
 	{
 		/*
@@ -1243,7 +1250,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
 					return;
 				}
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, SetOp))
+					/* SO1: a column it groups by (df_emit_plan_node) */
+					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
+									 df_setop_group((SetOp *) b->ctx, var->varattno));
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
 					/* UA1: a column of its union (df_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
@@ -2225,6 +2236,46 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				b->agg = saved;
 				b->agg_named = named;
 				appendStringInfo(out, ",\"name\":\"q%d\"}}", plan->plan_node_id);
+				return;
+			}
+
+		case T_SetOp:
+			{
+				/*
+				 * SO1: its child's rows grouped by the columns it tells
+				 * duplicates by, named q<plan_node_id>_g<k>, counting the
+				 * rows flagged 0 (left) and 1 (right): a group is kept as
+				 * nodeSetOp.c keeps it
+				 */
+				SetOp	   *so = (SetOp *) plan;
+				Plan	   *child = outerPlan(plan);
+				int			k;
+
+				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
+				df_emit_node(b, out, child);
+				appendStringInfoString(out, ",\"group\":[");
+				for (k = 0; k < so->numCols; k++)
+				{
+					if (k > 0)
+						appendStringInfoChar(out, ',');
+					df_emit_output_of(b, out, child, so->dupColIdx[k]);
+				}
+				appendStringInfoString(out, "],\"aggs\":[");
+				for (k = 0; k < 2; k++)
+				{
+					appendStringInfoString(out, k > 0 ? "," : "");
+					appendStringInfoString(out, "{\"fn\":\"count\",\"arg\":{\"case\":[{\"when\":"
+										   "{\"op\":\"=\",\"type\":\"bool\",\"args\":[");
+					df_emit_output_of(b, out, child, so->flagColIdx);
+					appendStringInfo(out, ",{\"lit\":{\"type\":\"int4\",\"value\":%d}}]},"
+									 "\"then\":{\"lit\":{\"type\":\"int4\",\"value\":1}}}],"
+									 "\"else\":{\"lit\":{\"type\":\"int4\",\"null\":true}}}}", k);
+				}
+				appendStringInfo(out, "],\"having\":{\"and\":["
+								 "{\"op\":\">\",\"type\":\"bool\",\"args\":[{\"agg\":0},{\"lit\":{\"type\":\"int8\",\"value\":0}}]},"
+								 "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[{\"agg\":1},{\"lit\":{\"type\":\"int8\",\"value\":0}}]}]},"
+								 "\"name\":\"q%d\"}}",
+								 so->cmd == SETOPCMD_INTERSECT ? ">" : "=", plan->plan_node_id);
 				return;
 			}
 

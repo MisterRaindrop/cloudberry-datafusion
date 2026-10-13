@@ -16,7 +16,11 @@
 -- under the License.
 --
 --
--- Set operations.  UA1: UNION ALL (Append), as DataFusion's union of its
+-- Set operations.  SO1: INTERSECT and EXCEPT (SetOp), as a grouping by
+-- their columns counting each side's rows; not the ALL forms, nor columns
+-- whose equal values may look different (numeric, floats, character
+-- without a length).
+-- UA1: UNION ALL (Append), as DataFusion's union of its
 -- inputs, which keeps no order between them: an Append whose order a node
 -- above reads stays on PostgreSQL; a Merge Append whose order nothing
 -- reads runs as one, and a GroupAggregate whose order nothing reads runs
@@ -31,10 +35,10 @@ ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_ex
 \c
 SET datafusion.worker_threads = 2;
 SET datafusion.motion_batches = on;
-CREATE TABLE df_u1 (k int, g int, a numeric(7,2), b int8, t text) DISTRIBUTED BY (k);
-CREATE TABLE df_u2 (k int, g int, a numeric(12,4), b int4, t varchar(10)) DISTRIBUTED BY (k);
-INSERT INTO df_u1 SELECT i, i % 7, CASE WHEN i % 97 = 0 THEN 'NaN' ELSE (i % 300) * 1.25 END, i::int8 * 1000000000, CASE WHEN i % 11 = 0 THEN NULL ELSE 't' || (i % 5) END FROM generate_series(1, 3000) i;
-INSERT INTO df_u2 SELECT i, i % 5, (i % 400) / 7.0, i, CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i % 3) END FROM generate_series(1, 2000) i;
+CREATE TABLE df_u1 (k int, g int, a numeric(7,2), b int8, t text, c char(4)) DISTRIBUTED BY (k);
+CREATE TABLE df_u2 (k int, g int, a numeric(12,4), b int4, t varchar(10), c char(4)) DISTRIBUTED BY (k);
+INSERT INTO df_u1 SELECT i, i % 7, CASE WHEN i % 97 = 0 THEN 'NaN' ELSE (i % 300) * 1.25 END, i::int8 * 1000000000, CASE WHEN i % 11 = 0 THEN NULL ELSE 't' || (i % 5) END, CASE WHEN i % 17 = 0 THEN NULL ELSE 'c' || (i % 6) END FROM generate_series(1, 3000) i;
+INSERT INTO df_u2 SELECT i, i % 5, (i % 400) / 7.0, i, CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i % 3) END, CASE WHEN i % 19 = 0 THEN NULL ELSE 'c' || (i % 4) END FROM generate_series(1, 2000) i;
 CREATE TABLE df_up (k int, g int, a numeric(7,2)) DISTRIBUTED BY (k) PARTITION BY RANGE (g) (START (0) END (8) EVERY (4));
 INSERT INTO df_up SELECT i, i % 8, i * 0.5 FROM generate_series(1, 1000) i;
 ANALYZE df_u1;
@@ -124,6 +128,176 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a 
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 not eligible: Append whose order of rows is read
 (9 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect
+                           ->  Append
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: "*SELECT* 2".g, (("*SELECT* 2".b)::bigint)
+                                       ->  Subquery Scan on "*SELECT* 2"
+                                             ->  Seq Scan on df_u2
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 1".g, "*SELECT* 1".b
+                                       ->  Subquery Scan on "*SELECT* 1"
+                                             ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, a FROM df_u1 INTERSECT SELECT g, a FROM df_u2) s;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect
+                           ->  Append
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: "*SELECT* 1".g, "*SELECT* 1".a
+                                       ->  Subquery Scan on "*SELECT* 1"
+                                             ->  Seq Scan on df_u1
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 2".g, "*SELECT* 2".a
+                                       ->  Subquery Scan on "*SELECT* 2"
+                                             ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: INTERSECT or EXCEPT on a column of type numeric
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g FROM df_u1 INTERSECT ALL SELECT g FROM df_u2) s;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect All
+                           ->  Append
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: "*SELECT* 2".g
+                                       ->  Subquery Scan on "*SELECT* 2"
+                                             ->  Seq Scan on df_u2
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 1".g
+                                       ->  Subquery Scan on "*SELECT* 1"
+                                             ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: INTERSECT ALL or EXCEPT ALL
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect
+                           ->  Append
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: "*SELECT* 2"."?column?", "*SELECT* 2".c
+                                       ->  Subquery Scan on "*SELECT* 2"
+                                             ->  Seq Scan on df_u2
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 1".g, "*SELECT* 1".c
+                                       ->  Subquery Scan on "*SELECT* 1"
+                                             ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, c::bpchar FROM df_u1 INTERSECT SELECT g, (c || 'x')::bpchar FROM df_u2) s;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect
+                           ->  Append
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: "*SELECT* 2".g, "*SELECT* 2".bpchar
+                                       ->  Subquery Scan on "*SELECT* 2"
+                                             ->  Seq Scan on df_u2
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 1".g, "*SELECT* 1".c
+                                       ->  Subquery Scan on "*SELECT* 1"
+                                             ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: INTERSECT or EXCEPT on a column of type character
+ DataFusion: slice 2 not eligible: type cast
+ DataFusion: slice 3 eligible
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: s.x, s.y
+   ->  Sort
+         Sort Key: s.x, s.y
+         ->  Subquery Scan on s
+               ->  HashSetOp Except
+                     ->  Append
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: "*SELECT* 1".x, "*SELECT* 1".y
+                                 ->  Subquery Scan on "*SELECT* 1"
+                                       ->  Seq Scan on df_u1
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: "*SELECT* 2"."?column?", "*SELECT* 2".g
+                                 ->  Subquery Scan on "*SELECT* 2"
+                                       ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(20 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: s.t
+   ->  Sort
+         Sort Key: s.t
+         ->  Subquery Scan on s
+               ->  HashSetOp Except
+                     ->  Append
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: "*SELECT* 1".t
+                                 ->  Subquery Scan on "*SELECT* 1"
+                                       ->  Seq Scan on df_u1
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: (("*SELECT* 2".t)::text)
+                                 ->  Subquery Scan on "*SELECT* 2"
+                                       ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(20 rows)
 
 SET enable_hashagg = off;
 EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
@@ -320,6 +494,420 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  6 |   124 | 31372.00
  7 |   124 | 31434.00
 (8 rows)
+
+SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
+ x  | t  
+----+----
+  0 | t0
+  1 | t1
+  2 | t2
+  3 | t3
+  4 | t4
+  5 | t0
+  6 | t1
+  7 | t2
+  8 | t3
+  9 | t4
+ 10 | t0
+ 11 | t1
+ 12 | t2
+ 13 | t3
+ 14 | t4
+ 15 | t0
+ 16 | t1
+ 17 | t2
+ 18 | t3
+ 19 | t4
+ 20 | t0
+ 21 | t1
+ 22 | t2
+ 23 | t3
+ 24 | t4
+ 25 | t0
+ 26 | t1
+ 27 | t2
+ 28 | t3
+ 29 | t4
+ 30 | t0
+ 31 | t1
+ 32 | t2
+ 33 | t3
+ 34 | t4
+ 35 | t0
+ 36 | t1
+ 37 | t2
+ 38 | t3
+ 39 | t4
+ 40 | t0
+ 40 | 
+ 41 | t1
+ 41 | 
+ 42 | t2
+ 42 | 
+ 43 | t3
+ 43 | 
+ 44 | t4
+ 44 | 
+ 45 | t0
+ 45 | 
+ 46 | t1
+ 46 | 
+ 47 | t2
+ 47 | 
+ 48 | t3
+ 48 | 
+ 49 | t4
+ 49 | 
+(60 rows)
+
+SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+ count 
+-------
+     3
+(1 row)
+
+SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+ t  
+----
+ t0
+ t1
+ t2
+ t3
+ t4
+(5 rows)
+
+SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
+ x  | y 
+----+---
+  0 | 1
+  0 | 2
+  0 | 3
+  0 | 4
+  0 | 5
+  0 | 6
+  1 | 0
+  1 | 2
+  1 | 3
+  1 | 4
+  1 | 5
+  1 | 6
+  2 | 0
+  2 | 1
+  2 | 3
+  2 | 4
+  2 | 5
+  2 | 6
+  3 | 0
+  3 | 1
+  3 | 2
+  3 | 4
+  3 | 5
+  3 | 6
+  4 | 0
+  4 | 1
+  4 | 2
+  4 | 3
+  4 | 5
+  4 | 6
+  5 | 1
+  5 | 2
+  5 | 3
+  5 | 4
+  5 | 5
+  5 | 6
+  6 | 0
+  6 | 2
+  6 | 3
+  6 | 4
+  6 | 5
+  6 | 6
+  7 | 0
+  7 | 1
+  7 | 3
+  7 | 4
+  7 | 5
+  7 | 6
+  8 | 0
+  8 | 1
+  8 | 2
+  8 | 4
+  8 | 5
+  8 | 6
+  9 | 0
+  9 | 1
+  9 | 2
+  9 | 3
+  9 | 5
+  9 | 6
+ 10 | 1
+ 10 | 2
+ 10 | 3
+ 10 | 4
+ 10 | 5
+ 10 | 6
+ 11 | 0
+ 11 | 2
+ 11 | 3
+ 11 | 4
+ 11 | 5
+ 11 | 6
+ 12 | 0
+ 12 | 1
+ 12 | 3
+ 12 | 4
+ 12 | 5
+ 12 | 6
+ 13 | 0
+ 13 | 1
+ 13 | 2
+ 13 | 4
+ 13 | 5
+ 13 | 6
+ 14 | 0
+ 14 | 1
+ 14 | 2
+ 14 | 3
+ 14 | 5
+ 14 | 6
+ 15 | 1
+ 15 | 2
+ 15 | 3
+ 15 | 4
+ 15 | 5
+ 15 | 6
+ 16 | 0
+ 16 | 2
+ 16 | 3
+ 16 | 4
+ 16 | 5
+ 16 | 6
+ 17 | 0
+ 17 | 1
+ 17 | 3
+ 17 | 4
+ 17 | 5
+ 17 | 6
+ 18 | 0
+ 18 | 1
+ 18 | 2
+ 18 | 4
+ 18 | 5
+ 18 | 6
+ 19 | 0
+ 19 | 1
+ 19 | 2
+ 19 | 3
+ 19 | 5
+ 19 | 6
+ 20 | 1
+ 20 | 2
+ 20 | 3
+ 20 | 4
+ 20 | 5
+ 20 | 6
+ 21 | 0
+ 21 | 2
+ 21 | 3
+ 21 | 4
+ 21 | 5
+ 21 | 6
+ 22 | 0
+ 22 | 1
+ 22 | 3
+ 22 | 4
+ 22 | 5
+ 22 | 6
+ 23 | 0
+ 23 | 1
+ 23 | 2
+ 23 | 4
+ 23 | 5
+ 23 | 6
+ 24 | 0
+ 24 | 1
+ 24 | 2
+ 24 | 3
+ 24 | 5
+ 24 | 6
+ 25 | 1
+ 25 | 2
+ 25 | 3
+ 25 | 4
+ 25 | 5
+ 25 | 6
+ 26 | 0
+ 26 | 2
+ 26 | 3
+ 26 | 4
+ 26 | 5
+ 26 | 6
+ 27 | 0
+ 27 | 1
+ 27 | 3
+ 27 | 4
+ 27 | 5
+ 27 | 6
+ 28 | 0
+ 28 | 1
+ 28 | 2
+ 28 | 4
+ 28 | 5
+ 28 | 6
+ 29 | 0
+ 29 | 1
+ 29 | 2
+ 29 | 3
+ 29 | 5
+ 29 | 6
+ 30 | 1
+ 30 | 2
+ 30 | 3
+ 30 | 4
+ 30 | 5
+ 30 | 6
+ 31 | 0
+ 31 | 2
+ 31 | 3
+ 31 | 4
+ 31 | 5
+ 31 | 6
+ 32 | 0
+ 32 | 1
+ 32 | 3
+ 32 | 4
+ 32 | 5
+ 32 | 6
+ 33 | 0
+ 33 | 1
+ 33 | 2
+ 33 | 4
+ 33 | 5
+ 33 | 6
+ 34 | 0
+ 34 | 1
+ 34 | 2
+ 34 | 3
+ 34 | 5
+ 34 | 6
+ 35 | 1
+ 35 | 2
+ 35 | 3
+ 35 | 4
+ 35 | 5
+ 35 | 6
+ 36 | 0
+ 36 | 2
+ 36 | 3
+ 36 | 4
+ 36 | 5
+ 36 | 6
+ 37 | 0
+ 37 | 1
+ 37 | 3
+ 37 | 4
+ 37 | 5
+ 37 | 6
+ 38 | 0
+ 38 | 1
+ 38 | 2
+ 38 | 4
+ 38 | 5
+ 38 | 6
+ 39 | 0
+ 39 | 1
+ 39 | 2
+ 39 | 3
+ 39 | 5
+ 39 | 6
+ 40 | 0
+ 40 | 1
+ 40 | 2
+ 40 | 3
+ 40 | 4
+ 40 | 5
+ 40 | 6
+ 41 | 0
+ 41 | 1
+ 41 | 2
+ 41 | 3
+ 41 | 4
+ 41 | 5
+ 41 | 6
+ 42 | 0
+ 42 | 1
+ 42 | 2
+ 42 | 3
+ 42 | 4
+ 42 | 5
+ 42 | 6
+ 43 | 0
+ 43 | 1
+ 43 | 2
+ 43 | 3
+ 43 | 4
+ 43 | 5
+ 43 | 6
+ 44 | 0
+ 44 | 1
+ 44 | 2
+ 44 | 3
+ 44 | 4
+ 44 | 5
+ 44 | 6
+ 45 | 0
+ 45 | 1
+ 45 | 2
+ 45 | 3
+ 45 | 4
+ 45 | 5
+ 45 | 6
+ 46 | 0
+ 46 | 1
+ 46 | 2
+ 46 | 3
+ 46 | 4
+ 46 | 5
+ 46 | 6
+ 47 | 0
+ 47 | 1
+ 47 | 2
+ 47 | 3
+ 47 | 4
+ 47 | 5
+ 47 | 6
+ 48 | 0
+ 48 | 1
+ 48 | 2
+ 48 | 3
+ 48 | 4
+ 48 | 5
+ 48 | 6
+ 49 | 0
+ 49 | 1
+ 49 | 2
+ 49 | 3
+ 49 | 4
+ 49 | 5
+ 49 | 6
+(310 rows)
+
+SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
+ count 
+-------
+    30
+(1 row)
+
+SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
+ count | count 
+-------+-------
+    25 |    20
+(1 row)
 
 SET enable_hashagg = off;
 SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
@@ -520,6 +1108,420 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  6 |   124 | 31372.00
  7 |   124 | 31434.00
 (8 rows)
+
+SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
+ x  | t  
+----+----
+  0 | t0
+  1 | t1
+  2 | t2
+  3 | t3
+  4 | t4
+  5 | t0
+  6 | t1
+  7 | t2
+  8 | t3
+  9 | t4
+ 10 | t0
+ 11 | t1
+ 12 | t2
+ 13 | t3
+ 14 | t4
+ 15 | t0
+ 16 | t1
+ 17 | t2
+ 18 | t3
+ 19 | t4
+ 20 | t0
+ 21 | t1
+ 22 | t2
+ 23 | t3
+ 24 | t4
+ 25 | t0
+ 26 | t1
+ 27 | t2
+ 28 | t3
+ 29 | t4
+ 30 | t0
+ 31 | t1
+ 32 | t2
+ 33 | t3
+ 34 | t4
+ 35 | t0
+ 36 | t1
+ 37 | t2
+ 38 | t3
+ 39 | t4
+ 40 | t0
+ 40 | 
+ 41 | t1
+ 41 | 
+ 42 | t2
+ 42 | 
+ 43 | t3
+ 43 | 
+ 44 | t4
+ 44 | 
+ 45 | t0
+ 45 | 
+ 46 | t1
+ 46 | 
+ 47 | t2
+ 47 | 
+ 48 | t3
+ 48 | 
+ 49 | t4
+ 49 | 
+(60 rows)
+
+SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+ count 
+-------
+     3
+(1 row)
+
+SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+ t  
+----
+ t0
+ t1
+ t2
+ t3
+ t4
+(5 rows)
+
+SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
+ x  | y 
+----+---
+  0 | 1
+  0 | 2
+  0 | 3
+  0 | 4
+  0 | 5
+  0 | 6
+  1 | 0
+  1 | 2
+  1 | 3
+  1 | 4
+  1 | 5
+  1 | 6
+  2 | 0
+  2 | 1
+  2 | 3
+  2 | 4
+  2 | 5
+  2 | 6
+  3 | 0
+  3 | 1
+  3 | 2
+  3 | 4
+  3 | 5
+  3 | 6
+  4 | 0
+  4 | 1
+  4 | 2
+  4 | 3
+  4 | 5
+  4 | 6
+  5 | 1
+  5 | 2
+  5 | 3
+  5 | 4
+  5 | 5
+  5 | 6
+  6 | 0
+  6 | 2
+  6 | 3
+  6 | 4
+  6 | 5
+  6 | 6
+  7 | 0
+  7 | 1
+  7 | 3
+  7 | 4
+  7 | 5
+  7 | 6
+  8 | 0
+  8 | 1
+  8 | 2
+  8 | 4
+  8 | 5
+  8 | 6
+  9 | 0
+  9 | 1
+  9 | 2
+  9 | 3
+  9 | 5
+  9 | 6
+ 10 | 1
+ 10 | 2
+ 10 | 3
+ 10 | 4
+ 10 | 5
+ 10 | 6
+ 11 | 0
+ 11 | 2
+ 11 | 3
+ 11 | 4
+ 11 | 5
+ 11 | 6
+ 12 | 0
+ 12 | 1
+ 12 | 3
+ 12 | 4
+ 12 | 5
+ 12 | 6
+ 13 | 0
+ 13 | 1
+ 13 | 2
+ 13 | 4
+ 13 | 5
+ 13 | 6
+ 14 | 0
+ 14 | 1
+ 14 | 2
+ 14 | 3
+ 14 | 5
+ 14 | 6
+ 15 | 1
+ 15 | 2
+ 15 | 3
+ 15 | 4
+ 15 | 5
+ 15 | 6
+ 16 | 0
+ 16 | 2
+ 16 | 3
+ 16 | 4
+ 16 | 5
+ 16 | 6
+ 17 | 0
+ 17 | 1
+ 17 | 3
+ 17 | 4
+ 17 | 5
+ 17 | 6
+ 18 | 0
+ 18 | 1
+ 18 | 2
+ 18 | 4
+ 18 | 5
+ 18 | 6
+ 19 | 0
+ 19 | 1
+ 19 | 2
+ 19 | 3
+ 19 | 5
+ 19 | 6
+ 20 | 1
+ 20 | 2
+ 20 | 3
+ 20 | 4
+ 20 | 5
+ 20 | 6
+ 21 | 0
+ 21 | 2
+ 21 | 3
+ 21 | 4
+ 21 | 5
+ 21 | 6
+ 22 | 0
+ 22 | 1
+ 22 | 3
+ 22 | 4
+ 22 | 5
+ 22 | 6
+ 23 | 0
+ 23 | 1
+ 23 | 2
+ 23 | 4
+ 23 | 5
+ 23 | 6
+ 24 | 0
+ 24 | 1
+ 24 | 2
+ 24 | 3
+ 24 | 5
+ 24 | 6
+ 25 | 1
+ 25 | 2
+ 25 | 3
+ 25 | 4
+ 25 | 5
+ 25 | 6
+ 26 | 0
+ 26 | 2
+ 26 | 3
+ 26 | 4
+ 26 | 5
+ 26 | 6
+ 27 | 0
+ 27 | 1
+ 27 | 3
+ 27 | 4
+ 27 | 5
+ 27 | 6
+ 28 | 0
+ 28 | 1
+ 28 | 2
+ 28 | 4
+ 28 | 5
+ 28 | 6
+ 29 | 0
+ 29 | 1
+ 29 | 2
+ 29 | 3
+ 29 | 5
+ 29 | 6
+ 30 | 1
+ 30 | 2
+ 30 | 3
+ 30 | 4
+ 30 | 5
+ 30 | 6
+ 31 | 0
+ 31 | 2
+ 31 | 3
+ 31 | 4
+ 31 | 5
+ 31 | 6
+ 32 | 0
+ 32 | 1
+ 32 | 3
+ 32 | 4
+ 32 | 5
+ 32 | 6
+ 33 | 0
+ 33 | 1
+ 33 | 2
+ 33 | 4
+ 33 | 5
+ 33 | 6
+ 34 | 0
+ 34 | 1
+ 34 | 2
+ 34 | 3
+ 34 | 5
+ 34 | 6
+ 35 | 1
+ 35 | 2
+ 35 | 3
+ 35 | 4
+ 35 | 5
+ 35 | 6
+ 36 | 0
+ 36 | 2
+ 36 | 3
+ 36 | 4
+ 36 | 5
+ 36 | 6
+ 37 | 0
+ 37 | 1
+ 37 | 3
+ 37 | 4
+ 37 | 5
+ 37 | 6
+ 38 | 0
+ 38 | 1
+ 38 | 2
+ 38 | 4
+ 38 | 5
+ 38 | 6
+ 39 | 0
+ 39 | 1
+ 39 | 2
+ 39 | 3
+ 39 | 5
+ 39 | 6
+ 40 | 0
+ 40 | 1
+ 40 | 2
+ 40 | 3
+ 40 | 4
+ 40 | 5
+ 40 | 6
+ 41 | 0
+ 41 | 1
+ 41 | 2
+ 41 | 3
+ 41 | 4
+ 41 | 5
+ 41 | 6
+ 42 | 0
+ 42 | 1
+ 42 | 2
+ 42 | 3
+ 42 | 4
+ 42 | 5
+ 42 | 6
+ 43 | 0
+ 43 | 1
+ 43 | 2
+ 43 | 3
+ 43 | 4
+ 43 | 5
+ 43 | 6
+ 44 | 0
+ 44 | 1
+ 44 | 2
+ 44 | 3
+ 44 | 4
+ 44 | 5
+ 44 | 6
+ 45 | 0
+ 45 | 1
+ 45 | 2
+ 45 | 3
+ 45 | 4
+ 45 | 5
+ 45 | 6
+ 46 | 0
+ 46 | 1
+ 46 | 2
+ 46 | 3
+ 46 | 4
+ 46 | 5
+ 46 | 6
+ 47 | 0
+ 47 | 1
+ 47 | 2
+ 47 | 3
+ 47 | 4
+ 47 | 5
+ 47 | 6
+ 48 | 0
+ 48 | 1
+ 48 | 2
+ 48 | 3
+ 48 | 4
+ 48 | 5
+ 48 | 6
+ 49 | 0
+ 49 | 1
+ 49 | 2
+ 49 | 3
+ 49 | 4
+ 49 | 5
+ 49 | 6
+(310 rows)
+
+SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
+ count 
+-------
+    30
+(1 row)
+
+SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
+ count | count 
+-------+-------
+    25 |    20
+(1 row)
 
 SET enable_hashagg = off;
 SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
@@ -743,6 +1745,420 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  7 |   124 | 31434.00
 (8 rows)
 
+SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
+ x  | t  
+----+----
+  0 | t0
+  1 | t1
+  2 | t2
+  3 | t3
+  4 | t4
+  5 | t0
+  6 | t1
+  7 | t2
+  8 | t3
+  9 | t4
+ 10 | t0
+ 11 | t1
+ 12 | t2
+ 13 | t3
+ 14 | t4
+ 15 | t0
+ 16 | t1
+ 17 | t2
+ 18 | t3
+ 19 | t4
+ 20 | t0
+ 21 | t1
+ 22 | t2
+ 23 | t3
+ 24 | t4
+ 25 | t0
+ 26 | t1
+ 27 | t2
+ 28 | t3
+ 29 | t4
+ 30 | t0
+ 31 | t1
+ 32 | t2
+ 33 | t3
+ 34 | t4
+ 35 | t0
+ 36 | t1
+ 37 | t2
+ 38 | t3
+ 39 | t4
+ 40 | t0
+ 40 | 
+ 41 | t1
+ 41 | 
+ 42 | t2
+ 42 | 
+ 43 | t3
+ 43 | 
+ 44 | t4
+ 44 | 
+ 45 | t0
+ 45 | 
+ 46 | t1
+ 46 | 
+ 47 | t2
+ 47 | 
+ 48 | t3
+ 48 | 
+ 49 | t4
+ 49 | 
+(60 rows)
+
+SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+ count 
+-------
+     3
+(1 row)
+
+SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+ t  
+----
+ t0
+ t1
+ t2
+ t3
+ t4
+(5 rows)
+
+SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
+ x  | y 
+----+---
+  0 | 1
+  0 | 2
+  0 | 3
+  0 | 4
+  0 | 5
+  0 | 6
+  1 | 0
+  1 | 2
+  1 | 3
+  1 | 4
+  1 | 5
+  1 | 6
+  2 | 0
+  2 | 1
+  2 | 3
+  2 | 4
+  2 | 5
+  2 | 6
+  3 | 0
+  3 | 1
+  3 | 2
+  3 | 4
+  3 | 5
+  3 | 6
+  4 | 0
+  4 | 1
+  4 | 2
+  4 | 3
+  4 | 5
+  4 | 6
+  5 | 1
+  5 | 2
+  5 | 3
+  5 | 4
+  5 | 5
+  5 | 6
+  6 | 0
+  6 | 2
+  6 | 3
+  6 | 4
+  6 | 5
+  6 | 6
+  7 | 0
+  7 | 1
+  7 | 3
+  7 | 4
+  7 | 5
+  7 | 6
+  8 | 0
+  8 | 1
+  8 | 2
+  8 | 4
+  8 | 5
+  8 | 6
+  9 | 0
+  9 | 1
+  9 | 2
+  9 | 3
+  9 | 5
+  9 | 6
+ 10 | 1
+ 10 | 2
+ 10 | 3
+ 10 | 4
+ 10 | 5
+ 10 | 6
+ 11 | 0
+ 11 | 2
+ 11 | 3
+ 11 | 4
+ 11 | 5
+ 11 | 6
+ 12 | 0
+ 12 | 1
+ 12 | 3
+ 12 | 4
+ 12 | 5
+ 12 | 6
+ 13 | 0
+ 13 | 1
+ 13 | 2
+ 13 | 4
+ 13 | 5
+ 13 | 6
+ 14 | 0
+ 14 | 1
+ 14 | 2
+ 14 | 3
+ 14 | 5
+ 14 | 6
+ 15 | 1
+ 15 | 2
+ 15 | 3
+ 15 | 4
+ 15 | 5
+ 15 | 6
+ 16 | 0
+ 16 | 2
+ 16 | 3
+ 16 | 4
+ 16 | 5
+ 16 | 6
+ 17 | 0
+ 17 | 1
+ 17 | 3
+ 17 | 4
+ 17 | 5
+ 17 | 6
+ 18 | 0
+ 18 | 1
+ 18 | 2
+ 18 | 4
+ 18 | 5
+ 18 | 6
+ 19 | 0
+ 19 | 1
+ 19 | 2
+ 19 | 3
+ 19 | 5
+ 19 | 6
+ 20 | 1
+ 20 | 2
+ 20 | 3
+ 20 | 4
+ 20 | 5
+ 20 | 6
+ 21 | 0
+ 21 | 2
+ 21 | 3
+ 21 | 4
+ 21 | 5
+ 21 | 6
+ 22 | 0
+ 22 | 1
+ 22 | 3
+ 22 | 4
+ 22 | 5
+ 22 | 6
+ 23 | 0
+ 23 | 1
+ 23 | 2
+ 23 | 4
+ 23 | 5
+ 23 | 6
+ 24 | 0
+ 24 | 1
+ 24 | 2
+ 24 | 3
+ 24 | 5
+ 24 | 6
+ 25 | 1
+ 25 | 2
+ 25 | 3
+ 25 | 4
+ 25 | 5
+ 25 | 6
+ 26 | 0
+ 26 | 2
+ 26 | 3
+ 26 | 4
+ 26 | 5
+ 26 | 6
+ 27 | 0
+ 27 | 1
+ 27 | 3
+ 27 | 4
+ 27 | 5
+ 27 | 6
+ 28 | 0
+ 28 | 1
+ 28 | 2
+ 28 | 4
+ 28 | 5
+ 28 | 6
+ 29 | 0
+ 29 | 1
+ 29 | 2
+ 29 | 3
+ 29 | 5
+ 29 | 6
+ 30 | 1
+ 30 | 2
+ 30 | 3
+ 30 | 4
+ 30 | 5
+ 30 | 6
+ 31 | 0
+ 31 | 2
+ 31 | 3
+ 31 | 4
+ 31 | 5
+ 31 | 6
+ 32 | 0
+ 32 | 1
+ 32 | 3
+ 32 | 4
+ 32 | 5
+ 32 | 6
+ 33 | 0
+ 33 | 1
+ 33 | 2
+ 33 | 4
+ 33 | 5
+ 33 | 6
+ 34 | 0
+ 34 | 1
+ 34 | 2
+ 34 | 3
+ 34 | 5
+ 34 | 6
+ 35 | 1
+ 35 | 2
+ 35 | 3
+ 35 | 4
+ 35 | 5
+ 35 | 6
+ 36 | 0
+ 36 | 2
+ 36 | 3
+ 36 | 4
+ 36 | 5
+ 36 | 6
+ 37 | 0
+ 37 | 1
+ 37 | 3
+ 37 | 4
+ 37 | 5
+ 37 | 6
+ 38 | 0
+ 38 | 1
+ 38 | 2
+ 38 | 4
+ 38 | 5
+ 38 | 6
+ 39 | 0
+ 39 | 1
+ 39 | 2
+ 39 | 3
+ 39 | 5
+ 39 | 6
+ 40 | 0
+ 40 | 1
+ 40 | 2
+ 40 | 3
+ 40 | 4
+ 40 | 5
+ 40 | 6
+ 41 | 0
+ 41 | 1
+ 41 | 2
+ 41 | 3
+ 41 | 4
+ 41 | 5
+ 41 | 6
+ 42 | 0
+ 42 | 1
+ 42 | 2
+ 42 | 3
+ 42 | 4
+ 42 | 5
+ 42 | 6
+ 43 | 0
+ 43 | 1
+ 43 | 2
+ 43 | 3
+ 43 | 4
+ 43 | 5
+ 43 | 6
+ 44 | 0
+ 44 | 1
+ 44 | 2
+ 44 | 3
+ 44 | 4
+ 44 | 5
+ 44 | 6
+ 45 | 0
+ 45 | 1
+ 45 | 2
+ 45 | 3
+ 45 | 4
+ 45 | 5
+ 45 | 6
+ 46 | 0
+ 46 | 1
+ 46 | 2
+ 46 | 3
+ 46 | 4
+ 46 | 5
+ 46 | 6
+ 47 | 0
+ 47 | 1
+ 47 | 2
+ 47 | 3
+ 47 | 4
+ 47 | 5
+ 47 | 6
+ 48 | 0
+ 48 | 1
+ 48 | 2
+ 48 | 3
+ 48 | 4
+ 48 | 5
+ 48 | 6
+ 49 | 0
+ 49 | 1
+ 49 | 2
+ 49 | 3
+ 49 | 4
+ 49 | 5
+ 49 | 6
+(310 rows)
+
+SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
+ count 
+-------
+    30
+(1 row)
+
+SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
+ count | count 
+-------+-------
+    25 |    20
+(1 row)
+
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
  g | count | sum 
 ---+-------+-----
@@ -916,6 +2332,420 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
  6 |   124 | 31372.00
  7 |   124 | 31434.00
 (8 rows)
+
+SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
+ count 
+-------
+     0
+(1 row)
+
+SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
+ x  | t  
+----+----
+  0 | t0
+  1 | t1
+  2 | t2
+  3 | t3
+  4 | t4
+  5 | t0
+  6 | t1
+  7 | t2
+  8 | t3
+  9 | t4
+ 10 | t0
+ 11 | t1
+ 12 | t2
+ 13 | t3
+ 14 | t4
+ 15 | t0
+ 16 | t1
+ 17 | t2
+ 18 | t3
+ 19 | t4
+ 20 | t0
+ 21 | t1
+ 22 | t2
+ 23 | t3
+ 24 | t4
+ 25 | t0
+ 26 | t1
+ 27 | t2
+ 28 | t3
+ 29 | t4
+ 30 | t0
+ 31 | t1
+ 32 | t2
+ 33 | t3
+ 34 | t4
+ 35 | t0
+ 36 | t1
+ 37 | t2
+ 38 | t3
+ 39 | t4
+ 40 | t0
+ 40 | 
+ 41 | t1
+ 41 | 
+ 42 | t2
+ 42 | 
+ 43 | t3
+ 43 | 
+ 44 | t4
+ 44 | 
+ 45 | t0
+ 45 | 
+ 46 | t1
+ 46 | 
+ 47 | t2
+ 47 | 
+ 48 | t3
+ 48 | 
+ 49 | t4
+ 49 | 
+(60 rows)
+
+SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+ count 
+-------
+     3
+(1 row)
+
+SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+ t  
+----
+ t0
+ t1
+ t2
+ t3
+ t4
+(5 rows)
+
+SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
+ x  | y 
+----+---
+  0 | 1
+  0 | 2
+  0 | 3
+  0 | 4
+  0 | 5
+  0 | 6
+  1 | 0
+  1 | 2
+  1 | 3
+  1 | 4
+  1 | 5
+  1 | 6
+  2 | 0
+  2 | 1
+  2 | 3
+  2 | 4
+  2 | 5
+  2 | 6
+  3 | 0
+  3 | 1
+  3 | 2
+  3 | 4
+  3 | 5
+  3 | 6
+  4 | 0
+  4 | 1
+  4 | 2
+  4 | 3
+  4 | 5
+  4 | 6
+  5 | 1
+  5 | 2
+  5 | 3
+  5 | 4
+  5 | 5
+  5 | 6
+  6 | 0
+  6 | 2
+  6 | 3
+  6 | 4
+  6 | 5
+  6 | 6
+  7 | 0
+  7 | 1
+  7 | 3
+  7 | 4
+  7 | 5
+  7 | 6
+  8 | 0
+  8 | 1
+  8 | 2
+  8 | 4
+  8 | 5
+  8 | 6
+  9 | 0
+  9 | 1
+  9 | 2
+  9 | 3
+  9 | 5
+  9 | 6
+ 10 | 1
+ 10 | 2
+ 10 | 3
+ 10 | 4
+ 10 | 5
+ 10 | 6
+ 11 | 0
+ 11 | 2
+ 11 | 3
+ 11 | 4
+ 11 | 5
+ 11 | 6
+ 12 | 0
+ 12 | 1
+ 12 | 3
+ 12 | 4
+ 12 | 5
+ 12 | 6
+ 13 | 0
+ 13 | 1
+ 13 | 2
+ 13 | 4
+ 13 | 5
+ 13 | 6
+ 14 | 0
+ 14 | 1
+ 14 | 2
+ 14 | 3
+ 14 | 5
+ 14 | 6
+ 15 | 1
+ 15 | 2
+ 15 | 3
+ 15 | 4
+ 15 | 5
+ 15 | 6
+ 16 | 0
+ 16 | 2
+ 16 | 3
+ 16 | 4
+ 16 | 5
+ 16 | 6
+ 17 | 0
+ 17 | 1
+ 17 | 3
+ 17 | 4
+ 17 | 5
+ 17 | 6
+ 18 | 0
+ 18 | 1
+ 18 | 2
+ 18 | 4
+ 18 | 5
+ 18 | 6
+ 19 | 0
+ 19 | 1
+ 19 | 2
+ 19 | 3
+ 19 | 5
+ 19 | 6
+ 20 | 1
+ 20 | 2
+ 20 | 3
+ 20 | 4
+ 20 | 5
+ 20 | 6
+ 21 | 0
+ 21 | 2
+ 21 | 3
+ 21 | 4
+ 21 | 5
+ 21 | 6
+ 22 | 0
+ 22 | 1
+ 22 | 3
+ 22 | 4
+ 22 | 5
+ 22 | 6
+ 23 | 0
+ 23 | 1
+ 23 | 2
+ 23 | 4
+ 23 | 5
+ 23 | 6
+ 24 | 0
+ 24 | 1
+ 24 | 2
+ 24 | 3
+ 24 | 5
+ 24 | 6
+ 25 | 1
+ 25 | 2
+ 25 | 3
+ 25 | 4
+ 25 | 5
+ 25 | 6
+ 26 | 0
+ 26 | 2
+ 26 | 3
+ 26 | 4
+ 26 | 5
+ 26 | 6
+ 27 | 0
+ 27 | 1
+ 27 | 3
+ 27 | 4
+ 27 | 5
+ 27 | 6
+ 28 | 0
+ 28 | 1
+ 28 | 2
+ 28 | 4
+ 28 | 5
+ 28 | 6
+ 29 | 0
+ 29 | 1
+ 29 | 2
+ 29 | 3
+ 29 | 5
+ 29 | 6
+ 30 | 1
+ 30 | 2
+ 30 | 3
+ 30 | 4
+ 30 | 5
+ 30 | 6
+ 31 | 0
+ 31 | 2
+ 31 | 3
+ 31 | 4
+ 31 | 5
+ 31 | 6
+ 32 | 0
+ 32 | 1
+ 32 | 3
+ 32 | 4
+ 32 | 5
+ 32 | 6
+ 33 | 0
+ 33 | 1
+ 33 | 2
+ 33 | 4
+ 33 | 5
+ 33 | 6
+ 34 | 0
+ 34 | 1
+ 34 | 2
+ 34 | 3
+ 34 | 5
+ 34 | 6
+ 35 | 1
+ 35 | 2
+ 35 | 3
+ 35 | 4
+ 35 | 5
+ 35 | 6
+ 36 | 0
+ 36 | 2
+ 36 | 3
+ 36 | 4
+ 36 | 5
+ 36 | 6
+ 37 | 0
+ 37 | 1
+ 37 | 3
+ 37 | 4
+ 37 | 5
+ 37 | 6
+ 38 | 0
+ 38 | 1
+ 38 | 2
+ 38 | 4
+ 38 | 5
+ 38 | 6
+ 39 | 0
+ 39 | 1
+ 39 | 2
+ 39 | 3
+ 39 | 5
+ 39 | 6
+ 40 | 0
+ 40 | 1
+ 40 | 2
+ 40 | 3
+ 40 | 4
+ 40 | 5
+ 40 | 6
+ 41 | 0
+ 41 | 1
+ 41 | 2
+ 41 | 3
+ 41 | 4
+ 41 | 5
+ 41 | 6
+ 42 | 0
+ 42 | 1
+ 42 | 2
+ 42 | 3
+ 42 | 4
+ 42 | 5
+ 42 | 6
+ 43 | 0
+ 43 | 1
+ 43 | 2
+ 43 | 3
+ 43 | 4
+ 43 | 5
+ 43 | 6
+ 44 | 0
+ 44 | 1
+ 44 | 2
+ 44 | 3
+ 44 | 4
+ 44 | 5
+ 44 | 6
+ 45 | 0
+ 45 | 1
+ 45 | 2
+ 45 | 3
+ 45 | 4
+ 45 | 5
+ 45 | 6
+ 46 | 0
+ 46 | 1
+ 46 | 2
+ 46 | 3
+ 46 | 4
+ 46 | 5
+ 46 | 6
+ 47 | 0
+ 47 | 1
+ 47 | 2
+ 47 | 3
+ 47 | 4
+ 47 | 5
+ 47 | 6
+ 48 | 0
+ 48 | 1
+ 48 | 2
+ 48 | 3
+ 48 | 4
+ 48 | 5
+ 48 | 6
+ 49 | 0
+ 49 | 1
+ 49 | 2
+ 49 | 3
+ 49 | 4
+ 49 | 5
+ 49 | 6
+(310 rows)
+
+SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT SELECT k % 45, g FROM df_u2) s;
+ count 
+-------
+    30
+(1 row)
+
+SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
+ count | count 
+-------+-------
+    25 |    20
+(1 row)
 
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
  g | count | sum 

@@ -2412,8 +2412,8 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 
 	if (plan == NULL)
 		return false;
-	if (IsA(plan, Motion) || df_append_plans(plan) != NIL)
-		return true;			/* UA1: an Append's are columns of its union */
+	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp))
+		return true;			/* UA1, SO1: columns of its union or grouping */
 	if (IsA(plan, Result))
 	{
 		/* R1: its child's columns */
@@ -3225,6 +3225,21 @@ df_append_plans(Plan *plan)
 	if (plan != NULL && IsA(plan, MergeAppend))
 		return ((MergeAppend *) plan)->mergeplans;
 	return NIL;
+}
+
+/*
+ * SO1: the index among the columns SetOp 'setop' tells duplicates by of
+ * its child's column 'attno', or -1.
+ */
+int
+df_setop_group(SetOp *setop, AttrNumber attno)
+{
+	int			k;
+
+	for (k = 0; k < setop->numCols; k++)
+		if (setop->dupColIdx[k] == attno)
+			return k;
+	return -1;
 }
 
 /* Is each output column of 'plan' a column of its child, as it is? */
@@ -4222,6 +4237,99 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->order_free = true;
 					df_check_plan(lfirst(lc), cxt, needed, false);
 				}
+				return;
+			}
+
+		case T_SetOp:
+			{
+				/*
+				 * SO1: INTERSECT and EXCEPT, over its child's rows each
+				 * flagged 0 (left) or 1 (right), as a grouping by the
+				 * columns it tells duplicates by, counting each side's
+				 * rows, with nodeSetOp.c's test on the counts.  Not the ALL
+				 * forms, which repeat rows.  A group's row is any of its
+				 * members': only of types whose equal values look alike
+				 * (not floats, -0 and 0; numeric, 1.0 and 1.00; character
+				 * without a length).
+				 */
+				SetOp	   *so = (SetOp *) plan;
+				Plan	   *child = outerPlan(plan);
+				Bitmapset  *child_needed = NULL;
+				TargetEntry *flag;
+				ListCell   *lc;
+				int			k;
+
+				if (so->cmd != SETOPCMD_INTERSECT && so->cmd != SETOPCMD_EXCEPT)
+				{
+					df_reject(cxt, "INTERSECT ALL or EXCEPT ALL");
+					return;
+				}
+				if (plan->qual != NIL || child == NULL || so->flagColIdx <= 0)
+				{
+					df_reject(cxt, "SetOp with a filter or without a flag column");
+					return;
+				}
+				if (!cxt->node_order_free)
+				{
+					df_reject(cxt, "SetOp whose order of rows is read");
+					return;
+				}
+				flag = get_tle_by_resno(child->targetlist, so->flagColIdx);
+				if (flag == NULL || exprType((Node *) flag->expr) != INT4OID)
+				{
+					df_reject(cxt, "SetOp flag column not of type integer");
+					return;
+				}
+				for (k = 0; k < so->numCols; k++)
+				{
+					TargetEntry *tle = get_tle_by_resno(child->targetlist, so->dupColIdx[k]);
+					Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
+					const char *problem;
+
+					/*
+					 * character(n) holds every value padded to n, so equal
+					 * values look alike; inputs of different lengths make
+					 * the column one without a length
+					 */
+					if (type != INT2OID && type != INT4OID && type != INT8OID &&
+						type != BOOLOID && type != DATEOID && type != TIMESTAMPOID &&
+						type != TEXTOID && type != VARCHAROID &&
+						!(type == BPCHAROID && exprTypmod((Node *) tle->expr) > 0))
+					{
+						df_reject(cxt, "INTERSECT or EXCEPT on a column of type %s",
+								  type == InvalidOid ? "?" : format_type_be(type));
+						return;
+					}
+					if (df_type_is_string(type) &&
+						(problem = df_string_compare_problem(cxt, "=", so->dupCollations[k])) != NULL)
+					{
+						df_reject(cxt, "INTERSECT or EXCEPT on text %s", problem);
+						return;
+					}
+					child_needed = bms_add_member(child_needed, so->dupColIdx[k]);
+				}
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+					Var		   *var = (Var *) tle->expr;
+
+					/* the flag passes through too, for no one above to read */
+					if (needed != NULL && !bms_is_member(tle->resno, needed))
+						continue;
+					if (!IsA(var, Var) || var->varno != OUTER_VAR ||
+						df_setop_group(so, var->varattno) < 0)
+					{
+						df_reject(cxt, "SetOp output other than its columns");
+						return;
+					}
+				}
+				child_needed = bms_add_member(child_needed, so->flagColIdx);
+				if (so->strategy == SETOP_SORTED && IsA(child, Sort))
+					cxt->skipped_sort = child;	/* grouped hashed (D2) */
+				cxt->order_free = true;
+				cxt->agg_input = true;	/* a grouping, worth the Motions below */
+				df_check_plan(child, cxt, child_needed, false);
+				cxt->agg_input = false;
 				return;
 			}
 

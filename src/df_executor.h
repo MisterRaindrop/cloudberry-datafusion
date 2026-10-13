@@ -371,6 +371,7 @@ extern Node *df_semi_key_for(HashJoin *hj, Var *var);
 extern bool df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left);
 extern bool df_numcmp_needed(Plan *ctx, OpExpr *op);
 extern List *df_append_plans(Plan *plan);
+extern int	df_setop_group(SetOp *setop, AttrNumber attno);
 
 /* IP1: init plan values for the translation of a slice that starts, or NULL */
 extern ParamExecData *df_param_values;
