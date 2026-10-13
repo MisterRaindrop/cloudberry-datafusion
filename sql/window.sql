@@ -52,6 +52,7 @@ EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g
 EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
 EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w ORDER BY 3, 1, 2;
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
 SET datafusion.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
 SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a DESC NULLS LAST), rank() OVER (PARTITION BY g ORDER BY a NULLS FIRST) FROM df_w WHERE k <= 30 ORDER BY 1, 2, 3;
@@ -71,6 +72,7 @@ SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_
 SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
 SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
 SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
 SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTITION BY g) a1, avg(sum(m)) OVER (PARTITION BY g) a2 FROM df_w GROUP BY g, a) x WHERE CASE WHEN a1 > 0 THEN s1 / a1 ELSE NULL END > CASE WHEN a2 > 0 THEN s2 / a2 ELSE NULL END ORDER BY 1, 2;
 SET datafusion.mode = on;
@@ -92,6 +94,7 @@ SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_
 SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
 SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
 SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
 SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTITION BY g) a1, avg(sum(m)) OVER (PARTITION BY g) a2 FROM df_w GROUP BY g, a) x WHERE CASE WHEN a1 > 0 THEN s1 / a1 ELSE NULL END > CASE WHEN a2 > 0 THEN s2 / a2 ELSE NULL END ORDER BY 1, 2;
 
@@ -122,6 +125,7 @@ SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_
 SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
 SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
 SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
 SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTITION BY g) a1, avg(sum(m)) OVER (PARTITION BY g) a2 FROM df_w GROUP BY g, a) x WHERE CASE WHEN a1 > 0 THEN s1 / a1 ELSE NULL END > CASE WHEN a2 > 0 THEN s2 / a2 ELSE NULL END ORDER BY 1, 2;
 SET datafusion.mode = on;
@@ -143,6 +147,7 @@ SELECT x.k, x.r, y.k, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_
 SELECT g, k, n, avg(n) OVER (PARTITION BY g), avg(a) OVER (PARTITION BY g ORDER BY a), avg(b) OVER (PARTITION BY g ORDER BY a, k ROWS UNBOUNDED PRECEDING) FROM df_w WHERE k <= 30 ORDER BY 1, 2;
 SELECT g, k, avg(m) OVER (PARTITION BY g ORDER BY k), avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w WHERE k <= 200 AND g IN (1, 3) ORDER BY 4, 1, 2;
 SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a ORDER BY 1, 2;
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
 SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTITION BY g) a1, avg(sum(m)) OVER (PARTITION BY g) a2 FROM df_w GROUP BY g, a) x WHERE CASE WHEN a1 > 0 THEN s1 / a1 ELSE NULL END > CASE WHEN a2 > 0 THEN s2 / a2 ELSE NULL END ORDER BY 1, 2;
 

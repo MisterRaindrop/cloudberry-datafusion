@@ -169,6 +169,29 @@ EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1
  DataFusion: slice 2 eligible, sends Arrow batches
 (16 rows)
 
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: x.g, x.k
+         ->  Limit
+               ->  Subquery Scan on x
+                     Filter: (x.s > 10)
+                     ->  WindowAgg
+                           Partition By: df_w.g
+                           Order By: df_w.k
+                           ->  Sort
+                                 Sort Key: df_w.g, df_w.k
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: df_w.g
+                                       ->  Seq Scan on df_w
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(18 rows)
+
 SET datafusion.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
  g | a | k  | rank | dense_rank | row_number 
@@ -730,6 +753,31 @@ SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a O
    | 2 |  5800.50 | 4498.5000000000000000
    |   |   682.50 | 4498.5000000000000000
 (32 rows)
+
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
+ g |  k  | s  
+---+-----+----
+ 0 |  77 | 12
+ 0 |  84 | 12
+ 0 |  98 | 14
+ 0 | 105 | 14
+ 0 | 112 | 15
+ 0 | 119 | 15
+ 0 | 126 | 15
+ 0 | 133 | 16
+ 0 | 140 | 18
+ 0 | 147 | 18
+ 0 | 154 | 19
+ 0 | 161 | 21
+ 0 | 168 | 21
+ 0 | 175 | 22
+ 0 | 189 | 22
+ 0 | 196 | 23
+ 0 | 203 | 25
+ 0 | 210 | 25
+ 0 | 217 | 26
+ 0 | 224 | 28
+(20 rows)
 
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
  g | a |    s     |          av           
@@ -1334,6 +1382,31 @@ SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a O
    | 2 |  5800.50 | 4498.5000000000000000
    |   |   682.50 | 4498.5000000000000000
 (32 rows)
+
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
+ g |  k  | s  
+---+-----+----
+ 0 |  77 | 12
+ 0 |  84 | 12
+ 0 |  98 | 14
+ 0 | 105 | 14
+ 0 | 112 | 15
+ 0 | 119 | 15
+ 0 | 126 | 15
+ 0 | 133 | 16
+ 0 | 140 | 18
+ 0 | 147 | 18
+ 0 | 154 | 19
+ 0 | 161 | 21
+ 0 | 168 | 21
+ 0 | 175 | 22
+ 0 | 189 | 22
+ 0 | 196 | 23
+ 0 | 203 | 25
+ 0 | 210 | 25
+ 0 | 217 | 26
+ 0 | 224 | 28
+(20 rows)
 
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
  g | a |    s     |          av           
@@ -2066,6 +2139,31 @@ SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a O
    |   |   682.50 | 4498.5000000000000000
 (32 rows)
 
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
+ g |  k  | s  
+---+-----+----
+ 0 |  77 | 12
+ 0 |  84 | 12
+ 0 |  98 | 14
+ 0 | 105 | 14
+ 0 | 112 | 15
+ 0 | 119 | 15
+ 0 | 126 | 15
+ 0 | 133 | 16
+ 0 | 140 | 18
+ 0 | 147 | 18
+ 0 | 154 | 19
+ 0 | 161 | 21
+ 0 | 168 | 21
+ 0 | 175 | 22
+ 0 | 189 | 22
+ 0 | 196 | 23
+ 0 | 203 | 25
+ 0 | 210 | 25
+ 0 | 217 | 26
+ 0 | 224 | 28
+(20 rows)
+
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
  g | a |    s     |          av           
 ---+---+----------+-----------------------
@@ -2669,6 +2767,31 @@ SELECT g, a, sum(n), avg(sum(n)) OVER (PARTITION BY g) FROM df_w GROUP BY g, a O
    | 2 |  5800.50 | 4498.5000000000000000
    |   |   682.50 | 4498.5000000000000000
 (32 rows)
+
+SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
+ g |  k  | s  
+---+-----+----
+ 0 |  77 | 12
+ 0 |  84 | 12
+ 0 |  98 | 14
+ 0 | 105 | 14
+ 0 | 112 | 15
+ 0 | 119 | 15
+ 0 | 126 | 15
+ 0 | 133 | 16
+ 0 | 140 | 18
+ 0 | 147 | 18
+ 0 | 154 | 19
+ 0 | 161 | 21
+ 0 | 168 | 21
+ 0 | 175 | 22
+ 0 | 189 | 22
+ 0 | 196 | 23
+ 0 | 203 | 25
+ 0 | 210 | 25
+ 0 | 217 | 26
+ 0 | 224 | 28
+(20 rows)
 
 SELECT * FROM (SELECT g, a, sum(n) s, avg(sum(n)) OVER (PARTITION BY g) av FROM df_w GROUP BY g, a) x WHERE CASE WHEN av <> 0 THEN abs(s - av) / av ELSE NULL END > 0.1 ORDER BY s - av, g, a;
  g | a |    s     |          av           

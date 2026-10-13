@@ -3725,8 +3725,18 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 				k;
 
 	if (agg != NULL && IsA(agg, Limit))
-		return df_passes_through((Plan *) agg) &&
-			df_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
+	{
+		Plan	   *below = outerPlan(agg);
+
+		if (!df_passes_through((Plan *) agg))
+			return false;
+		/* WIN1: as below without the Limit, which applies after (TPC-DS Q51) */
+		while (below != NULL && (IsA(below, SubqueryScan) || IsA(below, Result)))
+			below = IsA(below, SubqueryScan) ? ((SubqueryScan *) below)->subplan : outerPlan(below);
+		if (below != NULL && IsA(below, WindowAgg))
+			return true;
+		return df_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
+	}
 	if (agg != NULL)
 	{
 		/*
