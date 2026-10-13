@@ -499,6 +499,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | AV2 | avg returning numeric as a sort key and above its Agg, with its display scale |
 | WIN1 | Window functions: row_number, rank, dense_rank; count, sum, min, max over a frame |
 | WIN2 | avg of numeric and of integers over a frame, with its display scale |
+| UA1 | UNION ALL (Append) |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1262,6 +1263,25 @@ Not done: `avg` of floats; `min` and `max` of floats (of -0 and 0, PostgreSQL's 
 value, which the window's order determines); `ntile`, `lag`, `lead` and
 the other window functions; frames with offsets, GROUPS or EXCLUDE;
 FILTER and DISTINCT.
+
+### UNION ALL
+
+UA1: an Append (UNION ALL) runs as DataFusion's union of its inputs, each
+projected to columns q<id>_c<k> of the Append's node, which the nodes above
+read by name; an input that is a Motion (GPORCA redistributes each branch
+below the Append) is read from its stream, as any node reads its child.
+A numeric column is rescaled to the largest scale of its inputs; inputs of
+different scales, or of display scales of their own, give each value its
+own (DN1), carried beside it as q<id>_c<k>_s.  DataFusion keeps no order
+between the inputs, so an Append whose order a node above reads (a Limit
+without a sort) stays on PostgreSQL, as does one with run-time partition
+pruning.
+
+TPC-DS SF1: queries wholly in DataFusion 112 -> 120 of 206 executions by
+EXPLAIN (Q2, Q5, Q76, Q77, Q80 under the Postgres planner, Q71 and Q76
+under GPORCA too); the 44 executions of the queries with a UNION ALL give
+PostgreSQL's results, Q71's in another order of rows tied on its ORDER BY
+keys, as before.
 
 ### Subtrees below PostgreSQL's nodes
 

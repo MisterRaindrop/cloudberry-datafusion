@@ -570,6 +570,18 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *child;
 				TargetEntry *tle;
 
+				if (IsA(ctx, Append) && var->varno == OUTER_VAR)
+				{
+					/* UA1: any input's */
+					foreach(lc, ((Append *) ctx)->appendplans)
+					{
+						child = lfirst(lc);
+						tle = get_tle_by_resno(child->targetlist, var->varattno);
+						if (tle == NULL || df_numeric_may_be_infinite(child, (Node *) tle->expr))
+							return true;
+					}
+					return false;
+				}
 				if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
 					child = ((SubqueryScan *) ctx)->subplan;
 				else if (var->varno == OUTER_VAR || var->varno == INNER_VAR)
@@ -2403,8 +2415,8 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 
 	if (plan == NULL)
 		return false;
-	if (IsA(plan, Motion))
-		return true;
+	if (IsA(plan, Motion) || IsA(plan, Append))
+		return true;			/* UA1: an Append's are columns of its union */
 	if (IsA(plan, Result))
 	{
 		/* R1: its child's columns */
@@ -2663,6 +2675,24 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 	}
 	if (IsA(node, WindowFunc) && df_window_avg((WindowFunc *) node))
 		return v->found = true; /* WIN2 */
+	if (IsA(node, Var) && IsA(v->ctx, Append) && ((Var *) node)->varno == OUTER_VAR)
+	{
+		/* UA1: any input's */
+		Plan	   *saved = v->ctx;
+		ListCell   *lc;
+
+		foreach(lc, ((Append *) saved)->appendplans)
+		{
+			TargetEntry *tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist,
+												((Var *) node)->varattno);
+
+			v->ctx = lfirst(lc);
+			if (tle != NULL)
+				(void) df_numeric_varying_walker((Node *) tle->expr, v);
+		}
+		v->ctx = saved;
+		return v->found;
+	}
 	if (IsA(node, Var))
 	{
 		Var		   *var = (Var *) node;
@@ -2737,6 +2767,19 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 
 				if (IsA(ctx, Agg))
 					return false;	/* a grouping column */
+				if (IsA(ctx, Append) && var->varno == OUTER_VAR)
+				{
+					/* UA1: each input gives its own beside the value */
+					ListCell   *lc;
+
+					foreach(lc, ((Append *) ctx)->appendplans)
+					{
+						tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist, var->varattno);
+						if (tle == NULL || !df_dscale_ok(lfirst(lc), (Node *) tle->expr, batches))
+							return false;
+					}
+					return true;
+				}
 				if (var->varno == OUTER_VAR)
 					child = outerPlan(ctx);
 				else if (var->varno == INNER_VAR)
@@ -4081,6 +4124,57 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->projection_input = true;
 				df_check_plan(sq->subplan, cxt, refs.refs, false);
 				cxt->projection_input = saved;
+				return;
+			}
+
+		case T_Append:
+			{
+				/*
+				 * UA1: UNION ALL, each input's rows in turn, as DataFusion's
+				 * union of them, which keeps no order between them: nothing
+				 * above may read it.  Each output column is the inputs'
+				 * columns at its position; numeric of different scales, or
+				 * of display scales of their own, carries each value's
+				 * display scale beside it (DN1).
+				 */
+				Append	   *ap = (Append *) plan;
+				ListCell   *lc;
+
+				if (ap->part_prune_info != NULL)
+				{
+					df_reject(cxt, "Append with run-time partition pruning");
+					return;
+				}
+				if (ap->appendplans == NIL || plan->qual != NIL)
+				{
+					df_reject(cxt, "Append without inputs or with a filter");
+					return;
+				}
+				if (!cxt->node_order_free)
+				{
+					df_reject(cxt, "Append whose order of rows is read");
+					return;
+				}
+				cxt->allow_aggref = false;
+				df_check_targetlist(plan->targetlist, needed, cxt);
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+					int			p,
+								sc;
+
+					if (cxt->failed)
+						return;
+					if ((needed == NULL || bms_is_member(tle->resno, needed)) &&
+						df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) &&
+						!df_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
+						df_reject(cxt, "Append of numeric of display scales of their own");
+				}
+				foreach(lc, ap->appendplans)
+				{
+					cxt->order_free = true;
+					df_check_plan(lfirst(lc), cxt, needed, false);
+				}
 				return;
 			}
 

@@ -650,13 +650,24 @@ df_add_input(DfBuilder *b, Plan *leaf)
 	return list_length(b->inputs) - 1;
 }
 
-/* Column of input 'j' for 'attno', adding it if new; its index there. */
+/*
+ * Column of input 'j' for 'attno', adding it if new; its index there.  -1
+ * for a 'j' that is not one of the slice's inputs (df_input_of found no
+ * such leaf): the translation fails rather than read past the list.
+ */
 static int
 df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 {
-	DfInputDesc *in = list_nth(b->inputs, j);
+	DfInputDesc *in;
 	ListCell   *lc;
 	int			i = 0;
+
+	if (j < 0 || j >= list_length(b->inputs))
+	{
+		df_fail(b, "a column of a node that is not an input of the slice");
+		return -1;
+	}
+	in = list_nth(b->inputs, j);
 
 	foreach(lc, in->attnos)
 	{
@@ -678,6 +689,8 @@ df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, 
 {
 	int			k = df_input_column(b, j, attno, type, scale);
 
+	if (k < 0)
+		return;
 	if (j == 0)
 		appendStringInfo(out, "{\"col\":%d}", k);
 	else
@@ -839,6 +852,9 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
+	else if (IsA(child, Append))
+		/* UA1: a column of its union */
+		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
 	else if (IsA(child, Agg))
 	{
 		/*
@@ -883,6 +899,13 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
 
 	if (tle == NULL)
 		df_fail(b, "a reference to a child's output");
+	else if (IsA(child, Append))
+	{
+		/* UA1: the display scale its union carries beside the value */
+		b->ctx = child;
+		df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		b->ctx = saved;
+	}
 	else if (IsA(child, Agg))
 	{
 		Agg		   *agg = b->agg;
@@ -939,7 +962,11 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Append))
+					/* UA1: the display scale its union carries beside it */
+					appendStringInfo(out, "{\"name\":\"q%d_c%d_s\"}", b->ctx->plan_node_id,
+									 var->varattno - 1);
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
 					df_emit_dscale_output_of(b, out, outerPlan(b->ctx), var->varattno);
 				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
 					df_emit_dscale_output_of(b, out, innerPlan(b->ctx), var->varattno);
@@ -1216,7 +1243,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
 					return;
 				}
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
+				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Append))
+					/* UA1: a column of its union (df_emit_plan_node) */
+					appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", b->ctx->plan_node_id,
+									 var->varattno - 1);
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
 					df_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
 				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
 					df_emit_output_of(b, out, innerPlan(b->ctx), var->varattno);
@@ -2197,6 +2228,79 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				return;
 			}
 
+		case T_Append:
+			{
+				/*
+				 * UA1: the union of its inputs' rows, each projected to
+				 * columns q<plan_node_id>_c<k> (numeric at the column's
+				 * scale) and, beside one of display scales of their own,
+				 * q<plan_node_id>_c<k>_s
+				 */
+				ListCell   *lc;
+				ListCell   *lt;
+
+				appendStringInfoString(out, "{\"union\":{\"inputs\":[");
+				foreach(lc, ((Append *) plan)->appendplans)
+				{
+					if (foreach_current_index(lc) > 0)
+						appendStringInfoChar(out, ',');
+					df_emit_node(b, out, lfirst(lc));
+				}
+				appendStringInfoString(out, "],\"columns\":[");
+				foreach(lc, ((Append *) plan)->appendplans)
+				{
+					Plan	   *child = lfirst(lc);
+					bool		first = true;
+
+					appendStringInfoString(out, foreach_current_index(lc) > 0 ? ",[" : "[");
+					foreach(lt, plan->targetlist)
+					{
+						TargetEntry *tle = lfirst_node(TargetEntry, lt);
+						TargetEntry *ctle = get_tle_by_resno(child->targetlist, tle->resno);
+						int			p,
+									sc;
+
+						if (ctle == NULL)
+						{
+							df_fail(b, "an input column of an Append");
+							return;
+						}
+						appendStringInfoString(out, first ? "{\"expr\":" : ",{\"expr\":");
+						first = false;
+
+						/*
+						 * the input's output column, as any node reads its
+						 * child's (a Motion's from its stream), numeric at
+						 * the column's scale
+						 */
+						if (exprType((Node *) tle->expr) == NUMERICOID &&
+							df_scale_of(child, (Node *) ctle->expr) !=
+							df_scale_of(plan, (Node *) tle->expr))
+						{
+							int			to = df_scale_of(plan, (Node *) tle->expr);
+
+							appendStringInfoString(out, "{\"rescale\":");
+							df_emit_output_of(b, out, child, tle->resno);
+							appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}",
+											 to - df_scale_of(child, (Node *) ctle->expr),
+											 df_tag(NUMERICOID, to));
+						}
+						else
+							df_emit_output_of(b, out, child, tle->resno);
+						if (exprType((Node *) tle->expr) == NUMERICOID &&
+							df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc))
+						{
+							appendStringInfoString(out, ",\"dscale\":");
+							df_emit_dscale_output_of(b, out, child, tle->resno);
+						}
+						appendStringInfoChar(out, '}');
+					}
+					appendStringInfoChar(out, ']');
+				}
+				appendStringInfo(out, "],\"name\":\"q%d\"}}", plan->plan_node_id);
+				return;
+			}
+
 		case T_WindowAgg:
 			{
 				/*
@@ -2834,6 +2938,14 @@ df_slice_width(Plan *plan)
 	width = plan->plan_width;
 	if (IsA(plan, Motion))
 		return width;			/* another slice below */
+	if (IsA(plan, Append))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((Append *) plan)->appendplans)
+			width = Max(width, df_slice_width(lfirst(lc)));
+		return width;
+	}
 	return Max(width, Max(df_slice_width(outerPlan(plan)), df_slice_width(innerPlan(plan))));
 }
 

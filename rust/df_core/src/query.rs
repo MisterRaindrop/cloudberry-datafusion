@@ -60,6 +60,9 @@
 //!                       "name": s}}   (its rows with a column s_w<i> for
 //!                       each function, and s_w<i>_n for an avg's count: an
 //!                       avg's s_w<i> is its sum, WIN2; see `window`)
+//!         | {"union": {"inputs": [<node>...], "columns": [[{"expr": <expr>,
+//!                     "dscale": <expr>}...]...], "name": s}}   (UNION ALL: each
+//!                input's rows as columns s_c<k>, and s_c<k>_s for a "dscale")
 //!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
 //!                with a column s of numbers unique to each, above n: Cloudberry's
 //!                RowIdExpr)
@@ -1608,6 +1611,13 @@ fn memory_consumers(node: &Value) -> usize {
         return j.get("left").map_or(0, memory_consumers)
             + j.get("right").map_or(0, memory_consumers);
     }
+    if let Some(u) = node.get("union") {
+        // UA1: its inputs run side by side
+        return u
+            .get("inputs")
+            .and_then(Value::as_array)
+            .map_or(0, |i| i.iter().map(memory_consumers).sum());
+    }
     0
 }
 
@@ -1763,6 +1773,33 @@ fn build_node(
     }
     if let Some(w) = node.get("window") {
         return window(w, tables);
+    }
+    if let Some(u) = node.get("union") {
+        // UA1: each input's rows projected to columns <name>_c<k> (and a
+        // display scale <name>_c<k>_s), the union of them all
+        let name = field(u, "name")?.as_str().ok_or("plan spec: union name")?;
+        let inputs = field(u, "inputs")?.as_array().ok_or("plan spec: union inputs")?;
+        let columns = field(u, "columns")?.as_array().ok_or("plan spec: union columns")?;
+        if inputs.is_empty() || inputs.len() != columns.len() {
+            return Err("plan spec: union of no inputs, or columns not one list per input".into());
+        }
+        let mut acc: Option<LogicalPlanBuilder> = None;
+        for (input, cols) in inputs.iter().zip(columns) {
+            let b = build_node(input, tables)?;
+            let mut exprs = Vec::new();
+            for (k, c) in cols.as_array().ok_or("plan spec: union columns")?.iter().enumerate() {
+                exprs.push(expr(field(c, "expr")?)?.alias(format!("{name}_c{k}")));
+                if let Some(d) = c.get("dscale") {
+                    exprs.push(expr(d)?.alias(format!("{name}_c{k}_s")));
+                }
+            }
+            let p = b.project(exprs).map_err(df)?.build().map_err(df)?;
+            acc = Some(match acc {
+                None => LogicalPlanBuilder::from(p),
+                Some(a) => a.union(p).map_err(df)?,
+            });
+        }
+        return Ok(acc.unwrap());
     }
     if let Some(a) = node.get("aggregate") {
         let mut b = build_node(field(a, "input")?, tables)?;

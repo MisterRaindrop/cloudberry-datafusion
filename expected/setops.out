@@ -1,0 +1,883 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+--
+-- Set operations.  UA1: UNION ALL (Append), as DataFusion's union of its
+-- inputs, which keeps no order between them: an Append whose order a node
+-- above reads stays on PostgreSQL.  Numeric of different scales, or of
+-- display scales of their own, carries each value's display scale beside
+-- it.  Inputs that are Motions (GPORCA redistributes each branch below
+-- the Append) are read from their streams.  Each query runs with
+-- datafusion.mode off, then on; the two results must match.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET datafusion.worker_threads = 2;
+SET datafusion.motion_batches = on;
+CREATE TABLE df_u1 (k int, g int, a numeric(7,2), b int8, t text) DISTRIBUTED BY (k);
+CREATE TABLE df_u2 (k int, g int, a numeric(12,4), b int4, t varchar(10)) DISTRIBUTED BY (k);
+INSERT INTO df_u1 SELECT i, i % 7, CASE WHEN i % 97 = 0 THEN 'NaN' ELSE (i % 300) * 1.25 END, i::int8 * 1000000000, CASE WHEN i % 11 = 0 THEN NULL ELSE 't' || (i % 5) END FROM generate_series(1, 3000) i;
+INSERT INTO df_u2 SELECT i, i % 5, (i % 400) / 7.0, i, CASE WHEN i % 13 = 0 THEN NULL ELSE 'v' || (i % 3) END FROM generate_series(1, 2000) i;
+CREATE TABLE df_up (k int, g int, a numeric(7,2)) DISTRIBUTED BY (k) PARTITION BY RANGE (g) (START (0) END (8) EVERY (4));
+INSERT INTO df_up SELECT i, i % 8, i * 0.5 FROM generate_series(1, 1000) i;
+ANALYZE df_u1;
+ANALYZE df_u2;
+ANALYZE df_up;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT g, a FROM df_u1 UNION ALL SELECT g, a FROM df_u2) u GROUP BY u.g ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_u1.g
+   ->  Sort
+         Sort Key: df_u1.g
+         ->  HashAggregate
+               Group Key: df_u1.g
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: df_u1.g
+                     ->  Append
+                           ->  Seq Scan on df_u1
+                           ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(15 rows)
+
+EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_u1.k, df_u1.t
+   ->  Sort
+         Sort Key: df_u1.k, df_u1.t
+         ->  Hash Join
+               Hash Cond: (x.k = (df_u1.k + 1))
+               ->  Seq Scan on df_u1 x
+               ->  Hash
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: (df_u1.k + 1)
+                           ->  Append
+                                 ->  Seq Scan on df_u1
+                                       Filter: (k < 50)
+                                 ->  Subquery Scan on "*SELECT* 2"
+                                       ->  Seq Scan on df_u2
+                                             Filter: (k < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(20 rows)
+
+EXPLAIN (COSTS OFF) SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_u1_1.g
+   ->  Sort
+         Sort Key: df_u1_1.g
+         ->  Finalize HashAggregate
+               Group Key: df_u1_1.g
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: df_u1_1.g
+                     ->  Streaming Partial HashAggregate
+                           Group Key: df_u1_1.g
+                           ->  Append
+                                 ->  Seq Scan on df_u1 df_u1_1
+                                       Filter: (a <> 'NaN'::numeric)
+                                 ->  Seq Scan on df_u2
+                                 ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(19 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k, a FROM df_u1 UNION ALL SELECT k, a FROM df_u2) u LIMIT 5;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Limit
+               ->  Append
+                     ->  Seq Scan on df_u1
+                     ->  Seq Scan on df_u2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: Append whose order of rows is read
+(9 rows)
+
+SET datafusion.mode = off;
+SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
+ g | count | sum |       sum       | count 
+---+-------+-----+-----------------+-------
+ 0 |   828 | NaN | 642642000401000 |   760
+ 1 |   829 | NaN | 643071000399400 |   759
+ 2 |   829 | NaN | 643500000399800 |   760
+ 3 |   829 | NaN | 643929000400200 |   759
+ 4 |   829 | NaN | 644358000400600 |   759
+ 5 |   428 | NaN | 641786000000000 |   389
+ 6 |   428 | NaN | 642214000000000 |   389
+(7 rows)
+
+SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
+ k  | t  |   a    | g 
+----+----+--------+---
+  1 | t1 |   1.25 | 2
+  1 | v1 | 0.1429 | 2
+  2 | t2 |   2.50 | 3
+  2 | v2 | 0.2857 | 3
+  3 | t3 |   3.75 | 4
+  3 | v0 | 0.4286 | 4
+  4 | t4 |   5.00 | 5
+  4 | v1 | 0.5714 | 5
+  5 | t0 |   6.25 | 6
+  5 | v2 | 0.7143 | 6
+  6 | t1 |   7.50 | 0
+  6 | v0 | 0.8571 | 0
+  7 | t2 |   8.75 | 1
+  7 | v1 | 1.0000 | 1
+  8 | t3 |  10.00 | 2
+  8 | v2 | 1.1429 | 2
+  9 | t4 |  11.25 | 3
+  9 | v0 | 1.2857 | 3
+ 10 | t0 |  12.50 | 4
+ 10 | v1 | 1.4286 | 4
+ 11 | v2 | 1.5714 | 5
+ 11 |    |  13.75 | 5
+ 12 | t2 |  15.00 | 6
+ 12 | v0 | 1.7143 | 6
+ 13 | t3 |  16.25 | 0
+ 13 |    | 1.8571 | 0
+ 14 | t4 |  17.50 | 1
+ 14 | v2 | 2.0000 | 1
+ 15 | t0 |  18.75 | 2
+ 15 | v0 | 2.1429 | 2
+ 16 | t1 |  20.00 | 3
+ 16 | v1 | 2.2857 | 3
+ 17 | t2 |  21.25 | 4
+ 17 | v2 | 2.4286 | 4
+ 18 | t3 |  22.50 | 5
+ 18 | v0 | 2.5714 | 5
+ 19 | t4 |  23.75 | 6
+ 19 | v1 | 2.7143 | 6
+ 20 | t0 |  25.00 | 0
+ 20 | v2 | 2.8571 | 0
+ 21 | t1 |  26.25 | 1
+ 21 | v0 | 3.0000 | 1
+ 22 | v1 | 3.1429 | 2
+ 22 |    |  27.50 | 2
+ 23 | t3 |  28.75 | 3
+ 23 | v2 | 3.2857 | 3
+ 24 | t4 |  30.00 | 4
+ 24 | v0 | 3.4286 | 4
+ 25 | t0 |  31.25 | 5
+ 25 | v1 | 3.5714 | 5
+ 26 | t1 |  32.50 | 6
+ 26 |    | 3.7143 | 6
+ 27 | t2 |  33.75 | 0
+ 27 | v0 | 3.8571 | 0
+ 28 | t3 |  35.00 | 1
+ 28 | v1 | 4.0000 | 1
+ 29 | t4 |  36.25 | 2
+ 29 | v2 | 4.1429 | 2
+ 30 | t0 |  37.50 | 3
+ 30 | v0 | 4.2857 | 3
+ 31 | t1 |  38.75 | 4
+ 31 | v1 | 4.4286 | 4
+ 32 | t2 |  40.00 | 5
+ 32 | v2 | 4.5714 | 5
+ 33 | v0 | 4.7143 | 6
+ 33 |    |  41.25 | 6
+ 34 | t4 |  42.50 | 0
+ 34 | v1 | 4.8571 | 0
+ 35 | t0 |  43.75 | 1
+ 35 | v2 | 5.0000 | 1
+ 36 | t1 |  45.00 | 2
+ 36 | v0 | 5.1429 | 2
+ 37 | t2 |  46.25 | 3
+ 37 | v1 | 5.2857 | 3
+ 38 | t3 |  47.50 | 4
+ 38 | v2 | 5.4286 | 4
+ 39 | t4 |  48.75 | 5
+ 39 |    | 5.5714 | 5
+ 40 | t0 |  50.00 | 6
+ 40 | v1 | 5.7143 | 6
+ 41 | t1 |  51.25 | 0
+ 41 | v2 | 5.8571 | 0
+ 42 | t2 |  52.50 | 1
+ 42 | v0 | 6.0000 | 1
+ 43 | t3 |  53.75 | 2
+ 43 | v1 | 6.1429 | 2
+ 44 | v2 | 6.2857 | 3
+ 44 |    |  55.00 | 3
+ 45 | t0 |  56.25 | 4
+ 45 | v0 | 6.4286 | 4
+ 46 | t1 |  57.50 | 5
+ 46 | v1 | 6.5714 | 5
+ 47 | t2 |  58.75 | 6
+ 47 | v2 | 6.7143 | 6
+ 48 | t3 |  60.00 | 0
+ 48 | v0 | 6.8571 | 0
+ 49 | t4 |  61.25 | 1
+ 49 | v1 | 7.0000 | 1
+(98 rows)
+
+SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
+ g |             sum              | count 
+---+------------------------------+-------
+ 0 | 1001687.04783333333333330000 |  1252
+ 1 | 1002353.10700000000000000000 |  1254
+ 2 | 1003144.16666666666666673333 |  1254
+ 3 | 1003935.22633333333333330000 |  1254
+ 4 | 1004476.28550000000000000000 |  1254
+ 5 |  988981.50000000000000000000 |   851
+ 6 |  989628.91666666666666666667 |   851
+(7 rows)
+
+SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
+  k   |    a    
+------+---------
+    2 |  0.2857
+ 1202 |  0.2857
+    1 |    1.25
+ 1201 |    1.25
+ 2401 |    1.25
+  902 | 14.5714
+  602 | 28.8571
+ 1802 | 28.8571
+  302 | 43.1429
+ 1502 | 43.1429
+  401 |  126.25
+ 1601 |  126.25
+ 2801 |  126.25
+  801 |  251.25
+ 2001 |  251.25
+(15 rows)
+
+SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+ g | count |   sum    
+---+-------+----------
+ 0 |   124 | 31496.00
+ 1 |   123 | 31057.50
+ 2 |   123 | 31119.00
+ 3 |   124 | 31186.00
+ 4 |   124 | 31248.00
+ 5 |   124 | 31310.00
+ 6 |   124 | 31372.00
+ 7 |   124 | 31434.00
+(8 rows)
+
+SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 1 |   829 | NaN
+ 2 |   829 | NaN
+ 3 |   829 | NaN
+ 4 |   829 | NaN
+ 5 |   428 | NaN
+ 6 |   428 | NaN
+(6 rows)
+
+SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
+ t  | count 
+----+-------
+ t0 |   546
+ t1 |   545
+ t2 |   545
+ t3 |   546
+ t4 |   546
+ v0 |   615
+ v1 |   616
+ v2 |   616
+    |   425
+(9 rows)
+
+SET datafusion.mode = on;
+SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
+ g | count | sum |       sum       | count 
+---+-------+-----+-----------------+-------
+ 0 |   828 | NaN | 642642000401000 |   760
+ 1 |   829 | NaN | 643071000399400 |   759
+ 2 |   829 | NaN | 643500000399800 |   760
+ 3 |   829 | NaN | 643929000400200 |   759
+ 4 |   829 | NaN | 644358000400600 |   759
+ 5 |   428 | NaN | 641786000000000 |   389
+ 6 |   428 | NaN | 642214000000000 |   389
+(7 rows)
+
+SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
+ k  | t  |   a    | g 
+----+----+--------+---
+  1 | t1 |   1.25 | 2
+  1 | v1 | 0.1429 | 2
+  2 | t2 |   2.50 | 3
+  2 | v2 | 0.2857 | 3
+  3 | t3 |   3.75 | 4
+  3 | v0 | 0.4286 | 4
+  4 | t4 |   5.00 | 5
+  4 | v1 | 0.5714 | 5
+  5 | t0 |   6.25 | 6
+  5 | v2 | 0.7143 | 6
+  6 | t1 |   7.50 | 0
+  6 | v0 | 0.8571 | 0
+  7 | t2 |   8.75 | 1
+  7 | v1 | 1.0000 | 1
+  8 | t3 |  10.00 | 2
+  8 | v2 | 1.1429 | 2
+  9 | t4 |  11.25 | 3
+  9 | v0 | 1.2857 | 3
+ 10 | t0 |  12.50 | 4
+ 10 | v1 | 1.4286 | 4
+ 11 | v2 | 1.5714 | 5
+ 11 |    |  13.75 | 5
+ 12 | t2 |  15.00 | 6
+ 12 | v0 | 1.7143 | 6
+ 13 | t3 |  16.25 | 0
+ 13 |    | 1.8571 | 0
+ 14 | t4 |  17.50 | 1
+ 14 | v2 | 2.0000 | 1
+ 15 | t0 |  18.75 | 2
+ 15 | v0 | 2.1429 | 2
+ 16 | t1 |  20.00 | 3
+ 16 | v1 | 2.2857 | 3
+ 17 | t2 |  21.25 | 4
+ 17 | v2 | 2.4286 | 4
+ 18 | t3 |  22.50 | 5
+ 18 | v0 | 2.5714 | 5
+ 19 | t4 |  23.75 | 6
+ 19 | v1 | 2.7143 | 6
+ 20 | t0 |  25.00 | 0
+ 20 | v2 | 2.8571 | 0
+ 21 | t1 |  26.25 | 1
+ 21 | v0 | 3.0000 | 1
+ 22 | v1 | 3.1429 | 2
+ 22 |    |  27.50 | 2
+ 23 | t3 |  28.75 | 3
+ 23 | v2 | 3.2857 | 3
+ 24 | t4 |  30.00 | 4
+ 24 | v0 | 3.4286 | 4
+ 25 | t0 |  31.25 | 5
+ 25 | v1 | 3.5714 | 5
+ 26 | t1 |  32.50 | 6
+ 26 |    | 3.7143 | 6
+ 27 | t2 |  33.75 | 0
+ 27 | v0 | 3.8571 | 0
+ 28 | t3 |  35.00 | 1
+ 28 | v1 | 4.0000 | 1
+ 29 | t4 |  36.25 | 2
+ 29 | v2 | 4.1429 | 2
+ 30 | t0 |  37.50 | 3
+ 30 | v0 | 4.2857 | 3
+ 31 | t1 |  38.75 | 4
+ 31 | v1 | 4.4286 | 4
+ 32 | t2 |  40.00 | 5
+ 32 | v2 | 4.5714 | 5
+ 33 | v0 | 4.7143 | 6
+ 33 |    |  41.25 | 6
+ 34 | t4 |  42.50 | 0
+ 34 | v1 | 4.8571 | 0
+ 35 | t0 |  43.75 | 1
+ 35 | v2 | 5.0000 | 1
+ 36 | t1 |  45.00 | 2
+ 36 | v0 | 5.1429 | 2
+ 37 | t2 |  46.25 | 3
+ 37 | v1 | 5.2857 | 3
+ 38 | t3 |  47.50 | 4
+ 38 | v2 | 5.4286 | 4
+ 39 | t4 |  48.75 | 5
+ 39 |    | 5.5714 | 5
+ 40 | t0 |  50.00 | 6
+ 40 | v1 | 5.7143 | 6
+ 41 | t1 |  51.25 | 0
+ 41 | v2 | 5.8571 | 0
+ 42 | t2 |  52.50 | 1
+ 42 | v0 | 6.0000 | 1
+ 43 | t3 |  53.75 | 2
+ 43 | v1 | 6.1429 | 2
+ 44 | v2 | 6.2857 | 3
+ 44 |    |  55.00 | 3
+ 45 | t0 |  56.25 | 4
+ 45 | v0 | 6.4286 | 4
+ 46 | t1 |  57.50 | 5
+ 46 | v1 | 6.5714 | 5
+ 47 | t2 |  58.75 | 6
+ 47 | v2 | 6.7143 | 6
+ 48 | t3 |  60.00 | 0
+ 48 | v0 | 6.8571 | 0
+ 49 | t4 |  61.25 | 1
+ 49 | v1 | 7.0000 | 1
+(98 rows)
+
+SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
+ g |             sum              | count 
+---+------------------------------+-------
+ 0 | 1001687.04783333333333330000 |  1252
+ 1 | 1002353.10700000000000000000 |  1254
+ 2 | 1003144.16666666666666673333 |  1254
+ 3 | 1003935.22633333333333330000 |  1254
+ 4 | 1004476.28550000000000000000 |  1254
+ 5 |  988981.50000000000000000000 |   851
+ 6 |  989628.91666666666666666667 |   851
+(7 rows)
+
+SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
+  k   |    a    
+------+---------
+    2 |  0.2857
+ 1202 |  0.2857
+    1 |    1.25
+ 1201 |    1.25
+ 2401 |    1.25
+  902 | 14.5714
+  602 | 28.8571
+ 1802 | 28.8571
+  302 | 43.1429
+ 1502 | 43.1429
+  401 |  126.25
+ 1601 |  126.25
+ 2801 |  126.25
+  801 |  251.25
+ 2001 |  251.25
+(15 rows)
+
+SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+ g | count |   sum    
+---+-------+----------
+ 0 |   124 | 31496.00
+ 1 |   123 | 31057.50
+ 2 |   123 | 31119.00
+ 3 |   124 | 31186.00
+ 4 |   124 | 31248.00
+ 5 |   124 | 31310.00
+ 6 |   124 | 31372.00
+ 7 |   124 | 31434.00
+(8 rows)
+
+SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 1 |   829 | NaN
+ 2 |   829 | NaN
+ 3 |   829 | NaN
+ 4 |   829 | NaN
+ 5 |   428 | NaN
+ 6 |   428 | NaN
+(6 rows)
+
+SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
+ t  | count 
+----+-------
+ t0 |   546
+ t1 |   545
+ t2 |   545
+ t3 |   546
+ t4 |   546
+ v0 |   615
+ v1 |   616
+ v2 |   616
+    |   425
+(9 rows)
+
+-- GPORCA's plans
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: x.g
+   ->  Sort
+         Sort Key: x.g
+         ->  HashAggregate
+               Group Key: x.g
+               ->  Append
+                     ->  Hash Join
+                           Hash Cond: (x.g = y.k)
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: x.g
+                                 ->  Seq Scan on df_u1 x
+                           ->  Hash
+                                 ->  Seq Scan on df_u2 y
+                     ->  Hash Join
+                           Hash Cond: (y_1.g = x_1.k)
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: y_1.g
+                                 ->  Seq Scan on df_u2 y_1
+                           ->  Hash
+                                 ->  Seq Scan on df_u1 x_1
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(26 rows)
+
+SET datafusion.mode = off;
+SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
+ g | count | sum |       sum       | count 
+---+-------+-----+-----------------+-------
+ 0 |   828 | NaN | 642642000401000 |   760
+ 1 |   829 | NaN | 643071000399400 |   759
+ 2 |   829 | NaN | 643500000399800 |   760
+ 3 |   829 | NaN | 643929000400200 |   759
+ 4 |   829 | NaN | 644358000400600 |   759
+ 5 |   428 | NaN | 641786000000000 |   389
+ 6 |   428 | NaN | 642214000000000 |   389
+(7 rows)
+
+SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
+ k  | t  |   a    | g 
+----+----+--------+---
+  1 | t1 |   1.25 | 2
+  1 | v1 | 0.1429 | 2
+  2 | t2 |   2.50 | 3
+  2 | v2 | 0.2857 | 3
+  3 | t3 |   3.75 | 4
+  3 | v0 | 0.4286 | 4
+  4 | t4 |   5.00 | 5
+  4 | v1 | 0.5714 | 5
+  5 | t0 |   6.25 | 6
+  5 | v2 | 0.7143 | 6
+  6 | t1 |   7.50 | 0
+  6 | v0 | 0.8571 | 0
+  7 | t2 |   8.75 | 1
+  7 | v1 | 1.0000 | 1
+  8 | t3 |  10.00 | 2
+  8 | v2 | 1.1429 | 2
+  9 | t4 |  11.25 | 3
+  9 | v0 | 1.2857 | 3
+ 10 | t0 |  12.50 | 4
+ 10 | v1 | 1.4286 | 4
+ 11 | v2 | 1.5714 | 5
+ 11 |    |  13.75 | 5
+ 12 | t2 |  15.00 | 6
+ 12 | v0 | 1.7143 | 6
+ 13 | t3 |  16.25 | 0
+ 13 |    | 1.8571 | 0
+ 14 | t4 |  17.50 | 1
+ 14 | v2 | 2.0000 | 1
+ 15 | t0 |  18.75 | 2
+ 15 | v0 | 2.1429 | 2
+ 16 | t1 |  20.00 | 3
+ 16 | v1 | 2.2857 | 3
+ 17 | t2 |  21.25 | 4
+ 17 | v2 | 2.4286 | 4
+ 18 | t3 |  22.50 | 5
+ 18 | v0 | 2.5714 | 5
+ 19 | t4 |  23.75 | 6
+ 19 | v1 | 2.7143 | 6
+ 20 | t0 |  25.00 | 0
+ 20 | v2 | 2.8571 | 0
+ 21 | t1 |  26.25 | 1
+ 21 | v0 | 3.0000 | 1
+ 22 | v1 | 3.1429 | 2
+ 22 |    |  27.50 | 2
+ 23 | t3 |  28.75 | 3
+ 23 | v2 | 3.2857 | 3
+ 24 | t4 |  30.00 | 4
+ 24 | v0 | 3.4286 | 4
+ 25 | t0 |  31.25 | 5
+ 25 | v1 | 3.5714 | 5
+ 26 | t1 |  32.50 | 6
+ 26 |    | 3.7143 | 6
+ 27 | t2 |  33.75 | 0
+ 27 | v0 | 3.8571 | 0
+ 28 | t3 |  35.00 | 1
+ 28 | v1 | 4.0000 | 1
+ 29 | t4 |  36.25 | 2
+ 29 | v2 | 4.1429 | 2
+ 30 | t0 |  37.50 | 3
+ 30 | v0 | 4.2857 | 3
+ 31 | t1 |  38.75 | 4
+ 31 | v1 | 4.4286 | 4
+ 32 | t2 |  40.00 | 5
+ 32 | v2 | 4.5714 | 5
+ 33 | v0 | 4.7143 | 6
+ 33 |    |  41.25 | 6
+ 34 | t4 |  42.50 | 0
+ 34 | v1 | 4.8571 | 0
+ 35 | t0 |  43.75 | 1
+ 35 | v2 | 5.0000 | 1
+ 36 | t1 |  45.00 | 2
+ 36 | v0 | 5.1429 | 2
+ 37 | t2 |  46.25 | 3
+ 37 | v1 | 5.2857 | 3
+ 38 | t3 |  47.50 | 4
+ 38 | v2 | 5.4286 | 4
+ 39 | t4 |  48.75 | 5
+ 39 |    | 5.5714 | 5
+ 40 | t0 |  50.00 | 6
+ 40 | v1 | 5.7143 | 6
+ 41 | t1 |  51.25 | 0
+ 41 | v2 | 5.8571 | 0
+ 42 | t2 |  52.50 | 1
+ 42 | v0 | 6.0000 | 1
+ 43 | t3 |  53.75 | 2
+ 43 | v1 | 6.1429 | 2
+ 44 | v2 | 6.2857 | 3
+ 44 |    |  55.00 | 3
+ 45 | t0 |  56.25 | 4
+ 45 | v0 | 6.4286 | 4
+ 46 | t1 |  57.50 | 5
+ 46 | v1 | 6.5714 | 5
+ 47 | t2 |  58.75 | 6
+ 47 | v2 | 6.7143 | 6
+ 48 | t3 |  60.00 | 0
+ 48 | v0 | 6.8571 | 0
+ 49 | t4 |  61.25 | 1
+ 49 | v1 | 7.0000 | 1
+(98 rows)
+
+SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
+  k   |    a    
+------+---------
+    2 |  0.2857
+ 1202 |  0.2857
+    1 |    1.25
+ 1201 |    1.25
+ 2401 |    1.25
+  902 | 14.5714
+  602 | 28.8571
+ 1802 | 28.8571
+  302 | 43.1429
+ 1502 | 43.1429
+  401 |  126.25
+ 1601 |  126.25
+ 2801 |  126.25
+  801 |  251.25
+ 2001 |  251.25
+(15 rows)
+
+SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+ g | count |   sum    
+---+-------+----------
+ 0 |   124 | 31496.00
+ 1 |   123 | 31057.50
+ 2 |   123 | 31119.00
+ 3 |   124 | 31186.00
+ 4 |   124 | 31248.00
+ 5 |   124 | 31310.00
+ 6 |   124 | 31372.00
+ 7 |   124 | 31434.00
+(8 rows)
+
+SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 1 |   829 | NaN
+ 2 |   829 | NaN
+ 3 |   829 | NaN
+ 4 |   829 | NaN
+ 5 |   428 | NaN
+ 6 |   428 | NaN
+(6 rows)
+
+SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
+ t  | count 
+----+-------
+ t0 |   546
+ t1 |   545
+ t2 |   545
+ t3 |   546
+ t4 |   546
+ v0 |   615
+ v1 |   616
+ v2 |   616
+    |   425
+(9 rows)
+
+SET datafusion.mode = on;
+SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
+ g | count | sum |       sum       | count 
+---+-------+-----+-----------------+-------
+ 0 |   828 | NaN | 642642000401000 |   760
+ 1 |   829 | NaN | 643071000399400 |   759
+ 2 |   829 | NaN | 643500000399800 |   760
+ 3 |   829 | NaN | 643929000400200 |   759
+ 4 |   829 | NaN | 644358000400600 |   759
+ 5 |   428 | NaN | 641786000000000 |   389
+ 6 |   428 | NaN | 642214000000000 |   389
+(7 rows)
+
+SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
+ k  | t  |   a    | g 
+----+----+--------+---
+  1 | t1 |   1.25 | 2
+  1 | v1 | 0.1429 | 2
+  2 | t2 |   2.50 | 3
+  2 | v2 | 0.2857 | 3
+  3 | t3 |   3.75 | 4
+  3 | v0 | 0.4286 | 4
+  4 | t4 |   5.00 | 5
+  4 | v1 | 0.5714 | 5
+  5 | t0 |   6.25 | 6
+  5 | v2 | 0.7143 | 6
+  6 | t1 |   7.50 | 0
+  6 | v0 | 0.8571 | 0
+  7 | t2 |   8.75 | 1
+  7 | v1 | 1.0000 | 1
+  8 | t3 |  10.00 | 2
+  8 | v2 | 1.1429 | 2
+  9 | t4 |  11.25 | 3
+  9 | v0 | 1.2857 | 3
+ 10 | t0 |  12.50 | 4
+ 10 | v1 | 1.4286 | 4
+ 11 | v2 | 1.5714 | 5
+ 11 |    |  13.75 | 5
+ 12 | t2 |  15.00 | 6
+ 12 | v0 | 1.7143 | 6
+ 13 | t3 |  16.25 | 0
+ 13 |    | 1.8571 | 0
+ 14 | t4 |  17.50 | 1
+ 14 | v2 | 2.0000 | 1
+ 15 | t0 |  18.75 | 2
+ 15 | v0 | 2.1429 | 2
+ 16 | t1 |  20.00 | 3
+ 16 | v1 | 2.2857 | 3
+ 17 | t2 |  21.25 | 4
+ 17 | v2 | 2.4286 | 4
+ 18 | t3 |  22.50 | 5
+ 18 | v0 | 2.5714 | 5
+ 19 | t4 |  23.75 | 6
+ 19 | v1 | 2.7143 | 6
+ 20 | t0 |  25.00 | 0
+ 20 | v2 | 2.8571 | 0
+ 21 | t1 |  26.25 | 1
+ 21 | v0 | 3.0000 | 1
+ 22 | v1 | 3.1429 | 2
+ 22 |    |  27.50 | 2
+ 23 | t3 |  28.75 | 3
+ 23 | v2 | 3.2857 | 3
+ 24 | t4 |  30.00 | 4
+ 24 | v0 | 3.4286 | 4
+ 25 | t0 |  31.25 | 5
+ 25 | v1 | 3.5714 | 5
+ 26 | t1 |  32.50 | 6
+ 26 |    | 3.7143 | 6
+ 27 | t2 |  33.75 | 0
+ 27 | v0 | 3.8571 | 0
+ 28 | t3 |  35.00 | 1
+ 28 | v1 | 4.0000 | 1
+ 29 | t4 |  36.25 | 2
+ 29 | v2 | 4.1429 | 2
+ 30 | t0 |  37.50 | 3
+ 30 | v0 | 4.2857 | 3
+ 31 | t1 |  38.75 | 4
+ 31 | v1 | 4.4286 | 4
+ 32 | t2 |  40.00 | 5
+ 32 | v2 | 4.5714 | 5
+ 33 | v0 | 4.7143 | 6
+ 33 |    |  41.25 | 6
+ 34 | t4 |  42.50 | 0
+ 34 | v1 | 4.8571 | 0
+ 35 | t0 |  43.75 | 1
+ 35 | v2 | 5.0000 | 1
+ 36 | t1 |  45.00 | 2
+ 36 | v0 | 5.1429 | 2
+ 37 | t2 |  46.25 | 3
+ 37 | v1 | 5.2857 | 3
+ 38 | t3 |  47.50 | 4
+ 38 | v2 | 5.4286 | 4
+ 39 | t4 |  48.75 | 5
+ 39 |    | 5.5714 | 5
+ 40 | t0 |  50.00 | 6
+ 40 | v1 | 5.7143 | 6
+ 41 | t1 |  51.25 | 0
+ 41 | v2 | 5.8571 | 0
+ 42 | t2 |  52.50 | 1
+ 42 | v0 | 6.0000 | 1
+ 43 | t3 |  53.75 | 2
+ 43 | v1 | 6.1429 | 2
+ 44 | v2 | 6.2857 | 3
+ 44 |    |  55.00 | 3
+ 45 | t0 |  56.25 | 4
+ 45 | v0 | 6.4286 | 4
+ 46 | t1 |  57.50 | 5
+ 46 | v1 | 6.5714 | 5
+ 47 | t2 |  58.75 | 6
+ 47 | v2 | 6.7143 | 6
+ 48 | t3 |  60.00 | 0
+ 48 | v0 | 6.8571 | 0
+ 49 | t4 |  61.25 | 1
+ 49 | v1 | 7.0000 | 1
+(98 rows)
+
+SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
+  k   |    a    
+------+---------
+    2 |  0.2857
+ 1202 |  0.2857
+    1 |    1.25
+ 1201 |    1.25
+ 2401 |    1.25
+  902 | 14.5714
+  602 | 28.8571
+ 1802 | 28.8571
+  302 | 43.1429
+ 1502 | 43.1429
+  401 |  126.25
+ 1601 |  126.25
+ 2801 |  126.25
+  801 |  251.25
+ 2001 |  251.25
+(15 rows)
+
+SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
+ g | count |   sum    
+---+-------+----------
+ 0 |   124 | 31496.00
+ 1 |   123 | 31057.50
+ 2 |   123 | 31119.00
+ 3 |   124 | 31186.00
+ 4 |   124 | 31248.00
+ 5 |   124 | 31310.00
+ 6 |   124 | 31372.00
+ 7 |   124 | 31434.00
+(8 rows)
+
+SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
+ g | count | sum 
+---+-------+-----
+ 1 |   829 | NaN
+ 2 |   829 | NaN
+ 3 |   829 | NaN
+ 4 |   829 | NaN
+ 5 |   428 | NaN
+ 6 |   428 | NaN
+(6 rows)
+
+SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
+ t  | count 
+----+-------
+ t0 |   546
+ t1 |   545
+ t2 |   545
+ t3 |   546
+ t4 |   546
+ v0 |   615
+ v1 |   616
+ v2 |   616
+    |   425
+(9 rows)
+
+RESET datafusion.mode;
+DROP TABLE df_u1, df_u2, df_up;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;
