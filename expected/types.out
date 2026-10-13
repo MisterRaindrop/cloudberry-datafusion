@@ -62,8 +62,8 @@ EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
-                            QUERY PLAN                            
-------------------------------------------------------------------
+                         QUERY PLAN                         
+------------------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
@@ -71,7 +71,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
                      Filter: ((d - 1) > '01-01-2001'::date)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator - on date and integer
+ DataFusion: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
@@ -190,7 +190,7 @@ SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d O
 
 -- Arithmetic stays on PostgreSQL, and fails there as it should.
 SELECT max(d - date '2000-01-01') FROM df_ty WHERE id >= -1;
-ERROR:  cannot subtract infinite dates  (seg2 slice1 172.17.0.3:40002 pid=6281)
+ERROR:  cannot subtract infinite dates  (seg2 slice1 172.17.0.3:40002 pid=19684)
 -- A date against a timestamp constant compares dates (DT1): the constant
 -- rounded up for < and >=, down for <= and >; = and <> on a constant
 -- within a day are constant.  Dates past the timestamp range sort after
@@ -353,7 +353,9 @@ DROP TABLE df_ty3;
 -- extract(year | quarter | month | day from date) as numeric of scale 0
 -- (DT2).  The year of an infinite date is ±Infinity, which DataFusion
 -- groups, sorts, compares at scale 0 and returns, but arithmetic, sums,
--- casts and rescaling comparisons on it stay on PostgreSQL.
+-- casts and rescaling comparisons on it stay on PostgreSQL.  A date plus
+-- or minus days (DT3) as date_pli and date_mii: an infinite date stays,
+-- one beyond the dates PostgreSQL holds is 22008.
 CREATE TABLE df_ty4 (id int4, d date) DISTRIBUTED BY (id);
 INSERT INTO df_ty4 SELECT i, date '1992-01-01' + (i * 7919) % 2600 FROM generate_series(1, 3000) i;
 INSERT INTO df_ty4 VALUES (-1, '-infinity'), (-2, 'infinity'), (-3, '4714-11-24 BC'),
@@ -400,6 +402,19 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 199
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
  DataFusion: slice 1 not eligible: operator > rescaling a numeric that may be infinite
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty4
+                     Filter: ((id > 0) AND ((d + 45) > '01-01-1996'::date))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
 (8 rows)
 
 SET datafusion.mode = off;
@@ -468,6 +483,28 @@ SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
   1262
 (1 row)
 
+SELECT id, d + 30, 7 + d, d - 365 FROM df_ty4 WHERE id < 0 AND id NOT IN (-3, -6) ORDER BY id;
+ id |  ?column?  |  ?column?  |   ?column?    
+----+------------+------------+---------------
+ -9 | infinity   | infinity   | infinity
+ -8 |            |            | 
+ -7 | 03-30-2000 | 03-07-2000 | 03-01-1999
+ -5 | 01-31-0001 | 01-08-0001 | 01-02-0001 BC
+ -4 | 01-30-0001 | 01-07-0001 | 01-01-0001 BC
+ -2 | infinity   | infinity   | infinity
+ -1 | -infinity  | -infinity  | -infinity
+(7 rows)
+
+SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+ count 
+-------
+  1363
+(1 row)
+
+SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
+ERROR:  date out of range  (seg0 slice1 172.17.0.3:40000 pid=19683)
+SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
+ERROR:  date out of range  (seg1 slice1 172.17.0.3:40001 pid=19685)
 SET datafusion.mode = on;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
      y     | count 
@@ -534,6 +571,28 @@ SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
   1262
 (1 row)
 
+SELECT id, d + 30, 7 + d, d - 365 FROM df_ty4 WHERE id < 0 AND id NOT IN (-3, -6) ORDER BY id;
+ id |  ?column?  |  ?column?  |   ?column?    
+----+------------+------------+---------------
+ -9 | infinity   | infinity   | infinity
+ -8 |            |            | 
+ -7 | 03-30-2000 | 03-07-2000 | 03-01-1999
+ -5 | 01-31-0001 | 01-08-0001 | 01-02-0001 BC
+ -4 | 01-30-0001 | 01-07-0001 | 01-01-0001 BC
+ -2 | infinity   | infinity   | infinity
+ -1 | -infinity  | -infinity  | -infinity
+(7 rows)
+
+SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+ count 
+-------
+  1363
+(1 row)
+
+SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
+ERROR:  date out of range  (seg0 slice1 172.17.0.3:40000 pid=19683)
+SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
+ERROR:  date out of range  (seg1 slice1 172.17.0.3:40001 pid=19685)
 DROP TABLE df_ty4;
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.

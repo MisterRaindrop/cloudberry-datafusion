@@ -676,6 +676,13 @@ in PostgreSQL; grouping by `date` with a `timestamp` filter took 0.17 s and
 0.89 s (only the segments' slice in DataFusion; the coordinator sorts and
 limits).
 
+DT3: a date plus or minus a number of days (`date + integer`, `integer +
+date`, `date - integer`) runs as date_pli and date_mii do
+(df_core::pgdate::add_days): an infinite date stays as it is, a result
+outside the dates PostgreSQL holds raises 22008 "date out of range".
+TPC-DS Q72 (`d1.d_date + 5`) runs in DataFusion, 0.37 s against 0.82 s
+under the Postgres planner.
+
 ### tid
 
 TID1: GPORCA turns a semi join into a join and drops the copies by the

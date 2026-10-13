@@ -1374,6 +1374,19 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit_numcmp(b, out, name, linitial(op->args), lsecond(op->args), level);
 					return;
 				}
+				if (op->opfuncid == F_DATE_PLI || op->opfuncid == F_DATE_MII ||
+					op->opfuncid == F_INTEGER_PL_DATE)
+				{
+					/* DT3: date_pli, date_mii (df_core::pgdate) */
+					bool		swap = op->opfuncid == F_INTEGER_PL_DATE;
+
+					appendStringInfoString(out, "{\"dateadd\":[");
+					df_emit(b, out, swap ? lsecond(op->args) : linitial(op->args), level);
+					appendStringInfoChar(out, ',');
+					df_emit(b, out, swap ? linitial(op->args) : lsecond(op->args), level);
+					appendStringInfo(out, "],\"sign\":%d}", op->opfuncid == F_DATE_MII ? -1 : 1);
+					return;
+				}
 				if (df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
 				{
 					/* a date against a timestamp constant, as dates (DT1) */

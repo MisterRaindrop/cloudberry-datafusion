@@ -1715,7 +1715,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					}
 					else if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
 							 (op->opresulttype != BOOLOID || ltype != rtype) &&
-							 !df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
+							 !df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value) &&
+							 /* DT3: a date plus or minus days */
+							 op->opfuncid != F_DATE_PLI && op->opfuncid != F_DATE_MII &&
+							 op->opfuncid != F_INTEGER_PL_DATE)
 						df_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
 					else if (ltype == NUMERICOID || rtype == NUMERICOID)

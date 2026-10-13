@@ -113,6 +113,8 @@
 //!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
 //!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
 //!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
+//!         | {"dateadd": [<date>, <int4>], "sign": 1 | -1}   (date_pli,
+//!                                 date_mii: 22008 beyond the dates; DT3)
 //!         | {"assert": <expr>, "detail": s}   (true, or GPORCA's Assert's
 //!                                 error where <expr> is false: AS1)
 //!         | {"numcmp": "<" | "<=" | "=" | "<>" | ">=" | ">", "left": <side>,
@@ -660,6 +662,14 @@ fn expr(v: &Value) -> Result<Expr, String> {
         args.extend(rargs);
         return Ok(PgNumCmp::udf(op, l, r).call(args));
     }
+    if let Some(a) = v.get("dateadd").and_then(Value::as_array) {
+        // DT3: date_pli / date_mii
+        if a.len() != 2 {
+            return Err("plan spec: dateadd takes a date and a number of days".into());
+        }
+        let minus = field(v, "sign")?.as_i64() == Some(-1);
+        return Ok(crate::pgdate::PgDateAddDays::udf(minus).call(vec![expr(&a[0])?, expr(&a[1])?]));
+    }
     if let Some(e) = v.get("assert") {
         // AS1: true, or the Assert's error
         let detail = field(v, "detail")?.as_str().unwrap_or("").to_string();
@@ -771,6 +781,7 @@ fn may_fail(v: &Value) -> bool {
                 || map.contains_key("numdiv_scale")
                 || map.contains_key("numcmp")
                 || map.contains_key("assert")
+                || map.contains_key("dateadd")
             {
                 // DN1: numeric division by zero
                 return true;

@@ -185,3 +185,99 @@ mod tests {
         assert_eq!(extract(DateField::Month, i32::MAX), None);
     }
 }
+
+/// DT3: a date plus or minus a number of days, as date_pli and date_mii
+/// (date.c): an infinite date stays as it is; a result outside the dates
+/// PostgreSQL holds is 22008 "date out of range".
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PgDateAddDays {
+    minus: bool,
+    signature: Signature,
+}
+
+/// IS_VALID_DATE: from Julian day 0 up to JULIAN_MAXYEAR, from 2000-01-01.
+fn valid_date(d: i64) -> bool {
+    (-2_451_545..2_147_483_494 - 2_451_545).contains(&d)
+}
+
+/// date_pli / date_mii of `date` and `days`, or None for "date out of range".
+pub fn add_days(date: i32, days: i32, minus: bool) -> Option<i32> {
+    if date == i32::MIN || date == i32::MAX {
+        return Some(date);
+    }
+    let r = if minus { date as i64 - days as i64 } else { date as i64 + days as i64 };
+    // beyond int32 is date.c's overflow; within it, its range check
+    (r >= i32::MIN as i64 && r <= i32::MAX as i64 && valid_date(r)).then_some(r as i32)
+}
+
+impl PgDateAddDays {
+    pub fn udf(minus: bool) -> ScalarUDF {
+        ScalarUDF::new_from_impl(PgDateAddDays {
+            minus,
+            signature: Signature::exact(vec![DataType::Int32, DataType::Int32], Volatility::Immutable),
+        })
+    }
+}
+
+impl ScalarUDFImpl for PgDateAddDays {
+    fn name(&self) -> &str {
+        if self.minus {
+            "pg_date_mii"
+        } else {
+            "pg_date_pli"
+        }
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Int32)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let n = args.number_rows;
+        let dates = args.args[0].to_array(n)?;
+        let days = args.args[1].to_array(n)?;
+        let (dates, days) = (dates.as_primitive::<Int32Type>(), days.as_primitive::<Int32Type>());
+        let mut out = Vec::with_capacity(n);
+        for r in 0..n {
+            if dates.is_null(r) || days.is_null(r) {
+                out.push(None);
+                continue;
+            }
+            match add_days(dates.value(r), days.value(r), self.minus) {
+                Some(d) => out.push(Some(d)),
+                None => {
+                    return Err(DataFusionError::External(Box::new(
+                        crate::pgfunc::PgError::new("22008", "date out of range"),
+                    )))
+                }
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(
+            datafusion::arrow::array::Int32Array::from(out),
+        )))
+    }
+}
+
+#[cfg(test)]
+mod add_days_tests {
+    use super::*;
+
+    #[test]
+    fn as_date_pli_and_date_mii() {
+        assert_eq!(add_days(0, 31, false), Some(31));
+        assert_eq!(add_days(100, 30, true), Some(70));
+        assert_eq!(add_days(i32::MAX, 5, false), Some(i32::MAX));
+        assert_eq!(add_days(i32::MIN, 5, true), Some(i32::MIN));
+        // the last date PostgreSQL holds, 5874897-12-31, and one past it
+        let last = 2_147_483_494 - 2_451_545 - 1;
+        assert_eq!(add_days(last - 1, 1, false), Some(last));
+        assert_eq!(add_days(last, 1, false), None);
+        // 4714-11-24 BC is the first; int32 overflow is an error too
+        assert_eq!(add_days(-2_451_545, 1, true), None);
+        assert_eq!(add_days(2_000_000_000, i32::MAX, false), None);
+    }
+}
