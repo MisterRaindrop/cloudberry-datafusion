@@ -43,13 +43,14 @@
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use datafusion::arrow::array::UInt32Array;
+use datafusion::arrow::array::{Array, UInt32Array};
 use datafusion::arrow::compute::{concat_batches, take_record_batch};
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::hash_utils::{create_hashes, RandomState};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
+use datafusion::common::utils::memory::estimate_memory_size;
 use datafusion::common::{internal_err, NullEquality, Result};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -83,6 +84,25 @@ const HASH_ROW_BYTES: usize = 40;
 /// Bytes of a bucket's rows gathered before they are written as one batch
 /// (or the session's batch size in rows, whichever comes first).
 const BUCKET_BATCH_BYTES: usize = 1 << 20;
+
+/// Bytes DataFusion's hash join reserves to concatenate a build side's
+/// batches into one: none for a single batch, which it keeps as it is; the
+/// estimate of its `concat_build_batches` otherwise.
+fn concat_bytes(batches: &[RecordBatch]) -> Result<usize> {
+    if batches.len() <= 1 {
+        return Ok(0);
+    }
+    let mut bytes = 0;
+    for array in batches.iter().flat_map(|b| b.columns()) {
+        bytes += match array.data_type() {
+            DataType::Utf8View | DataType::BinaryView => {
+                array.len() * 16 + array.nulls().map_or(0, |_| array.len().div_ceil(8))
+            }
+            _ => array.to_data().get_slice_memory_size()?,
+        };
+    }
+    Ok(bytes)
+}
 
 /// Replaces each partitioned HashJoinExec (and one reading single
 /// partitions) by a SpillingHashJoinExec.
@@ -394,9 +414,11 @@ impl Run {
     async fn collect(&self, mut build: SendableRecordBatchStream, depth: u32) -> Result<Collected> {
         let reservation = self.reservation(depth);
         let mut batches = Vec::new();
+        let mut bytes = 0;
         while let Some(batch) = build.next().await {
             let batch = batch?;
             let size = get_record_batch_memory_size(&batch);
+            bytes += size;
             if reservation
                 .try_grow(size + batch.num_rows() * HASH_ROW_BYTES)
                 .is_err()
@@ -407,6 +429,18 @@ impl Run {
             }
             batches.push(batch);
         }
+        // The join reserves its table, and the copy it concatenates the
+        // batches into while it holds them (apache/datafusion#25496): a build
+        // side fits only with room for those too, which HASH_ROW_BYTES a row
+        // may not have left.
+        let rows = batches.iter().map(|b| b.num_rows()).sum();
+        let need = bytes + self.join_table_bytes(rows)? + concat_bytes(&batches)?;
+        let short = need.saturating_sub(reservation.size());
+        if short > 0 && reservation.try_grow(short).is_err() {
+            drop(reservation);
+            let rest = self.empty(&self.spec.left_schema);
+            return Ok(Collected::Overflow(batches, rest));
+        }
         Ok(Collected::All(batches, reservation))
     }
 
@@ -416,6 +450,30 @@ impl Run {
         probe: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
         self.join_parts(build, Some(probe), 0, 0).await
+    }
+
+    /// Bytes DataFusion's hash join reserves for the table of a build side
+    /// of `rows` rows: the estimate of its `new_join_hashmap`, with room for
+    /// the map's own fields; or, on one integer key, at most what an
+    /// ArrayMap over the keys' range takes, which it builds instead where
+    /// the range is small or the keys dense in it, and which may take more.
+    fn join_table_bytes(&self, rows: usize) -> Result<usize> {
+        let hash = if rows > u32::MAX as usize {
+            estimate_memory_size::<(u64, u64)>(rows, 64)? + rows * 8
+        } else {
+            estimate_memory_size::<(u32, u64)>(rows, 64)? + rows * 4
+        };
+        let array = match self.spec.on.as_slice() {
+            [(key, _)] if key.data_type(&self.spec.left_schema)?.is_integer() => {
+                let options = &self.ctx.session_config().options().execution;
+                let density = options.perfect_hash_join_min_key_density;
+                let range = if density > 0.0 { (rows as f64 / density) as usize } else { usize::MAX };
+                let range = range.max(options.perfect_hash_join_small_build_threshold);
+                range.saturating_add(1).saturating_add(rows).saturating_mul(4)
+            }
+            _ => 0,
+        };
+        Ok(hash.max(array))
     }
 
     /// Join a build side with a probe side (None: empty), splitting both by
@@ -778,6 +836,12 @@ mod tests {
     /// Join `l` and `r` (columns renamed lk, lk2, lv and rk, rk2, rv) and
     /// count the rows: query `i` of the test's.
     async fn query(ctx: &SessionContext, i: usize) -> DataFrame {
+        let (join, aggs) = joined(ctx, i).await;
+        join.aggregate(vec![], aggs).unwrap()
+    }
+
+    /// The join of query `i`, and the aggregates that count its rows.
+    async fn joined(ctx: &SessionContext, i: usize) -> (DataFrame, Vec<datafusion::prelude::Expr>) {
         use datafusion::functions_aggregate::expr_fn::{count, sum};
         use datafusion::prelude::{col, lit};
         let l = ctx
@@ -905,10 +969,7 @@ mod tests {
         } else {
             (&["lk", "lk2"], &["rk", "rk2"])
         };
-        l.join(r, jt, lk, rk, filter)
-            .unwrap()
-            .aggregate(vec![], aggs)
-            .unwrap()
+        (l.join(r, jt, lk, rk, filter).unwrap(), aggs)
     }
 
     /// The query's rows as text, sorted, and how many spills its joins made.
@@ -1017,6 +1078,104 @@ mod tests {
         });
     }
 
+    /// Join a build side of `rows` rows, keys `key(i)` and `cols` int
+    /// columns in all, in batches of 1024 rows, with itself, under a pool
+    /// with room for what the build side reserves a batch at a time and
+    /// little more; return how many times the join spilled.
+    fn join_under_a_tight_pool(rows: i32, cols: usize, key: fn(i32) -> i32) -> usize {
+        use datafusion::prelude::col;
+        crate::runtime::init(2).unwrap();
+        let handle = crate::runtime::handle().unwrap();
+        handle.block_on(async {
+            let schema = Arc::new(Schema::new(
+                (0..cols)
+                    .map(|c| Field::new(format!("c{c}"), DataType::Int32, false))
+                    .collect::<Vec<_>>(),
+            ));
+            let batches = (0..(rows + 1023) / 1024)
+                .map(|b| {
+                    let ids = (b * 1024)..((b + 1) * 1024).min(rows);
+                    let columns = (0..cols)
+                        .map(|c| {
+                            Arc::new(Int32Array::from_iter_values(
+                                ids.clone().map(|i| if c == 0 { key(i) } else { i % 7 }),
+                            )) as _
+                        })
+                        .collect();
+                    RecordBatch::try_new(schema.clone(), columns).unwrap()
+                })
+                .collect::<Vec<_>>();
+            let collected: usize = batches
+                .iter()
+                .map(|b| get_record_batch_memory_size(b) + b.num_rows() * HASH_ROW_BYTES)
+                .sum();
+            let limit = collected + (rows as usize);
+            let table = || Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).unwrap());
+            let config = SessionConfig::new().with_target_partitions(1).with_batch_size(1024);
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::new(FairSpillPool::new(limit)))
+                .with_disk_manager_builder(
+                    DiskManagerBuilder::default()
+                        .with_mode(DiskManagerMode::Directories(vec![std::env::temp_dir()])),
+                )
+                .build_arc()
+                .unwrap();
+            let state = SessionStateBuilder::new()
+                .with_config(config)
+                .with_runtime_env(runtime)
+                .with_default_features()
+                .with_physical_optimizer_rule(Arc::new(SpillHashJoins))
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            ctx.register_table("b", table()).unwrap();
+            ctx.register_table("p", table()).unwrap();
+            let b = ctx.table("b").await.unwrap()
+                .select((0..cols).map(|c| col(format!("c{c}")).alias(format!("b{c}"))).collect::<Vec<_>>())
+                .unwrap();
+            let p = ctx.table("p").await.unwrap();
+            let plan = b
+                .join(p, JoinType::Inner, &["b0"], &["c0"], None)
+                .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                .await
+                .unwrap();
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), rows as usize);
+            fn spills(plan: &Arc<dyn ExecutionPlan>) -> usize {
+                let own = if plan.name() == "SpillingHashJoinExec" {
+                    plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0)
+                } else {
+                    0
+                };
+                own + plan.children().into_iter().map(spills).sum::<usize>()
+            }
+            spills(&plan)
+        })
+    }
+
+    /// A build side of several batches fits only with room for the copy the
+    /// join concatenates them into: one that fits without it spills, rather
+    /// than leave the copy to a pool that has no room for it.
+    #[test]
+    fn a_build_side_fits_with_its_concatenated_copy() {
+        // 8 bytes a row and 40 for the table, which takes 38 (twice as many
+        // slots as rows, at its load factor), and the copy 8 more
+        assert!(join_under_a_tight_pool(8192, 2, |i| i) > 0, "the build side did not spill");
+    }
+
+    /// Keys dense enough in their range make the join build an array over
+    /// the range, which may take more than a hash table: a build side fits
+    /// only with room for that.
+    #[test]
+    fn a_build_side_fits_with_an_array_over_its_keys() {
+        // a hash table takes 24 bytes a row (its slots barely more than the
+        // rows), an array over keys 6.5 apart 30 and its copy 12 more: past
+        // the 40 a row reserved
+        assert!(join_under_a_tight_pool(14000, 3, |i| i * 13 / 2) > 0, "the build side did not spill");
+    }
+
     /// The join's memory comes out of the reservation first, although the
     /// pool would not grant the reservation as much any more; past it, out
     /// of the pool as memory that cannot spill.
@@ -1057,9 +1216,36 @@ mod tests {
                 .with_can_spill(true)
                 .register(full.task_ctx().memory_pool());
             hog.try_grow(limit).unwrap();
+            // The joins' rows, counted and summed here: an aggregate above
+            // them reserves for its accumulators when it starts
+            // (apache/datafusion#24692), which a full pool does not grant.
+            async fn rows(ctx: &SessionContext, i: usize) -> (Vec<(usize, i64)>, usize) {
+                let plan = joined(ctx, i).await.0.create_physical_plan().await.unwrap();
+                let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
+                    .await
+                    .unwrap();
+                let schema = plan.schema();
+                let sums = (0..schema.fields().len())
+                    .map(|c| {
+                        batches.iter().fold((0, 0), |(n, sum), b| {
+                            let a = b.column(c).as_any().downcast_ref::<Int32Array>().unwrap();
+                            (n + a.len() - a.null_count(), sum + a.iter().flatten().map(i64::from).sum::<i64>())
+                        })
+                    })
+                    .collect();
+                fn spills(plan: &Arc<dyn ExecutionPlan>) -> usize {
+                    let own = if plan.name() == "SpillingHashJoinExec" {
+                        plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    own + plan.children().into_iter().map(spills).sum::<usize>()
+                }
+                (sums, spills(&plan))
+            }
             for i in [0, 3, 5] {
-                let (want, _) = run(&plain, i).await;
-                let (got, spills) = run(&full, i).await;
+                let (want, _) = rows(&plain, i).await;
+                let (got, spills) = rows(&full, i).await;
                 assert_eq!(got, want, "query {i}");
                 assert_eq!(spills, 0, "query {i} spilled");
             }

@@ -549,7 +549,12 @@ planner's estimate) and is wrapped in `SpillingHashJoinExec`
 (`rust/df_core/src/spilljoin.rs`), a grace hash join around DataFusion's:
 
 - a partition collects its build side under a reservation of the batches'
-  size and 40 bytes a row for the hash table; when it fits, DataFusion's
+  size and 40 bytes a row for the hash table, and, read to its end, of what
+  DataFusion's join reserves beyond: its hash table as it estimates it (on
+  one integer key, the most an array over the keys' range may take, which
+  it builds instead where the keys are dense), and the copy it concatenates
+  the batches into while it still holds them (apache/datafusion#25496;
+  TPC-DS Q4 failed for 1.2 MB without it); when it fits, DataFusion's
   in-memory hash join runs on it, taking that reservation over (a pool of
   its own drawn from it): freed and reserved again, the bytes could go to
   another consumer in between, and the join, which cannot spill, finds no
@@ -1287,8 +1292,9 @@ DataFusion: ten partitions sort under the slice's 65 MB, partitions that
 end their input early merge their spilled runs with as many buffers as the
 pool grants, and a partition still sorting then finds no memory left
 (DataFusion 55.2.0; apache/datafusion#25804, finding 9).  A plain sort
-does the same under 64 MB.  apache/datafusion#26264 proposes the fix;
-these queries wait for a DataFusion release that has it.
+does the same under 64 MB.  apache/datafusion#26264 proposes the fix; on
+DataFusion's main with it (see Build) both finish, with the rows
+PostgreSQL gives: 2.1 s against 9.0 s, and 3.0 s against 6.4 s.
 
 A sum over a frame adds 19 digits to its argument's bound, as a sum over
 a group does; a sum of the sums of an Agg's groups (TPC-DS Q12, Q20, Q98:
@@ -1448,6 +1454,11 @@ make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config install
 make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config installcheck
 make df-rust-test
 ```
+
+DataFusion is a commit of MisterRaindrop/datafusion's branch of
+apache/datafusion#26264 (`rust/Cargo.toml`), DataFusion's main with that
+fix, which cargo fetches from GitHub; back to a release from crates.io once
+one has it.
 
 ## FFI contract
 

@@ -21,8 +21,6 @@
 [workspace]
 resolver = "2"
 members = ["df_core", "df_ffi"]
-# vendored crates are path dependencies, not members (vendor/README.md)
-exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,16 +29,16 @@ license = "Apache-2.0"
 publish = false
 
 [workspace.dependencies]
-datafusion = { version = "55.2", default-features = false }
+# DataFusion main with apache/datafusion#26264 (the final merge of a
+# spilled sort leaving memory for others), from the branch of that pull
+# request, until a release has it; then back to crates.io.  Main also has
+# apache/datafusion#24891 (the spill pool deadlock), which 55.2.0 lacked.
+datafusion = { git = "https://github.com/MisterRaindrop/datafusion", rev = "5c59c075f2b158f12be02d80380887855dba4653", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 libc = "0.2"
 serde_json = "1"
 futures = "0.3"
 df_core = { path = "df_core" }
-
-# DataFusion 55.2.0 with apache/datafusion#24891 (vendor/README.md).
-[patch.crates-io]
-datafusion-physical-plan = { path = "vendor/datafusion-physical-plan" }
 
 # panic must stay "unwind": every FFI entry point relies on catch_unwind to
 # turn a panic into an ordinary PostgreSQL ERROR.  "abort" would take the

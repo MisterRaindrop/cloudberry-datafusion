@@ -24,9 +24,8 @@
 //! reader waits on a drained one while its next batch is in the other, the
 //! distributor gate closes, and every worker parks for good
 //! (apache/datafusion#24883).  A TPC-H Q8 at scale factor 10 stopped so on
-//! three segments.  rust/vendor/datafusion-physical-plan carries the fix
-//! (apache/datafusion#24891); this is its test of the pool, through the
-//! public interface.
+//! three segments.  DataFusion's main has the fix (apache/datafusion#24891);
+//! this is its test of the pool, through the public interface.
 
 use std::io::Write;
 use std::pin::Pin;
