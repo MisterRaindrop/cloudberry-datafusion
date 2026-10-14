@@ -69,8 +69,8 @@ EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT g, a FROM df_u1 
 (15 rows)
 
 EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                                     QUERY PLAN                                                      
+---------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: df_u1.k, df_u1.t
    ->  Sort
@@ -89,7 +89,7 @@ EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 
                                              Filter: (k < 50)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ DataFusion: slice 1 eligible below the top: Hash Join (above: sort key of type text under a collation other than C)
  DataFusion: slice 2 eligible
 (20 rows)
 
@@ -367,7 +367,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u
                                        ->  Seq Scan on df_u2
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ DataFusion: slice 1 not eligible: sort key of type text under a collation other than C
  DataFusion: slice 2 eligible
  DataFusion: slice 3 eligible
 (20 rows)

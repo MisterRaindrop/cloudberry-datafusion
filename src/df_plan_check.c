@@ -373,6 +373,31 @@ df_type_is_string(Oid type)
 }
 
 /*
+ * CL2: for EXPLAIN on the coordinator, whether the default collation's
+ * LC_COLLATE and LC_CTYPE are C on the nodes running the slice being
+ * reported: 1 or 0 for the segments (df_explain_slices), -1 for this
+ * node's own.
+ */
+static int	df_explain_collate_c = -1;
+static int	df_explain_ctype_c = -1;
+
+static bool
+df_collate_is_c(Oid collation)
+{
+	if (collation == DEFAULT_COLLATION_OID && df_explain_collate_c >= 0)
+		return df_explain_collate_c == 1;
+	return lc_collate_is_c(collation);
+}
+
+static bool
+df_ctype_is_c(Oid collation)
+{
+	if (collation == DEFAULT_COLLATION_OID && df_explain_ctype_c >= 0)
+		return df_explain_ctype_c == 1;
+	return lc_ctype_is_c(collation);
+}
+
+/*
  * Why comparing strings under 'collation' as 'name' does stays on
  * PostgreSQL, or NULL.  Whether the database's default collation is C is
  * each node's own: the coordinator and the segments can differ (e.g. C and
@@ -390,7 +415,7 @@ df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 		cxt->locale_dependent = true;
 	if (!OidIsValid(collation))
 		return "without a collation";
-	if (equality ? !get_collation_isdeterministic(collation) : !lc_collate_is_c(collation))
+	if (equality ? !get_collation_isdeterministic(collation) : !df_collate_is_c(collation))
 		return equality ? "under a nondeterministic collation" : "under a collation other than C";
 	return NULL;
 }
@@ -513,7 +538,7 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 		case DF_COLL_CTYPE_C:
 			if (collation == DEFAULT_COLLATION_OID)
 				cxt->locale_dependent = true;
-			if (!OidIsValid(collation) || !lc_ctype_is_c(collation))
+			if (!OidIsValid(collation) || !df_ctype_is_c(collation))
 				return "under a collation other than C";
 			return NULL;
 	}
@@ -5395,10 +5420,19 @@ bool		df_motion_batches = false;
 bool		df_cluster_collation_c = false;
 
 /*
+ * CL2: on the coordinator, whether the default collation's LC_COLLATE and
+ * LC_CTYPE are C on every primary segment, as df_probe_cluster_collation
+ * found; -1 before it has, or if it could not.
+ */
+static int	df_segments_collate_c = -1;
+static int	df_segments_ctype_c = -1;
+
+/*
  * Is the database's default collation C (or POSIX, by libc) on the
  * coordinator and every primary segment?  Asked once per session: a
  * database's collation does not change.  An error asking, other than a
- * cancel, counts as no.
+ * cancel, counts as no.  Also records the segments' LC_COLLATE and
+ * LC_CTYPE, for EXPLAIN (CL2).
  */
 static bool
 df_probe_cluster_collation(void)
@@ -5407,8 +5441,6 @@ df_probe_cluster_collation(void)
 	ResourceOwner owner = CurrentResourceOwner;
 	bool		c = false;
 
-	if (!lc_collate_is_c(DEFAULT_COLLATION_OID))
-		return false;
 	BeginInternalSubTransaction(NULL);
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
@@ -5416,7 +5448,9 @@ df_probe_cluster_collation(void)
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
 		if (SPI_execute("SELECT count(*), count(*) FILTER (WHERE datlocprovider = 'c' "
-						"AND datcollate IN ('C', 'POSIX')) "
+						"AND datcollate IN ('C', 'POSIX')), "
+						"count(*) FILTER (WHERE datlocprovider = 'c' "
+						"AND datctype IN ('C', 'POSIX')) "
 						"FROM gp_dist_random('pg_database') "
 						"WHERE datname = current_database()",
 						true, 0) == SPI_OK_SELECT && SPI_processed == 1)
@@ -5426,8 +5460,15 @@ df_probe_cluster_collation(void)
 														  SPI_tuptable->tupdesc, 1, &isnull));
 			int64		clike = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
 															SPI_tuptable->tupdesc, 2, &isnull));
+			int64		ctlike = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+															 SPI_tuptable->tupdesc, 3, &isnull));
 
-			c = all == getgpsegmentCount() && clike == all;
+			if (all == getgpsegmentCount())
+			{
+				df_segments_collate_c = clike == all;
+				df_segments_ctype_c = ctlike == all;
+			}
+			c = lc_collate_is_c(DEFAULT_COLLATION_OID) && df_segments_collate_c == 1;
 		}
 		SPI_finish();
 		ReleaseCurrentSubTransaction();
@@ -6253,6 +6294,8 @@ df_root_cmp(const void *a, const void *b)
 	return ((const DfSliceRoot *) a)->index - ((const DfSliceRoot *) b)->index;
 }
 
+static void df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out);
+
 /* Append "DataFusion: slice N ..." lines for every slice of 'stmt'. */
 void
 df_explain_slices(PlannedStmt *stmt, StringInfo out)
@@ -6288,45 +6331,72 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 	}
 	qsort(cxt.roots, cxt.nroots, sizeof(DfSliceRoot), df_root_cmp);
 
-	for (i = 0; i < cxt.nroots; i++)
+	PG_TRY();
 	{
-		char		reason[256];
+		for (i = 0; i < cxt.nroots; i++)
+			df_explain_slice(stmt, &cxt.roots[i], out);
+	}
+	PG_FINALLY();
+	{
+		df_explain_collate_c = -1;
+		df_explain_ctype_c = -1;
+	}
+	PG_END_TRY();
+	pfree(cxt.roots);
+}
 
-		if (cxt.roots[i].init_plan)
-			appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
-							 "which the coordinator runs before the query\n",
-							 cxt.roots[i].index);
-		else if (df_check_slice(stmt, cxt.roots[i].root, cxt.roots[i].is_sender, NULL,
-						   reason, sizeof(reason)))
-			appendStringInfo(out, "DataFusion: slice %d eligible%s\n", cxt.roots[i].index,
-							 cxt.roots[i].is_sender &&
-							 df_motion_sends_batches(stmt, (Motion *) cxt.roots[i].root) ?
-							 ", sends Arrow batches" : "");
+/*
+ * The "DataFusion: slice N ..." line of slice 'root'.  CL2: a slice the
+ * segments run is reported as they check it, by their default collation,
+ * which can differ from the coordinator's (C and C.UTF-8).
+ */
+static void
+df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
+{
+	char		reason[256];
+	GangType	gang = stmt->slices[root->index].gangType;
+
+	if ((gang == GANGTYPE_PRIMARY_READER || gang == GANGTYPE_PRIMARY_WRITER ||
+		 gang == GANGTYPE_SINGLETON_READER) && Gp_role == GP_ROLE_DISPATCH)
+	{
+		df_explain_collate_c = df_segments_collate_c;
+		df_explain_ctype_c = df_segments_ctype_c;
+	}
+	else
+	{
+		df_explain_collate_c = -1;
+		df_explain_ctype_c = -1;
+	}
+	if (root->init_plan)
+		appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
+						 "which the coordinator runs before the query\n", root->index);
+	else if (df_check_slice(stmt, root->root, root->is_sender, NULL, reason, sizeof(reason)))
+		appendStringInfo(out, "DataFusion: slice %d eligible%s\n", root->index,
+						 root->is_sender &&
+						 df_motion_sends_batches(stmt, (Motion *) root->root) ?
+						 ", sends Arrow batches" : "");
+	else
+	{
+		Plan	   *compute = root->is_sender ? outerPlan(root->root) : root->root;
+		List	   *points = df_slice_attach_points(stmt, compute, df_batch_motions(stmt));
+		ListCell   *lc;
+
+		if (points == NIL)
+			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
+							 root->index, reason);
 		else
 		{
-			Plan	   *compute = cxt.roots[i].is_sender ?
-				outerPlan(cxt.roots[i].root) : cxt.roots[i].root;
-			List	   *points = df_slice_attach_points(stmt, compute, df_batch_motions(stmt));
-			ListCell   *lc;
-
-			if (points == NIL)
-				appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
-								 cxt.roots[i].index, reason);
-			else
+			/* T2: what runs below PostgreSQL's nodes, and why they stay */
+			appendStringInfo(out, "DataFusion: slice %d eligible below the top:",
+							 root->index);
+			foreach(lc, points)
 			{
-				/* T2: what runs below PostgreSQL's nodes, and why they stay */
-				appendStringInfo(out, "DataFusion: slice %d eligible below the top:",
-								 cxt.roots[i].index);
-				foreach(lc, points)
-				{
-					Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
+				Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
 
-					appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
-									 df_plan_name(p) ? df_plan_name(p) : "?");
-				}
-				appendStringInfo(out, " (above: %s)\n", reason);
+				appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
+								 df_plan_name(p) ? df_plan_name(p) : "?");
 			}
+			appendStringInfo(out, " (above: %s)\n", reason);
 		}
 	}
-	pfree(cxt.roots);
 }

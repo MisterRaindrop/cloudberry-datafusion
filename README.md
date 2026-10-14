@@ -503,6 +503,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | SO1 | INTERSECT and EXCEPT (SetOp) |
 | AS1 | GPORCA's Assert of a scalar subquery's rows |
 | SR1 | D3 below Subquery Scans |
+| CL2 | EXPLAIN checks a segment slice by the segments' collation |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -737,7 +738,12 @@ slice on PostgreSQL, and the partial sums below it in tuples.  A database
 created without `LC_COLLATE` takes each node's own template's, so a
 cluster initialized with different locales needs `CREATE DATABASE ...
 TEMPLATE template0 LC_COLLATE 'C'` for this.  Asking costs about 4 ms
-once per session.  `ILIKE`, regular expressions, `md5`, `initcap` and other
+once per session.  CL2: the same question records the segments'
+`LC_COLLATE` and `LC_CTYPE`, and EXPLAIN reports a slice the segments
+run as they check it: with the coordinator at C and the segments at
+C.UTF-8 (as in the development container), a Sort by a text column under
+the default collation used to read "eligible" while the segments kept it
+on PostgreSQL.  `ILIKE`, regular expressions, `md5`, `initcap` and other
 string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `name` and databases in
 other encodings.  The direct PAX reader hands out strings too (C1), as
 offsets and bytes like the main thread's batches: char(n) keeps its

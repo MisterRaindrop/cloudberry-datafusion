@@ -1074,8 +1074,8 @@ FROM generate_series(1, 30000) i;
 ANALYZE df_lc;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                                        QUERY PLAN                                                        
+--------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    Merge Key: f, s
    ->  Sort
@@ -1089,7 +1089,7 @@ EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f,
                            ->  Seq Scan on df_lc
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ DataFusion: slice 1 eligible below the top: Aggregate (above: sort key of type character under a collation other than C)
  DataFusion: slice 2 eligible, sends Arrow batches
 (15 rows)
 
