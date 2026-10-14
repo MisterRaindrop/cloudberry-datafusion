@@ -568,6 +568,28 @@ df_common_scale(Plan *ctx, Node *l, Node *r)
 }
 
 /*
+ * CU2: ,"collate": the locale by which this node orders strings, for an
+ * ordering comparison or min/max ('name') of string 'arg' under
+ * 'collation' that is not ordered by the bytes.
+ */
+static void
+df_emit_collate(StringInfo out, Oid collation, Node *arg, const char *name)
+{
+	Oid			type = exprType(arg);
+	const char *locale;
+
+	if ((type != TEXTOID && type != VARCHAROID && type != BPCHAROID) ||
+		(strcmp(name, "<") != 0 && strcmp(name, "<=") != 0 && strcmp(name, ">") != 0 &&
+		 strcmp(name, ">=") != 0 && strcmp(name, "min") != 0 && strcmp(name, "max") != 0))
+		return;
+	locale = df_collation_locale(collation);
+	if (locale == NULL)
+		return;
+	appendStringInfoString(out, ",\"collate\":");
+	df_emit_json_string(out, locale, strlen(locale));
+}
+
+/*
  * An operand of a comparison: a float as PostgreSQL compares it, -0 as 0
  * and every NaN as one, above all numbers (df_core::pgfloat); a character
  * value without its trailing blanks (B1).
@@ -1486,6 +1508,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				{
 					/* a comparison (LIKE sees character values padded: bpcharlike) */
 					df_emit_operands(b, out, linitial(op->args), lsecond(op->args), level);
+					df_emit_collate(out, op->inputcollid, linitial(op->args), name);
 					appendStringInfoChar(out, '}');
 					return;
 				}
@@ -2832,6 +2855,9 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		if (agg->aggdistinct != NIL && !combine &&
 			strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
 			appendStringInfoString(aggs, ",\"distinct\":true");
+		if (agg->args != NIL)
+			df_emit_collate(aggs, agg->inputcollid,
+							(Node *) linitial_node(TargetEntry, agg->args)->expr, name);
 		appendStringInfoChar(aggs, '}');
 	}
 }

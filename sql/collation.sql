@@ -96,6 +96,33 @@ SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
 SET datafusion.mode = on;
 SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
 
+-- Comparisons and min/max under it (CU2) run in DataFusion by strcoll_l
+-- with the node's locale: case, punctuation and accents order as the
+-- language has them, not as the bytes.
+SET datafusion.mode = off;
+CREATE TABLE df_cu (k int, g int, t text, u varchar(20)) DISTRIBUTED BY (k);
+INSERT INTO df_cu SELECT i, i % 5,
+  CASE WHEN i % 97 = 0 THEN NULL ELSE (ARRAY['apple', 'Apple', 'a-b', 'ab', 'a b', '0_4z', '04z',
+  'Éire', 'eire', 'zebra', 'Zebra', 'co-op', 'coop', 'ä', 'b', '', ' x', 'Ω'])[1 + i % 18] || (i % 3)::text END,
+  (ARRAY['m', 'M', 'Ä', 'n', '-n'])[1 + i % 5] || (i % 3)::text
+FROM generate_series(1, 6000) i;
+ANALYZE df_cu;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, min(t), max(t) FROM df_cu WHERE t < 'b' GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT min(t), max(u) FROM df_cu;
+EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+SET datafusion.mode = off;
+SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t >= 'apple1' THEN 1 ELSE 0 END),
+  sum(CASE WHEN t BETWEEN 'a' AND 'coop2' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+SELECT g, min(t), max(t), min(u), max(u) FROM df_cu WHERE t < 'b' GROUP BY g ORDER BY g;
+SELECT min(t), max(t), min(u), max(u), min(t COLLATE "C") FROM df_cu;
+SET datafusion.mode = on;
+SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t >= 'apple1' THEN 1 ELSE 0 END),
+  sum(CASE WHEN t BETWEEN 'a' AND 'coop2' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+SELECT g, min(t), max(t), min(u), max(u) FROM df_cu WHERE t < 'b' GROUP BY g ORDER BY g;
+SELECT min(t), max(t), min(u), max(u), min(t COLLATE "C") FROM df_cu;
+
 \c contrib_regression
 DROP DATABASE df_coll_c WITH (FORCE);
 DROP DATABASE df_coll_utf8 WITH (FORCE);

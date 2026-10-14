@@ -91,7 +91,9 @@
 //!                fn: count, sum, min, max, avg, count_merge (adds up partial
 //!                counts, 0 without rows: PostgreSQL's combining count), or
 //!                avg_merge with "arg2" (sum of arg / sum of arg2, NULL when
-//!                that is 0: combines avg states of sum and count)
+//!                that is 0: combines avg states of sum and count); min and
+//!                max of strings with "collate": l order them by libc
+//!                locale l (CU2, pgcoll)
 //!   "having":    <expr> | null,
 //!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ],
 //!   "route":     { "kind": "hash", "keys": [ {"col": k, "hash": "int4"}, ... ],
@@ -103,6 +105,8 @@
 //!         | {"per_set": [v, ...], "set": <expr>}   (int4 v of the set
 //!                                 <expr> names: GROUPING() and the like)
 //!         | {"op": "+", "type": t, "args": [<expr>, <expr>]}
+//!         | {"op": "<", "type": "bool", "args": [..], "collate": l}   (<, <=,
+//!                                 >, >= of strings by libc locale l: CU2)
 //!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
 //!         | {"isnull": <expr>} | {"isnotnull": <expr>}
 //!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
@@ -530,6 +534,12 @@ fn expr(v: &Value) -> Result<Expr, String> {
         if name == "||" {
             return Ok(PgStrFn::udf(StrFn::Textcat).call(vec![a, b]));
         }
+        if let Some(loc) = v.get("collate").and_then(Value::as_str) {
+            // CU2: strings ordered by a libc locale
+            return Ok(crate::pgcoll::PgCollCmp::udf(name, loc)
+                .map_err(|e| e.to_string())?
+                .call(vec![a, b]));
+        }
         if let Some(cmp) = comparison(name) {
             return Ok(binary_expr(a, cmp, b));
         }
@@ -860,8 +870,16 @@ fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, S
         // numeric.  sum_decimal: sum of numeric(p, s), NaN aside; the second
         // aggregate notes NaNs (`aggregate_extra`) and the projection after
         // the aggregate makes the sum NaN then.
+        "min" | "max" if v.get("collate").is_some() => collated_min_max(v, need(arg)?)?,
         _ => aggregate_of(name, need(arg)?)?,
     })
+}
+
+/// CU2: min or max of strings under the libc locale "collate" names.
+fn collated_min_max(v: &Value, a: Expr) -> Result<Expr, String> {
+    let loc = field(v, "collate")?.as_str().ok_or("plan spec: bad collate")?;
+    let max = field(v, "fn")?.as_str() == Some("max");
+    Ok(crate::pgcoll::PgCollMinMax::udaf(max, loc).call(vec![a]))
 }
 
 /// Aggregate `name` (as in `aggregate`) of `a`.
@@ -1989,6 +2007,9 @@ fn build_node(
                 let p = col(format!("p{i}"));
                 let pn = col(format!("p{i}_n"));
                 match field(g, "fn")?.as_str().unwrap_or("") {
+                    "min" | "max" if g.get("collate").is_some() => {
+                        agg_exprs.push(collated_min_max(g, p)?.alias(&a))
+                    }
                     "min" => agg_exprs.push(min(p).alias(&a)),
                     "max" => agg_exprs.push(max(p).alias(&a)),
                     "any" => agg_exprs.push(

@@ -49,6 +49,7 @@
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_type_d.h"
@@ -491,6 +492,53 @@ df_collate_is_c(Oid collation)
 	return lc_collate_is_c(collation);
 }
 
+/* The provider of 'collation': libc, ICU, or for the default, the database's. */
+static char
+df_collation_provider(Oid collation)
+{
+	HeapTuple	tup;
+	char		provider;
+
+	if (collation == DEFAULT_COLLATION_OID)
+		return df_database_provider();
+	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(collation));
+	if (!HeapTupleIsValid(tup))
+		return COLLPROVIDER_DEFAULT;
+	provider = ((Form_pg_collation) GETSTRUCT(tup))->collprovider;
+	ReleaseSysCache(tup);
+	return provider;
+}
+
+/*
+ * CU2: the libc locale by which this node orders strings under
+ * 'collation', or NULL where it orders them by their bytes: the
+ * database's LC_COLLATE for the default collation, else the collation's
+ * collcollate.  DataFusion then compares them by strcoll_l
+ * (df_core::pgcoll).
+ */
+const char *
+df_collation_locale(Oid collation)
+{
+	HeapTuple	tup;
+	Datum		d;
+	bool		isnull;
+	char	   *locale;
+
+	if (df_collate_is_c(collation))
+		return NULL;
+	if (collation == DEFAULT_COLLATION_OID)
+		return pstrdup(setlocale(LC_COLLATE, NULL));
+	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(collation));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for collation %u", collation);
+	d = SysCacheGetAttr(COLLOID, tup, Anum_pg_collation_collcollate, &isnull);
+	locale = isnull ? NULL : TextDatumGetCString(d);
+	ReleaseSysCache(tup);
+	if (locale == NULL)
+		elog(ERROR, "collation %u has no collcollate", collation);
+	return locale;
+}
+
 static bool
 df_ctype_is_c(Oid collation)
 {
@@ -520,6 +568,26 @@ df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
 	if (equality ? !get_collation_isdeterministic(collation) : !df_collate_is_c(collation))
 		return equality ? "under a nondeterministic collation" : "under a collation other than C";
 	return NULL;
+}
+
+/*
+ * Why ordering strings under 'collation' by operator or min/max 'name'
+ * stays on PostgreSQL, or NULL.  Beyond df_string_compare_problem: under a
+ * deterministic libc collation of a language (CU2), DataFusion compares by
+ * strcoll_l with the node's locale, as PostgreSQL there.  Sorts stay as
+ * df_string_compare_problem has them.
+ */
+static const char *
+df_string_order_problem(DfCheckContext *cxt, const char *name, Oid collation)
+{
+	if (strcmp(name, "<") != 0 && strcmp(name, "<=") != 0 && strcmp(name, ">") != 0 &&
+		strcmp(name, ">=") != 0 && strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
+		return df_string_compare_problem(cxt, name, collation);
+	if (OidIsValid(collation) && GetDatabaseEncoding() == PG_UTF8 &&
+		df_collation_provider(collation) == COLLPROVIDER_LIBC &&
+		get_collation_isdeterministic(collation))
+		return NULL;
+	return df_string_compare_problem(cxt, name, collation);
 }
 
 static const DfStringFunc df_string_funcs[] = {
@@ -1932,7 +2000,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						if (op->opresulttype != BOOLOID || (ltype != rtype && !bplike))
 							df_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
-						else if ((problem = df_string_compare_problem(cxt, name, op->inputcollid)) != NULL)
+						else if ((problem = df_string_order_problem(cxt, name, op->inputcollid)) != NULL)
 							df_reject(cxt, "operator %s on %s %s", name,
 									  format_type_be(ltype), problem);
 						else if ((strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0) &&
@@ -2078,9 +2146,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					/* bpchar_larger compares without trailing blanks, returns the padded value */
 					df_reject(cxt, "aggregate %s of character", name);
 				else if (df_type_is_string(agg->aggtype) &&
-						 df_string_compare_problem(cxt, name, agg->inputcollid) != NULL)
+						 df_string_order_problem(cxt, name, agg->inputcollid) != NULL)
 					df_reject(cxt, "aggregate %s of %s %s", name, format_type_be(agg->aggtype),
-							  df_string_compare_problem(cxt, name, agg->inputcollid));
+							  df_string_order_problem(cxt, name, agg->inputcollid));
 				if (cxt->failed)
 					return true;
 				/* MS1: the branches of a sum's argument may differ in scale */

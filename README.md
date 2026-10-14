@@ -505,6 +505,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | SR1 | D3 below Subquery Scans |
 | CL2 | EXPLAIN checks a segment slice by the segments' collation |
 | CU1 | The default collation C.UTF-8 orders strings in DataFusion, as C |
+| CU2 | Comparisons and min/max of strings under a libc collation of a language, by strcoll_l |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -709,7 +710,8 @@ which agrees with PostgreSQL as follows:
 | Operation | Runs in DataFusion when the collation is |
 |---|---|
 | `=`, `<>`, GROUP BY keys, hash join keys | deterministic (any libc or ICU collation that is not `deterministic = false`) |
-| `<`, `<=`, `>`, `>=`, `min`, `max` | C or POSIX; the default collation also where it is libc's C.UTF-8 (CU1) |
+| `<`, `<=`, `>`, `>=`, `min`, `max` | C or POSIX; the default collation also where it is libc's C.UTF-8 (CU1); any deterministic libc collation by `strcoll_l` (CU2) |
+| ORDER BY, merge keys, window order | C or POSIX, or C.UTF-8 (CU1) |
 
 Anything else stays on PostgreSQL with the reason in EXPLAIN (`operator <
 on text under a collation other than C`).  Whether the database's default
@@ -735,8 +737,20 @@ coordinator asks each segment the same, comparing those pairs in a scan
 of `pg_database` under its default collation.  glibc 2.34 in the
 development container passes, and 118 thousand strings of every BMP code
 point and some beyond sort alike under C.UTF-8 and C, and alike in
-DataFusion and PostgreSQL.  Other languages' collations (en_US.utf8)
-stay on PostgreSQL for ordering.
+DataFusion and PostgreSQL.
+
+CU2: under a deterministic libc collation of a language (en_US.utf8),
+`<`, `<=`, `>`, `>=` (and BETWEEN) of strings and their min and max run in
+DataFusion by `strcoll_l` with the locale the node orders by, then the
+bytes where it finds two strings equal, as varstr_cmp
+(`df_core::pgcoll`): the database's LC_COLLATE for the default
+collation, a collation's collcollate otherwise.  glibc's `strxfrm` keys
+would let DataFusion sort by them, but on glibc 2.34 they order 540 of
+400 thousand adjacent pairs of ordinary strings otherwise than strcoll
+(`'04z'` and `'0_4z'`), so sorts stay on PostgreSQL under such a
+collation.  Over 3 million rows under en_US.utf8, a count with `t < '8'`
+took 35-54 ms against 161-198 ms, a grouped min and max 122-133 ms
+against 318-357 ms.
 
 CL1: where the default collation is C (or POSIX, by libc, or C.UTF-8 by
 CU1) on every node,

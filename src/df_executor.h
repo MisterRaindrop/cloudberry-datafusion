@@ -230,6 +230,7 @@ typedef struct DfStringFunc
 
 extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
+extern const char *df_collation_locale(Oid collation);
 extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);

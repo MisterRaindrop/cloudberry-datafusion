@@ -251,6 +251,109 @@ SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
  PERU                      | 142714.30
 (7 rows)
 
+-- Comparisons and min/max under it (CU2) run in DataFusion by strcoll_l
+-- with the node's locale: case, punctuation and accents order as the
+-- language has them, not as the bytes.
+SET datafusion.mode = off;
+CREATE TABLE df_cu (k int, g int, t text, u varchar(20)) DISTRIBUTED BY (k);
+INSERT INTO df_cu SELECT i, i % 5,
+  CASE WHEN i % 97 = 0 THEN NULL ELSE (ARRAY['apple', 'Apple', 'a-b', 'ab', 'a b', '0_4z', '04z',
+  'Éire', 'eire', 'zebra', 'Zebra', 'co-op', 'coop', 'ä', 'b', '', ' x', 'Ω'])[1 + i % 18] || (i % 3)::text END,
+  (ARRAY['m', 'M', 'Ä', 'n', '-n'])[1 + i % 5] || (i % 3)::text
+FROM generate_series(1, 6000) i;
+ANALYZE df_cu;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, min(t), max(t) FROM df_cu WHERE t < 'b' GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g
+               ->  Streaming Partial HashAggregate
+                     Group Key: g
+                     ->  Seq Scan on df_cu
+                           Filter: (t < 'b'::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT min(t), max(u) FROM df_cu;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_cu
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_cu
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+SET datafusion.mode = off;
+SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t >= 'apple1' THEN 1 ELSE 0 END),
+  sum(CASE WHEN t BETWEEN 'a' AND 'coop2' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+ sum  | sum  | sum  | sum  
+------+------+------+------
+ 2973 | 3297 | 2971 | 1979
+(1 row)
+
+SELECT g, min(t), max(t), min(u), max(u) FROM df_cu WHERE t < 'b' GROUP BY g ORDER BY g;
+ g | min |  max   | min | max 
+---+-----+--------+-----+-----
+ 0 | 0   | Apple1 | m0  | m2
+ 1 | 0   | Apple1 | M0  | M2
+ 2 | 0   | Apple1 | Ä0  | Ä2
+ 3 | 0   | Apple1 | n0  | n2
+ 4 | 0   | Apple1 | -n0 | -n2
+(5 rows)
+
+SELECT min(t), max(t), min(u), max(u), min(t COLLATE "C") FROM df_cu;
+ min | max | min | max | min 
+-----+-----+-----+-----+-----
+ 0   | Ω2  | Ä0  | n2  |  x1
+(1 row)
+
+SET datafusion.mode = on;
+SELECT sum(CASE WHEN t < 'B' THEN 1 ELSE 0 END), sum(CASE WHEN t >= 'apple1' THEN 1 ELSE 0 END),
+  sum(CASE WHEN t BETWEEN 'a' AND 'coop2' THEN 1 ELSE 0 END), sum(CASE WHEN t > u THEN 1 ELSE 0 END) FROM df_cu;
+ sum  | sum  | sum  | sum  
+------+------+------+------
+ 2973 | 3297 | 2971 | 1979
+(1 row)
+
+SELECT g, min(t), max(t), min(u), max(u) FROM df_cu WHERE t < 'b' GROUP BY g ORDER BY g;
+ g | min |  max   | min | max 
+---+-----+--------+-----+-----
+ 0 | 0   | Apple1 | m0  | m2
+ 1 | 0   | Apple1 | M0  | M2
+ 2 | 0   | Apple1 | Ä0  | Ä2
+ 3 | 0   | Apple1 | n0  | n2
+ 4 | 0   | Apple1 | -n0 | -n2
+(5 rows)
+
+SELECT min(t), max(t), min(u), max(u), min(t COLLATE "C") FROM df_cu;
+ min | max | min | max | min 
+-----+-----+-----+-----+-----
+ 0   | Ω2  | Ä0  | n2  |  x1
+(1 row)
+
 \c contrib_regression
 DROP DATABASE df_coll_c WITH (FORCE);
 DROP DATABASE df_coll_utf8 WITH (FORCE);
