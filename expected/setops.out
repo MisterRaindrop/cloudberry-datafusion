@@ -372,6 +372,45 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u
  DataFusion: slice 3 eligible
 (20 rows)
 
+-- an input grouped before a Motion: the Motion is still read below the SetOp (TPC-DS Q38)
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
+                                                   QUERY PLAN                                                    
+-----------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Subquery Scan on s
+                     ->  HashSetOp Intersect
+                           ->  Append
+                                 ->  Subquery Scan on "*SELECT* 3"
+                                       ->  HashAggregate
+                                             Group Key: ((df_u1.g % 3)), ((df_u1.k % 4))
+                                             ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                                   Hash Key: ((df_u1.g % 3)), ((df_u1.k % 4))
+                                                   ->  Seq Scan on df_u1
+                                                         Filter: (k < 300)
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: "*SELECT* 2".g, "*SELECT* 2"."?column?"
+                                       ->  Result
+                                             ->  HashSetOp Intersect
+                                                   ->  Append
+                                                         ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                                               Hash Key: "*SELECT* 2".g, "*SELECT* 2"."?column?"
+                                                               ->  Subquery Scan on "*SELECT* 2"
+                                                                     ->  Seq Scan on df_u2
+                                                         ->  Redistribute Motion 3:3  (slice5; segments: 3)
+                                                               Hash Key: "*SELECT* 1".x, "*SELECT* 1".y
+                                                               ->  Subquery Scan on "*SELECT* 1"
+                                                                     ->  Seq Scan on df_u1 df_u1_1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+ DataFusion: slice 5 eligible, sends Arrow batches
+(33 rows)
+
 SET enable_hashagg = off;
 EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
                             QUERY PLAN                            
@@ -643,6 +682,12 @@ SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 IN
  count 
 -------
      3
+(1 row)
+
+SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
+ count | sum | sum 
+-------+-----+-----
+    12 |  12 |  18
 (1 row)
 
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
@@ -1292,6 +1337,12 @@ SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 IN
  count 
 -------
      3
+(1 row)
+
+SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
+ count | sum | sum 
+-------+-----+-----
+    12 |  12 |  18
 (1 row)
 
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;

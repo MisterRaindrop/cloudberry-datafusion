@@ -63,6 +63,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTER
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT g, c::bpchar FROM df_u1 INTERSECT SELECT g, (c || 'x')::bpchar FROM df_u2) s;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT k % 50 x, g y FROM df_u1 EXCEPT SELECT k % 40, g FROM df_u2) s ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
+-- an input grouped before a Motion: the Motion is still read below the SetOp (TPC-DS Q38)
+EXPLAIN (COSTS OFF) SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
 SET enable_hashagg = off;
 EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
 RESET enable_hashagg;
@@ -75,6 +77,7 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
 SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
 SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
 SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
 SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;
@@ -96,6 +99,7 @@ SELECT g, count(*), sum(a) FROM df_up WHERE k > 10 GROUP BY g ORDER BY 1;
 SELECT count(*) FROM (SELECT g, b FROM df_u1 INTERSECT SELECT g, b FROM df_u2) s;
 SELECT * FROM (SELECT k % 50 x, t FROM df_u1 EXCEPT SELECT k % 40, t FROM df_u2) s ORDER BY 1, 2;
 SELECT count(*) FROM (SELECT g, t FROM df_u1 INTERSECT SELECT g, t FROM df_u2 INTERSECT SELECT g % 3, t FROM df_u1) s;
+SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FROM df_u1 INTERSECT SELECT g, k % 4 FROM df_u2 INTERSECT SELECT g % 3, k % 4 FROM df_u1 WHERE k < 300 GROUP BY 1, 2) s;
 SELECT * FROM (SELECT t FROM df_u1 EXCEPT SELECT t FROM df_u2) s ORDER BY 1;
 SELECT u.g, u.s FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 WHERE 1 = 0 GROUP BY g) u JOIN df_u1 x ON x.k = u.g + 1 ORDER BY 1, 2;
 SELECT count(*), count(u.s), sum(u.s) FROM (SELECT sum(a) s FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT sum(a) FROM df_u2 WHERE 1 = 0) u;

@@ -4406,6 +4406,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * display scale beside it (DN1).
 				 */
 				ListCell   *lc;
+				bool		agg_input;
+				bool		join_input;
+				bool		window_input;
 
 				if (IsA(plan, Append) ? ((Append *) plan)->part_prune_info != NULL :
 					((MergeAppend *) plan)->part_prune_info != NULL)
@@ -4440,8 +4443,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						!df_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
 						df_reject(cxt, "Append of numeric of display scales of their own");
 				}
+				agg_input = cxt->agg_input;
+				join_input = cxt->join_input;
+				window_input = cxt->window_input;
 				foreach(lc, df_append_plans(plan))
 				{
+					/*
+					 * as above each input: an Agg in one clears agg_input
+					 * when it returns (TPC-DS Q38, an INTERSECT's Motion)
+					 */
+					cxt->agg_input = agg_input;
+					cxt->join_input = join_input;
+					cxt->window_input = window_input;
 					cxt->order_free = true;
 					df_check_plan(lfirst(lc), cxt, needed, false);
 				}
