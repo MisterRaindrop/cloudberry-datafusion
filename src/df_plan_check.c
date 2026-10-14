@@ -3885,6 +3885,9 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 		if (below != NULL && IsA(below, WindowAgg))
 			return true;
 	}
+	/* SR1: also below Subquery Scans passing its columns on (TPC-DS Q24) */
+	while (agg != NULL && IsA(agg, SubqueryScan))
+		agg = (Agg *) ((SubqueryScan *) agg)->subplan;
 	if (agg == NULL || !IsA(agg, Agg) || agg->aggstrategy != AGG_SORTED ||
 		outerPlan(agg) == NULL || !IsA(outerPlan(agg), Sort) || motion->numSortCols == 0)
 		return false;
@@ -3892,6 +3895,8 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 	{
 		TargetEntry *mtle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
 		Var		   *var = mtle ? (Var *) mtle->expr : NULL;
+		Plan	   *above = outerPlan(motion);
+		AttrNumber	col;
 		TargetEntry *atle;
 		Var		   *grp;
 		Oid			type;
@@ -3899,7 +3904,18 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 
 		if (var == NULL || !IsA(var, Var) || var->varno != OUTER_VAR)
 			return false;
-		atle = get_tle_by_resno(agg->plan.targetlist, var->varattno);
+		/* the GroupAggregate's column the key is, through the Subquery Scans */
+		col = var->varattno;
+		for (; IsA(above, SubqueryScan); above = ((SubqueryScan *) above)->subplan)
+		{
+			TargetEntry *stle = get_tle_by_resno(above->targetlist, col);
+
+			if (stle == NULL || !IsA(stle->expr, Var) ||
+				((Var *) stle->expr)->varno != ((SubqueryScan *) above)->scan.scanrelid)
+				return false;
+			col = ((Var *) stle->expr)->varattno;
+		}
+		atle = get_tle_by_resno(agg->plan.targetlist, col);
 		grp = atle ? (Var *) atle->expr : NULL;
 		if (grp == NULL || !IsA(grp, Var) || grp->varno != OUTER_VAR)
 			return false;

@@ -216,6 +216,26 @@ SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) O
 RESET gp_enable_multiphase_agg;
 DROP TABLE df_go;
 
+-- A GroupAggregate below a Subquery Scan under a sorted Gather (SR1,
+-- TPC-DS Q24): as D3, DataFusion groups hashed and sorts the slice's
+-- output by the Gather's keys, grouping columns passed on by the Subquery
+-- Scan, here a prefix of the groups.
+CREATE TABLE df_sr (k int, a int, b int, n numeric(10,2)) DISTRIBUTED BY (k);
+INSERT INTO df_sr SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 7 END, i % 5,
+  (i % 211) * 0.75 FROM generate_series(1, 20000) i;
+ANALYZE df_sr;
+SET enable_hashagg = off;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
+SET datafusion.mode = off;
+SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
+SET datafusion.mode = on;
+SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
+RESET gp_enable_multiphase_agg;
+RESET enable_hashagg;
+DROP TABLE df_sr;
+
 -- GPORCA's Result over the slice's Sort (S2, TPC-DS Q58): DataFusion
 -- projects, then sorts by the columns the Result passes the Sort's keys on
 -- as, and the Limit above applies after.

@@ -502,6 +502,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | UA1 | UNION ALL (Append) |
 | SO1 | INTERSECT and EXCEPT (SetOp) |
 | AS1 | GPORCA's Assert of a scalar subquery's rows |
+| SR1 | D3 below Subquery Scans |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -1145,8 +1146,10 @@ aggregate node of the spec.  And a GroupAggregate whose order no one
 reads, below an unsorted Motion, a Sort or another aggregate, runs
 hashed without the Sort below it.  Below a sorted Motion whose keys are
 its groups (D3), it runs hashed and the slice sorts its output by those
-keys: the groups are unique, so the order is the same.  One below a Limit
-or at the top of a slice is D7's.  `count(DISTINCT a % 100000)`
+keys: the groups are unique, so the order is the same.  Also below
+Subquery Scans that pass its grouping columns on as the Motion's keys
+(SR1, TPC-DS Q24), with the keys a prefix of the groups.  One below a
+Limit or at the top of a slice is D7's.  `count(DISTINCT a % 100000)`
 over 30 million rows took 0.65 s against 3.29 s.
 
 D4: the planner also pushes a LIMIT below the sorted Motion, over the
