@@ -17,8 +17,9 @@
 --
 --
 -- Ordering strings by the database's default collation runs in DataFusion
--- where that collation is C, but whether it is C is each node's own: the
--- coordinator and the segments can differ.  Which Motions carry batches
+-- where that collation orders them by their bytes (C, POSIX, or C.UTF-8 by
+-- code point), but whether it does is each node's own: the coordinator and
+-- the segments can differ.  Which Motions carry batches
 -- must come out alike on every node, so the coordinator asks every segment
 -- and sets datafusion.cluster_collation_c, which it sends them.
 --
@@ -50,13 +51,36 @@ SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
 SET datafusion.mode = on;
 SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
 
--- A database of another collation: no slice orders strings in DataFusion,
--- and the setting stays off even when set.
+-- A database of C.UTF-8 (CU1), which orders by code point: for UTF-8,
+-- by the bytes, as C.  The coordinator checks that it does so on every
+-- node, so the slice runs in DataFusion as under C.
 CREATE DATABASE df_coll_utf8 TEMPLATE template0 LC_COLLATE 'C.UTF-8' LC_CTYPE 'C.UTF-8';
 ALTER DATABASE df_coll_utf8 SET session_preload_libraries = 'datafusion_executor';
 \c df_coll_utf8
+SET datafusion.mode = off;
 CREATE TABLE df_coll (k int, name char(25), v numeric(12,2)) DISTRIBUTED BY (k);
-INSERT INTO df_coll SELECT i, (ARRAY['FRANCE', 'GERMANY', 'CHINA', 'PERU'])[i % 4 + 1],
+INSERT INTO df_coll SELECT i, (ARRAY['FRANCE', 'GERMANY', 'CHINA', 'PERU', 'chile', 'Éire', 'ÅLAND'])[i % 7 + 1],
+  (i % 1000) / 10.0 FROM generate_series(1, 20000) i;
+ANALYZE df_coll;
+SET optimizer = on;
+SET optimizer_enable_hashagg = off;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
+SHOW datafusion.cluster_collation_c;
+SELECT DISTINCT current_setting('datafusion.cluster_collation_c') FROM gp_dist_random('gp_id');
+SET datafusion.mode = off;
+SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
+SET datafusion.mode = on;
+SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
+
+-- A database of a language's collation: no slice orders strings in
+-- DataFusion, and the setting stays off even when set.
+CREATE DATABASE df_coll_en TEMPLATE template0 LC_COLLATE 'en_US.utf8' LC_CTYPE 'en_US.utf8';
+ALTER DATABASE df_coll_en SET session_preload_libraries = 'datafusion_executor';
+\c df_coll_en
+CREATE TABLE df_coll (k int, name char(25), v numeric(12,2)) DISTRIBUTED BY (k);
+INSERT INTO df_coll SELECT i, (ARRAY['FRANCE', 'GERMANY', 'CHINA', 'PERU', 'chile', 'Éire', 'ÅLAND'])[i % 7 + 1],
   (i % 1000) / 10.0 FROM generate_series(1, 20000) i;
 ANALYZE df_coll;
 SET datafusion.cluster_collation_c = on;
@@ -75,3 +99,4 @@ SELECT name, sum(v) FROM df_coll GROUP BY name ORDER BY name;
 \c contrib_regression
 DROP DATABASE df_coll_c WITH (FORCE);
 DROP DATABASE df_coll_utf8 WITH (FORCE);
+DROP DATABASE df_coll_en WITH (FORCE);

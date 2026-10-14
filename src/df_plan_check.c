@@ -42,12 +42,15 @@
  */
 #include "postgres.h"
 
+#include <locale.h>
+
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation_d.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_type_d.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbutil.h"
@@ -381,11 +384,110 @@ df_type_is_string(Oid type)
 static int	df_explain_collate_c = -1;
 static int	df_explain_ctype_c = -1;
 
+/*
+ * CU1: pairs of strings, each in byte order, whose order differs under a
+ * collation of any language: case, punctuation, accents, and a code point
+ * beyond U+FFFF against one below it (UTF-16's order).  C.UTF-8 orders by
+ * code point, which for UTF-8 is byte order, where its implementation does
+ * (glibc's since 2.35, and distributions' own before); these tell.  As
+ * code points, terminated by 0.
+ */
+typedef struct DfBytewisePair
+{
+	pg_wchar	x[4];
+	pg_wchar	y[4];
+} DfBytewisePair;
+
+static const DfBytewisePair df_bytewise_pairs[] = {
+	{{'B'}, {'a'}},
+	{{'Z'}, {'a'}},
+	{{'a', '-', 'c'}, {'a', 'b'}},
+	{{'f'}, {0xE9}},
+	{{'b'}, {0xE4}},
+	{{0xFFFD}, {0x1F600}},
+	{{0xD7FF}, {0xE000}},
+};
+
+/* Is 'locale' a name of C.UTF-8 (C.UTF-8, C.utf8, ...)? */
+static bool
+df_c_utf8_name(const char *locale)
+{
+	return locale != NULL && (locale[0] == 'C' || locale[0] == 'c') && locale[1] == '.' &&
+		(pg_strcasecmp(locale + 2, "UTF-8") == 0 || pg_strcasecmp(locale + 2, "UTF8") == 0);
+}
+
+static void
+df_utf8_of(const pg_wchar *cps, char *out)
+{
+	for (; *cps != 0; cps++)
+		out += pg_utf_mblen(unicode_to_utf8(*cps, (unsigned char *) out));
+	*out = '\0';
+}
+
+/* The provider of this database's default collation (pg_database). */
+static char
+df_database_provider(void)
+{
+	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	char		provider = COLLPROVIDER_DEFAULT;
+
+	if (HeapTupleIsValid(tup))
+	{
+		provider = ((Form_pg_database) GETSTRUCT(tup))->datlocprovider;
+		ReleaseSysCache(tup);
+	}
+	return provider;
+}
+
+/*
+ * Does this node compare strings under the database's default collation
+ * by their bytes?  Under C or POSIX, or (CU1) under libc's C.UTF-8 where
+ * strcoll orders df_bytewise_pairs as their bytes.
+ */
+static bool
+df_default_collation_bytewise(void)
+{
+	static int	bytewise = -1;
+
+	if (bytewise < 0)
+	{
+		bytewise = lc_collate_is_c(DEFAULT_COLLATION_OID);
+		if (!bytewise && df_database_provider() == COLLPROVIDER_LIBC &&
+			GetDatabaseEncoding() == PG_UTF8 &&
+			df_c_utf8_name(setlocale(LC_COLLATE, NULL)))
+		{
+			int			i;
+
+			bytewise = 1;
+			for (i = 0; i < lengthof(df_bytewise_pairs); i++)
+			{
+				char		x[17],
+							y[17];
+
+				df_utf8_of(df_bytewise_pairs[i].x, x);
+				df_utf8_of(df_bytewise_pairs[i].y, y);
+				if (strcoll(x, y) >= 0 || strcoll(y, x) <= 0)
+					bytewise = 0;
+			}
+		}
+	}
+	return bytewise == 1;
+}
+
+/*
+ * Does comparing strings under 'collation' order them by their bytes, as
+ * DataFusion does?  The default collation's answer is each node's own,
+ * unless the coordinator found it so on every node (CL1).
+ */
 static bool
 df_collate_is_c(Oid collation)
 {
-	if (collation == DEFAULT_COLLATION_OID && df_explain_collate_c >= 0)
-		return df_explain_collate_c == 1;
+	if (collation == DEFAULT_COLLATION_OID)
+	{
+		if (df_explain_collate_c >= 0)
+			return df_explain_collate_c == 1;
+		return df_cluster_collation_c || df_default_collation_bytewise();
+	}
 	return lc_collate_is_c(collation);
 }
 
@@ -5441,11 +5543,12 @@ static int	df_segments_collate_c = -1;
 static int	df_segments_ctype_c = -1;
 
 /*
- * Is the database's default collation C (or POSIX, by libc) on the
- * coordinator and every primary segment?  Asked once per session: a
+ * Does the database's default collation order strings by their bytes on
+ * the coordinator and every primary segment: C or POSIX by libc, or (CU1)
+ * libc's C.UTF-8 where it orders by code point?  Asked once per session: a
  * database's collation does not change.  An error asking, other than a
- * cancel, counts as no.  Also records the segments' LC_COLLATE and
- * LC_CTYPE, for EXPLAIN (CL2).
+ * cancel, counts as no.  Also records the segments' answer and whether
+ * their LC_CTYPE is C, for EXPLAIN (CL2).
  */
 static bool
 df_probe_cluster_collation(void)
@@ -5458,30 +5561,71 @@ df_probe_cluster_collation(void)
 	MemoryContextSwitchTo(cxt);
 	PG_TRY();
 	{
+		StringInfoData sql;
+		int			i,
+					k;
+
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
-		if (SPI_execute("SELECT count(*), count(*) FILTER (WHERE datlocprovider = 'c' "
-						"AND datcollate IN ('C', 'POSIX')), "
-						"count(*) FILTER (WHERE datlocprovider = 'c' "
-						"AND datctype IN ('C', 'POSIX')) "
-						"FROM gp_dist_random('pg_database') "
-						"WHERE datname = current_database()",
-						true, 0) == SPI_OK_SELECT && SPI_processed == 1)
-		{
-			bool		isnull;
-			int64		all = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-														  SPI_tuptable->tupdesc, 1, &isnull));
-			int64		clike = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-															SPI_tuptable->tupdesc, 2, &isnull));
-			int64		ctlike = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-															 SPI_tuptable->tupdesc, 3, &isnull));
 
+		/*
+		 * Each segment's row, with whether it orders df_bytewise_pairs by
+		 * their bytes (CU1): compared in the scan's projection, on the
+		 * segment, under its default collation; e (empty, of the default
+		 * collation where datname's is C) keeps them from being folded here.
+		 */
+		initStringInfo(&sql);
+		appendStringInfoString(&sql, "SELECT datlocprovider, datcollate, datctype, ");
+		for (i = 0; i < lengthof(df_bytewise_pairs); i++)
+		{
+			const pg_wchar *sides[2] = {df_bytewise_pairs[i].x, df_bytewise_pairs[i].y};
+			int			side;
+
+			appendStringInfoString(&sql, i > 0 ? " AND (" : "(");
+			for (side = 0; side < 2; side++)
+			{
+				appendStringInfoString(&sql, side > 0 ? " < (" : "(");
+				for (k = 0; sides[side][k] != 0; k++)
+					appendStringInfo(&sql, "chr(%u) || ", sides[side][k]);
+				appendStringInfoString(&sql, "e)");
+			}
+			appendStringInfoChar(&sql, ')');
+		}
+		appendStringInfoString(&sql, " FROM (SELECT *, substr(datname, 1, 0)::text "
+							   "COLLATE \"default\" AS e "
+							   "FROM gp_dist_random('pg_database') "
+							   "WHERE datname = current_database()) d");
+		if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT)
+		{
+			int64		all = SPI_processed;
+			int64		clike = 0;
+			int64		ctlike = 0;
+			uint64		r;
+
+			for (r = 0; r < SPI_processed; r++)
+			{
+				HeapTuple	tup = SPI_tuptable->vals[r];
+				TupleDesc	desc = SPI_tuptable->tupdesc;
+				bool		isnull;
+				char		provider = DatumGetChar(SPI_getbinval(tup, desc, 1, &isnull));
+				char	   *collate = SPI_getvalue(tup, desc, 2);
+				char	   *ctype = SPI_getvalue(tup, desc, 3);
+				bool		pairs = DatumGetBool(SPI_getbinval(tup, desc, 4, &isnull)) && !isnull;
+
+				if (provider != COLLPROVIDER_LIBC)
+					continue;
+				if (strcmp(collate, "C") == 0 || strcmp(collate, "POSIX") == 0 ||
+					(df_c_utf8_name(collate) && pairs))
+					clike++;
+				if (strcmp(ctype, "C") == 0 || strcmp(ctype, "POSIX") == 0)
+					ctlike++;
+			}
 			if (all == getgpsegmentCount())
 			{
 				df_segments_collate_c = clike == all;
 				df_segments_ctype_c = ctlike == all;
 			}
-			c = lc_collate_is_c(DEFAULT_COLLATION_OID) && df_segments_collate_c == 1;
+			c = df_default_collation_bytewise() && df_segments_collate_c == 1;
 		}
 		SPI_finish();
 		ReleaseCurrentSubTransaction();

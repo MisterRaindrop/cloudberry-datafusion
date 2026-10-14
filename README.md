@@ -504,6 +504,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | AS1 | GPORCA's Assert of a scalar subquery's rows |
 | SR1 | D3 below Subquery Scans |
 | CL2 | EXPLAIN checks a segment slice by the segments' collation |
+| CU1 | The default collation C.UTF-8 orders strings in DataFusion, as C |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
@@ -708,7 +709,7 @@ which agrees with PostgreSQL as follows:
 | Operation | Runs in DataFusion when the collation is |
 |---|---|
 | `=`, `<>`, GROUP BY keys, hash join keys | deterministic (any libc or ICU collation that is not `deterministic = false`) |
-| `<`, `<=`, `>`, `>=`, `min`, `max` | C or POSIX |
+| `<`, `<=`, `>`, `>=`, `min`, `max` | C or POSIX; the default collation also where it is libc's C.UTF-8 (CU1) |
 
 Anything else stays on PostgreSQL with the reason in EXPLAIN (`operator <
 on text under a collation other than C`).  Whether the database's default
@@ -725,7 +726,20 @@ aggregate in DataFusion, and the Sort above it too where the collation is
 C, or on PostgreSQL where it is not.  An explicit `COLLATE "C"` is the
 same everywhere and keeps the batches.
 
-CL1: where the default collation is C (or POSIX, by libc) on every node,
+CU1: libc's C.UTF-8 orders by code point, which for UTF-8 is the order
+of the bytes, so a default collation of C.UTF-8 counts as C where the
+node checks that it does: strcoll must order a few pairs that any
+language's collation orders otherwise (case, punctuation, accents, a code
+point beyond U+FFFF against one below it) as their bytes.  The
+coordinator asks each segment the same, comparing those pairs in a scan
+of `pg_database` under its default collation.  glibc 2.34 in the
+development container passes, and 118 thousand strings of every BMP code
+point and some beyond sort alike under C.UTF-8 and C, and alike in
+DataFusion and PostgreSQL.  Other languages' collations (en_US.utf8)
+stay on PostgreSQL for ordering.
+
+CL1: where the default collation is C (or POSIX, by libc, or C.UTF-8 by
+CU1) on every node,
 ordering by it no longer depends on the node.  The coordinator asks once
 per session, before its first query with `datafusion.mode` on is planned
 for EXPLAIN or dispatched, querying `pg_database` on every segment, and
@@ -1391,7 +1405,7 @@ does not pass on keeps the slice on PostgreSQL.
 | integers, bool, date, time, timestamp, timestamptz | as stored; date and timestamp infinities at the ends |
 | float4, float8 | through `pg_float_key`: -0 equals 0, NaN above all numbers |
 | numeric(p, s) | Decimal256; NaN, stored above every number, last |
-| text, varchar | bytes, under a C collation only |
+| text, varchar | bytes, under a C collation only (or C.UTF-8, CU1) |
 
 NULLS FIRST/LAST and DESC are DataFusion's.  An avg returning numeric
 sorts as its value, divided in DataFusion (AV2).  A sort key ordered by
