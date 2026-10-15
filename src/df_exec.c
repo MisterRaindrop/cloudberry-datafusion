@@ -142,6 +142,7 @@ typedef struct DfInput
 	DfSliceInput *spec;			/* the columns read */
 	SeqScanState *scan;			/* the scan whose table we read, or NULL */
 	MotionState *motion;		/* else the receiving Motion we read */
+	PlanState  *reader;			/* else the Shared Scan reader we pull */
 	TableScanDesc scandesc;
 	int			maxattno;		/* highest column read */
 
@@ -913,10 +914,13 @@ df_exec_fill(DfExec *x, DfInput *in)
 
 	while (n < x->spec.batch_rows && !strings_full)
 	{
-		if (in->motion)
+		if (in->motion || in->reader)
 		{
-			/* The Motion's own receive path, with its instrumentation. */
-			slot = ExecProcNode(&in->motion->ps);
+			/*
+			 * The Motion's own receive path, with its instrumentation; a
+			 * Shared Scan reader's, which waits for its producer.
+			 */
+			slot = ExecProcNode(in->motion ? &in->motion->ps : in->reader);
 			if (TupIsNull(slot))
 			{
 				in->ended = true;
@@ -1640,7 +1644,10 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		return false;
 	}
 
-	/* Each input's executor state: a Seq Scan, or a Motion receiving. */
+	/*
+	 * Each input's executor state: a Seq Scan, a Motion receiving, or a
+	 * Shared Scan reader.
+	 */
 	x->ninputs = x->spec.ninputs;
 	x->inputs = palloc0(sizeof(DfInput) * Max(x->ninputs, 1));
 	for (j = 0; j < x->ninputs; j++)
@@ -1659,6 +1666,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			if (in->ipc)
 				df_batch_head(in->rx_head, (Motion *) ps->plan);
 		}
+		else if (ps != NULL && IsA(ps, ShareInputScanState))
+			in->reader = ps;
 		else
 		{
 			MemoryContextSwitchTo(oldcxt);
@@ -1666,7 +1675,19 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			return false;
 		}
 		if (in->motion != NULL && !in->ipc)
-			df_input_states(in, (Motion *) in->motion->ps.plan);
+		{
+			/* its states' scales may come from a Shared Scan's producer */
+			df_numeric_stmt = queryDesc->plannedstmt;
+			PG_TRY();
+			{
+				df_input_states(in, (Motion *) in->motion->ps.plan);
+			}
+			PG_FINALLY();
+			{
+				df_numeric_stmt = NULL;
+			}
+			PG_END_TRY();
+		}
 		in->invalues = palloc0(sizeof(char *) * Max(in->spec->ncols, 1));
 		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
 		in->inoffsets = palloc0(sizeof(int32 *) * Max(in->spec->ncols, 1));

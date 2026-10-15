@@ -921,6 +921,11 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 					   df_motion_stream_column((Motion *) child, resno) + 1,
 					   exprType((Node *) tle->expr),
 					   df_scale_of(child, (Node *) tle->expr));
+	else if (IsA(child, ShareInputScan))
+		/* the producer's input's column at that position */
+		df_emit_column(b, out, df_input_of(b, child), resno,
+					   exprType((Node *) tle->expr),
+					   df_scale_of(child, (Node *) tle->expr));
 	else
 	{
 		b->ctx = child;
@@ -967,6 +972,8 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
 		df_emit_column(b, out, df_input_of(b, child),
 					   df_motion_stream_column((Motion *) child, resno) + 1,
 					   INT4OID, DF_SCALE_DSCALE);
+	else if (IsA(child, ShareInputScan))
+		df_emit_column(b, out, df_input_of(b, child), resno, INT4OID, DF_SCALE_DSCALE);
 	else
 	{
 		b->ctx = child;
@@ -2109,6 +2116,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 	{
 		case T_SeqScan:
 		case T_Motion:
+		case T_ShareInputScan:	/* a reader: its rows, pulled */
 			{
 				int			j = df_add_input(b, plan);
 

@@ -1507,9 +1507,9 @@ WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store)
  DataFusion: slice 1 eligible below the top: Aggregate (above: plan node type 25 is not supported)
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible
- DataFusion: slice 4 not eligible: Shared Scan is not supported
- DataFusion: slice 5 eligible
- DataFusion: slice 6 not eligible: Shared Scan is not supported
+ DataFusion: slice 4 eligible, sends Arrow batches
+ DataFusion: slice 5 eligible, sends Arrow batches
+ DataFusion: slice 6 eligible, sends Arrow batches
 (35 rows)
 
 SET optimizer = off;

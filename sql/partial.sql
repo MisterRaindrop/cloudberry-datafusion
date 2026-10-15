@@ -92,7 +92,9 @@ SET optimizer = off;
 -- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): below the Sequence,
 -- the producer's input runs in DataFusion, which the producer reads once
 -- into the store its readers share, in other slices (the first) or its
--- own (the second).  The readers stay on PostgreSQL.
+-- own (the second).  A reader stays on PostgreSQL, and DataFusion pulls
+-- its rows for what computes on them (the join in the second), or for a
+-- Motion carrying batches (the first's readers).
 SET optimizer = on;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
@@ -112,6 +114,28 @@ WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b O
 SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
 SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
 SET optimizer = off;
+
+-- Numeric values of display scales of their own (an avg, a sum of
+-- COALESCE branches of different scales) keep them through a Shared Scan:
+-- read from a reader's tuples, as from a Motion's; and a Motion of a
+-- reader's rows (redistributed by n) carries tuples, as its producer's
+-- input decides for both of its ends.
+CREATE TABLE df_ps (id int, k int, a numeric(9,2), r numeric(9,2)) DISTRIBUTED BY (id);
+INSERT INTO df_ps SELECT i, i % 11, round((i % 1000) / 7.0, 2),
+  CASE WHEN i % 3 = 0 THEN NULL ELSE (i % 50) / 10.0 END
+FROM generate_series(1, 30000) i;
+ANALYZE df_ps;
+SET optimizer = on;
+SET datafusion.mode = off;
+WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
+WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
+SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
+SET datafusion.mode = on;
+WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
+WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
+SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
+SET optimizer = off;
+DROP TABLE df_ps;
 
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

@@ -2712,7 +2712,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	if (plan == NULL)
 		return false;
 	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp) ||
-		df_empty_result(plan))
+		df_empty_result(plan) || IsA(plan, ShareInputScan))
 		return true;			/* UA1, SO1: columns of its union or grouping */
 	if (IsA(plan, Result))
 	{
@@ -2996,7 +2996,17 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 		Plan	   *child = NULL;
 		TargetEntry *tle;
 
-		if (var->varno == OUTER_VAR)
+		if (IsA(v->ctx, ShareInputScan))
+		{
+			/* a Shared Scan's column is its producer's input's */
+			Plan	   *producer = outerPlan(v->ctx) ? v->ctx :
+				df_share_producer((ShareInputScan *) v->ctx);
+
+			child = producer ? outerPlan(producer) : NULL;
+		}
+		else if (var->varno == OUTER_VAR && IsA(v->ctx, Sequence))
+			child = llast(((Sequence *) v->ctx)->subplans);
+		else if (var->varno == OUTER_VAR)
 			child = outerPlan(v->ctx);
 		else if (var->varno == INNER_VAR)
 			child = innerPlan(v->ctx);
@@ -3043,7 +3053,8 @@ df_output_varying(Plan *ctx, Node *expr)
  * AV2: can DataFusion give each value of numeric 'expr' of node 'ctx' its
  * display scale (df_emit_dscale)?  One of one scale has that one, an avg
  * returning numeric the scale numeric_avg picks from its sum and count, a
- * value received from a Motion carrying tuples (not in 'batches') its own;
+ * value received from a Motion carrying tuples (not in 'batches') or read
+ * from a Shared Scan its own;
  * operators, CASE and COALESCE as DN1 has them.
  */
 static bool
@@ -3077,7 +3088,9 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 					}
 					return true;
 				}
-				if (var->varno == OUTER_VAR)
+				if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
+					child = llast(((Sequence *) ctx)->subplans);
+				else if (var->varno == OUTER_VAR)
 					child = outerPlan(ctx);
 				else if (var->varno == INNER_VAR)
 					child = innerPlan(ctx);
@@ -3088,6 +3101,8 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 					return false;
 				if (IsA(child, Motion))
 					return !bms_is_member(((Motion *) child)->motionID, batches);
+				if (IsA(child, ShareInputScan) && outerPlan(child) == NULL)
+					return true;	/* a reader's tuples carry it, as a Motion's */
 				return df_dscale_ok(child, (Node *) tle->expr, batches);
 			}
 		case T_OpExpr:
@@ -5355,6 +5370,58 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_ShareInputScan:
+			{
+				ListCell   *lc;
+
+				/*
+				 * A reader of a Shared Scan stays on PostgreSQL, which
+				 * waits for the producer and reads the store; the main
+				 * thread pulls its rows, as a receiving Motion's.  Its rows
+				 * are the producer's input's, unprojected: a column is the
+				 * one at its position there.  Worth it only below what
+				 * computes, or below a Motion carrying batches, which
+				 * passes them on cheaper than tuples.  The producer itself
+				 * writes the store: below it (T2), not as part of the
+				 * slice.
+				 */
+				if (outerPlan(plan) != NULL)
+				{
+					df_reject(cxt, "the producer of a Shared Scan");
+					return;
+				}
+				if (!cxt->agg_input && !cxt->join_input && !cxt->window_input &&
+					!cxt->batch_sender)
+				{
+					df_reject(cxt, "reads a Shared Scan with nothing to compute on its rows");
+					return;
+				}
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+					Oid			type = exprType((Node *) tle->expr);
+					int			p,
+								s;
+					bool		dyn;
+
+					if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varattno != tle->resno)
+					{
+						df_reject(cxt, "a Shared Scan reader whose columns are not the producer's");
+						return;
+					}
+					if (bms_is_member(tle->resno, needed) &&
+						(!df_type_supported(type) ||
+						 (type == NUMERICOID &&
+						  (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
+						   p > DF_NUMERIC_MAX_EXPR_PRECISION))))
+					{
+						df_reject(cxt, "reads a Shared Scan column of type %s", format_type_be(type));
+						return;
+					}
+				}
+				return;
+			}
+
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
@@ -5557,13 +5624,13 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
  * Can DataFusion take over subtree 'plan', and is it worth starting for
  * it?  Not at a Hash node, which its Hash Join runs through
  * MultiExecProcNode rather than ExecProcNode (its child can be taken
- * over); not for rows it would only pass on: a Motion's, or a table's
- * without a filter.
+ * over); not for rows it would only pass on: a Motion's, a Shared Scan
+ * reader's, or a table's without a filter.
  */
 static bool
 df_attach_worth(Plan *plan)
 {
-	if (IsA(plan, Motion) || IsA(plan, Hash))
+	if (IsA(plan, Motion) || IsA(plan, Hash) || IsA(plan, ShareInputScan))
 		return false;
 	if (IsA(plan, SeqScan) && plan->qual == NIL)
 		return false;
@@ -6162,8 +6229,8 @@ df_list_motions(Plan *plan, List **motions)
  * own: PostgreSQL's receiver rejects it with an error, and ours rejects
  * tuple chunks, so nothing is ever misread.
  */
-Bitmapset *
-df_batch_motions(PlannedStmt *stmt)
+static Bitmapset *
+df_batch_motions_of(PlannedStmt *stmt)
 {
 	List	   *motions = NIL;
 	Bitmapset  *batches = NULL;
@@ -6200,6 +6267,31 @@ df_batch_motions(PlannedStmt *stmt)
 			}
 		}
 	} while (changed);
+	return batches;
+}
+
+/*
+ * df_batch_motions_of, with 'stmt' the statement whose Shared Scans
+ * df_numeric_range follows to their producers: a Motion of a reader's
+ * rows carries what its producer's input computes, and both ends must
+ * see the same.
+ */
+Bitmapset *
+df_batch_motions(PlannedStmt *stmt)
+{
+	PlannedStmt *volatile saved = df_numeric_stmt;
+	Bitmapset  *volatile batches = NULL;
+
+	df_numeric_stmt = stmt;
+	PG_TRY();
+	{
+		batches = df_batch_motions_of(stmt);
+	}
+	PG_FINALLY();
+	{
+		df_numeric_stmt = saved;
+	}
+	PG_END_TRY();
 	return batches;
 }
 

@@ -318,7 +318,9 @@ SET optimizer = off;
 -- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): below the Sequence,
 -- the producer's input runs in DataFusion, which the producer reads once
 -- into the store its readers share, in other slices (the first) or its
--- own (the second).  The readers stay on PostgreSQL.
+-- own (the second).  A reader stays on PostgreSQL, and DataFusion pulls
+-- its rows for what computes on them (the join in the second), or for a
+-- Motion carrying batches (the first's readers).
 SET optimizer = on;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
@@ -352,14 +354,14 @@ SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  DataFusion: slice 1 eligible below the top: Hash Join, Aggregate (above: plan node type 25 is not supported)
  DataFusion: slice 2 eligible
- DataFusion: slice 3 not eligible: Shared Scan is not supported
- DataFusion: slice 4 not eligible: Shared Scan is not supported
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
 (29 rows)
 
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
 SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
-                                              QUERY PLAN                                              
-------------------------------------------------------------------------------------------------------
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Sequence
          ->  Shared Scan (share slice:id 1:0)
@@ -381,7 +383,7 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
                      ->  Shared Scan (share slice:id 1:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate (above: plan node type 25 is not supported)
+ DataFusion: slice 1 eligible below the top: Aggregate, Hash Join (above: plan node type 25 is not supported)
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible
 (24 rows)
@@ -505,6 +507,87 @@ SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LI
 (5 rows)
 
 SET optimizer = off;
+-- Numeric values of display scales of their own (an avg, a sum of
+-- COALESCE branches of different scales) keep them through a Shared Scan:
+-- read from a reader's tuples, as from a Motion's; and a Motion of a
+-- reader's rows (redistributed by n) carries tuples, as its producer's
+-- input decides for both of its ends.
+CREATE TABLE df_ps (id int, k int, a numeric(9,2), r numeric(9,2)) DISTRIBUTED BY (id);
+INSERT INTO df_ps SELECT i, i % 11, round((i % 1000) / 7.0, 2),
+  CASE WHEN i % 3 = 0 THEN NULL ELSE (i % 50) / 10.0 END
+FROM generate_series(1, 30000) i;
+ANALYZE df_ps;
+SET optimizer = on;
+SET datafusion.mode = off;
+WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
+ k  |          m          |          m          
+----+---------------------+---------------------
+  0 | 71.3451705170517052 | 71.3451705170517052
+  1 | 71.3571407624633431 | 71.3571407624633431
+  2 | 71.3952639296187683 | 71.3952639296187683
+  3 | 71.3810190615835777 | 71.3810190615835777
+  4 | 71.3928932893289329 | 71.3928932893289329
+  5 | 71.3785918591859186 | 71.3785918591859186
+  6 | 71.3642904290429043 | 71.3642904290429043
+  7 | 71.3499889988998900 | 71.3499889988998900
+  8 | 71.3356875687568757 | 71.3356875687568757
+  9 | 71.3213861386138614 | 71.3213861386138614
+ 10 | 71.3070847084708471 | 71.3070847084708471
+(11 rows)
+
+WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
+SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
+ k  |     s     | ?column? | n  
+----+-----------+----------+----
+  0 | 190105.98 |   102.30 | 10
+  0 | 190105.98 |   163.74 | 10
+  0 | 190105.98 |   204.30 | 10
+ 10 | 189994.02 |     0.00 | 10
+ 10 | 189994.02 |    45.90 | 10
+ 10 | 189994.02 |    91.50 | 10
+ 10 | 189994.02 |   111.96 | 10
+ 10 | 189994.02 |   122.40 | 10
+ 10 | 189994.02 |   158.30 | 10
+ 10 | 189994.02 |   198.90 | 10
+ 10 | 189994.02 |   244.80 | 10
+(11 rows)
+
+SET datafusion.mode = on;
+WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
+ k  |          m          |          m          
+----+---------------------+---------------------
+  0 | 71.3451705170517052 | 71.3451705170517052
+  1 | 71.3571407624633431 | 71.3571407624633431
+  2 | 71.3952639296187683 | 71.3952639296187683
+  3 | 71.3810190615835777 | 71.3810190615835777
+  4 | 71.3928932893289329 | 71.3928932893289329
+  5 | 71.3785918591859186 | 71.3785918591859186
+  6 | 71.3642904290429043 | 71.3642904290429043
+  7 | 71.3499889988998900 | 71.3499889988998900
+  8 | 71.3356875687568757 | 71.3356875687568757
+  9 | 71.3213861386138614 | 71.3213861386138614
+ 10 | 71.3070847084708471 | 71.3070847084708471
+(11 rows)
+
+WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
+SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
+ k  |     s     | ?column? | n  
+----+-----------+----------+----
+  0 | 190105.98 |   102.30 | 10
+  0 | 190105.98 |   163.74 | 10
+  0 | 190105.98 |   204.30 | 10
+ 10 | 189994.02 |     0.00 | 10
+ 10 | 189994.02 |    45.90 | 10
+ 10 | 189994.02 |    91.50 | 10
+ 10 | 189994.02 |   111.96 | 10
+ 10 | 189994.02 |   122.40 | 10
+ 10 | 189994.02 |   158.30 | 10
+ 10 | 189994.02 |   198.90 | 10
+ 10 | 189994.02 |   244.80 | 10
+(11 rows)
+
+SET optimizer = off;
+DROP TABLE df_ps;
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

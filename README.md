@@ -1426,7 +1426,7 @@ Sequence runs each input once, in order, and the producer reads its input
 once into the store its readers share, in its own slice or others
 (`init_tuplestore_state`; a rescan reads the store again), so both
 qualify: DataFusion runs the producer's input, and PostgreSQL keeps the
-store, the readers and their synchronization.  The Motions below the
+store and its synchronization.  The Motions below the
 Sequence are now seen by the batch decision too.  Of TPC-DS's 206
 executions, the 32 with a Shared Scan (all GPORCA) run this way, with
 PostgreSQL's rows, together 18.99 s before and 14.86 s now (PostgreSQL
@@ -1435,6 +1435,24 @@ and now 0.66 s, Q23b 1.84 and 0.85, Q95 1.27 and 0.55, Q22 0.94 and 0.68,
 Q36 0.64 and 0.23, Q67 1.67 and 1.48.  Where the producer's input is only
 joins, little changes: TPC-DS Q18's chain of six Redistribute joins under
 GPORCA, now through batch Motions, took 0.36 s and now 0.39 s.
+
+A reader of a Shared Scan is an input of the slice: PostgreSQL's node
+waits for the producer and reads the store, and the main thread pulls
+its rows, as a receiving Motion's, for what computes on them or for a
+Motion carrying batches.  Its rows are the producer's input's,
+unprojected, so its columns must be those, at their positions.  Numeric
+values of display scales of their own (an avg, a sum of COALESCE
+branches of different scales) keep them, as from a Motion of tuples;
+finding that they are such follows the reader to its producer, also
+when the Motions that carry batches are chosen, so that a Motion of a
+reader's rows carries tuples at both of its ends.  Since a reader ends
+by telling its producer it is done whether it read every row or not
+(`ExecEndShareInputScan`), DataFusion may stop early.  With both ends,
+the 32 TPC-DS executions with a Shared Scan give PostgreSQL's rows;
+Q22 took 0.68 s with the producer alone and now 0.47 s, Q67 1.48 and
+1.29 to 1.34 (PostgreSQL 1.40 to 1.45 s and 1.96 to 2.36 s); the others
+change within the noise, the 32 together 14.86 s and 15.33 s in single
+runs.
 
 Over the TPC-H queries of Cloudberry's regression tests, run with their
 data under both planners, 144 slices run this way (50 under the Postgres
