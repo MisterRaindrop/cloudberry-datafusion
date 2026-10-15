@@ -312,6 +312,14 @@ settings alone, so both ends agree.
   returns the receive buffer; it keeps the motion layer's end-of-stream
   count the way `cdbmotion.c` does for an unordered receiver.  A full
   decode queue is waited on until it has room, not by waiting for output.
+  Chunks taken without bytes to decode (a stream's head, alone in the
+  first packet of each sender, or its end) are taken all the same: the
+  main thread comes back for more at once instead of waiting 10 ms for
+  output, during which the senders, unacknowledged, stalled.  That cost
+  about 12 ms a sender at every batch Motion: a join of seven TPC-DS
+  tables (Q18's) grouped under the Postgres planner, six batch Motions,
+  took 0.25 s and now 0.11 s, against 0.12 s through tuple Motions; the
+  TPC-DS executions without a Shared Scan 70.7 s and now 58.6 s.
 - **Safety.**  The chunks carry a chunk type of their own, outside
   PostgreSQL's range, so a PostgreSQL receiver rejects them with an error,
   and our receiver rejects tuple chunks; each stream starts with a magic

@@ -568,7 +568,7 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 
 /*
  * Batch-Motion input: hand the received bytes to DataFusion, receiving more
- * when they are taken.  Sets *pushed when bytes were taken, *full when the
+ * when they are taken.  Sets *pushed when chunks were taken, *full when the
  * queue was full.
  */
 static void
@@ -633,6 +633,15 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 													  "end of stream");
 	}
 	df_rx_release(x, in, motion_id);
+
+	/*
+	 * Taken, even without bytes for DataFusion: a stream's head alone (the
+	 * first packet of each sender, as its first chunk of data fills a
+	 * packet of its own) or its end.  The caller must come back for more
+	 * at once, not wait for results: while it waits, nothing here takes
+	 * the senders' packets or acknowledges them, and they stall.
+	 */
+	*pushed = true;
 }
 
 /* Does input 'in' scan a PAX table the direct reader may read? */
