@@ -613,13 +613,21 @@ df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
 
 /*
  * A grouping key, DISTINCT argument: character ones marked, which group by
- * their value without trailing blanks (df_core::query::build_node).
+ * their value without trailing blanks (df_core::query::build_node), except
+ * a table's character(n), which holds every value padded to n, so that
+ * equal values look alike as they are (df_bpchar_length).
  */
+static bool
+df_bpchar_unpadded(Plan *ctx, Node *e)
+{
+	return exprType(e) == BPCHAROID && df_bpchar_length(ctx, e) < 0;
+}
+
 static void
 df_emit_grouped(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 {
 	TargetEntry *tle = get_tle_by_resno(child->targetlist, resno);
-	bool		bp = tle != NULL && exprType((Node *) tle->expr) == BPCHAROID;
+	bool		bp = tle != NULL && df_bpchar_unpadded(child, (Node *) tle->expr);
 
 	if (bp)
 		appendStringInfoString(out, "{\"bpchar\":");
@@ -2837,7 +2845,7 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		{
 			/* arguments are expressions of the aggregate over its child */
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-			bool		bp = agg->aggdistinct != NIL && !combine && exprType(arg) == BPCHAROID;
+			bool		bp = agg->aggdistinct != NIL && !combine && df_bpchar_unpadded((Plan *) aggnode, arg);
 
 			b->ctx = (Plan *) aggnode;
 			if (bp)

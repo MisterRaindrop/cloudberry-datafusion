@@ -233,6 +233,7 @@ extern const char *df_bpchar_func(Oid funcid);
 extern const char *df_collation_locale(Oid collation);
 extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
+extern int	df_bpchar_length(Plan *ctx, Node *expr);
 extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);
 extern bool df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale);
 /* AVG1: does it depend on an avg returning numeric (of an output column)? */

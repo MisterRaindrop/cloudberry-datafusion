@@ -216,6 +216,60 @@ WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
 SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
 SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
 
+-- A table's character(n) holds every value padded to n, so its values
+-- group and are told apart by DISTINCT as stored, without the blanks cut.
+-- Not so a character without a length, or an Append of character(5) and
+-- character(10), which GPORCA's plan gives the type modifier of the first.
+CREATE TABLE df_bg5 (a char(5), b char(5), v int) DISTRIBUTED BY (v);
+CREATE TABLE df_bg10 (a char(10), v int) DISTRIBUTED BY (v);
+CREATE TABLE df_bgn (a bpchar, v int) DISTRIBUTED BY (v);
+INSERT INTO df_bg5 SELECT (ARRAY['x', 'xy', '中', 'x y', ''])[1 + i % 5], (ARRAY['p', 'q'])[1 + i % 2], i
+FROM generate_series(1, 20000) i;
+INSERT INTO df_bg10 SELECT (ARRAY['x', 'xy', '中', 'zz'])[1 + i % 4], i FROM generate_series(1, 20000) i;
+INSERT INTO df_bgn SELECT (ARRAY['x', 'x  ', 'x   ', '中 ', '中'])[1 + i % 5], i FROM generate_series(1, 20000) i;
+ANALYZE df_bg5;
+ANALYZE df_bg10;
+ANALYZE df_bgn;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+SELECT count(DISTINCT a) FROM df_bgn;
+SET datafusion.mode = on;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+SELECT count(DISTINCT a) FROM df_bgn;
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+SELECT count(DISTINCT a) FROM df_bgn;
+SET datafusion.mode = on;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+SELECT count(DISTINCT a) FROM df_bgn;
+DROP TABLE df_bg5, df_bg10, df_bgn;
+
 -- A slice sorting by the default collation still reads the batches of a
 -- split numeric sum (TPC-H Q1): every node runs the aggregate below the
 -- Sort in DataFusion, and the Sort too where the collation is C.

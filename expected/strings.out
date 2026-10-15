@@ -1065,6 +1065,299 @@ SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df
  NATION_9 |     4 |   800
 (10 rows)
 
+-- A table's character(n) holds every value padded to n, so its values
+-- group and are told apart by DISTINCT as stored, without the blanks cut.
+-- Not so a character without a length, or an Append of character(5) and
+-- character(10), which GPORCA's plan gives the type modifier of the first.
+CREATE TABLE df_bg5 (a char(5), b char(5), v int) DISTRIBUTED BY (v);
+CREATE TABLE df_bg10 (a char(10), v int) DISTRIBUTED BY (v);
+CREATE TABLE df_bgn (a bpchar, v int) DISTRIBUTED BY (v);
+INSERT INTO df_bg5 SELECT (ARRAY['x', 'xy', '中', 'x y', ''])[1 + i % 5], (ARRAY['p', 'q'])[1 + i % 2], i
+FROM generate_series(1, 20000) i;
+INSERT INTO df_bg10 SELECT (ARRAY['x', 'xy', '中', 'zz'])[1 + i % 4], i FROM generate_series(1, 20000) i;
+INSERT INTO df_bgn SELECT (ARRAY['x', 'x  ', 'x   ', '中 ', '中'])[1 + i % 5], i FROM generate_series(1, 20000) i;
+ANALYZE df_bg5;
+ANALYZE df_bg10;
+ANALYZE df_bgn;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+   a    | octet_length | count |   sum    
+--------+--------------+-------+----------
+        |            5 |  4000 | 40006000
+ x      |            5 |  4000 | 40010000
+ x y    |            5 |  4000 | 40002000
+ xy     |            5 |  4000 | 39994000
+ 中     |            7 |  4000 | 39998000
+(5 rows)
+
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+   a    |   b   | count 
+--------+-------+-------
+        | p     |  2000
+        | q     |  2000
+        |       |  4000
+ x      | p     |  2000
+ x      | q     |  2000
+ x      |       |  4000
+ x y    | p     |  2000
+ x y    | q     |  2000
+ x y    |       |  4000
+ xy     | p     |  2000
+ xy     | q     |  2000
+ xy     |       |  4000
+ 中     | p     |  2000
+ 中     | q     |  2000
+ 中     |       |  4000
+        |       | 20000
+(16 rows)
+
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+  a  | count 
+-----+-------
+     |  4000
+ x   |  9000
+ x y |  4000
+ xy  |  9000
+ zz  |  5000
+ 中  |  9000
+(6 rows)
+
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+ a  | count 
+----+-------
+ x  | 12000
+ 中 |  8000
+(2 rows)
+
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+ count | count | count 
+-------+-------+-------
+     5 |     2 | 20000
+(1 row)
+
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+ count 
+-------
+     6
+(1 row)
+
+SELECT count(DISTINCT a) FROM df_bgn;
+ count 
+-------
+     2
+(1 row)
+
+SET datafusion.mode = on;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+   a    | octet_length | count |   sum    
+--------+--------------+-------+----------
+        |            5 |  4000 | 40006000
+ x      |            5 |  4000 | 40010000
+ x y    |            5 |  4000 | 40002000
+ xy     |            5 |  4000 | 39994000
+ 中     |            7 |  4000 | 39998000
+(5 rows)
+
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+   a    |   b   | count 
+--------+-------+-------
+        | p     |  2000
+        | q     |  2000
+        |       |  4000
+ x      | p     |  2000
+ x      | q     |  2000
+ x      |       |  4000
+ x y    | p     |  2000
+ x y    | q     |  2000
+ x y    |       |  4000
+ xy     | p     |  2000
+ xy     | q     |  2000
+ xy     |       |  4000
+ 中     | p     |  2000
+ 中     | q     |  2000
+ 中     |       |  4000
+        |       | 20000
+(16 rows)
+
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+  a  | count 
+-----+-------
+     |  4000
+ x   |  9000
+ x y |  4000
+ xy  |  9000
+ zz  |  5000
+ 中  |  9000
+(6 rows)
+
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+ a  | count 
+----+-------
+ x  | 12000
+ 中 |  8000
+(2 rows)
+
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+ count | count | count 
+-------+-------+-------
+     5 |     2 | 20000
+(1 row)
+
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+ count 
+-------
+     6
+(1 row)
+
+SELECT count(DISTINCT a) FROM df_bgn;
+ count 
+-------
+     2
+(1 row)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+   a    | octet_length | count |   sum    
+--------+--------------+-------+----------
+        |            5 |  4000 | 40006000
+ x      |            5 |  4000 | 40010000
+ x y    |            5 |  4000 | 40002000
+ xy     |            5 |  4000 | 39994000
+ 中     |            7 |  4000 | 39998000
+(5 rows)
+
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+   a    |   b   | count 
+--------+-------+-------
+        | p     |  2000
+        | q     |  2000
+        |       |  4000
+ x      | p     |  2000
+ x      | q     |  2000
+ x      |       |  4000
+ x y    | p     |  2000
+ x y    | q     |  2000
+ x y    |       |  4000
+ xy     | p     |  2000
+ xy     | q     |  2000
+ xy     |       |  4000
+ 中     | p     |  2000
+ 中     | q     |  2000
+ 中     |       |  4000
+        |       | 20000
+(16 rows)
+
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+  a  | count 
+-----+-------
+     |  4000
+ x   |  9000
+ x y |  4000
+ xy  |  9000
+ zz  |  5000
+ 中  |  9000
+(6 rows)
+
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+ a  | count 
+----+-------
+ x  | 12000
+ 中 |  8000
+(2 rows)
+
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+ count | count | count 
+-------+-------+-------
+     5 |     2 | 20000
+(1 row)
+
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+ count 
+-------
+     6
+(1 row)
+
+SELECT count(DISTINCT a) FROM df_bgn;
+ count 
+-------
+     2
+(1 row)
+
+SET datafusion.mode = on;
+SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
+   a    | octet_length | count |   sum    
+--------+--------------+-------+----------
+        |            5 |  4000 | 40006000
+ x      |            5 |  4000 | 40010000
+ x y    |            5 |  4000 | 40002000
+ xy     |            5 |  4000 | 39994000
+ 中     |            7 |  4000 | 39998000
+(5 rows)
+
+SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
+   a    |   b   | count 
+--------+-------+-------
+        | p     |  2000
+        | q     |  2000
+        |       |  4000
+ x      | p     |  2000
+ x      | q     |  2000
+ x      |       |  4000
+ x y    | p     |  2000
+ x y    | q     |  2000
+ x y    |       |  4000
+ xy     | p     |  2000
+ xy     | q     |  2000
+ xy     |       |  4000
+ 中     | p     |  2000
+ 中     | q     |  2000
+ 中     |       |  4000
+        |       | 20000
+(16 rows)
+
+SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
+GROUP BY a ORDER BY a::text COLLATE "C", 2;
+  a  | count 
+-----+-------
+     |  4000
+ x   |  9000
+ x y |  4000
+ xy  |  9000
+ zz  |  5000
+ 中  |  9000
+(6 rows)
+
+SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
+ a  | count 
+----+-------
+ x  | 12000
+ 中 |  8000
+(2 rows)
+
+SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
+ count | count | count 
+-------+-------+-------
+     5 |     2 | 20000
+(1 row)
+
+SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
+ count 
+-------
+     6
+(1 row)
+
+SELECT count(DISTINCT a) FROM df_bgn;
+ count 
+-------
+     2
+(1 row)
+
+DROP TABLE df_bg5, df_bg10, df_bgn;
 -- A slice sorting by the default collation still reads the batches of a
 -- split numeric sum (TPC-H Q1): every node runs the aggregate below the
 -- Sort in DataFusion, and the Sort too where the collation is C.

@@ -877,6 +877,21 @@ against 1.03 s; with an ORDER BY under the database's default collation
 the aggregate still reads batches (TPC-H Q1 at scale factor 1 on PAX:
 0.27 s against 1.35 s).
 
+A grouping key or DISTINCT argument that is a table's `char(n)` column,
+followed through the nodes above the scan as numeric precision is (an
+Append needs it of all its inputs, with one n), groups by the value as
+stored: every value is padded to n, so equal values look alike, and
+neither the key nor a group's padded value is computed.  The type
+modifier of a reference does not tell: GPORCA gives an Append of
+char(5) and char(10) the first.  `pg_bpchar_key` cuts the blanks by
+bytes (a blank never ends a character of more than one byte) into a
+builder sized for them.  Grouping 2.34 million rows by four char(50)
+TPC-DS item columns (Q22's body, GPORCA's two-stage plan) took
+0.16 s and 0.66 CPU-seconds, against 0.27 s and 1.49 before and
+0.69 s and 1.07 on PostgreSQL; Q22's five-level union of such groupings
+0.49 s and 2.52 CPU-seconds, against 0.70 s and 4.47 before and 0.74 s
+and 3.47.
+
 ### numeric results of integer aggregates
 
 `sum(int8)` and `avg` of `int2`, `int4` and `int8` return numeric (N1).

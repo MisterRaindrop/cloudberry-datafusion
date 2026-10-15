@@ -1523,6 +1523,87 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 }
 
 /*
+ * Is character 'expr' of plan node 'ctx' a column of a table's
+ * character(n), found through the references of the nodes above it (as
+ * df_numeric_range follows them), so that every value is padded to n and
+ * equal values look alike as they are?  An Append needs it of all its
+ * inputs, with one n.  A type modifier on a reference does not tell:
+ * GPORCA gives an Append of character(5) and character(10) the first.
+ * Rows a scan of another kind returns (a foreign table's) need not be
+ * padded.
+ */
+int
+df_bpchar_length(Plan *ctx, Node *expr)
+{
+	Var		   *var;
+	Plan	   *child;
+	TargetEntry *tle;
+
+	if (ctx == NULL || expr == NULL || !IsA(expr, Var) || exprType(expr) != BPCHAROID)
+		return -1;
+	var = (Var *) expr;
+	if (IsA(ctx, SubqueryScan) && var->varno == ((Scan *) ctx)->scanrelid)
+	{
+		child = ((SubqueryScan *) ctx)->subplan;
+		tle = get_tle_by_resno(child->targetlist, var->varattno);
+		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+	}
+	if (IsA(ctx, ShareInputScan))
+	{
+		Plan	   *producer = outerPlan(ctx) ? ctx :
+			df_share_producer((ShareInputScan *) ctx);
+
+		child = producer ? outerPlan(producer) : NULL;
+		tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+	}
+	if (var->varno == OUTER_VAR && df_append_plans(ctx) != NIL)
+	{
+		ListCell   *lc;
+		int			n = -1;
+
+		foreach(lc, df_append_plans(ctx))
+		{
+			int			cn;
+
+			child = lfirst(lc);
+			tle = get_tle_by_resno(child->targetlist, var->varattno);
+			cn = tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+			if (cn < 0 || (n >= 0 && cn != n))
+				return -1;
+			n = cn;
+		}
+		return n;
+	}
+	if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
+	{
+		child = llast(((Sequence *) ctx)->subplans);
+		tle = get_tle_by_resno(child->targetlist, var->varattno);
+		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+	}
+	if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
+	{
+		switch (nodeTag(ctx))
+		{
+			case T_SeqScan:
+			case T_DynamicSeqScan:
+			case T_IndexScan:
+			case T_DynamicIndexScan:
+			case T_IndexOnlyScan:
+			case T_BitmapHeapScan:
+			case T_DynamicBitmapHeapScan:
+				return var->varno == ((Scan *) ctx)->scanrelid && var->vartypmod > VARHDRSZ ?
+					var->vartypmod - VARHDRSZ : -1;
+			default:
+				return -1;
+		}
+	}
+	child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
+	tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
+	return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+}
+
+/*
  * DN1: is numeric 'expr' of node 'ctx' one whose values have display scales
  * of their own, row by row?  Sets the scale they are carried at, the
  * largest, and the precision at it.

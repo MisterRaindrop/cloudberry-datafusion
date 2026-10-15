@@ -240,7 +240,15 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// it: without trailing blanks (bcTruelen; only ' ', which UTF-8 never uses
 /// inside another character).  Values themselves keep their padding.
 pub fn bpchar_trim(v: &str) -> &str {
-    v.trim_end_matches(' ')
+    // by bytes: a blank never ends a character of more than one byte, so
+    // the cut is at a character boundary (trim_end_matches decodes from
+    // the end character by character, a third of the cost of a grouping)
+    let b = v.as_bytes();
+    let mut n = b.len();
+    while n > 0 && b[n - 1] == b' ' {
+        n -= 1;
+    }
+    unsafe { v.get_unchecked(..n) }
 }
 
 /// `bpchar_key(x)`: x without trailing blanks; a constant is trimmed here.
@@ -276,12 +284,13 @@ impl ScalarUDFImpl for PgBpcharKey {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let a = utf8(&args.args[0].to_array(args.number_rows)?)?;
-        let out: StringArray = a
-            .as_string::<i32>()
-            .iter()
-            .map(|v| v.map(bpchar_trim))
-            .collect();
-        Ok(ColumnarValue::Array(Arc::new(out)))
+        let a = a.as_string::<i32>();
+        // at most the padded bytes, so the builder never grows
+        let mut out = StringBuilder::with_capacity(a.len(), a.value_data().len());
+        for v in a.iter() {
+            out.append_option(v.map(bpchar_trim));
+        }
+        Ok(ColumnarValue::Array(Arc::new(out.finish())))
     }
 }
 
@@ -960,5 +969,48 @@ mod tests {
         assert!(!like("xbc", "a\\").unwrap());
         assert!(like("abc", "a\\").is_err());
         assert!(like("abc", "%\\").is_err());
+    }
+
+    #[test]
+    fn character_values_lose_only_trailing_blanks() {
+        for (v, want) in [
+            ("ab   ", "ab"),
+            ("a b ", "a b"),
+            ("   ", ""),
+            ("", ""),
+            (" a", " a"),
+            ("中文  ", "中文"),
+            ("é\t ", "é\t"),
+        ] {
+            assert_eq!(bpchar_trim(v), want, "{v:?}");
+        }
+        let a = StringArray::from(vec![Some("x  "), None, Some("中 ")]);
+        let f = PgBpcharKey {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Immutable),
+        };
+        let out = f
+            .invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(Arc::new(a))],
+                arg_fields: vec![Arc::new(datafusion::arrow::datatypes::Field::new(
+                    "a",
+                    DataType::Utf8,
+                    true,
+                ))],
+                number_rows: 3,
+                return_field: Arc::new(datafusion::arrow::datatypes::Field::new(
+                    "k",
+                    DataType::Utf8,
+                    true,
+                )),
+                config_options: Arc::new(Default::default()),
+            })
+            .unwrap()
+            .to_array(3)
+            .unwrap();
+        let out = out.as_string::<i32>();
+        assert_eq!(
+            out.iter().collect::<Vec<_>>(),
+            vec![Some("x"), None, Some("中")]
+        );
     }
 }
