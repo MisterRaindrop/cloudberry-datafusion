@@ -1407,7 +1407,8 @@ their rows as from any child: ORCA's Result on top, a Sort under the
 database's default collation, a Limit WITH TIES, a combining aggregate
 over a Nested Loop.  Only children their parents run once qualify: below
 Result, Sort, Limit, Unique, Material, ProjectSet, WindowAgg, Agg,
-SubqueryScan, every child of an Append, both sides of a Hash Join, the
+SubqueryScan, every child of an Append or a Sequence, a Shared Scan's
+producer, both sides of a Hash Join, the
 outer side of a Nested Loop or Merge Join (whose inner side is rescanned
 or marked), never a Hash node itself (its join builds the table through
 MultiExecProcNode; its child qualifies).  DataFusion's output is ordered
@@ -1417,6 +1418,23 @@ unfiltered scan's) is not worth starting.  Such a slice sends tuples;
 its subtrees still read batch Motions, which the batch decision now
 counts.  EXPLAIN shows `eligible below the top: <nodes> (above:
 <reason>)`.
+
+GPORCA's Shared Scan (a CTE read more than once, and the grouping sets
+of a ROLLUP, which GPORCA turns into one) puts its producer under a
+Sequence, in a slice with the producer's joins and aggregates.  The
+Sequence runs each input once, in order, and the producer reads its input
+once into the store its readers share, in its own slice or others
+(`init_tuplestore_state`; a rescan reads the store again), so both
+qualify: DataFusion runs the producer's input, and PostgreSQL keeps the
+store, the readers and their synchronization.  The Motions below the
+Sequence are now seen by the batch decision too.  Of TPC-DS's 206
+executions, the 32 with a Shared Scan (all GPORCA) run this way, with
+PostgreSQL's rows, together 18.99 s before and 14.86 s now (PostgreSQL
+alone: Q23a 2.10 s, Q23b 2.24, Q95 0.78, Q22 1.48, Q36 0.61): Q23a 1.50 s
+and now 0.66 s, Q23b 1.84 and 0.85, Q95 1.27 and 0.55, Q22 0.94 and 0.68,
+Q36 0.64 and 0.23, Q67 1.67 and 1.48.  Where the producer's input is only
+joins, little changes: TPC-DS Q18's chain of six Redistribute joins under
+GPORCA, now through batch Motions, took 0.36 s and now 0.39 s.
 
 Over the TPC-H queries of Cloudberry's regression tests, run with their
 data under both planners, 144 slices run this way (50 under the Postgres

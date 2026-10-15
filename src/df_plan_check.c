@@ -5631,6 +5631,20 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_fr
 			foreach(lc, df_append_plans(plan))
 				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
 			return;
+		case T_Sequence:
+			/* GPORCA's Sequence runs each input once, in order */
+			foreach(lc, ((Sequence *) plan)->subplans)
+				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
+			return;
+		case T_ShareInputScan:
+
+			/*
+			 * The producer of a Shared Scan reads its input once into the
+			 * store its readers share (init_tuplestore_state); a rescan
+			 * reads the store again.  A reader has no input.
+			 */
+			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
+			return;
 		default:
 			return;
 	}
@@ -5664,6 +5678,14 @@ df_plan_contains(Plan *plan, Plan *target)
 		return false;
 	if (IsA(plan, SubqueryScan) && df_plan_contains(((SubqueryScan *) plan)->subplan, target))
 		return true;
+	if (IsA(plan, Sequence))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((Sequence *) plan)->subplans)
+			if (df_plan_contains(lfirst(lc), target))
+				return true;
+	}
 	if (df_append_plans(plan) != NIL)
 	{
 		ListCell   *lc;
@@ -6103,8 +6125,8 @@ df_motion_batchable(Motion *motion)
 }
 
 /*
- * The Motions of the plan tree 'plan', also below a Subquery Scan and an
- * Append.  Those of init plans are listed by the caller (IP2).
+ * The Motions of the plan tree 'plan', also below a Subquery Scan, an
+ * Append and a Sequence.  Those of init plans are listed by the caller (IP2).
  */
 static void
 df_list_motions(Plan *plan, List **motions)
@@ -6119,6 +6141,9 @@ df_list_motions(Plan *plan, List **motions)
 	df_list_motions(innerPlan(plan), motions);
 	if (IsA(plan, SubqueryScan))
 		df_list_motions(((SubqueryScan *) plan)->subplan, motions);
+	if (IsA(plan, Sequence))
+		foreach(lc, ((Sequence *) plan)->subplans)
+			df_list_motions(lfirst(lc), motions);
 	if (df_append_plans(plan) != NIL)
 		foreach(lc, df_append_plans(plan))
 			df_list_motions(lfirst(lc), motions);

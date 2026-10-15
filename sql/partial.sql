@@ -89,6 +89,30 @@ SET optimizer = on;
 SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
 SET optimizer = off;
 
+-- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): below the Sequence,
+-- the producer's input runs in DataFusion, which the producer reads once
+-- into the store its readers share, in other slices (the first) or its
+-- own (the second).  The readers stay on PostgreSQL.
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k;
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
+SET datafusion.mode = off;
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+SET datafusion.mode = on;
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+SET optimizer = off;
+
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

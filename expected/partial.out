@@ -315,6 +315,196 @@ SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDE
 (5 rows)
 
 SET optimizer = off;
+-- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): below the Sequence,
+-- the producer's input runs in DataFusion, which the producer reads once
+-- into the store its readers share, in other slices (the first) or its
+-- own (the second).  The readers stay on PostgreSQL.
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  Hash Join
+                     Hash Cond: (a.id = (b.id * 700))
+                     ->  Seq Scan on df_pt a
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: (b.id * 700)
+                                 ->  Seq Scan on df_pt2 b
+         ->  HashAggregate
+               Group Key: share0_ref3.k
+               ->  Hash Join
+                     Hash Cond: (share0_ref3.k = share0_ref2.w)
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                           Hash Key: share0_ref3.k
+                           ->  Result
+                                 ->  Shared Scan (share slice:id 3:0)
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                 Hash Key: share0_ref2.w
+                                 ->  Result
+                                       ->  Shared Scan (share slice:id 4:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Hash Join, Aggregate (above: plan node type 25 is not supported)
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 not eligible: Shared Scan is not supported
+ DataFusion: slice 4 not eligible: Shared Scan is not supported
+(29 rows)
+
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  HashAggregate
+                     Group Key: a.t
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a.t
+                           ->  Hash Join
+                                 Hash Cond: (a.id = (b.id * 700))
+                                 ->  Seq Scan on df_pt a
+                                 ->  Hash
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: (b.id * 700)
+                                             ->  Seq Scan on df_pt2 b
+         ->  Hash Join
+               Hash Cond: (share0_ref3.t = share0_ref2.t)
+               ->  Shared Scan (share slice:id 1:0)
+               ->  Hash
+                     ->  Shared Scan (share slice:id 1:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Aggregate (above: plan node type 25 is not supported)
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible
+(24 rows)
+
+SET datafusion.mode = off;
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
+ k | count |   sum   | sum 
+---+-------+---------+-----
+ 0 |    24 | 3057600 |   0
+ 1 |    24 | 2234400 |  24
+ 2 |    24 | 2940000 |  48
+ 3 |    24 | 2116800 |  72
+ 4 |    24 | 2822400 |  96
+(5 rows)
+
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+  t  | n |   s    
+-----+---+--------
+ k0  | 1 | 151900
+ k1  | 1 |  93100
+ k10 | 2 | 191100
+ k11 | 1 | 112700
+ k12 | 1 |  53900
+ k13 | 1 | 147000
+ k14 | 1 |  88200
+ k15 | 2 | 210700
+ k16 | 1 | 122500
+ k17 | 1 |  63700
+ k18 | 2 | 161700
+ k19 | 1 |  98000
+ k2  | 2 | 220500
+ k20 | 2 | 230300
+ k21 | 1 | 132300
+ k22 | 1 |  73500
+ k23 | 2 | 181300
+ k24 | 1 | 107800
+ k25 | 1 |  49000
+ k26 | 1 | 142100
+ k27 | 1 |  83300
+ k28 | 2 | 200900
+ k29 | 1 | 117600
+ k3  | 1 | 127400
+ k30 | 1 |  58800
+ k4  | 1 |  68600
+ k5  | 2 | 171500
+ k6  | 1 | 102900
+ k7  | 2 | 240100
+ k8  | 1 | 137200
+ k9  | 1 |  78400
+(31 rows)
+
+SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+ k |  t  | count |   sum   
+---+-----+-------+---------
+ 0 | k0  |    74 | 7828275
+ 0 | k1  |    75 | 7910175
+ 0 | k10 |    74 | 7801339
+ 0 | k11 |    75 | 7882875
+ 0 | k12 |    74 | 7754201
+(5 rows)
+
+SET datafusion.mode = on;
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
+ k | count |   sum   | sum 
+---+-------+---------+-----
+ 0 |    24 | 3057600 |   0
+ 1 |    24 | 2234400 |  24
+ 2 |    24 | 2940000 |  48
+ 3 |    24 | 2116800 |  72
+ 4 |    24 | 2822400 |  96
+(5 rows)
+
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+  t  | n |   s    
+-----+---+--------
+ k0  | 1 | 151900
+ k1  | 1 |  93100
+ k10 | 2 | 191100
+ k11 | 1 | 112700
+ k12 | 1 |  53900
+ k13 | 1 | 147000
+ k14 | 1 |  88200
+ k15 | 2 | 210700
+ k16 | 1 | 122500
+ k17 | 1 |  63700
+ k18 | 2 | 161700
+ k19 | 1 |  98000
+ k2  | 2 | 220500
+ k20 | 2 | 230300
+ k21 | 1 | 132300
+ k22 | 1 |  73500
+ k23 | 2 | 181300
+ k24 | 1 | 107800
+ k25 | 1 |  49000
+ k26 | 1 | 142100
+ k27 | 1 |  83300
+ k28 | 2 | 200900
+ k29 | 1 | 117600
+ k3  | 1 | 127400
+ k30 | 1 |  58800
+ k4  | 1 |  68600
+ k5  | 2 | 171500
+ k6  | 1 | 102900
+ k7  | 2 | 240100
+ k8  | 1 | 137200
+ k9  | 1 |  78400
+(31 rows)
+
+SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+ k |  t  | count |   sum   
+---+-----+-------+---------
+ 0 | k0  |    74 | 7828275
+ 0 | k1  |    75 | 7910175
+ 0 | k10 |    74 | 7801339
+ 0 | k11 |    75 | 7882875
+ 0 | k12 |    74 | 7754201
+(5 rows)
+
+SET optimizer = off;
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

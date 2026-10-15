@@ -1522,6 +1522,16 @@ df_find_state(PlanState *ps, Plan *leaf)
 				return found;
 		return NULL;
 	}
+	if (IsA(ps, SequenceState))
+	{
+		SequenceState *ss = (SequenceState *) ps;
+		int			i;
+
+		for (i = 0; i < ss->numSubplans; i++)
+			if ((found = df_find_state(ss->subplans[i], leaf)) != NULL)
+				return found;
+		return NULL;
+	}
 	found = df_find_state(outerPlanState(ps), leaf);
 	return found ? found : df_find_state(innerPlanState(ps), leaf);
 }
