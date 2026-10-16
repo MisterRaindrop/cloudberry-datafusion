@@ -1476,6 +1476,28 @@ Q22 took 0.68 s with the producer alone and now 0.47 s, Q67 1.48 and
 change within the noise, the 32 together 14.86 s and 15.33 s in single
 runs.
 
+The slice of the Sequence now runs in DataFusion as a whole: the
+Sequence passes its last input's rows on, which DataFusion computes, and
+before it starts, PostgreSQL runs the other inputs, the producers, to
+their end, as `ExecSequence` does (`completeSubplan`); their own inputs
+run in DataFusion below them (T2).  So the slice sends batches, and
+EXPLAIN says `eligible; below its Shared Scan producers: <nodes>`.  An
+input of an Append that only passes rows on is worth reading where
+another input computes: GPORCA's ROLLUP has its grand total's row come
+from a Motion, as an input of the union of the other levels.  A reader
+right below the slice's Motion, with no Result between, is translated
+too (TPC-DS Q5, Q14, Q27, Q67 under GPORCA).  TPC-DS executions wholly
+in DataFusion went from 138 to 147 of 206 (Q2, Q22, Q27, Q31, Q36, Q64,
+Q67, Q70 and Q86 under GPORCA); every one still gives PostgreSQL's rows.
+The 32 with a Shared Scan took 15.08 s before and 14.77 s now, together
+with the faster decision above; alone, running the Sequence's slice as
+a whole saved nothing measurable in Q22 or Q67, and made Q14a slower
+(1.15 s to 2.05 s) until the decision was made once per process: its
+larger slices had made each decision three times as long.  Where the
+Sequence's last input is only a Motion of the main query's rows (Q1,
+Q4, Q11, Q30, Q59, Q74, Q81 under GPORCA), the slice has nothing to
+compute and stays as it was.
+
 Over the TPC-H queries of Cloudberry's regression tests, run with their
 data under both planners, 144 slices run this way (50 under the Postgres
 planner, 94 under ORCA) besides the 388 that run whole, and every query

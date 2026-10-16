@@ -189,6 +189,9 @@ typedef struct DfExec
 								 * or the Motion we send batches through */
 	int			ninputs;
 	DfInput    *inputs;			/* fed in this order, each to its end */
+	int			nprerun;
+	PlanState **prerun;			/* Shared Scan producers PostgreSQL runs
+								 * first, as their Sequences would */
 
 	/* M7b batch Motions */
 	MotionState *send;			/* the Motion we send batches through */
@@ -330,6 +333,21 @@ df_hash_memory(PlanState *ps)
 		bytes += df_hash_budget(ps->plan);
 	else if (IsA(ps, SortState))
 		bytes += PlanStateOperatorMemKB(ps) * 1024.0;	/* as nodeSort.c (S1) */
+	else if (IsA(ps, SequenceState))
+	{
+		/* its last input; PostgreSQL runs the others (df_exec_prerun) */
+		SequenceState *ss = (SequenceState *) ps;
+
+		return df_hash_memory(ss->subplans[ss->numSubplans - 1]);
+	}
+	else if (IsA(ps, AppendState))
+	{
+		AppendState *as = (AppendState *) ps;
+		int			i;
+
+		for (i = 0; i < as->as_nplans; i++)
+			bytes += df_hash_memory(as->appendplans[i]);
+	}
 	return bytes + df_hash_memory(outerPlanState(ps)) + df_hash_memory(innerPlanState(ps));
 }
 
@@ -1360,6 +1378,25 @@ df_exec_emit(DfExec *x)
 	return ExecStoreVirtualTuple(x->outslot);
 }
 
+/*
+ * Run the Shared Scan producers of the slice's Sequences to their end, as
+ * ExecSequence does before reading its last input (completeSubplan): each
+ * writes the store its readers share, and readers of this slice, pulled as
+ * inputs, find it complete.
+ */
+static void
+df_exec_prerun(DfExec *x)
+{
+	int			i;
+
+	for (i = 0; i < x->nprerun; i++)
+	{
+		while (!TupIsNull(ExecProcNode(x->prerun[i])))
+			CHECK_FOR_INTERRUPTS();
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
 static TupleTableSlot *
 df_exec_next(DfExec *x)
 {
@@ -1367,7 +1404,10 @@ df_exec_next(DfExec *x)
 	char		sqlstate[6] = "XX000";
 
 	if (x->query == NULL && !x->done)
+	{
+		df_exec_prerun(x);
 		df_exec_begin(x);
+	}
 
 	for (;;)
 	{
@@ -1710,6 +1750,25 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			in->incols[c].offsets = in->inoffsets[c];
 			in->maxattno = Max(in->maxattno,
 							   in->tupatt ? in->tupatt[c] : in->spec->attnos[c]);
+		}
+	}
+	{
+		List	   *producers = df_slice_producers(root->plan);
+		ListCell   *lc;
+
+		x->nprerun = list_length(producers);
+		x->prerun = palloc0(sizeof(PlanState *) * Max(x->nprerun, 1));
+		foreach(lc, producers)
+		{
+			PlanState  *ps = df_find_state(root, lfirst(lc));
+
+			if (ps == NULL)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				snprintf(reason, reasonlen, "no executor state for a Shared Scan producer");
+				return false;
+			}
+			x->prerun[foreach_current_index(lc)] = ps;
 		}
 	}
 	x->root = root;

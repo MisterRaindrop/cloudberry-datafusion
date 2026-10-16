@@ -315,18 +315,22 @@ SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDE
 (5 rows)
 
 SET optimizer = off;
--- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): below the Sequence,
--- the producer's input runs in DataFusion, which the producer reads once
--- into the store its readers share, in other slices (the first) or its
--- own (the second).  A reader stays on PostgreSQL, and DataFusion pulls
--- its rows for what computes on them (the join in the second), or for a
--- Motion carrying batches (the first's readers).
+-- GPORCA's Shared Scan (a CTE read twice, a ROLLUP): the slice of its
+-- Sequence runs in DataFusion, which reads the Sequence's last input;
+-- PostgreSQL first runs the producer, as the Sequence would, and the
+-- producer reads its input, run in DataFusion below it, once into the
+-- store its readers share, in other slices (the first) or its own (the
+-- second).  A reader stays on PostgreSQL, and DataFusion pulls its rows
+-- for what computes on them (the join in the second), or for a Motion
+-- carrying batches (the first's and the third's readers, right below
+-- their Motions in the third).  The ROLLUP's grand total comes from a Motion with nothing
+-- computed on it, read as an input of the union of the other levels.
 SET optimizer = on;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k;
-                                                  QUERY PLAN                                                  
---------------------------------------------------------------------------------------------------------------
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Sequence
          ->  Shared Scan (share slice:id 1:0)
@@ -352,7 +356,7 @@ SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY
                                        ->  Shared Scan (share slice:id 4:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Hash Join, Aggregate (above: plan node type 25 is not supported)
+ DataFusion: slice 1 eligible; below its Shared Scan producers: Hash Join
  DataFusion: slice 2 eligible
  DataFusion: slice 3 eligible, sends Arrow batches
  DataFusion: slice 4 eligible, sends Arrow batches
@@ -360,8 +364,8 @@ SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY
 
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
 SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
-                                                  QUERY PLAN                                                  
---------------------------------------------------------------------------------------------------------------
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Sequence
          ->  Shared Scan (share slice:id 1:0)
@@ -383,10 +387,78 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
                      ->  Shared Scan (share slice:id 1:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate, Hash Join (above: plan node type 25 is not supported)
+ DataFusion: slice 1 eligible; below its Shared Scan producers: Aggregate
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible
 (24 rows)
+
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  Hash Join
+                     Hash Cond: (a.id = (b.id * 700))
+                     ->  Seq Scan on df_pt a
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: (b.id * 700)
+                                 ->  Seq Scan on df_pt2 b
+         ->  Hash Join
+               Hash Cond: (share0_ref3.k = share0_ref2.w)
+               ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                     Hash Key: share0_ref3.k
+                     ->  Shared Scan (share slice:id 3:0)
+               ->  Hash
+                     ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                           Hash Key: share0_ref2.w
+                           ->  Shared Scan (share slice:id 4:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible; below its Shared Scan producers: Hash Join
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible, sends Arrow batches
+(25 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t);
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Sequence
+         ->  Shared Scan (share slice:id 1:0)
+               ->  Seq Scan on df_pt
+         ->  Append
+               ->  Finalize HashAggregate
+                     Group Key: share0_ref2.k, share0_ref2.t
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: share0_ref2.k, share0_ref2.t
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: share0_ref2.k, share0_ref2.t
+                                 ->  Shared Scan (share slice:id 2:0)
+               ->  Finalize HashAggregate
+                     Group Key: share0_ref3.k
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                           Hash Key: share0_ref3.k
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: share0_ref3.k
+                                 ->  Shared Scan (share slice:id 3:0)
+               ->  Result
+                     ->  Redistribute Motion 1:3  (slice4)
+                           ->  Finalize Aggregate
+                                 ->  Gather Motion 3:1  (slice5; segments: 3)
+                                       ->  Partial Aggregate
+                                             ->  Shared Scan (share slice:id 5:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 eligible
+ DataFusion: slice 5 eligible, sends Arrow batches
+(32 rows)
 
 SET datafusion.mode = off;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
@@ -436,6 +508,132 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
  k8  | 1 | 137200
  k9  | 1 |  78400
 (31 rows)
+
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w ORDER BY 1, 2, 3, 4, 5, 6;
+ k | w |   v    | k  | w |   v    
+---+---+--------+----+---+--------
+ 0 | 1 | 127400 |  2 | 0 | 122500
+ 0 | 1 | 127400 |  3 | 0 |  24500
+ 0 | 1 | 127400 |  5 | 0 | 147000
+ 0 | 1 | 127400 |  6 | 0 |  49000
+ 0 | 1 | 127400 |  8 | 0 | 171500
+ 0 | 1 | 127400 |  9 | 0 |  73500
+ 0 | 1 | 127400 | 11 | 0 | 196000
+ 0 | 1 | 127400 | 12 | 0 |  98000
+ 0 | 3 |  63700 |  2 | 0 | 122500
+ 0 | 3 |  63700 |  3 | 0 |  24500
+ 0 | 3 |  63700 |  5 | 0 | 147000
+ 0 | 3 |  63700 |  6 | 0 |  49000
+ 0 | 3 |  63700 |  8 | 0 | 171500
+ 0 | 3 |  63700 |  9 | 0 |  73500
+ 0 | 3 |  63700 | 11 | 0 | 196000
+ 0 | 3 |  63700 | 12 | 0 |  98000
+ 0 | 4 | 191100 |  2 | 0 | 122500
+ 0 | 4 | 191100 |  3 | 0 |  24500
+ 0 | 4 | 191100 |  5 | 0 | 147000
+ 0 | 4 | 191100 |  6 | 0 |  49000
+ 0 | 4 | 191100 |  8 | 0 | 171500
+ 0 | 4 | 191100 |  9 | 0 |  73500
+ 0 | 4 | 191100 | 11 | 0 | 196000
+ 0 | 4 | 191100 | 12 | 0 |  98000
+ 1 | 1 |  29400 |  0 | 1 | 127400
+ 1 | 1 |  29400 |  1 | 1 |  29400
+ 1 | 1 |  29400 |  3 | 1 | 151900
+ 1 | 1 |  29400 |  4 | 1 |  53900
+ 1 | 1 |  29400 |  6 | 1 | 176400
+ 1 | 1 |  29400 |  7 | 1 |  78400
+ 1 | 1 |  29400 | 10 | 1 | 102900
+ 1 | 1 |  29400 | 11 | 1 |   4900
+ 1 | 2 | 156800 |  0 | 1 | 127400
+ 1 | 2 | 156800 |  1 | 1 |  29400
+ 1 | 2 | 156800 |  3 | 1 | 151900
+ 1 | 2 | 156800 |  4 | 1 |  53900
+ 1 | 2 | 156800 |  6 | 1 | 176400
+ 1 | 2 | 156800 |  7 | 1 |  78400
+ 1 | 2 | 156800 | 10 | 1 | 102900
+ 1 | 2 | 156800 | 11 | 1 |   4900
+ 1 | 4 |  93100 |  0 | 1 | 127400
+ 1 | 4 |  93100 |  1 | 1 |  29400
+ 1 | 4 |  93100 |  3 | 1 | 151900
+ 1 | 4 |  93100 |  4 | 1 |  53900
+ 1 | 4 |  93100 |  6 | 1 | 176400
+ 1 | 4 |  93100 |  7 | 1 |  78400
+ 1 | 4 |  93100 | 10 | 1 | 102900
+ 1 | 4 |  93100 | 11 | 1 |   4900
+ 2 | 0 | 122500 |  1 | 2 | 156800
+ 2 | 0 | 122500 |  2 | 2 |  58800
+ 2 | 0 | 122500 |  4 | 2 | 181300
+ 2 | 0 | 122500 |  5 | 2 |  83300
+ 2 | 0 | 122500 |  8 | 2 | 107800
+ 2 | 0 | 122500 |  9 | 2 |   9800
+ 2 | 0 | 122500 | 11 | 2 | 132300
+ 2 | 0 | 122500 | 12 | 2 |  34300
+ 2 | 2 |  58800 |  1 | 2 | 156800
+ 2 | 2 |  58800 |  2 | 2 |  58800
+ 2 | 2 |  58800 |  4 | 2 | 181300
+ 2 | 2 |  58800 |  5 | 2 |  83300
+ 2 | 2 |  58800 |  8 | 2 | 107800
+ 2 | 2 |  58800 |  9 | 2 |   9800
+ 2 | 2 |  58800 | 11 | 2 | 132300
+ 2 | 2 |  58800 | 12 | 2 |  34300
+ 2 | 3 | 186200 |  1 | 2 | 156800
+ 2 | 3 | 186200 |  2 | 2 |  58800
+ 2 | 3 | 186200 |  4 | 2 | 181300
+ 2 | 3 | 186200 |  5 | 2 |  83300
+ 2 | 3 | 186200 |  8 | 2 | 107800
+ 2 | 3 | 186200 |  9 | 2 |   9800
+ 2 | 3 | 186200 | 11 | 2 | 132300
+ 2 | 3 | 186200 | 12 | 2 |  34300
+ 3 | 0 |  24500 |  0 | 3 |  63700
+ 3 | 0 |  24500 |  2 | 3 | 186200
+ 3 | 0 |  24500 |  3 | 3 |  88200
+ 3 | 0 |  24500 |  6 | 3 | 112700
+ 3 | 0 |  24500 |  7 | 3 |  14700
+ 3 | 0 |  24500 |  9 | 3 | 137200
+ 3 | 0 |  24500 | 10 | 3 |  39200
+ 3 | 0 |  24500 | 12 | 3 | 161700
+ 3 | 1 | 151900 |  0 | 3 |  63700
+ 3 | 1 | 151900 |  2 | 3 | 186200
+ 3 | 1 | 151900 |  3 | 3 |  88200
+ 3 | 1 | 151900 |  6 | 3 | 112700
+ 3 | 1 | 151900 |  7 | 3 |  14700
+ 3 | 1 | 151900 |  9 | 3 | 137200
+ 3 | 1 | 151900 | 10 | 3 |  39200
+ 3 | 1 | 151900 | 12 | 3 | 161700
+ 3 | 3 |  88200 |  0 | 3 |  63700
+ 3 | 3 |  88200 |  2 | 3 | 186200
+ 3 | 3 |  88200 |  3 | 3 |  88200
+ 3 | 3 |  88200 |  6 | 3 | 112700
+ 3 | 3 |  88200 |  7 | 3 |  14700
+ 3 | 3 |  88200 |  9 | 3 | 137200
+ 3 | 3 |  88200 | 10 | 3 |  39200
+ 3 | 3 |  88200 | 12 | 3 | 161700
+ 4 | 1 |  53900 |  0 | 4 | 191100
+ 4 | 1 |  53900 |  1 | 4 |  93100
+ 4 | 1 |  53900 |  4 | 4 | 117600
+ 4 | 1 |  53900 |  5 | 4 |  19600
+ 4 | 1 |  53900 |  7 | 4 | 142100
+ 4 | 1 |  53900 |  8 | 4 |  44100
+ 4 | 1 |  53900 | 10 | 4 | 166600
+ 4 | 1 |  53900 | 11 | 4 |  68600
+ 4 | 2 | 181300 |  0 | 4 | 191100
+ 4 | 2 | 181300 |  1 | 4 |  93100
+ 4 | 2 | 181300 |  4 | 4 | 117600
+ 4 | 2 | 181300 |  5 | 4 |  19600
+ 4 | 2 | 181300 |  7 | 4 | 142100
+ 4 | 2 | 181300 |  8 | 4 |  44100
+ 4 | 2 | 181300 | 10 | 4 | 166600
+ 4 | 2 | 181300 | 11 | 4 |  68600
+ 4 | 4 | 117600 |  0 | 4 | 191100
+ 4 | 4 | 117600 |  1 | 4 |  93100
+ 4 | 4 | 117600 |  4 | 4 | 117600
+ 4 | 4 | 117600 |  5 | 4 |  19600
+ 4 | 4 | 117600 |  7 | 4 | 142100
+ 4 | 4 | 117600 |  8 | 4 |  44100
+ 4 | 4 | 117600 | 10 | 4 | 166600
+ 4 | 4 | 117600 | 11 | 4 |  68600
+(120 rows)
 
 SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
  k |  t  | count |   sum   
@@ -495,6 +693,132 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
  k8  | 1 | 137200
  k9  | 1 |  78400
 (31 rows)
+
+WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
+SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w ORDER BY 1, 2, 3, 4, 5, 6;
+ k | w |   v    | k  | w |   v    
+---+---+--------+----+---+--------
+ 0 | 1 | 127400 |  2 | 0 | 122500
+ 0 | 1 | 127400 |  3 | 0 |  24500
+ 0 | 1 | 127400 |  5 | 0 | 147000
+ 0 | 1 | 127400 |  6 | 0 |  49000
+ 0 | 1 | 127400 |  8 | 0 | 171500
+ 0 | 1 | 127400 |  9 | 0 |  73500
+ 0 | 1 | 127400 | 11 | 0 | 196000
+ 0 | 1 | 127400 | 12 | 0 |  98000
+ 0 | 3 |  63700 |  2 | 0 | 122500
+ 0 | 3 |  63700 |  3 | 0 |  24500
+ 0 | 3 |  63700 |  5 | 0 | 147000
+ 0 | 3 |  63700 |  6 | 0 |  49000
+ 0 | 3 |  63700 |  8 | 0 | 171500
+ 0 | 3 |  63700 |  9 | 0 |  73500
+ 0 | 3 |  63700 | 11 | 0 | 196000
+ 0 | 3 |  63700 | 12 | 0 |  98000
+ 0 | 4 | 191100 |  2 | 0 | 122500
+ 0 | 4 | 191100 |  3 | 0 |  24500
+ 0 | 4 | 191100 |  5 | 0 | 147000
+ 0 | 4 | 191100 |  6 | 0 |  49000
+ 0 | 4 | 191100 |  8 | 0 | 171500
+ 0 | 4 | 191100 |  9 | 0 |  73500
+ 0 | 4 | 191100 | 11 | 0 | 196000
+ 0 | 4 | 191100 | 12 | 0 |  98000
+ 1 | 1 |  29400 |  0 | 1 | 127400
+ 1 | 1 |  29400 |  1 | 1 |  29400
+ 1 | 1 |  29400 |  3 | 1 | 151900
+ 1 | 1 |  29400 |  4 | 1 |  53900
+ 1 | 1 |  29400 |  6 | 1 | 176400
+ 1 | 1 |  29400 |  7 | 1 |  78400
+ 1 | 1 |  29400 | 10 | 1 | 102900
+ 1 | 1 |  29400 | 11 | 1 |   4900
+ 1 | 2 | 156800 |  0 | 1 | 127400
+ 1 | 2 | 156800 |  1 | 1 |  29400
+ 1 | 2 | 156800 |  3 | 1 | 151900
+ 1 | 2 | 156800 |  4 | 1 |  53900
+ 1 | 2 | 156800 |  6 | 1 | 176400
+ 1 | 2 | 156800 |  7 | 1 |  78400
+ 1 | 2 | 156800 | 10 | 1 | 102900
+ 1 | 2 | 156800 | 11 | 1 |   4900
+ 1 | 4 |  93100 |  0 | 1 | 127400
+ 1 | 4 |  93100 |  1 | 1 |  29400
+ 1 | 4 |  93100 |  3 | 1 | 151900
+ 1 | 4 |  93100 |  4 | 1 |  53900
+ 1 | 4 |  93100 |  6 | 1 | 176400
+ 1 | 4 |  93100 |  7 | 1 |  78400
+ 1 | 4 |  93100 | 10 | 1 | 102900
+ 1 | 4 |  93100 | 11 | 1 |   4900
+ 2 | 0 | 122500 |  1 | 2 | 156800
+ 2 | 0 | 122500 |  2 | 2 |  58800
+ 2 | 0 | 122500 |  4 | 2 | 181300
+ 2 | 0 | 122500 |  5 | 2 |  83300
+ 2 | 0 | 122500 |  8 | 2 | 107800
+ 2 | 0 | 122500 |  9 | 2 |   9800
+ 2 | 0 | 122500 | 11 | 2 | 132300
+ 2 | 0 | 122500 | 12 | 2 |  34300
+ 2 | 2 |  58800 |  1 | 2 | 156800
+ 2 | 2 |  58800 |  2 | 2 |  58800
+ 2 | 2 |  58800 |  4 | 2 | 181300
+ 2 | 2 |  58800 |  5 | 2 |  83300
+ 2 | 2 |  58800 |  8 | 2 | 107800
+ 2 | 2 |  58800 |  9 | 2 |   9800
+ 2 | 2 |  58800 | 11 | 2 | 132300
+ 2 | 2 |  58800 | 12 | 2 |  34300
+ 2 | 3 | 186200 |  1 | 2 | 156800
+ 2 | 3 | 186200 |  2 | 2 |  58800
+ 2 | 3 | 186200 |  4 | 2 | 181300
+ 2 | 3 | 186200 |  5 | 2 |  83300
+ 2 | 3 | 186200 |  8 | 2 | 107800
+ 2 | 3 | 186200 |  9 | 2 |   9800
+ 2 | 3 | 186200 | 11 | 2 | 132300
+ 2 | 3 | 186200 | 12 | 2 |  34300
+ 3 | 0 |  24500 |  0 | 3 |  63700
+ 3 | 0 |  24500 |  2 | 3 | 186200
+ 3 | 0 |  24500 |  3 | 3 |  88200
+ 3 | 0 |  24500 |  6 | 3 | 112700
+ 3 | 0 |  24500 |  7 | 3 |  14700
+ 3 | 0 |  24500 |  9 | 3 | 137200
+ 3 | 0 |  24500 | 10 | 3 |  39200
+ 3 | 0 |  24500 | 12 | 3 | 161700
+ 3 | 1 | 151900 |  0 | 3 |  63700
+ 3 | 1 | 151900 |  2 | 3 | 186200
+ 3 | 1 | 151900 |  3 | 3 |  88200
+ 3 | 1 | 151900 |  6 | 3 | 112700
+ 3 | 1 | 151900 |  7 | 3 |  14700
+ 3 | 1 | 151900 |  9 | 3 | 137200
+ 3 | 1 | 151900 | 10 | 3 |  39200
+ 3 | 1 | 151900 | 12 | 3 | 161700
+ 3 | 3 |  88200 |  0 | 3 |  63700
+ 3 | 3 |  88200 |  2 | 3 | 186200
+ 3 | 3 |  88200 |  3 | 3 |  88200
+ 3 | 3 |  88200 |  6 | 3 | 112700
+ 3 | 3 |  88200 |  7 | 3 |  14700
+ 3 | 3 |  88200 |  9 | 3 | 137200
+ 3 | 3 |  88200 | 10 | 3 |  39200
+ 3 | 3 |  88200 | 12 | 3 | 161700
+ 4 | 1 |  53900 |  0 | 4 | 191100
+ 4 | 1 |  53900 |  1 | 4 |  93100
+ 4 | 1 |  53900 |  4 | 4 | 117600
+ 4 | 1 |  53900 |  5 | 4 |  19600
+ 4 | 1 |  53900 |  7 | 4 | 142100
+ 4 | 1 |  53900 |  8 | 4 |  44100
+ 4 | 1 |  53900 | 10 | 4 | 166600
+ 4 | 1 |  53900 | 11 | 4 |  68600
+ 4 | 2 | 181300 |  0 | 4 | 191100
+ 4 | 2 | 181300 |  1 | 4 |  93100
+ 4 | 2 | 181300 |  4 | 4 | 117600
+ 4 | 2 | 181300 |  5 | 4 |  19600
+ 4 | 2 | 181300 |  7 | 4 | 142100
+ 4 | 2 | 181300 |  8 | 4 |  44100
+ 4 | 2 | 181300 | 10 | 4 | 166600
+ 4 | 2 | 181300 | 11 | 4 |  68600
+ 4 | 4 | 117600 |  0 | 4 | 191100
+ 4 | 4 | 117600 |  1 | 4 |  93100
+ 4 | 4 | 117600 |  4 | 4 | 117600
+ 4 | 4 | 117600 |  5 | 4 |  19600
+ 4 | 4 | 117600 |  7 | 4 | 142100
+ 4 | 4 | 117600 |  8 | 4 |  44100
+ 4 | 4 | 117600 | 10 | 4 | 166600
+ 4 | 4 | 117600 | 11 | 4 |  68600
+(120 rows)
 
 SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
  k |  t  | count |   sum   

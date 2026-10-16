@@ -921,6 +921,8 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 					   df_motion_stream_column((Motion *) child, resno) + 1,
 					   exprType((Node *) tle->expr),
 					   df_scale_of(child, (Node *) tle->expr));
+	else if (IsA(child, Sequence))
+		df_emit_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
 	else if (IsA(child, ShareInputScan))
 		/* the producer's input's column at that position */
 		df_emit_column(b, out, df_input_of(b, child), resno,
@@ -972,6 +974,8 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
 		df_emit_column(b, out, df_input_of(b, child),
 					   df_motion_stream_column((Motion *) child, resno) + 1,
 					   INT4OID, DF_SCALE_DSCALE);
+	else if (IsA(child, Sequence))
+		df_emit_dscale_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
 	else if (IsA(child, ShareInputScan))
 		df_emit_column(b, out, df_input_of(b, child), resno, INT4OID, DF_SCALE_DSCALE);
 	else
@@ -1012,7 +1016,9 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
+				if (level == DF_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
+					df_emit_dscale_output_of(b, out, b->ctx, var->varattno);
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
 					/* UA1: the display scale its union carries beside it */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d_s\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
@@ -1293,7 +1299,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
 					return;
 				}
-				if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, SetOp))
+				if (level == DF_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
+					/* a reader at the top of the slice: its own column */
+					df_emit_output_of(b, out, b->ctx, var->varattno);
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, SetOp))
 					/* SO1: a column it groups by (df_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
 									 df_setop_group((SetOp *) b->ctx, var->varattno));
@@ -2135,6 +2144,11 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 		case T_Hash:
 		case T_Material:
 			df_emit_node(b, out, outerPlan(plan));
+			return;
+
+		case T_Sequence:
+			/* its last input's rows; PostgreSQL runs the others first */
+			df_emit_node(b, out, llast(((Sequence *) plan)->subplans));
 			return;
 
 		case T_NestLoop:
@@ -3419,6 +3433,15 @@ df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
 	appendStringInfoChar(out, ']');
 }
 
+/* 'plan', or the last input of the Sequences it is, whose rows they pass on */
+static Plan *
+df_sequence_body(Plan *plan)
+{
+	while (plan != NULL && IsA(plan, Sequence))
+		plan = llast(((Sequence *) plan)->subplans);
+	return plan;
+}
+
 /*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
@@ -3440,16 +3463,20 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	Sort	   *sort = NULL;
 	List	   *values;
 
-	/* S1: a Limit and a Sort at the top, over the rows of the rest */
+	/*
+	 * S1: a Limit and a Sort at the top, over the rows of the rest; a
+	 * Sequence passes its last input's rows on.
+	 */
+	root = df_sequence_body(root);
 	if (IsA(root, Limit))
 	{
 		limit = (Limit *) root;
-		root = outerPlan(root);
+		root = df_sequence_body(outerPlan(root));
 	}
 	if (root != NULL && IsA(root, Sort))
 	{
 		sort = (Sort *) root;
-		root = outerPlan(root);
+		root = df_sequence_body(outerPlan(root));
 	}
 	else if (root != NULL && IsA(root, Result) && outerPlan(root) != NULL &&
 			 IsA(outerPlan(root), Sort))

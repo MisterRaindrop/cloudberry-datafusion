@@ -112,6 +112,9 @@ df_takeover_find(QueryDesc *queryDesc)
 	return NULL;
 }
 
+static bool df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index,
+							 List *points, bool record);
+
 /*
  * T2: run in DataFusion the subtrees below the PostgreSQL nodes at the top
  * of slice 'slice_index' (whose top PlanState is 'top') that can run there.
@@ -121,7 +124,35 @@ static bool
 df_attach_below(QueryDesc *queryDesc, PlanState *top, int slice_index)
 {
 	PlannedStmt *stmt = queryDesc->plannedstmt;
-	List	   *points = df_slice_attach_points(stmt, top->plan, df_batch_motions(stmt));
+
+	return df_attach_points(queryDesc, top, slice_index,
+							df_slice_attach_points(stmt, top->plan, df_batch_motions(stmt)),
+							true);
+}
+
+/*
+ * T2: below the Shared Scan producers that PostgreSQL runs first in slice
+ * 'slice_index', which DataFusion runs from its top PlanState 'top'
+ * (df_exec_prerun): their inputs.
+ */
+static void
+df_attach_producers(QueryDesc *queryDesc, PlanState *top, int slice_index)
+{
+	PlannedStmt *stmt = queryDesc->plannedstmt;
+	List	   *points = NIL;
+	ListCell   *lc;
+
+	foreach(lc, df_slice_producers(top->plan))
+		points = list_concat(points, df_slice_attach_points(stmt, lfirst(lc),
+															df_batch_motions(stmt)));
+	if (points != NIL)
+		df_attach_points(queryDesc, top, slice_index, points, false);
+}
+
+static bool
+df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index, List *points,
+				 bool record)
+{
 	ListCell   *lc;
 	int			attached = 0;
 
@@ -140,7 +171,8 @@ df_attach_below(QueryDesc *queryDesc, PlanState *top, int slice_index)
 	if (attached > 0)
 	{
 		elog(DEBUG1, "datafusion: slice %d runs %d subtrees below its top", slice_index, attached);
-		df_takeover_record(queryDesc, slice_index);
+		if (record)
+			df_takeover_record(queryDesc, slice_index);
 	}
 	return attached > 0;
 }
@@ -192,7 +224,10 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 						   reason, sizeof(reason)) &&
 			attach != NULL &&
 			df_exec_attach(queryDesc, attach, send, &tails, reason, sizeof(reason)))
+		{
 			df_takeover_record(queryDesc, slice_index);
+			df_attach_producers(queryDesc, attach, slice_index);
+		}
 		else if (send == NULL && attach != NULL &&
 				 df_attach_below(queryDesc, attach, slice_index))
 			 /* T2: subtrees below PostgreSQL's nodes */ ;

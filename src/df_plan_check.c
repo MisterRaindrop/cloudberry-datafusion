@@ -99,6 +99,8 @@ typedef struct DfCheckContext
 	bool		agg_input;		/* checking the child of an Agg node */
 	bool		join_input;		/* checking an input of a join */
 	bool		window_input;	/* checking the child of a WindowAgg (WIN1) */
+	bool		union_input;	/* checking an input of an Append whose other
+								 * inputs compute (df_plan_computes) */
 	WindowAgg  *window;			/* the WindowAgg whose expressions are
 								 * checked, which computes their window
 								 * functions (WIN1) */
@@ -4293,6 +4295,39 @@ df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
 	return true;
 }
 
+/* Does 'plan' aggregate, join or window rows of its slice? */
+static bool
+df_plan_computes(Plan *plan)
+{
+	ListCell   *lc;
+
+	if (plan == NULL || IsA(plan, Motion))
+		return false;
+	if (IsA(plan, Agg) || IsA(plan, HashJoin) || IsA(plan, NestLoop) ||
+		IsA(plan, MergeJoin) || IsA(plan, WindowAgg) || IsA(plan, SetOp))
+		return true;
+	if (IsA(plan, SubqueryScan))
+		return df_plan_computes(((SubqueryScan *) plan)->subplan);
+	if (IsA(plan, Sequence))
+		return df_plan_computes(llast(((Sequence *) plan)->subplans));
+	foreach(lc, df_append_plans(plan))
+		if (df_plan_computes(lfirst(lc)))
+			return true;
+	return df_plan_computes(outerPlan(plan)) || df_plan_computes(innerPlan(plan));
+}
+
+/* Does an input of Append 'plan' compute (df_plan_computes)? */
+static bool
+df_append_computes(Plan *plan)
+{
+	ListCell   *lc;
+
+	foreach(lc, df_append_plans(plan))
+		if (df_plan_computes(lfirst(lc)))
+			return true;
+	return false;
+}
+
 static void
 df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 			  bool root_is_sender)
@@ -4675,6 +4710,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				bool		agg_input;
 				bool		join_input;
 				bool		window_input;
+				bool		union_input;
 
 				if (IsA(plan, Append) ? ((Append *) plan)->part_prune_info != NULL :
 					((MergeAppend *) plan)->part_prune_info != NULL)
@@ -4712,18 +4748,24 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				agg_input = cxt->agg_input;
 				join_input = cxt->join_input;
 				window_input = cxt->window_input;
+				union_input = cxt->union_input;
 				foreach(lc, df_append_plans(plan))
 				{
 					/*
 					 * as above each input: an Agg in one clears agg_input
-					 * when it returns (TPC-DS Q38, an INTERSECT's Motion)
+					 * when it returns (TPC-DS Q38, an INTERSECT's Motion).
+					 * An input that only passes rows on is worth reading
+					 * where another computes: GPORCA's ROLLUP has the grand
+					 * total's row come from a Motion (TPC-DS Q22, Q67).
 					 */
 					cxt->agg_input = agg_input;
 					cxt->join_input = join_input;
 					cxt->window_input = window_input;
+					cxt->union_input = union_input || df_append_computes(plan);
 					cxt->order_free = true;
 					df_check_plan(lfirst(lc), cxt, needed, false);
 				}
+				cxt->union_input = union_input;
 				return;
 			}
 
@@ -5391,7 +5433,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				if (!cxt->agg_input && !cxt->join_input && !cxt->window_input &&
-					!cxt->batch_sender)
+					!cxt->union_input && !cxt->batch_sender)
 				{
 					df_reject(cxt, "reads a Shared Scan with nothing to compute on its rows");
 					return;
@@ -5422,6 +5464,56 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_Sequence:
+			{
+				/*
+				 * GPORCA's Sequence: its inputs but the last are Shared Scan
+				 * producers, which PostgreSQL runs to their end first, as
+				 * ExecSequence does, writing the stores their readers share
+				 * (df_exec_prerun); DataFusion runs their own inputs below
+				 * them (T2).  Its rows are its last input's, which the
+				 * slice computes.
+				 */
+				Sequence   *seq = (Sequence *) plan;
+				Plan	   *body = llast(seq->subplans);
+				ListCell   *lc;
+
+				foreach(lc, seq->subplans)
+				{
+					Plan	   *sub = lfirst(lc);
+
+					if (sub != body && (!IsA(sub, ShareInputScan) || outerPlan(sub) == NULL))
+					{
+						df_reject(cxt, "Sequence of something other than Shared Scan producers");
+						return;
+					}
+				}
+				if (plan->qual != NIL ||
+					list_length(plan->targetlist) != list_length(body->targetlist))
+				{
+					df_reject(cxt, "Sequence that computes columns");
+					return;
+				}
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+					Var		   *var = (Var *) tle->expr;
+
+					if (!IsA(var, Var) || var->varno != OUTER_VAR || var->varattno != tle->resno)
+					{
+						df_reject(cxt, "Sequence that computes columns");
+						return;
+					}
+				}
+				if (plan == cxt->top)
+					cxt->top = body;
+				if (plan == cxt->output)
+					cxt->output = body;
+				cxt->order_free = cxt->node_order_free; /* its last input's order */
+				df_check_plan(body, cxt, needed, false);
+				return;
+			}
+
 		case T_Motion:
 			{
 				Motion	   *motion = (Motion *) plan;
@@ -5438,7 +5530,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * Motion's targetlist is evaluated by the sending slice;
 					 * here only the types of the columns read matter.
 					 */
-					if (!cxt->agg_input && !cxt->join_input && !cxt->window_input)
+					if (!cxt->agg_input && !cxt->join_input && !cxt->window_input &&
+						!cxt->union_input)
 					{
 						df_reject(cxt, "receives rows from a %s with nothing to compute on them",
 								  df_plan_name(plan));
@@ -5765,6 +5858,45 @@ df_plan_contains(Plan *plan, Plan *target)
 		df_plan_contains(innerPlan(plan), target);
 }
 
+static void
+df_collect_producers(Plan *plan, List **producers)
+{
+	ListCell   *lc;
+
+	if (plan == NULL || IsA(plan, Motion) || IsA(plan, ShareInputScan))
+		return;
+	if (IsA(plan, Sequence))
+	{
+		Plan	   *body = llast(((Sequence *) plan)->subplans);
+
+		foreach(lc, ((Sequence *) plan)->subplans)
+			if (lfirst(lc) != body)
+				*producers = lappend(*producers, lfirst(lc));
+		df_collect_producers(body, producers);
+		return;
+	}
+	if (IsA(plan, SubqueryScan))
+		df_collect_producers(((SubqueryScan *) plan)->subplan, producers);
+	foreach(lc, df_append_plans(plan))
+		df_collect_producers(lfirst(lc), producers);
+	df_collect_producers(outerPlan(plan), producers);
+	df_collect_producers(innerPlan(plan), producers);
+}
+
+/*
+ * The Shared Scan producers that the Sequences of the slice part 'plan'
+ * DataFusion runs (df_check_slice) run first, in the order they run: what
+ * PostgreSQL still runs of it, before DataFusion starts (df_exec_prerun).
+ */
+List *
+df_slice_producers(Plan *plan)
+{
+	List	   *producers = NIL;
+
+	df_collect_producers(plan, &producers);
+	return producers;
+}
+
 /* ---------------------------------------------------------------------
  * M7b: which Gather Motions carry Arrow batches
  * ---------------------------------------------------------------------
@@ -6078,13 +6210,25 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
 	List	   *points = NIL;
 	ListCell   *lc;
 
-	if (df_slice_runs_in_datafusion(stmt, index, batches))
-		return true;
 	if (index < 0 || index >= stmt->numSlices || df_is_init_plan_slice(stmt, index))
 		return false;
 	sender = findSenderMotion(stmt, index);
 	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
-	df_find_attach(stmt, compute, batches, true, &points);
+	if (df_slice_runs_in_datafusion(stmt, index, batches))
+	{
+		/* PostgreSQL runs its Shared Scan producers, their inputs below (T2) */
+		List	   *producers = df_slice_producers(compute);
+		bool		produced = false;
+
+		foreach(lc, producers)
+			produced = produced || df_plan_contains(lfirst(lc), (Plan *) motion);
+		if (!produced)
+			return true;
+		foreach(lc, producers)
+			df_find_attach(stmt, lfirst(lc), batches, true, &points);
+	}
+	else
+		df_find_attach(stmt, compute, batches, true, &points);
 	foreach(lc, points)
 	{
 		DfAttach   *a = lfirst(lc);
@@ -6929,10 +7073,30 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 		appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
 						 "which the coordinator runs before the query\n", root->index);
 	else if (df_check_slice(stmt, root->root, root->is_sender, NULL, reason, sizeof(reason)))
-		appendStringInfo(out, "DataFusion: slice %d eligible%s\n", root->index,
+	{
+		Plan	   *compute = root->is_sender ? outerPlan(root->root) : root->root;
+		ListCell   *lc;
+		int			n = 0;
+
+		appendStringInfo(out, "DataFusion: slice %d eligible%s", root->index,
 						 root->is_sender &&
 						 df_motion_sends_batches(stmt, (Motion *) root->root) ?
 						 ", sends Arrow batches" : "");
+		/* T2: below the Shared Scan producers PostgreSQL runs first */
+		foreach(lc, df_slice_producers(compute))
+		{
+			ListCell   *pc;
+
+			foreach(pc, df_slice_attach_points(stmt, lfirst(lc), df_batch_motions(stmt)))
+			{
+				Plan	   *p = ((DfAttach *) lfirst(pc))->plan;
+
+				appendStringInfo(out, "%s %s", n++ > 0 ? "," : "; below its Shared Scan producers:",
+								 df_plan_name(p) ? df_plan_name(p) : "?");
+			}
+		}
+		appendStringInfoChar(out, '\n');
+	}
 	else
 	{
 		Plan	   *compute = root->is_sender ? outerPlan(root->root) : root->root;

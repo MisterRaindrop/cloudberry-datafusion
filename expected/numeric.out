@@ -1473,8 +1473,8 @@ SET optimizer = on;
 EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
 SELECT count(*), sum(c1.total) FROM ctr c1
 WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
-                                                    QUERY PLAN                                                    
-------------------------------------------------------------------------------------------------------------------
+                                                               QUERY PLAN                                                                
+-----------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Sequence
          ->  Shared Scan (share slice:id 1:0)
@@ -1504,7 +1504,7 @@ WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store)
                                                                            ->  Shared Scan (share slice:id 6:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate (above: plan node type 25 is not supported)
+ DataFusion: slice 1 eligible below the top: Aggregate (above: receives rows from a Redistribute Motion with nothing to compute on them)
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible
  DataFusion: slice 4 eligible, sends Arrow batches
