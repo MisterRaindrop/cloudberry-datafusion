@@ -6004,8 +6004,31 @@ df_try_translate(PlannedStmt *stmt, Plan *root, const DfTails *tails, bool tuple
 	return ok;
 }
 
+/*
+ * While df_batch_motions_of decides, each slice's verdict for its current
+ * set of batch Motions, which it forgets when the set changes: -1 unknown.
+ * A slice is asked once as the sender of its Motion and once per Motion
+ * it receives.
+ */
+static int8 *df_runs_memo = NULL;
+
+static bool df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches);
+
 static bool
 df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
+{
+	bool		runs;
+
+	if (df_runs_memo == NULL || index < 0 || index >= stmt->numSlices)
+		return df_slice_runs_in_datafusion_b(stmt, index, batches);
+	if (df_runs_memo[index] < 0)
+		df_runs_memo[index] = df_slice_runs_in_datafusion_b(stmt, index, batches) ? 1 : 0;
+	runs = df_runs_memo[index] == 1;
+	return runs;
+}
+
+static bool
+df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	char		reason[256];
 	DfTails		tails;
@@ -6250,23 +6273,35 @@ df_batch_motions_of(PlannedStmt *stmt)
 		if (m->motionID > 0 && m->motionID < stmt->numSlices && df_motion_batchable(m))
 			batches = bms_add_member(batches, m->motionID);
 	}
-	do
+	df_runs_memo = palloc(sizeof(int8) * Max(stmt->numSlices, 1));
+	memset(df_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
+	PG_TRY();
 	{
-		changed = false;
-		foreach(lc, motions)
+		do
 		{
-			Motion	   *m = (Motion *) lfirst(lc);
-
-			if (bms_is_member(m->motionID, batches) &&
-				!(df_slice_runs_in_datafusion(stmt, m->motionID, batches) &&
-				  df_slice_reads_batches(stmt, stmt->slices[m->motionID].parentIndex,
-										 m, batches)))
+			changed = false;
+			foreach(lc, motions)
 			{
-				batches = bms_del_member(batches, m->motionID);
-				changed = true;
+				Motion	   *m = (Motion *) lfirst(lc);
+
+				if (bms_is_member(m->motionID, batches) &&
+					!(df_slice_runs_in_datafusion(stmt, m->motionID, batches) &&
+					  df_slice_reads_batches(stmt, stmt->slices[m->motionID].parentIndex,
+											 m, batches)))
+				{
+					batches = bms_del_member(batches, m->motionID);
+					changed = true;
+					memset(df_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
+				}
 			}
-		}
-	} while (changed);
+		} while (changed);
+	}
+	PG_FINALLY();
+	{
+		pfree(df_runs_memo);
+		df_runs_memo = NULL;
+	}
+	PG_END_TRY();
 	return batches;
 }
 
@@ -6276,11 +6311,47 @@ df_batch_motions_of(PlannedStmt *stmt)
  * rows carries what its producer's input computes, and both ends must
  * see the same.
  */
+/*
+ * df_batch_motions' answer for the statement it last decided, and the
+ * settings it depends on besides the plan; forgotten at the start of each
+ * ExecutorStart and EXPLAIN (df_batch_motions_forget), which every caller
+ * runs within, so that a statement at a freed one's address is decided
+ * anew.  Deciding checks and translates each slice, more than once:
+ * TPC-DS Q14a under GPORCA took 100 to 600 ms per decision, which each
+ * process of the query made up to 13 times as it started.
+ */
+static struct
+{
+	bool		valid;
+	PlannedStmt *stmt;
+	bool		motion_batches;
+	int			mode;
+	int			collate_c;
+	int			ctype_c;
+	Bitmapset  *batches;		/* in TopMemoryContext */
+}			df_batches_cache;
+
+void
+df_batch_motions_forget(void)
+{
+	if (df_batches_cache.batches != NULL)
+		bms_free(df_batches_cache.batches);
+	memset(&df_batches_cache, 0, sizeof(df_batches_cache));
+}
+
 Bitmapset *
 df_batch_motions(PlannedStmt *stmt)
 {
 	PlannedStmt *volatile saved = df_numeric_stmt;
 	Bitmapset  *volatile batches = NULL;
+	MemoryContext oldcxt;
+
+	if (df_batches_cache.valid && df_batches_cache.stmt == stmt &&
+		df_batches_cache.motion_batches == df_motion_batches &&
+		df_batches_cache.mode == df_mode &&
+		df_batches_cache.collate_c == df_explain_collate_c &&
+		df_batches_cache.ctype_c == df_explain_ctype_c)
+		return df_batches_cache.batches;
 
 	df_numeric_stmt = stmt;
 	PG_TRY();
@@ -6292,7 +6363,17 @@ df_batch_motions(PlannedStmt *stmt)
 		df_numeric_stmt = saved;
 	}
 	PG_END_TRY();
-	return batches;
+	df_batch_motions_forget();
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	df_batches_cache.batches = bms_copy(batches);
+	MemoryContextSwitchTo(oldcxt);
+	df_batches_cache.stmt = stmt;
+	df_batches_cache.motion_batches = df_motion_batches;
+	df_batches_cache.mode = df_mode;
+	df_batches_cache.collate_c = df_explain_collate_c;
+	df_batches_cache.ctype_c = df_explain_ctype_c;
+	df_batches_cache.valid = true;
+	return df_batches_cache.batches;
 }
 
 /* Does 'motion' carry Arrow IPC batches instead of tuples? */

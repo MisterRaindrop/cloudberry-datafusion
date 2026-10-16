@@ -150,6 +150,7 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/* before the plan is dispatched */
 	df_sync_cluster_collation();
+	df_batch_motions_forget();
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -244,6 +245,7 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 	uint64		runs_before;
 
 	df_sync_cluster_collation();
+	df_batch_motions_forget();
 	if (prev_ExplainOneQuery)
 	{
 		prev_ExplainOneQuery(query, cursorOptions, into, es, queryString,

@@ -325,6 +325,17 @@ settings alone, so both ends agree.
   and our receiver rejects tuple chunks; each stream starts with a magic
   and the Motion's signature (its id and column types), which the receiver
   checks.  A mismatch can only fail the query, never be misread.
+- **Deciding.**  Which Motions carry batches is the largest set whose
+  slices all run given the rest, found by checking and translating each
+  slice until none drops out.  Each process now decides once per
+  statement, at ExecutorStart or EXPLAIN, and keeps each slice's verdict
+  while the set does not change; it used to decide again for every
+  question about the plan.  TPC-DS Q14a under GPORCA, 32 slices, spent
+  100 to 600 ms per decision and up to 13 decisions in each process as it
+  started: its EXPLAIN took 0.95 s with the checks (0.5 s without) and
+  takes 0.55 s, and the query 1.15 s and now 1.0 s; Q88 1.50 and 0.76 s,
+  Q9 1.12 and 0.52 s.  All 206 TPC-DS executions, DataFusion alone, took
+  72.0 s and now 69.3 s (medians of three runs).
 
 Over 30 million distributed rows with `gp_enable_multiphase_agg = off`, so
 that every row is gathered to the coordinator's aggregate, 3 DataFusion

@@ -354,6 +354,7 @@ extern void df_install_hooks(void);
 extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 						   DfTails *tails, char *reason, size_t reasonlen);
 extern List *df_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches);
+extern void df_batch_motions_forget(void);
 extern Plan *df_local_slice_root(QueryDesc *queryDesc, int *slice_index,
 								 bool *is_sender);
 extern void df_explain_slices(PlannedStmt *stmt, StringInfo out);
