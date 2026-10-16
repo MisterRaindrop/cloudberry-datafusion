@@ -26,6 +26,7 @@ use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int32Array, Int32Builder, StringArray,
     StringBuilder,
 };
+use datafusion::arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{Result, ScalarValue};
@@ -249,6 +250,57 @@ pub fn bpchar_trim(v: &str) -> &str {
         n -= 1;
     }
     unsafe { v.get_unchecked(..n) }
+}
+
+/// CP1: character(n) values that crossed a Motion without their trailing
+/// blanks, padded back to `n` characters, as the table holds them.  A value
+/// of `n` characters or more stays as it is.
+pub fn bpchar_pad(a: &StringArray, n: usize) -> Result<StringArray, PgError> {
+    let data = a.value_data();
+    let offsets = a.value_offsets();
+    // characters: the bytes that do not continue one (all, in ASCII)
+    let ascii = data.is_ascii();
+    let chars = |v: &[u8]| {
+        if ascii {
+            v.len()
+        } else {
+            v.iter().filter(|&&b| (b as i8) >= -0x40).count()
+        }
+    };
+    let value = |i: usize| &data[offsets[i] as usize..offsets[i + 1] as usize];
+    let mut total = 0usize;
+    for i in 0..a.len() {
+        if a.is_valid(i) {
+            let v = value(i);
+            total += v.len() + n.saturating_sub(chars(v));
+        }
+    }
+    if total > i32::MAX as usize {
+        return Err(PgError::new(
+            "54000",
+            "character values padded back beyond the size of a batch",
+        ));
+    }
+    let mut values = Vec::with_capacity(total);
+    let mut offs = Vec::with_capacity(a.len() + 1);
+    offs.push(0i32);
+    for i in 0..a.len() {
+        if a.is_valid(i) {
+            let v = value(i);
+            values.extend_from_slice(v);
+            values.resize(values.len() + n.saturating_sub(chars(v)), b' ');
+        }
+        offs.push(values.len() as i32);
+    }
+    // SAFETY: the offsets grow from 0 to the end of the values, and the
+    // values are UTF-8 characters followed by blanks
+    Ok(unsafe {
+        StringArray::new_unchecked(
+            OffsetBuffer::new_unchecked(ScalarBuffer::from(offs)),
+            Buffer::from_vec(values),
+            a.nulls().cloned(),
+        )
+    })
 }
 
 /// `bpchar_key(x)`: x without trailing blanks; a constant is trimmed here.
@@ -1012,5 +1064,27 @@ mod tests {
             out.iter().collect::<Vec<_>>(),
             vec![Some("x"), None, Some("中")]
         );
+    }
+
+    #[test]
+    fn character_values_are_padded_back_by_characters() {
+        let a = StringArray::from(vec![Some("ab"), None, Some(""), Some("é"), Some("abcdef")]);
+        let p = bpchar_pad(&a, 4).unwrap();
+        let v: Vec<Option<&str>> = p.iter().collect();
+        assert_eq!(
+            v,
+            vec![
+                Some("ab  "),
+                None,
+                Some("    "),
+                Some("é   "),
+                Some("abcdef")
+            ]
+        );
+        assert_eq!(p.value_data().len(), 4 + 4 + 5 + 6);
+        // what the sender trims, the receiver restores
+        let padded = StringArray::from(vec!["ab  ", "日本  ", "    "]);
+        let trimmed: StringArray = padded.iter().map(|v| v.map(bpchar_trim)).collect();
+        assert_eq!(bpchar_pad(&trimmed, 4).unwrap(), padded);
     }
 }

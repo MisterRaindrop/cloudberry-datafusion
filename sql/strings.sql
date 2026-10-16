@@ -270,6 +270,50 @@ SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_b
 SELECT count(DISTINCT a) FROM df_bgn;
 DROP TABLE df_bg5, df_bg10, df_bgn;
 
+-- Between slices, batches carry a table's character(n) values without
+-- their trailing blanks, and the receiver pads them back to n characters
+-- (not bytes: '中' is three).  Not a character(1), nor the values of an
+-- Append of character(5) and character(12), which keep their own padding.
+CREATE TABLE df_cp (id int, a char(5), c char(1), w char(12)) DISTRIBUTED BY (id);
+CREATE TABLE df_cp2 (k char(12), n int) DISTRIBUTED BY (n);
+INSERT INTO df_cp SELECT i, CASE WHEN i % 7 = 0 THEN NULL ELSE (ARRAY['x', 'xy', '中', 'x y', '', '中文 ab'])[1 + i % 6] END,
+  (ARRAY['p', ' ', 'q'])[1 + i % 3], (ARRAY['k1', 'k22', '日本', 'k 4', '', 'k1 '])[1 + i % 5]
+FROM generate_series(1, 20000) i;
+INSERT INTO df_cp2 SELECT (ARRAY['k1', 'k22', '日本', 'k 4', ''])[1 + i % 5], i % 3 FROM generate_series(1, 300) i;
+ANALYZE df_cp;
+ANALYZE df_cp2;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
+GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
+SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
+GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
+SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
+GROUP BY s ORDER BY s::text COLLATE "C";
+SET datafusion.mode = on;
+SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
+GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
+SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
+GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
+SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
+GROUP BY s ORDER BY s::text COLLATE "C";
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
+GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
+SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
+GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
+SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
+GROUP BY s ORDER BY s::text COLLATE "C";
+SET datafusion.mode = on;
+SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
+GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
+SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
+GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
+SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
+GROUP BY s ORDER BY s::text COLLATE "C";
+DROP TABLE df_cp, df_cp2;
+
 -- A slice sorting by the default collation still reads the batches of a
 -- split numeric sum (TPC-H Q1): every node runs the aggregate below the
 -- Sort in DataFusion, and the Sort too where the collation is C.

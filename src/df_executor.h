@@ -342,7 +342,9 @@ extern int	df_agg_group_index(Agg *agg, AttrNumber attno);
 extern int	df_grouping_value(List *cols, Bitmapset *set);
 extern bool df_motion_pg_state(Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
-extern uint64 df_motion_signature(Motion *motion);
+extern int	df_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno);
+extern int	df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos);
+extern uint64 df_motion_signature(PlannedStmt *stmt, Motion *motion);
 extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **tag);
 
 /* df_hooks.c */

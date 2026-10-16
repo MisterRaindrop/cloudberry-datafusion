@@ -1473,9 +1473,9 @@ df_exec_proc_node(PlanState *pstate)
 
 /* The head of a batch stream through 'motion': magic, then signature. */
 static void
-df_batch_head(uint8 *head, Motion *motion)
+df_batch_head(uint8 *head, PlannedStmt *stmt, Motion *motion)
 {
-	uint64		sig = df_motion_signature(motion);
+	uint64		sig = df_motion_signature(stmt, motion);
 
 	memcpy(head, DF_BATCH_MAGIC, 8);
 	memcpy(head + 8, &sig, 8);
@@ -1664,7 +1664,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			in->motion = (MotionState *) ps;
 			in->ipc = df_motion_sends_batches(queryDesc->plannedstmt, (Motion *) ps->plan);
 			if (in->ipc)
-				df_batch_head(in->rx_head, (Motion *) ps->plan);
+				df_batch_head(in->rx_head, queryDesc->plannedstmt, (Motion *) ps->plan);
 		}
 		else if (ps != NULL && IsA(ps, ShareInputScanState))
 			in->reader = ps;
@@ -1717,21 +1717,31 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	if (send)
 	{
 		Motion	   *motion = (Motion *) send->ps.plan;
+		StringInfoData json;
+		AttrNumber	r;
+		int			ntrim = 0;
 
 		x->send = send;
-		df_batch_head(x->tx_head, motion);
+		df_batch_head(x->tx_head, queryDesc->plannedstmt, motion);
 		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion chunks",
 											ALLOCSET_DEFAULT_SIZES);
+		initStringInfo(&json);
+		appendBinaryStringInfo(&json, x->spec.json, strlen(x->spec.json) - 1);
+
+		/* CP1: character(n) values go without their trailing blanks */
+		for (r = 1; r <= list_length(motion->plan.targetlist); r++)
+			if (df_motion_bpchar_pad(queryDesc->plannedstmt, motion, r) > 0)
+				appendStringInfo(&json, "%s%d", ntrim++ > 0 ? "," : ",\"trim\":[",
+								 df_motion_stream_column(motion, r));
+		if (ntrim > 0)
+			appendStringInfoChar(&json, ']');
 		x->send_nroutes = 1;
 		if (motion->motionType == MOTIONTYPE_HASH)
 		{
 			/* Route rows as the Motion's cdbhash would (nodeMotion.c). */
-			StringInfoData json;
 			int			i;
 
 			x->send_nroutes = send->numHashSegments * Max(send->parallel_workers, 1);
-			initStringInfo(&json);
-			appendBinaryStringInfo(&json, x->spec.json, strlen(x->spec.json) - 1);
 			appendStringInfoString(&json, ",\"route\":{\"kind\":\"hash\",\"keys\":[");
 			for (i = 0; i < list_length(motion->hashExprs); i++)
 			{
@@ -1745,10 +1755,11 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 								 i > 0 ? "," : "",
 								 df_motion_stream_column(motion, column + 1), tag);
 			}
-			appendStringInfo(&json, "],\"segments\":%d,\"workers\":%d}}",
+			appendStringInfo(&json, "],\"segments\":%d,\"workers\":%d}",
 							 send->numHashSegments, Max(send->parallel_workers, 1));
-			x->spec.json = json.data;
 		}
+		appendStringInfoChar(&json, '}');
+		x->spec.json = json.data;
 		x->head_sent_to = palloc0(sizeof(bool) * x->send_nroutes);
 	}
 	x->estate = estate;

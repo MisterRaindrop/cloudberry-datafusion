@@ -190,7 +190,7 @@ use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
 use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
-use crate::pgstr::{bpchar_key, PgLike, PgStrFn, StrFn};
+use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
 /// Rows per input batch the main thread pushes.
@@ -2441,9 +2441,35 @@ impl Query {
                                 .ok_or_else(|| internal("bad motion column".into()))
                         })
                         .collect::<Result<_, _>>()?;
+                    // CP1: the length to pad each column's character(n) values back to
+                    let pads: Vec<Option<usize>> = match inputs[j].get("motion_pad") {
+                        Some(p) => p
+                            .as_array()
+                            .filter(|p| p.len() == positions.len())
+                            .ok_or_else(|| internal("bad motion pads".into()))?
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| match v.as_i64() {
+                                Some(n)
+                                    if n > 0 && schema.field(i).data_type() == &DataType::Utf8 =>
+                                {
+                                    Ok(Some(n as usize))
+                                }
+                                Some(n) if n <= 0 => Ok(None),
+                                _ => Err(internal("bad motion pad".into())),
+                            })
+                            .collect::<Result<_, _>>()?,
+                        None => vec![None; positions.len()],
+                    };
                     let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
                     let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
-                    decoders.push(handle.spawn(decode_ipc(rx, in_tx, schema.clone(), positions)));
+                    decoders.push(handle.spawn(decode_ipc(
+                        rx,
+                        in_tx,
+                        schema.clone(),
+                        positions,
+                        pads,
+                    )));
                     let partition = ChannelPartition {
                         schema: schema.clone(),
                         rx: Mutex::new(Some(in_rx)),
@@ -2500,12 +2526,31 @@ impl Query {
             .as_array()
             .cloned()
             .unwrap_or_default();
+        // CP1: character(n) outputs sent without their trailing blanks
+        let trim: Vec<usize> = match spec.get("trim") {
+            Some(t) if ipc_output => t
+                .as_array()
+                .ok_or_else(|| internal("bad trim columns".into()))?
+                .iter()
+                .map(|v| index(v).map_err(internal))
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err(internal("trimming needs IPC output".into())),
+            None => Vec::new(),
+        };
         let mut out_types = Vec::with_capacity(outputs.len());
         let mut out_exprs = Vec::with_capacity(outputs.len());
         for (i, o) in outputs.iter().enumerate() {
             let ty = PgType::parse(o.get("type").and_then(Value::as_str).unwrap_or(""))
                 .map_err(internal)?;
             let e = expr(field(o, "expr").map_err(internal)?).map_err(internal)?;
+            let e = if trim.contains(&i) {
+                if ty != PgType::Bpchar {
+                    return Err(internal(format!("trimmed output {i} is not character")));
+                }
+                bpchar_key(e)
+            } else {
+                e
+            };
             out_exprs.push(
                 Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), ty.arrow()))
                     .alias(format!("o{i}")),
@@ -3004,12 +3049,14 @@ impl Drop for Query {
 
 /// Decode the Arrow IPC streams arriving from a Motion, one per route, and
 /// feed their rows to the plan: input column i is the stream's column
-/// `positions[i]`.  A malformed stream fails the plan.
+/// `positions[i]`, its character values padded back to `pads[i]`
+/// characters if given (CP1).  A malformed stream fails the plan.
 async fn decode_ipc(
     mut rx: IpcReceiver,
     tx: BatchSender,
     schema: SchemaRef,
     positions: Vec<usize>,
+    pads: Vec<Option<usize>>,
 ) {
     let mut decoders: HashMap<i32, StreamDecoder> = HashMap::new();
     let fail = |e: String| {
@@ -3030,12 +3077,19 @@ async fn decode_ipc(
                 }
             };
             let n = batch.num_rows();
-            let mut arrays = Vec::with_capacity(positions.len());
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(positions.len());
             for (i, &k) in positions.iter().enumerate() {
                 match batch.columns().get(k) {
-                    Some(a) if a.data_type() == schema.field(i).data_type() => {
-                        arrays.push(a.clone())
-                    }
+                    Some(a) if a.data_type() == schema.field(i).data_type() => match pads[i] {
+                        Some(len) => match bpchar_pad(a.as_string::<i32>(), len) {
+                            Ok(p) => arrays.push(Arc::new(p)),
+                            Err(e) => {
+                                let _ = tx.send(fail(e.to_string())).await;
+                                return;
+                            }
+                        },
+                        None => arrays.push(a.clone()),
+                    },
                     _ => {
                         let _ = tx
                             .send(fail(format!("column {k} is missing or has another type")))
@@ -3564,6 +3618,103 @@ mod tests {
         }
         // 4 rows (one NULL): count_merge adds up the non-NULL values 10+20+30.
         assert_eq!(row, vec![60, 60, 4]);
+    }
+
+    #[test]
+    fn character_values_cross_motions_without_blanks() {
+        // CP1: character(6) values leave without their trailing blanks and
+        // come back padded to 6 characters.
+        runtime::init(2).unwrap();
+        let values: Vec<Option<&str>> = [
+            Some("ab    "),
+            None,
+            Some("      "),
+            Some("中文    "),
+            Some("a b c "),
+        ]
+        .repeat(200);
+        let mut bytes = Vec::new();
+        let mut offsets = vec![0i32];
+        let mut nulls = Vec::new();
+        for v in &values {
+            bytes.extend_from_slice(v.unwrap_or("").as_bytes());
+            offsets.push(bytes.len() as i32);
+            nulls.push(v.is_none() as u8);
+        }
+        let dir = std::env::temp_dir();
+        let send = |trim: &str| {
+            let spec = format!(
+                r#"{{"scan":{{"columns":[{{"type":"bpchar"}}]}},"filter":null,"aggregate":null,
+                "having":null,"output":[{{"expr":{{"col":0}},"type":"bpchar"}}]{trim}}}"#
+            );
+            let mut q = Query::start_with(
+                &spec,
+                2,
+                64 << 20,
+                dir.to_str().unwrap(),
+                Source::Pushed,
+                true,
+            )
+            .unwrap();
+            let col = RawColumn {
+                values: bytes.as_ptr(),
+                nulls: nulls.as_ptr(),
+                offsets: offsets.as_ptr(),
+            };
+            while !unsafe { q.push(&[col], values.len()) }.unwrap() {}
+            q.finish_input();
+            let mut out = Vec::new();
+            loop {
+                match q.poll(Duration::from_millis(50)) {
+                    Poll::Bytes(_) => out.extend_from_slice(q.output_bytes()),
+                    Poll::Pending => {}
+                    Poll::Done => return out,
+                    Poll::Batch(_) => panic!("batch instead of IPC bytes"),
+                    Poll::Failed(e) => panic!("{e:?}"),
+                    Poll::Panicked(m) => panic!("{m}"),
+                }
+            }
+        };
+        let padded = send("");
+        let trimmed = send(r#","trim":[0]"#);
+        assert!(
+            trimmed.len() < padded.len(),
+            "{} vs {}",
+            trimmed.len(),
+            padded.len()
+        );
+        let recv = r#"{"scan":{"columns":[{"type":"bpchar"}],"motion_columns":[0],"motion_pad":[6]},
+            "filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"bpchar"}]}"#;
+        let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false)
+            .unwrap();
+        while !q.push_ipc(0, &[&trimmed[..]]).unwrap() {}
+        q.finish_input();
+        let mut got = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(n) => {
+                    let c = q.output_column(0).unwrap();
+                    for r in 0..n {
+                        if unsafe { *c.nulls.add(r) } != 0 {
+                            got.push(None);
+                            continue;
+                        }
+                        let (a, b) =
+                            unsafe { (*c.offsets.add(r) as usize, *c.offsets.add(r + 1) as usize) };
+                        let s = unsafe { std::slice::from_raw_parts(c.values.add(a), b - a) };
+                        got.push(Some(String::from_utf8(s.to_vec()).unwrap()));
+                    }
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
+            }
+        }
+        let want: Vec<Option<String>> = values.iter().map(|v| v.map(String::from)).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

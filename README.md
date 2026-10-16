@@ -900,6 +900,17 @@ TPC-DS item columns (Q22's body, GPORCA's two-stage plan) took
 0.49 s and 2.52 CPU-seconds, against 0.70 s and 4.47 before and 0.74 s
 and 3.47.
 
+Such a column crosses a batch Motion without its trailing blanks (CP1),
+most of the bytes of a wide `char(n)`: the sender cuts them as
+`pg_bpchar_key` does (a Redistribute hashes the same value either way),
+and the receiver pads each value back to n characters, not bytes, so
+it arrives as stored.  Both ends find n from the Motion itself, and it
+is part of the Motion's signature, so a disagreement fails instead of
+misreading.  A `char(1)` is sent as it is.  Over TPC-DS at scale factor
+1 (medians of three runs, both planners), DataFusion took 79.2 s
+against 83.3 s before; Q67 under GPORCA 1.42 s against 1.97, Q22 0.60 s
+against 0.82.
+
 ### numeric results of integer aggregates
 
 `sum(int8)` and `avg` of `int2`, `int4` and `int8` return numeric (N1).

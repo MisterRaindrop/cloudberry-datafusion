@@ -6648,12 +6648,61 @@ df_motion_stream_column(Motion *motion, AttrNumber resno)
 }
 
 /*
+ * CP1: the length n of column 'resno' of batch Motion 'motion' when its
+ * values are a table's character(n), each padded to n characters
+ * (df_bpchar_length), or -1.  The sender sends them without their trailing
+ * blanks, most of the bytes of a wide character(n), and the receiver pads
+ * them back to n characters.  A character(1) has no blanks to save.
+ */
+int
+df_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
+{
+	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
+	PlannedStmt *volatile saved = df_numeric_stmt;
+	volatile int n = -1;
+
+	if (tle == NULL || exprType((Node *) tle->expr) != BPCHAROID)
+		return -1;
+	/* a Shared Scan's reader leads to its producer */
+	df_numeric_stmt = stmt;
+	PG_TRY();
+	{
+		n = df_bpchar_length((Plan *) motion, (Node *) tle->expr);
+	}
+	PG_FINALLY();
+	{
+		df_numeric_stmt = saved;
+	}
+	PG_END_TRY();
+	return n > 1 ? n : -1;
+}
+
+/* CP1: df_motion_bpchar_pad of the column at stream column 'pos'. */
+int
+df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos)
+{
+	int			start = 0;
+	AttrNumber	r;
+
+	for (r = 1; r <= list_length(motion->plan.targetlist); r++)
+	{
+		int			width = df_motion_state_columns(motion, r);
+
+		if (start == pos)
+			return width > 0 ? -1 : df_motion_bpchar_pad(stmt, motion, r);
+		start += Max(width, 1);
+	}
+	return -1;
+}
+
+/*
  * What both ends of a batch Motion must agree on, hashed (FNV-1a): the
- * Motion and the types of the columns it carries.  The sender puts it at
- * the start of each stream and the receiver checks it.
+ * Motion, the types of the columns it carries, and the length the
+ * character(n) ones are padded back to (CP1).  The sender puts it at the
+ * start of each stream and the receiver checks it.
  */
 uint64
-df_motion_signature(Motion *motion)
+df_motion_signature(PlannedStmt *stmt, Motion *motion)
 {
 	uint64		h = UINT64CONST(14695981039346656037);
 	ListCell   *lc;
@@ -6662,7 +6711,12 @@ df_motion_signature(Motion *motion)
 	DF_MIX(motion->motionID);
 	DF_MIX(list_length(motion->plan.targetlist));
 	foreach(lc, motion->plan.targetlist)
-		DF_MIX(exprType((Node *) lfirst_node(TargetEntry, lc)->expr));
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		DF_MIX(exprType((Node *) tle->expr));
+		DF_MIX(df_motion_bpchar_pad(stmt, motion, tle->resno));
+	}
 #undef DF_MIX
 	return h;
 }

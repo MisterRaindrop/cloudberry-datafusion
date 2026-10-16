@@ -3566,6 +3566,26 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 				foreach(lt, in->attnos)
 					appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "", lfirst_int(lt) - 1);
 				appendStringInfoChar(&json, ']');
+
+				/*
+				 * CP1: the length each column's character(n) values are
+				 * padded back to (they come without their trailing blanks
+				 * in batches), -1 for the others
+				 */
+				k = 0;
+				foreach(lt, in->attnos)
+					if (df_motion_stream_pad(df_numeric_stmt, (Motion *) in->leaf,
+											 lfirst_int(lt) - 1) > 0)
+						break;
+				if (lt != NULL)
+				{
+					appendStringInfoString(&json, ",\"motion_pad\":[");
+					foreach(lt, in->attnos)
+						appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "",
+										 df_motion_stream_pad(df_numeric_stmt, (Motion *) in->leaf,
+															  lfirst_int(lt) - 1));
+					appendStringInfoChar(&json, ']');
+				}
 			}
 			appendStringInfoChar(&json, '}');
 		}
