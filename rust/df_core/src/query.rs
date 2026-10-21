@@ -1184,6 +1184,9 @@ pub struct PaxScan {
     shared: Arc<PaxShared>,
     /// most groups decoded at once for the query (0: no limit)
     max_readers: usize,
+    /// true once the scan has ended (`close`); held shared by a partition
+    /// calling into the scan, exclusively to end it
+    ended: std::sync::RwLock<bool>,
 }
 
 /// What the PAX scans of one query share: the account their decoding
@@ -1279,7 +1282,29 @@ impl PaxScan {
             pending: AtomicUsize::new(0),
             shared: Arc::new(PaxShared::new(0)),
             max_readers: 0,
+            ended: std::sync::RwLock::new(false),
         }
+    }
+
+    /// End the scan, once, after the calls into it under way; partitions
+    /// then find nothing left.  The query does this on the main thread
+    /// as it is released: the scan would otherwise end when its last
+    /// partition lets it go, on a worker after the query has stopped,
+    /// past the transaction's check for PAX's resources ("pax resource
+    /// leaks"), whenever a plan stops reading before the scan's end.
+    pub fn close(&self) {
+        let mut ended = self.ended.write().unwrap_or_else(|e| e.into_inner());
+        if !*ended {
+            *ended = true;
+            // SAFETY: no partition is calling into the scan (`ended` is held).
+            unsafe { (self.end)(self.scan) }
+        }
+    }
+
+    /// Has the scan ended?  A partition about to call into it holds the
+    /// guard meanwhile.
+    fn ended(&self) -> std::sync::RwLockReadGuard<'_, bool> {
+        self.ended.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// At most `n` groups of the query's PAX scans decoded at once (0: no
@@ -1416,8 +1441,7 @@ enum PaxPiece {
 
 impl Drop for PaxScan {
     fn drop(&mut self) {
-        // SAFETY: no partition is reading any more (they hold an Arc).
-        unsafe { (self.end)(self.scan) }
+        self.close();
     }
 }
 
@@ -1527,7 +1551,14 @@ impl PartitionStream for PaxPartition {
                     if let Some(batch) = scan.pop_ready() {
                         return Some((Ok(batch), (scan, false)));
                     }
-                    let (index, first, count) = match scan.take() {
+                    let piece = {
+                        let ended = scan.ended();
+                        if *ended {
+                            return None;
+                        }
+                        scan.take()
+                    };
+                    let (index, first, count) = match piece {
                         Ok(PaxPiece::Read(index, first, count)) => (index, first, count),
                         Ok(PaxPiece::Wait) => {
                             notified.await;
@@ -1546,19 +1577,31 @@ impl PartitionStream for PaxPartition {
                         error: None,
                     };
                     let mut err = vec![0 as c_char; 1024];
-                    // SAFETY: see PaxScan; ctx outlives the call.
-                    let rc = unsafe {
-                        (scan.read)(
-                            scan.scan,
-                            index as i32,
-                            first,
-                            count,
-                            pax_emit,
-                            pax_account,
-                            &mut ctx as *mut EmitContext as *mut c_void,
-                            err.as_mut_ptr(),
-                            err.len(),
-                        )
+                    let rc = {
+                        let ended = scan.ended();
+                        if *ended {
+                            None
+                        } else {
+                            // SAFETY: see PaxScan; ctx outlives the call.
+                            Some(unsafe {
+                                (scan.read)(
+                                    scan.scan,
+                                    index as i32,
+                                    first,
+                                    count,
+                                    pax_emit,
+                                    pax_account,
+                                    &mut ctx as *mut EmitContext as *mut c_void,
+                                    err.as_mut_ptr(),
+                                    err.len(),
+                                )
+                            })
+                        }
+                    };
+                    let Some(rc) = rc else {
+                        // the query was released meanwhile
+                        scan.done_reading();
+                        return None;
                     };
                     if rc != 0 {
                         let msg = ctx.error.take().unwrap_or_else(|| {
@@ -2286,6 +2329,8 @@ pub struct Query {
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
     pax_shared: Option<Arc<PaxShared>>,
+    /// the PAX scans of the query, ended as it is released (`PaxScan::close`)
+    pax_scans: Vec<Arc<PaxScan>>,
 }
 
 /// Memory and spill figures of a query, for EXPLAIN ANALYZE.
@@ -2426,6 +2471,7 @@ impl Query {
         let mut ipc_tx = Vec::with_capacity(sources.len());
         let mut decoders = Vec::new();
         let mut tables = Vec::with_capacity(sources.len());
+        let mut pax_scans = Vec::new();
         for (j, source) in sources.into_iter().enumerate() {
             let schema = in_schemas[j].clone();
             let (tx, itx, table) = match source {
@@ -2499,6 +2545,7 @@ impl Query {
                         scan.shared = shared.clone();
                     }
                     let scan = Arc::new(scan);
+                    pax_scans.push(scan.clone());
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
                         .map(|_| {
                             Arc::new(PaxPartition {
@@ -2761,6 +2808,7 @@ impl Query {
             physical: physical_slot,
             partitions,
             pax_shared,
+            pax_scans,
         })
     }
 
@@ -3043,6 +3091,9 @@ impl Drop for Query {
         }
         if let Some(t) = self.task.take() {
             t.abort();
+        }
+        for scan in &self.pax_scans {
+            scan.close();
         }
     }
 }
@@ -4026,15 +4077,49 @@ mod tests {
         }
         let peak = q.stats().pax_decode_peak;
         drop(q);
-        // The scan is released once the plan is gone.
-        for _ in 0..100 {
-            if fake.ended.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // The scan ends as the query is released.
         assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
         (row, peak)
+    }
+
+    /// A query released while a partition is inside its scan ends the scan
+    /// as it is released, once that call returns, and only then: not later
+    /// on a worker, once the aborted plan lets the scan go.
+    #[test]
+    fn pax_scan_ends_as_query_is_released() {
+        runtime::init(2).unwrap();
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let fake = FakeScan {
+            gate: Some(FakeGate {
+                entered: Mutex::new(entered_tx),
+                release: Mutex::new(release_rx),
+            }),
+            ..Default::default()
+        };
+        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+            "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
+            "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
+        let ptr = &fake as *const FakeScan as *mut c_void;
+        let scan = PaxScan::new(ptr, 4, fake_read, fake_end, fake_groups);
+        let dir = std::env::temp_dir();
+        // one partition: the gate holds its worker, the other runs the timer
+        let q =
+            Query::start_with(spec, 1, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan), false)
+                .unwrap();
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("no partition entered the scan");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            // the partition inside the scan returns
+            drop(release);
+        });
+        let t = std::time::Instant::now();
+        drop(q);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+        assert!(t.elapsed() >= Duration::from_millis(150), "ended before the call returned");
+        releaser.join().unwrap();
     }
 
     #[test]

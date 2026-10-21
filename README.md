@@ -235,6 +235,14 @@ micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
 and filtered on one thread, slower than through the table AM; on one
 segment it now takes 23 ms against 32 ms through the table AM.
 
+The query ends its scans on the main thread as it is released, once any
+partition's call into a scan has returned; partitions then find nothing
+left.  The scan used to end when its last partition let it go: where a
+plan stopped reading before the scan's end, that was on a worker, after
+the query had been released and past the transaction's check of PAX's
+resources ("WARNING: pax resource leaks"; TPC-DS Q8 under GPORCA with 3
+partitions or fewer, every time).
+
 Like PAX's own scan, it skips micro-partitions and then groups whose
 min/max statistics (`minmax_columns`) rule out the scan's qual, honouring
 `pax.enable_sparse_filter`.  That evaluates operators through fmgr, so it
