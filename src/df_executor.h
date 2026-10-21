@@ -306,6 +306,7 @@ typedef struct DfPaxReader
 
 extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */
 extern int	df_pax_max_decoders;	/* GUC datafusion.pax_max_decoders */
+extern int	df_slice_partitions;	/* GUC datafusion.slice_partitions */
 extern const DfPaxReader *df_pax_reader_get(void);
 extern uint64 df_pax_direct_scans;	/* scans read through it */
 extern bool df_last_run_pax;	/* df_last_run read PAX directly */

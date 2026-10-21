@@ -70,6 +70,23 @@ SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
 EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF)
 SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
 
+-- Each query runs in 8 * worker threads / (slices running together *
+-- primaries on the host) partitions, at least 1: on the coordinator, a
+-- primary of its host with the 3 segments, of the 2 slices of a plain
+-- aggregate's plan, 2 of the 2 threads; of the 3 of a join's, 1.
+-- datafusion.slice_partitions fixes them, up to the threads.
+SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
+SELECT partitions FROM datafusion_debug_last_run();
+SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
+SELECT partitions FROM datafusion_debug_last_run();
+SET datafusion.slice_partitions = 8;
+SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
+SELECT partitions FROM datafusion_debug_last_run();
+SET datafusion.slice_partitions = 1;
+SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
+SELECT partitions FROM datafusion_debug_last_run();
+RESET datafusion.slice_partitions;
+
 -- An error on a segment carries PostgreSQL's SQLSTATE and message.
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
 \set VERBOSITY sqlstate

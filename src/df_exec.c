@@ -70,8 +70,11 @@
 #include "postgres.h"
 
 #include "access/tableam.h"
+#include "cdb/cdbgang.h"
 #include "cdb/cdbinterconnect.h"
 #include "cdb/cdbmotion.h"
+#include "cdb/cdbutil.h"
+#include "cdb/cdbvars.h"
 #include "cdb/ml_ipc.h"
 #include "cdb/tupchunk.h"
 #include "cdb/tupchunklist.h"
@@ -122,6 +125,7 @@ uint64		df_runs_completed = 0;
 DfQueryStats df_last_run;
 bool		df_pax_direct_read = true;
 int			df_pax_max_decoders = 0;
+int			df_slice_partitions = 0;
 uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
 DfPaxScanInfo df_last_pax_scan;
@@ -204,6 +208,8 @@ typedef struct DfExec
 	DfSliceSpec spec;
 	int64		memory_limit;	/* operator memory budget, bytes */
 	int64		headroom;		/* vmem lease ahead of the heap, bytes */
+	int			slices_together;	/* slices of the plan running with ours */
+	int			host_segments;	/* primary segments on this host */
 
 	DfQuery    *query;			/* NULL until the first row is requested */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
@@ -739,6 +745,82 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, DfPaxInput
 	return true;
 }
 
+/* The top slice of slice 'index''s tree (parentIndex -1). */
+static int
+df_slice_tree_root(PlannedStmt *stmt, int index)
+{
+	int			steps = 0;
+
+	while (stmt->slices[index].parentIndex >= 0 &&
+		   stmt->slices[index].parentIndex < stmt->numSlices &&
+		   steps++ < stmt->numSlices)
+		index = stmt->slices[index].parentIndex;
+	return index;
+}
+
+/*
+ * The slices of 'stmt' that run while slice 'index' does: those of its
+ * slice tree.  An init plan's slices form a tree of their own, run before
+ * the main plan's.
+ */
+static int
+df_slices_together(PlannedStmt *stmt, int index)
+{
+	int			root;
+	int			n = 0;
+	int			i;
+
+	if (stmt == NULL || index < 0 || index >= stmt->numSlices)
+		return 1;
+	root = df_slice_tree_root(stmt, index);
+	for (i = 0; i < stmt->numSlices; i++)
+		if (df_slice_tree_root(stmt, i) == root)
+			n++;
+	return Max(n, 1);
+}
+
+/*
+ * Primaries on this host, from gp_segment_configuration, the coordinator's
+ * among them: a QE gets the count from the coordinator as it starts
+ * (gpqeid), the coordinator looks its own host up.  At least 1.  Counts the
+ * roles in effect, so a host that took over its mirrors' primaries counts
+ * them.
+ */
+static int
+df_host_segments(void)
+{
+	int			n = host_primary_segment_count;
+
+	if (Gp_role == GP_ROLE_DISPATCH)
+	{
+		CdbComponentDatabaseInfo *qd = cdbcomponent_getComponentInfo(MASTER_CONTENT_ID);
+
+		n = qd ? qd->hostPrimaryCount : 0;
+	}
+	return Max(n, 1);
+}
+
+/*
+ * Partitions of a query, out of 'workers' threads, while 'slices' slices of
+ * the plan run together in each of 'segments' primaries on the host:
+ * datafusion.slice_partitions, else 8 * workers / (slices * segments), at
+ * least 1, at most 'workers'.  Every slice that took a partition per thread
+ * made the slices of a plan of many crowd the host's cores: TPC-DS at scale
+ * factor 1, 3 segments on 10 cores, took 100 s with 10 partitions, 89 s
+ * with 1 and 88 s with 2; plans of more than 10 slices ran fastest with 1,
+ * of 5 to 10 with 2, of fewer with any (4 primaries there, with the
+ * coordinator's).  Counting them keeps a host of one segment busy and one
+ * of many from crowding more.
+ */
+static int
+df_query_partitions(int workers, int slices, int segments)
+{
+	int			n = df_slice_partitions > 0 ? df_slice_partitions :
+		8 * workers / (Max(slices, 1) * Max(segments, 1));
+
+	return Max(Min(n, workers), 1);
+}
+
 static void
 df_exec_begin(DfExec *x)
 {
@@ -781,7 +863,9 @@ df_exec_begin(DfExec *x)
 		}
 	}
 	/* From here on the query owns the PAX scans, even if this fails. */
-	status = df_ffi_query_start(x->spec.json, (uint32_t) workers,
+	status = df_ffi_query_start(x->spec.json,
+								(uint32_t) df_query_partitions(workers, x->slices_together,
+															  x->host_segments),
 								(uint64_t) x->memory_limit, df_spill_dir(),
 								df_query_flags(x), (uint32_t) x->ninputs, df_ipc_inputs(x),
 								pax, reader ? reader->read : NULL,
@@ -1824,6 +1908,9 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	x->estate = estate;
 	x->memory_limit = df_slice_memory(root);
 	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);
+	x->slices_together = df_slices_together(queryDesc->plannedstmt,
+											LocallyExecutingSliceIndex(estate));
+	x->host_segments = df_host_segments();
 
 	x->outcols = palloc0(sizeof(DfColumn) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);

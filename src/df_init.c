@@ -121,6 +121,18 @@ _PG_init(void)
 							GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("datafusion.slice_partitions",
+							"Partitions each DataFusion query of a slice runs in.",
+							"0 picks them by the slices running together and the "
+							"primaries on the host: eight times the worker "
+							"threads over the product, at least 1.  At most the "
+							"worker threads.",
+							&df_slice_partitions,
+							0, 0, 1024,
+							PGC_USERSET,
+							GUC_GPDB_NEED_SYNC,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("datafusion.motion_batches",
 							 "Experimental: send Arrow batches through Gather Motions between DataFusion slices.",
 							 "When both the sending and the receiving slice of a Gather Motion run "

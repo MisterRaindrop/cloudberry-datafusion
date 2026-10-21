@@ -26,7 +26,15 @@ as an ordinary `ERROR` without taking the backend down.  Nothing executes
 queries yet.
 
 `datafusion.worker_threads` sets the runtime size (0 = one thread per CPU).
-It takes effect when a backend first uses DataFusion.
+It takes effect when a backend first uses DataFusion.  Each query of a
+slice runs in `datafusion.slice_partitions` partitions; 0, the default,
+gives it eight times the threads over the slices of its plan that run
+together (its slice tree: an init plan's run apart) times the primaries on
+its host (segments and coordinator, as `gp_segment_configuration` has
+them), at least 1 and at most the threads.  The setting is the same on
+every segment (the coordinator passes it to them), so the default is what
+follows a host's own segment count where hosts differ, or where one has
+taken over its mirrors' primaries.
 
 Milestone M2 adds the executor and EXPLAIN hooks.  `datafusion.mode` is
 `off` (default), `explain` or `on`.  With `explain` or `on`, text-format
@@ -79,8 +87,16 @@ PostgreSQL semantics are kept where DataFusion differs:
 Known differences and limits:
 
 - `datafusion.worker_threads` defaults to one thread per CPU in every
-  backend, so several QEs on one host oversubscribe it; set it to cores
-  divided by segments per host until the default does that.
+  backend, and a query took a partition per thread, so the slices of a
+  plan of many crowded the host's cores.  The partitions now follow the
+  slices running together (`datafusion.slice_partitions`): over TPC-DS at
+  scale factor 1, 3 segments on 10 cores, DataFusion took 99.8 s and now
+  89.7 s (medians of three runs, both planners, on a busy host; 87.7 s
+  and 76.9 s in an earlier run); plans of more than 20 slices 28.1 s and
+  23.5 s, of 11 to 20 34.2 s and 30.4 s, of up to 4 about the same.  The
+  rule also divides by the primaries on the host, which the coordinator
+  tells each QE as it starts, so a host of one segment keeps its cores
+  busy and one of many does not crowd them more.
 - With GPORCA, `HAVING` lands in a separate Result node, which does not
   qualify yet; the PostgreSQL planner puts it in the aggregate.
 - A sorted Gather Motion (with a Sort below it, chosen for example for a

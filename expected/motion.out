@@ -190,6 +190,62 @@ SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
  DataFusion: 2 partitions, memory limit 32768 kB, peak 129 kB, spilled 0 kB in 0 files
 (9 rows)
 
+-- Each query runs in 8 * worker threads / (slices running together *
+-- primaries on the host) partitions, at least 1: on the coordinator, a
+-- primary of its host with the 3 segments, of the 2 slices of a plain
+-- aggregate's plan, 2 of the 2 threads; of the 3 of a join's, 1.
+-- datafusion.slice_partitions fixes them, up to the threads.
+SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
+ count  |    sum     
+--------+------------
+ 100000 | 9997650000
+(1 row)
+
+SELECT partitions FROM datafusion_debug_last_run();
+ partitions 
+------------
+          2
+(1 row)
+
+SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
+ count  
+--------
+ 198000
+(1 row)
+
+SELECT partitions FROM datafusion_debug_last_run();
+ partitions 
+------------
+          1
+(1 row)
+
+SET datafusion.slice_partitions = 8;
+SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
+ count  
+--------
+ 198000
+(1 row)
+
+SELECT partitions FROM datafusion_debug_last_run();
+ partitions 
+------------
+          2
+(1 row)
+
+SET datafusion.slice_partitions = 1;
+SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
+ count  |    sum     
+--------+------------
+ 100000 | 9997650000
+(1 row)
+
+SELECT partitions FROM datafusion_debug_last_run();
+ partitions 
+------------
+          1
+(1 row)
+
+RESET datafusion.slice_partitions;
 -- An error on a segment carries PostgreSQL's SQLSTATE and message.
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
 ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=89058)
