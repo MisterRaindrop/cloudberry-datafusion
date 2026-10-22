@@ -832,6 +832,49 @@ df_any_call(Var *var)
 }
 
 /*
+ * DN1: the display scale of numeric column 'col' of an Agg's child that it
+ * groups by, whose values have display scales of their own, as the call
+ * max(display scale) of the Agg (df_emit_agg_calls).  Equal values make
+ * one group; PostgreSQL keeps the first row's display scale, of an order
+ * the plan does not fix, and this is one of them.
+ */
+static Aggref *
+df_key_scale_call(AttrNumber col)
+{
+	Aggref	   *call = makeNode(Aggref);
+
+	call->aggfnoid = InvalidOid;
+	call->aggtype = INT4OID;
+	call->aggsplit = AGGSPLIT_SIMPLE;
+	call->aggargtypes = list_make1_oid(NUMERICOID);
+	call->args = list_make1(makeTargetEntry((Expr *) makeVar(OUTER_VAR, col, NUMERICOID, -1,
+															 InvalidOid, 0),
+											1, NULL, false));
+	call->location = -1;
+	return call;
+}
+
+/* DN1: is 'col' of Agg 'agg''s child a key it groups by, of such scales? */
+static bool
+df_key_scale_needed(Agg *agg, AttrNumber col)
+{
+	DfAggGroups g;
+	TargetEntry *tle = get_tle_by_resno(outerPlan(agg)->targetlist, col);
+	int			p,
+				s,
+				k;
+
+	if (tle == NULL || exprType((Node *) tle->expr) != NUMERICOID ||
+		!df_numeric_dyn(outerPlan(agg), (Node *) tle->expr, &p, &s))
+		return false;
+	df_agg_groups(agg, &g);
+	for (k = 0; k < g.ncols; k++)
+		if (g.cols[k] == col)
+			return true;
+	return false;
+}
+
+/*
  * RI1: a column of b->agg's child it does not group by.  The planner puts
  * one there only where the groups determine it: a column of a table
  * grouped by its key, or of a row whose copies a grouping by RowIdExpr
@@ -1030,8 +1073,11 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 						 ((Scan *) b->ctx)->scanrelid == var->varno)
 					df_emit_dscale_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan,
 											 var->varattno);
+				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR &&
+						 df_key_scale_needed(b->agg, var->varattno))
+					df_emit_call_ref(b, out, df_key_scale_call(var->varattno), "key_scale");
 				else
-					/* a grouping key or a column the groups determine */
+					/* a column the groups determine */
 					df_fail(b, "the display scale of a column");
 				return;
 			}
@@ -2313,6 +2359,19 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						na->aggfns = lappend(na->aggfns, "mixed_scale");
 					}
 				}
+				/* DN1: the display scales of its keys of scales of their own */
+				{
+					DfAggGroups g;
+					int			k;
+
+					df_agg_groups(agg, &g);
+					for (k = 0; k < g.ncols; k++)
+						if (df_key_scale_needed(agg, g.cols[k]))
+						{
+							na->aggrefs = lappend(na->aggrefs, df_key_scale_call(g.cols[k]));
+							na->aggfns = lappend(na->aggfns, "key_scale");
+						}
+				}
 				/* RI1: the columns it does not group by, as any() */
 				ungrouped.agg = agg;
 				ungrouped.vars = NIL;
@@ -2809,6 +2868,16 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			df_emit_column(b, aggs, df_input_of(b, child), pos + (count || mixed ? 2 : 1),
 						   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
 						   count || mixed ? 0 : df_scale_of((Plan *) aggnode, arg));
+			appendStringInfoChar(aggs, '}');
+			continue;
+		}
+		if (fn != NULL && strcmp(fn, "key_scale") == 0)
+		{
+			/* DN1: a grouping key's display scale (df_key_scale_call) */
+			b->ctx = (Plan *) aggnode;
+			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":");
+			df_emit_dscale(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr,
+						   DF_LEVEL_SCAN);
 			appendStringInfoChar(aggs, '}');
 			continue;
 		}

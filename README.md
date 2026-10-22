@@ -1092,8 +1092,22 @@ larger of the operands' for + and -, their sum for *, select_div_scale's
 for /, the branch's for a CASE or COALESCE, the largest of the values for
 a sum; a value received from a Motion brings its own, read from the
 tuple.  A Motion of such a column carries tuples; a sum's partial state
-passes the scale as MS1's does.  min, max, avg, GROUP BY and Redistribute
-keys of such a value stay on PostgreSQL.
+passes the scale as MS1's does.  min, max, avg and Redistribute keys of
+such a value stay on PostgreSQL.
+
+A GROUP BY key of such a value groups by the value; the group shows the
+largest display scale of its rows, which the Agg keeps as a call of its
+own (max of the key's display scale).  PostgreSQL shows the first row's,
+in an order the plan does not fix, so where equal values of a group
+differ in display scale (`0.00` and `0.0` from `coalesce(x, 0.0)`) either
+is one PostgreSQL could show.  A sum or difference whose one operand's
+display scale is never below the other's has that one throughout:
+`ext_sales_price - coalesce(return_amount, 0.0)` over `numeric(7,2)` is
+of scale 2, and goes through batch Motions as such (TPC-DS Q75's GROUP
+BY key).  GROUP BY of a quotient (Q49's ratios) and Q75 under the
+Postgres planner now run wholly in DataFusion: TPC-DS SF1 coverage 147
+-> 150 of 206 executions by EXPLAIN, results unchanged apart from Q71's
+ties.
 
 Over 20 million rows of `numeric(15,2)`, `sum(price) / sum(qty)` per
 group took 0.42 s against 0.92 s, `sum(disc / 3)` 1.17 s against 1.38 s,

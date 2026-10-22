@@ -1272,6 +1272,14 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				{
 					*scale = Max(ls, rs);
 					*precision = Max(lp - ls, rp - rs) + *scale + 1;
+
+					/*
+					 * DN1: the larger of the operands' display scales, one
+					 * operand's own where the other's are never above it
+					 * (x - COALESCE(y, 0.0) of numeric(7, 2) x and y)
+					 */
+					if (ldyn != rdyn && (ldyn ? rs >= ls : ls >= rs))
+						*dyn = false;
 				}
 				else if (strcmp(name, "*") == 0)
 				{
@@ -4496,9 +4504,22 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						int			p,
 									s;
 
-						if (!df_numeric_ps(child, (Node *) tle->expr, &p, &s))
+						bool		dyn;
+
+						/*
+						 * DN1: one of display scales of its own groups by
+						 * value, its display scale one of the group's
+						 * (df_key_scale_call)
+						 */
+						if (!df_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
 						{
 							df_reject(cxt, "GROUP BY key of numeric of unknown precision");
+							return;
+						}
+						if (dyn && groups.nsets > 0)
+						{
+							df_reject(cxt, "GROUP BY key of numeric of display scales of its own "
+									  "with grouping sets");
 							return;
 						}
 					}

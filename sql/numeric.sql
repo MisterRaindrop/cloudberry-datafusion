@@ -447,8 +447,8 @@ DROP TABLE df_ps;
 -- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
 -- computes it, in arbitrary precision.  An Append of inputs of different
 -- scales gives such values too.  A Motion of such a column carries
--- tuples, which hold it; min, max, avg and GROUP BY of one stay on
--- PostgreSQL.
+-- tuples, which hold it; min, max and avg of one stay on PostgreSQL.  A
+-- GROUP BY of one groups by value (below).
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
 INSERT INTO df_dn SELECT g, g % 37,
   CASE WHEN g % 53 = 0 THEN NULL ELSE ((g * 7919) % 100000 - 30000) / 100.0 END,
@@ -525,6 +525,43 @@ SELECT k, coalesce(a * i, 0), coalesce(a, 0.0), CASE WHEN b > 50 THEN a / b ELSE
 SELECT g, r FROM (SELECT i g, sum(a) / sum(b) r FROM df_dn GROUP BY i) x WHERE r > 1 ORDER BY r, g;
 SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM df_dn GROUP BY i) x JOIN (SELECT i, count(*) n FROM df_dn GROUP BY i) y ON y.i = x.g ORDER BY 1;
 SET optimizer = off;
+-- DN1: a GROUP BY key of display scales of its own groups by value; the
+-- group shows the largest display scale of its rows (PostgreSQL keeps the
+-- first row's, in an order the plan does not fix; here they are alike
+-- within a group); redistributed between the stages, it is hashed as a
+-- value.  x - COALESCE(y, 0.0) of numeric(7, 2) x and y has x's display
+-- scale throughout, as any sum or difference whose one side's display
+-- scale is never below the other's, and goes through batch Motions.
+CREATE TABLE df_dk (k int, x numeric(7,2), y numeric(7,2)) DISTRIBUTED BY (k);
+INSERT INTO df_dk SELECT g, g % 50, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 7 + 1 END FROM generate_series(1, 20000) g;
+ANALYZE df_dk;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1;
+SET datafusion.mode = off;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+SELECT r, n FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s WHERE r > 20 ORDER BY 1;
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+SET datafusion.mode = on;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+SELECT r, n FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s WHERE r > 20 ORDER BY 1;
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1;
+SET datafusion.mode = off;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+SET datafusion.mode = on;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_dk;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;

@@ -1941,8 +1941,8 @@ DROP TABLE df_ps;
 -- largest scale numeric_avg may pick) is exact: each side as PostgreSQL
 -- computes it, in arbitrary precision.  An Append of inputs of different
 -- scales gives such values too.  A Motion of such a column carries
--- tuples, which hold it; min, max, avg and GROUP BY of one stay on
--- PostgreSQL.
+-- tuples, which hold it; min, max and avg of one stay on PostgreSQL.  A
+-- GROUP BY of one groups by value (below).
 CREATE TABLE df_dn (k int, i int, a numeric(7,2), b numeric(7,2), c numeric(12,4)) DISTRIBUTED BY (k);
 INSERT INTO df_dn SELECT g, g % 37,
   CASE WHEN g % 53 = 0 THEN NULL ELSE ((g * 7919) % 100000 - 30000) / 100.0 END,
@@ -2091,7 +2091,7 @@ EXPLAIN (COSTS OFF) SELECT a / b AS r, count(*) FROM df_dn WHERE b <> 0 GROUP BY
                      Filter: (b <> '0'::numeric)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ DataFusion: slice 1 eligible
  DataFusion: slice 2 eligible
 (11 rows)
 
@@ -4170,6 +4170,299 @@ SELECT x.g, x.s, x.r, y.n FROM (SELECT i g, sum(a / 3) s, sum(a) / sum(b) r FROM
 (37 rows)
 
 SET optimizer = off;
+-- DN1: a GROUP BY key of display scales of its own groups by value; the
+-- group shows the largest display scale of its rows (PostgreSQL keeps the
+-- first row's, in an order the plan does not fix; here they are alike
+-- within a group); redistributed between the stages, it is hashed as a
+-- value.  x - COALESCE(y, 0.0) of numeric(7, 2) x and y has x's display
+-- scale throughout, as any sum or difference whose one side's display
+-- scale is never below the other's, and goes through batch Motions.
+CREATE TABLE df_dk (k int, x numeric(7,2), y numeric(7,2)) DISTRIBUTED BY (k);
+INSERT INTO df_dk SELECT g, g % 50, CASE WHEN g % 11 = 0 THEN NULL ELSE g % 7 + 1 END FROM generate_series(1, 20000) g;
+ANALYZE df_dk;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: ((x / y))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: ((x / y))
+               ->  Streaming Partial HashAggregate
+                     Group Key: (x / y)
+                     ->  Seq Scan on df_dk
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: ((x - COALESCE(y, 0.0)))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: ((x - COALESCE(y, 0.0)))
+               ->  Streaming Partial HashAggregate
+                     Group Key: (x - COALESCE(y, 0.0))
+                     ->  Seq Scan on df_dk
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+           r            | count |  sum   
+------------------------+-------+--------
+ 0.00000000000000000000 |   364 |   0.00
+ 0.14285714285714285714 |    52 |  52.00
+ 0.16666666666666666667 |    52 |  52.00
+ 0.20000000000000000000 |    52 |  52.00
+ 0.25000000000000000000 |    51 |  51.00
+ 0.28571428571428571429 |    52 | 104.00
+ 0.33333333333333333333 |   104 | 156.00
+ 0.40000000000000000000 |    52 | 104.00
+ 0.42857142857142857143 |    52 | 156.00
+ 0.50000000000000000000 |   157 | 313.00
+ 0.57142857142857142857 |    52 | 208.00
+ 0.60000000000000000000 |    52 | 156.00
+(12 rows)
+
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+ count |            sum            | max  
+-------+---------------------------+------
+   233 | 2385.25000000000000000000 | 1818
+(1 row)
+
+SELECT r, n FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s WHERE r > 20 ORDER BY 1;
+          r          |  n  
+---------------------+-----
+ 20.5000000000000000 |  52
+ 21.0000000000000000 | 105
+ 21.5000000000000000 |  53
+ 22.0000000000000000 | 104
+ 22.5000000000000000 |  52
+ 23.0000000000000000 | 104
+ 23.5000000000000000 |  52
+ 24.0000000000000000 | 104
+ 24.5000000000000000 |  51
+ 25.0000000000000000 |  52
+ 26.0000000000000000 |  52
+ 27.0000000000000000 |  51
+ 28.0000000000000000 |  53
+ 29.0000000000000000 |  52
+ 30.0000000000000000 |  52
+ 31.0000000000000000 |  51
+ 32.0000000000000000 |  52
+ 33.0000000000000000 |  52
+ 34.0000000000000000 |  52
+ 35.0000000000000000 |  52
+ 36.0000000000000000 |  52
+ 37.0000000000000000 |  52
+ 38.0000000000000000 |  52
+ 39.0000000000000000 |  51
+ 40.0000000000000000 |  52
+ 41.0000000000000000 |  52
+ 42.0000000000000000 |  53
+ 43.0000000000000000 |  51
+ 44.0000000000000000 |  52
+ 45.0000000000000000 |  52
+ 46.0000000000000000 |  52
+ 47.0000000000000000 |  52
+ 48.0000000000000000 |  52
+ 49.0000000000000000 |  53
+(34 rows)
+
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+   d   | count 
+-------+-------
+ -7.00 |    52
+ -6.00 |   104
+ -5.00 |   155
+ -4.00 |   208
+ -3.00 |   259
+ -2.00 |   312
+ -1.00 |   368
+  0.00 |   400
+(8 rows)
+
+SET datafusion.mode = on;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+           r            | count |  sum   
+------------------------+-------+--------
+ 0.00000000000000000000 |   364 |   0.00
+ 0.14285714285714285714 |    52 |  52.00
+ 0.16666666666666666667 |    52 |  52.00
+ 0.20000000000000000000 |    52 |  52.00
+ 0.25000000000000000000 |    51 |  51.00
+ 0.28571428571428571429 |    52 | 104.00
+ 0.33333333333333333333 |   104 | 156.00
+ 0.40000000000000000000 |    52 | 104.00
+ 0.42857142857142857143 |    52 | 156.00
+ 0.50000000000000000000 |   157 | 313.00
+ 0.57142857142857142857 |    52 | 208.00
+ 0.60000000000000000000 |    52 | 156.00
+(12 rows)
+
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+ count |            sum            | max  
+-------+---------------------------+------
+   233 | 2385.25000000000000000000 | 1818
+(1 row)
+
+SELECT r, n FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s WHERE r > 20 ORDER BY 1;
+          r          |  n  
+---------------------+-----
+ 20.5000000000000000 |  52
+ 21.0000000000000000 | 105
+ 21.5000000000000000 |  53
+ 22.0000000000000000 | 104
+ 22.5000000000000000 |  52
+ 23.0000000000000000 | 104
+ 23.5000000000000000 |  52
+ 24.0000000000000000 | 104
+ 24.5000000000000000 |  51
+ 25.0000000000000000 |  52
+ 26.0000000000000000 |  52
+ 27.0000000000000000 |  51
+ 28.0000000000000000 |  53
+ 29.0000000000000000 |  52
+ 30.0000000000000000 |  52
+ 31.0000000000000000 |  51
+ 32.0000000000000000 |  52
+ 33.0000000000000000 |  52
+ 34.0000000000000000 |  52
+ 35.0000000000000000 |  52
+ 36.0000000000000000 |  52
+ 37.0000000000000000 |  52
+ 38.0000000000000000 |  52
+ 39.0000000000000000 |  51
+ 40.0000000000000000 |  52
+ 41.0000000000000000 |  52
+ 42.0000000000000000 |  53
+ 43.0000000000000000 |  51
+ 44.0000000000000000 |  52
+ 45.0000000000000000 |  52
+ 46.0000000000000000 |  52
+ 47.0000000000000000 |  52
+ 48.0000000000000000 |  52
+ 49.0000000000000000 |  53
+(34 rows)
+
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+   d   | count 
+-------+-------
+ -7.00 |    52
+ -6.00 |   104
+ -5.00 |   155
+ -4.00 |   208
+ -3.00 |   259
+ -2.00 |   312
+ -1.00 |   368
+  0.00 |   400
+(8 rows)
+
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: ((x / y))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: ((x / y))
+               ->  Streaming Partial HashAggregate
+                     Group Key: (x / y)
+                     ->  Seq Scan on df_dk
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+           r            | count |  sum   
+------------------------+-------+--------
+ 0.00000000000000000000 |   364 |   0.00
+ 0.14285714285714285714 |    52 |  52.00
+ 0.16666666666666666667 |    52 |  52.00
+ 0.20000000000000000000 |    52 |  52.00
+ 0.25000000000000000000 |    51 |  51.00
+ 0.28571428571428571429 |    52 | 104.00
+ 0.33333333333333333333 |   104 | 156.00
+ 0.40000000000000000000 |    52 | 104.00
+ 0.42857142857142857143 |    52 | 156.00
+ 0.50000000000000000000 |   157 | 313.00
+ 0.57142857142857142857 |    52 | 208.00
+ 0.60000000000000000000 |    52 | 156.00
+(12 rows)
+
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+ count |            sum            | max  
+-------+---------------------------+------
+   233 | 2385.25000000000000000000 | 1818
+(1 row)
+
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+   d   | count 
+-------+-------
+ -7.00 |    52
+ -6.00 |   104
+ -5.00 |   155
+ -4.00 |   208
+ -3.00 |   259
+ -2.00 |   312
+ -1.00 |   368
+  0.00 |   400
+(8 rows)
+
+SET datafusion.mode = on;
+SELECT x / y r, count(*), sum(x) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 12;
+           r            | count |  sum   
+------------------------+-------+--------
+ 0.00000000000000000000 |   364 |   0.00
+ 0.14285714285714285714 |    52 |  52.00
+ 0.16666666666666666667 |    52 |  52.00
+ 0.20000000000000000000 |    52 |  52.00
+ 0.25000000000000000000 |    51 |  51.00
+ 0.28571428571428571429 |    52 | 104.00
+ 0.33333333333333333333 |   104 | 156.00
+ 0.40000000000000000000 |    52 | 104.00
+ 0.42857142857142857143 |    52 | 156.00
+ 0.50000000000000000000 |   157 | 313.00
+ 0.57142857142857142857 |    52 | 208.00
+ 0.60000000000000000000 |    52 | 156.00
+(12 rows)
+
+SELECT count(*), sum(r), max(n) FROM (SELECT x / y r, count(*) n FROM df_dk GROUP BY 1) s;
+ count |            sum            | max  
+-------+---------------------------+------
+   233 | 2385.25000000000000000000 | 1818
+(1 row)
+
+SELECT x - coalesce(y, 0.0) d, count(*) FROM df_dk GROUP BY 1 ORDER BY 1 LIMIT 8;
+   d   | count 
+-------+-------
+ -7.00 |    52
+ -6.00 |   104
+ -5.00 |   155
+ -4.00 |   208
+ -3.00 |   259
+ -2.00 |   312
+ -1.00 |   368
+  0.00 |   400
+(8 rows)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_dk;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
