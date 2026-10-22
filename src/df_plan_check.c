@@ -5762,9 +5762,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  * anywhere else in the slice is a receiver.
  */
 static bool
-df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+df_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 				 Bitmapset *batches, DfTails *tails, char *reason, size_t reasonlen,
-				 bool *locale_dependent)
+				 bool *locale_dependent, bool order_free)
 {
 	DfCheckContext cxt;
 	PlannedStmt *volatile saved_stmt = df_numeric_stmt;
@@ -5789,6 +5789,7 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	{
 		cxt.top = root_is_sender ? outerPlan(root) : root;
 		cxt.output = cxt.top;
+		cxt.order_free = order_free;
 		cxt.tails_ok = !(root_is_sender &&
 						 bms_is_member(((Motion *) root)->motionID, batches));
 		df_numeric_stmt = stmt;
@@ -5808,6 +5809,16 @@ df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	if (tails)
 		*tails = cxt.tails;
 	return !cxt.failed;
+}
+
+/* df_check_slice_o of a slice part whose order of rows a node above may read */
+static bool
+df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+				 Bitmapset *batches, DfTails *tails, char *reason, size_t reasonlen,
+				 bool *locale_dependent)
+{
+	return df_check_slice_o(stmt, root, root_is_sender, batches, tails, reason, reasonlen,
+							locale_dependent, false);
 }
 
 bool
@@ -5865,8 +5876,8 @@ df_attach_worth(Plan *plan)
  * and look below them instead, for subtrees every node runs alike.
  */
 static void
-df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
-			   List **points)
+df_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
+				 bool order_free, List **points)
 {
 	char		reason[256];
 	DfTails		tails;
@@ -5876,8 +5887,8 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_fr
 	if (plan == NULL || IsA(plan, Motion))
 		return;
 	if (df_attach_worth(plan) &&
-		df_check_slice_b(stmt, plan, false, batches, &tails, reason, sizeof(reason),
-						 &locale_dependent) &&
+		df_check_slice_o(stmt, plan, false, batches, &tails, reason, sizeof(reason),
+						 &locale_dependent, order_free) &&
 		!(locale_free && locale_dependent))
 	{
 		DfAttach   *a = palloc0(sizeof(DfAttach));
@@ -5908,36 +5919,48 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_fr
 		case T_Hash:
 		case T_NestLoop:
 		case T_MergeJoin:
-			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
+			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
 			return;
 		case T_HashJoin:
-			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
-			df_find_attach(stmt, innerPlan(plan), batches, locale_free, points);
+			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
+			df_find_attach_o(stmt, innerPlan(plan), batches, locale_free, false, points);
 			return;
 		case T_SubqueryScan:
-			df_find_attach(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, points);
+			df_find_attach_o(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, false, points);
 			return;
 		case T_Append:
 			foreach(lc, df_append_plans(plan))
-				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
+				df_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
 			return;
 		case T_Sequence:
 			/* GPORCA's Sequence runs each input once, in order */
 			foreach(lc, ((Sequence *) plan)->subplans)
-				df_find_attach(stmt, lfirst(lc), batches, locale_free, points);
+				df_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
 			return;
 		case T_ShareInputScan:
 
 			/*
 			 * The producer of a Shared Scan reads its input once into the
 			 * store its readers share (init_tuplestore_state); a rescan
-			 * reads the store again.  A reader has no input.
+			 * reads the store again.  A reader has no input.  What the
+			 * readers' parents may read of the order of rows is an order
+			 * that a node of the input makes (a Sort), not the order an
+			 * Append's inputs come in, which neither planner gives an
+			 * Append: DataFusion may interleave them (TPC-DS Q4, Q11 and
+			 * Q74 under GPORCA, a UNION ALL in a CTE).
 			 */
-			df_find_attach(stmt, outerPlan(plan), batches, locale_free, points);
+			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, true, points);
 			return;
 		default:
 			return;
 	}
+}
+
+static void
+df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
+			   List **points)
+{
+	df_find_attach_o(stmt, plan, batches, locale_free, false, points);
 }
 
 /*

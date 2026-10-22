@@ -508,6 +508,63 @@ WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
  DataFusion: slice 6 eligible, sends Arrow batches
 (39 rows)
 
+-- a UNION ALL as the producer's input runs in DataFusion as a whole: the
+-- readers do not read the order its inputs come in (TPC-DS Q11)
+EXPLAIN (COSTS OFF) WITH c AS (SELECT 's' AS src, k, sum(v) AS s FROM df_pt GROUP BY k
+  UNION ALL SELECT 'w', w, count(*) FROM df_pt2 GROUP BY w)
+SELECT x.k, x.s, y.s FROM c x JOIN c y ON x.k = y.k AND x.src = 's' AND y.src = 'w' ORDER BY x.k LIMIT 3;
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: share0_ref3.k
+   ->  Sort
+         Sort Key: share0_ref3.k
+         ->  Sequence
+               ->  Shared Scan (share slice:id 1:0)
+                     ->  Append
+                           ->  Result
+                                 Filter: ((('s'::text) = 's'::text) OR (('s'::text) = 'w'::text))
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_pt.k
+                                       ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                             Hash Key: df_pt.k
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_pt.k
+                                                   ->  Seq Scan on df_pt
+                           ->  Result
+                                 Filter: ((('w'::text) = 's'::text) OR (('w'::text) = 'w'::text))
+                                 ->  GroupAggregate
+                                       Group Key: df_pt2.w
+                                       ->  Sort
+                                             Sort Key: df_pt2.w
+                                             ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                   Hash Key: df_pt2.w
+                                                   ->  Seq Scan on df_pt2
+               ->  Redistribute Motion 1:3  (slice4)
+                     ->  Limit
+                           ->  Gather Motion 3:1  (slice5; segments: 3)
+                                 Merge Key: share0_ref3.k
+                                 ->  Limit
+                                       ->  Sort
+                                             Sort Key: share0_ref3.k
+                                             ->  Hash Join
+                                                   Hash Cond: (share0_ref3.k = share0_ref2.k)
+                                                   ->  Result
+                                                         Filter: (share0_ref3.src = 's'::text)
+                                                         ->  Shared Scan (share slice:id 5:0)
+                                                   ->  Hash
+                                                         ->  Result
+                                                               Filter: (share0_ref2.src = 'w'::text)
+                                                               ->  Shared Scan (share slice:id 5:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Append (above: sorts at most 3 rows of a Limit, received from a Redistribute Motion, with nothing else to compute on them)
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+ DataFusion: slice 4 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 5 eligible
+(48 rows)
+
 SET datafusion.mode = off;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
@@ -704,6 +761,16 @@ WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
  0 | 542500
 (4 rows)
 
+WITH c AS (SELECT 's' AS src, k, sum(v) AS s FROM df_pt GROUP BY k
+  UNION ALL SELECT 'w', w, count(*) FROM df_pt2 GROUP BY w)
+SELECT x.k, x.s, y.s FROM c x JOIN c y ON x.k = y.k AND x.src = 's' AND y.src = 'w' ORDER BY x.k LIMIT 3;
+ k |     s     | s 
+---+-----------+---
+ 0 | 242267298 | 8
+ 1 | 242283454 | 8
+ 2 | 242299610 | 8
+(3 rows)
+
 SET datafusion.mode = on;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
@@ -899,6 +966,16 @@ WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
  0 | 525000
  0 | 542500
 (4 rows)
+
+WITH c AS (SELECT 's' AS src, k, sum(v) AS s FROM df_pt GROUP BY k
+  UNION ALL SELECT 'w', w, count(*) FROM df_pt2 GROUP BY w)
+SELECT x.k, x.s, y.s FROM c x JOIN c y ON x.k = y.k AND x.src = 's' AND y.src = 'w' ORDER BY x.k LIMIT 3;
+ k |     s     | s 
+---+-----------+---
+ 0 | 242267298 | 8
+ 1 | 242283454 | 8
+ 2 | 242299610 | 8
+(3 rows)
 
 SET optimizer = off;
 -- Numeric values of display scales of their own (an avg, a sum of

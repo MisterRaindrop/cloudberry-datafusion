@@ -1516,6 +1516,14 @@ and now 0.66 s, Q23b 1.84 and 0.85, Q95 1.27 and 0.55, Q22 0.94 and 0.68,
 Q36 0.64 and 0.23, Q67 1.67 and 1.48.  Where the producer's input is only
 joins, little changes: TPC-DS Q18's chain of six Redistribute joins under
 GPORCA, now through batch Motions, took 0.36 s and now 0.39 s.
+A UNION ALL as the producer's input runs in DataFusion as a whole,
+which may interleave its inputs' rows: what the readers' parents may
+read of the store's order is an order a node of the input makes (a
+Sort), never the order an Append's inputs come in, which neither planner
+gives an Append.  Below another PostgreSQL node, which may read its
+order, such an Append stays and only its inputs run in DataFusion.  TPC-DS Q4, Q11 and Q74 under GPORCA
+(a CTE of store and web sales together) run their Append so, and Q11
+now wholly in DataFusion.
 
 A reader of a Shared Scan is an input of the slice: PostgreSQL's node
 waits for the producer and reads the store, and the main thread pulls
