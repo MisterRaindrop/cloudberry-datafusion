@@ -85,6 +85,7 @@ typedef struct DfInputDesc
 								 * position + 1, of each input column */
 	List	   *types;			/* oid: type of each */
 	List	   *scales;			/* int: scale of each numeric one */
+	bool		set;			/* SP1: a subquery's rows, read whole first */
 } DfInputDesc;
 
 /* A1: an Agg below a join or another Agg, a named node of the plan. */
@@ -678,6 +679,25 @@ df_add_input(DfBuilder *b, Plan *leaf)
 	in->leaf = leaf;
 	b->inputs = lappend(b->inputs, in);
 	return list_length(b->inputs) - 1;
+}
+
+/*
+ * SP1: add an input reading the rows of a subquery from 'top', the top of
+ * its plan, unless one does; its index.  Such an input is read whole
+ * before the others.
+ */
+static int
+df_add_set_input(DfBuilder *b, Plan *top)
+{
+	ListCell   *lc;
+	int			j;
+
+	foreach(lc, b->inputs)
+		if (((DfInputDesc *) lfirst(lc))->leaf == top)
+			return foreach_current_index(lc);
+	j = df_add_input(b, top);
+	((DfInputDesc *) llast(b->inputs))->set = true;
+	return j;
 }
 
 /*
@@ -1432,6 +1452,42 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			}
 			appendStringInfo(out, "{\"name\":\"rowid%d\"}", b->ctx->plan_node_id);
 			return;
+
+		case T_SubPlan:
+			{
+				/*
+				 * SP1: x = ANY (rows of a subquery): x against the set of
+				 * the rows' values, which DataFusion collects from them
+				 * before it runs the plan, compared as = compares them (floats as
+				 * floats compare, -0 as 0; character values without their
+				 * trailing blanks)
+				 */
+				SubPlan    *sp = (SubPlan *) node;
+				Node	   *arg = NULL;
+				Plan	   *top;
+				Oid			type;
+				int			j;
+
+				if (df_subplan_in_set(df_numeric_stmt, sp, &arg) != NULL ||
+					(top = df_subplan_rows(df_numeric_stmt, sp)) == NULL)
+				{
+					df_fail(b, "a subquery");
+					return;
+				}
+				type = exprType(arg);
+				j = df_add_set_input(b, top);
+				if (df_input_column(b, j, 1, type, 0) != 0)
+				{
+					df_fail(b, "a subquery's column");
+					return;
+				}
+				appendStringInfoString(out, "{\"in_set\":");
+				df_emit(b, out, arg, level);
+				appendStringInfo(out, ",\"set\":%d,\"key\":\"%s\"}", j,
+								 type == FLOAT4OID || type == FLOAT8OID ? "float" :
+								 type == BPCHAROID ? "bpchar" : "plain");
+				return;
+			}
 
 		case T_Param:
 			/* IP1: an init plan's value (numeric only compared: above) */
@@ -3654,6 +3710,8 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 				appendStringInfo(&json, "%s{\"type\":\"%s\"}", k++ > 0 ? "," : "",
 								 df_tag(lfirst_oid(lt), lfirst_int(ls)));
 			appendStringInfoChar(&json, ']');
+			if (in->set)
+				appendStringInfoString(&json, ",\"set\":true");
 			if (IsA(in->leaf, Motion))
 			{
 				/* The stream column behind each input column (M7b batches). */
@@ -3716,6 +3774,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		int			k = 0;
 
 		si->leaf = in->leaf;
+		si->set = in->set;
 		si->ncols = list_length(in->attnos);
 		si->attnos = palloc(sizeof(AttrNumber) * Max(si->ncols, 1));
 		si->types = palloc(sizeof(Oid) * Max(si->ncols, 1));

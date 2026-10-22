@@ -134,6 +134,10 @@
 //!                                 as PostgreSQL does, at scale S; pgnum)
 //!         | {"avg_numeric_scale": [<sum>, <count>], "scale": s}   (its display
 //!                                 scale, int4; AV2)
+//!         | {"in_set": <expr>, "set": j, "key": "plain" | "float" | "bpchar"}
+//!                                 (<expr> = ANY (the rows of input j, a
+//!                                 subquery's, marked "set": true and read
+//!                                 whole before the plan runs; pgset, SP1)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -190,6 +194,7 @@ use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
 use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
+use crate::pgset::{InSet, SetHolder, SetKey};
 use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
@@ -477,7 +482,45 @@ fn input_column(j: usize, k: usize) -> String {
     }
 }
 
+thread_local! {
+    /// SP1: the sets of the plan being built, by input (`in_set`).
+    static SETS: std::cell::RefCell<HashMap<usize, Arc<SetHolder>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Clears SETS when the plan is built, or its building fails.
+struct SetsBuilding;
+
+impl SetsBuilding {
+    fn start(sets: &[(usize, Arc<SetHolder>, BatchReceiver)]) -> SetsBuilding {
+        SETS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.clear();
+            for (j, h, _) in sets {
+                s.insert(*j, h.clone());
+            }
+        });
+        SetsBuilding
+    }
+}
+
+impl Drop for SetsBuilding {
+    fn drop(&mut self) {
+        SETS.with(|s| s.borrow_mut().clear());
+    }
+}
+
 fn expr(v: &Value) -> Result<Expr, String> {
+    if let Some(e) = v.get("in_set") {
+        let j = index(field(v, "set")?)?;
+        let key = SetKey::parse(v.get("key").and_then(Value::as_str).unwrap_or(""))
+            .ok_or("plan spec: bad set key")?;
+        let h = SETS
+            .with(|s| s.borrow().get(&j).cloned())
+            .ok_or("plan spec: in_set of an input that is not a set")?;
+        h.set_key(key);
+        return Ok(InSet::udf(h).call(vec![expr(e)?]));
+    }
     if let Some(i) = v.get("col") {
         let j = match v.get("input") {
             Some(j) => index(j)?,
@@ -2472,8 +2515,21 @@ impl Query {
         let mut decoders = Vec::new();
         let mut tables = Vec::with_capacity(sources.len());
         let mut pax_scans = Vec::new();
+        let mut sets: Vec<(usize, Arc<SetHolder>, BatchReceiver)> = Vec::new();
         for (j, source) in sources.into_iter().enumerate() {
             let schema = in_schemas[j].clone();
+            if inputs[j].get("set").and_then(Value::as_bool) == Some(true) {
+                // SP1: a subquery's rows, read whole into a set first
+                if !matches!(source, Source::Pushed) {
+                    return Err(internal(format!("subquery input {j} is not pushed")));
+                }
+                let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
+                sets.push((j, Arc::new(SetHolder::default()), rx));
+                in_tx.push(Some(tx));
+                ipc_tx.push(None);
+                tables.push(None);
+                continue;
+            }
             let (tx, itx, table) = match source {
                 Source::Ipc => {
                     let positions: Vec<usize> = field(&inputs[j], "motion_columns")
@@ -2567,6 +2623,7 @@ impl Query {
             tables.push(Some(table));
         }
 
+        let building = SetsBuilding::start(&sets);
         let b = build_node(&plan_node, &mut tables).map_err(internal)?;
         let outputs = field(&spec, "output")
             .map_err(internal)?
@@ -2639,6 +2696,7 @@ impl Query {
             b = b.limit(n("skip").unwrap_or(0), n("fetch")).map_err(df)?;
         }
         let plan = b.build().map_err(df)?;
+        drop(building);
         let route = match spec.get("route").filter(|v| !v.is_null()) {
             Some(r) if ipc_output => Some(HashRoute::parse(r).map_err(internal)?),
             Some(_) => return Err(internal("a route needs IPC output".into())),
@@ -2700,6 +2758,14 @@ impl Query {
 
         let task = handle.spawn(async move {
             let run = async {
+                // SP1: each subquery's rows into its set, before the plan
+                // runs (the main thread feeds them first)
+                for (_, h, mut rx) in sets {
+                    while let Some(batch) = rx.recv().await {
+                        h.add(&batch?)?;
+                    }
+                    h.finish();
+                }
                 let state = ctx.state();
                 let physical = state.create_physical_plan(&plan).await?;
                 if let Ok(mut s) = slot.lock() {

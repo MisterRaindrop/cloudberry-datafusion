@@ -568,6 +568,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
 | NR1 | Numeric columns through Append, GPORCA's Sequence and Shared Scan; sums 19 digits wider than their argument |
 | PS1 | Partial sum and avg through tuples both ways: PostgreSQL's states, written and read by the C side |
+| SP1 | `x IN (subquery)` as a hashed SubPlan, against a set of the subquery's rows read first |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would
@@ -633,6 +634,24 @@ null-aware anti join does the same, but only as a left anti join, which
 builds its table on the side it keeps: the outer one is the left side, fed
 first, and must fit the Hash node's budget.  One key and no join filter;
 NOT IN over several columns stays on PostgreSQL.
+
+SP1: `x IN (SELECT y ...)` that the planner leaves as a hashed SubPlan
+(under an OR, or as a column: TPC-DS Q10's `exists (...) or exists
+(...)`, Q45's `i_item_id in (...) or ...`) is evaluated against a set.
+The subquery's rows come from a Motion into the slice, through nodes that
+only pass them on (GPORCA's Result and Materialize, which PostgreSQL
+runs); they are an input of their own, fed whole before the others, and
+DataFusion collects them into a set before the plan runs
+(df_core::pgset).  As ExecHashSubPlan: TRUE where x is in the set, NULL
+where it is not and the set holds a NULL, else FALSE; a NULL x is NULL,
+or FALSE against no rows.  One column, of integers, dates, booleans,
+floats (-0 as 0, NaN as NaN), strings under a deterministic collation
+(varchar as text), or character(n) without trailing blanks; any other
+subquery, a correlated one, or one of several columns stays on
+PostgreSQL.  The set is not counted against the slice's memory.  The
+slices sending a SubPlan's rows are reported by EXPLAIN too; before, they
+ran as any other slice does but were left out of its list.  TPC-DS SF1: Q10 under the Postgres planner
+and Q45 under both now run wholly in DataFusion.
 
 NL1: a Nested Loop without parameters (GPORCA's TPC-H Q11 compares each
 group with a broadcast total in its join filter) runs as DataFusion's
@@ -1061,7 +1080,9 @@ like any other, found by the Motion they send through (`subplan_sliceIds`
 maps an init plan to its top slice, the one without a parent), and the
 Motions between them count when choosing batch Motions: TPC-H Q15's
 maximum revenue sums by supplier in DataFusion, the partial sums passing to
-the final ones as batches.  EXPLAIN lists these slices too.
+the final ones as batches.  EXPLAIN lists these slices too.  A top slice
+that only gathers the rows its slices below compute (TPC-DS Q58's) is
+reported as a query's top slice that does, with nothing to compute.
 
 ### numeric of display scales of their own
 

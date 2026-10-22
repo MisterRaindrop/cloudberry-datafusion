@@ -1515,8 +1515,12 @@ df_exec_next(DfExec *x)
 		{
 			int			j;
 
-			for (j = 0; j < x->ninputs && x->inputs[j].done; j++)
+			/* SP1: a subquery's rows first, which DataFusion reads whole first */
+			for (j = 0; j < x->ninputs && (x->inputs[j].done || !x->inputs[j].spec->set); j++)
 				;
+			if (j == x->ninputs)
+				for (j = 0; j < x->ninputs && x->inputs[j].done; j++)
+					;
 			if (j == x->ninputs)
 				x->input_done = true;
 			else
@@ -1625,6 +1629,19 @@ df_find_state(PlanState *ps, Plan *leaf)
 		return NULL;
 	if (ps->plan == leaf)
 		return ps;
+	if (ps->subPlan != NIL)
+	{
+		/* SP1: a subquery's rows, pulled from the top of its plan */
+		ListCell   *lc;
+
+		foreach(lc, ps->subPlan)
+		{
+			SubPlanState *sps = lfirst_node(SubPlanState, lc);
+
+			if (sps->planstate != NULL && sps->planstate->plan == leaf)
+				return sps->planstate;
+		}
+	}
 	if (IsA(ps, MotionState))
 		return NULL;
 	if (IsA(ps, SubqueryScanState))
@@ -1792,6 +1809,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		}
 		else if (ps != NULL && IsA(ps, ShareInputScanState))
 			in->reader = ps;
+		else if (ps != NULL && x->spec.inputs[j].set)
+			in->reader = ps;	/* SP1: the top of a subquery's plan */
 		else
 		{
 			MemoryContextSwitchTo(oldcxt);

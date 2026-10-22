@@ -391,6 +391,57 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
 
+-- x IN (subquery) as a hashed SubPlan (SP1, TPC-DS Q10, Q45: under an OR,
+-- or as a column): the subquery's rows come from a Motion, which the
+-- slice reads whole first into a set; each x is looked up in it.  Not
+-- found, x gives NULL where the set holds a NULL; a NULL x gives NULL,
+-- or FALSE against no rows.  Floats compare with -0 as 0 and NaN as NaN,
+-- character(n) without trailing blanks, varchar as text.  The slices
+-- sending the subquery's rows are reported too.
+CREATE TABLE df_sp_o (id int, k int, t char(5), v varchar, c float8) DISTRIBUTED BY (id);
+CREATE TABLE df_sp_i (w int, k int, t char(3), v varchar, c float8) DISTRIBUTED BY (w);
+CREATE TABLE df_sp_n (w int, k int) DISTRIBUTED BY (w);
+CREATE TABLE df_sp_e (w int, k int) DISTRIBUTED BY (w);
+INSERT INTO df_sp_o SELECT i, i % 40, (i % 13)::text, (i % 17)::text, (i % 9) - 4.0 FROM generate_series(1, 3000) i;
+INSERT INTO df_sp_o VALUES (3001, NULL, NULL, NULL, NULL), (3002, 3, '3  ', '3 ', '-0'), (3003, 4, 'x', 'x', 'NaN');
+INSERT INTO df_sp_i SELECT i, i % 7 * 3, (i % 5)::text, (i % 4)::text, (i % 3)::float8 FROM generate_series(1, 500) i;
+INSERT INTO df_sp_i VALUES (501, 1000, 'x  ', 'x  ', 'NaN'), (502, 1001, 'zz', 'zz', '0');
+INSERT INTO df_sp_n SELECT i, i % 7 FROM generate_series(1, 300) i;
+INSERT INTO df_sp_n VALUES (301, NULL);
+ANALYZE df_sp_o; ANALYZE df_sp_i; ANALYZE df_sp_n; ANALYZE df_sp_e;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+-- a correlated subquery stays on PostgreSQL
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o o WHERE k IN (SELECT k FROM df_sp_i i WHERE i.w = o.id) OR id < 100;
+-- an init plan whose top slice only gathers its rows is reported as a
+-- query's top slice that does (TPC-DS Q58's)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE k = (SELECT k FROM df_sp_i WHERE w = 7);
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+SET optimizer = off;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
+
 -- A hash join's build side coming from another join (JE1,
 -- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at

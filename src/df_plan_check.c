@@ -1889,6 +1889,97 @@ df_check_expr_list(List *exprs, DfCheckContext *cxt)
 	return df_check_expr((Node *) exprs, cxt);
 }
 
+/*
+ * SP1: the rows of SubPlan 'sp' of statement 'stmt', if they come from a
+ * Motion this slice receives, through nodes that only pass them on (a
+ * Result without a filter, a Materialize, as GPORCA puts over it): the
+ * top of that plan, which PostgreSQL runs and DataFusion pulls as an
+ * input, else NULL.
+ */
+Plan *
+df_subplan_rows(PlannedStmt *stmt, SubPlan *sp)
+{
+	Plan	   *plan;
+
+	if (stmt == NULL || sp->plan_id < 1 || sp->plan_id > list_length(stmt->subplans))
+		return NULL;
+	plan = list_nth(stmt->subplans, sp->plan_id - 1);
+	for (Plan *p = plan; p != NULL; p = outerPlan(p))
+	{
+		if (IsA(p, Motion))
+			return ((Motion *) p)->motionType != MOTIONTYPE_GATHER_SINGLE ? plan : NULL;
+		if (!(IsA(p, Material) || (IsA(p, Result) && p->qual == NIL &&
+								   ((Result *) p)->resconstantqual == NULL)) ||
+			innerPlan(p) != NULL || p->initPlan != NIL)
+			return NULL;
+	}
+	return NULL;
+}
+
+/*
+ * SP1: is SubPlan 'sp' x = ANY (rows of an uncorrelated subquery), hashed
+ * (PostgreSQL builds a hash table of the rows once), of one column whose
+ * values DataFusion compares as PostgreSQL's = does?  Sets *arg to x.
+ * Returns the reason it is not, or NULL.
+ */
+const char *
+df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
+{
+	OpExpr	   *op;
+	Node	   *l,
+			   *r;
+	char	   *name;
+	Oid			type;
+
+	if (sp->subLinkType != ANY_SUBLINK || !sp->useHashTable)
+		return "subquery other than a hashed IN";
+	if (sp->args != NIL || sp->parParam != NIL || sp->setParam != NIL ||
+		list_length(sp->paramIds) != 1)
+		return "correlated subquery or one of several columns";
+	if (sp->testexpr == NULL || !IsA(sp->testexpr, OpExpr))
+		return "IN subquery of several columns";
+	op = (OpExpr *) sp->testexpr;
+	if (list_length(op->args) != 2 || op->opno >= FirstGenbkiObjectId)
+		return "IN subquery with an operator of its own";
+	l = linitial(op->args);
+	r = lsecond(op->args);
+	while (IsA(r, RelabelType))
+		r = (Node *) ((RelabelType *) r)->arg;
+	if (!IsA(r, Param) || ((Param *) r)->paramkind != PARAM_EXEC ||
+		((Param *) r)->paramid != linitial_int(sp->paramIds))
+		return "IN subquery comparing other than its column";
+	name = get_opname(op->opno);
+	type = exprType(l);
+	if (name == NULL || strcmp(name, "=") != 0)
+		return "IN subquery by an operator other than =";
+	/* varchar's values compare as text, relabeled on both sides */
+	if (exprType(lsecond(op->args)) != type ||
+		(((Param *) r)->paramtype != type &&
+		 !(df_type_is_string(type) && df_type_is_string(((Param *) r)->paramtype) &&
+		   type != BPCHAROID && ((Param *) r)->paramtype != BPCHAROID)))
+		return "IN subquery of two types";
+	switch (type)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case DATEOID:
+		case BOOLOID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+			break;
+		default:
+			return "IN subquery of a type other than integers, dates, floats or strings";
+	}
+	if (df_subplan_rows(stmt, sp) == NULL)
+		return "IN subquery whose rows do not come from a Motion as they are";
+	*arg = l;
+	return NULL;
+}
+
 /* Expression walker: returns true to stop at the first unsupported node. */
 static bool
 df_check_expr(Node *node, DfCheckContext *cxt)
@@ -2412,6 +2503,24 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			}
 
 		case T_SubPlan:
+			{
+				/* SP1: x = ANY (rows of a subquery), against a set of them */
+				SubPlan    *sp = (SubPlan *) node;
+				Node	   *arg = NULL;
+				const char *problem = df_subplan_in_set(cxt->stmt, sp, &arg);
+				const char *sproblem;
+
+				if (problem != NULL)
+					df_reject(cxt, "%s", problem);
+				else if (df_type_is_string(exprType(arg)) &&
+						 (sproblem = df_string_compare_problem(cxt, "=",
+															  ((OpExpr *) sp->testexpr)->inputcollid)) != NULL)
+					df_reject(cxt, "IN subquery of %s %s", format_type_be(exprType(arg)), sproblem);
+				else
+					(void) df_check_expr(arg, cxt);
+				return cxt->failed;
+			}
+
 		case T_AlternativeSubPlan:
 			df_reject(cxt, "subquery");
 			return true;
@@ -7047,7 +7156,14 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 		Plan	   *plan = df_init_plan_root(stmt, i, &slice);
 
 		if (plan == NULL)
+		{
+			/*
+			 * A SubPlan's plan runs in the slice of the node it is in; the
+			 * slices sending to its Motions are slices of the query too
+			 */
+			df_collect_motions((Node *) list_nth(stmt->subplans, i), &cxt);
 			continue;
+		}
 		df_add_root(&cxt, slice, plan, false);
 		cxt.roots[cxt.nroots - 1].init_plan = true;
 		df_collect_motions((Node *) plan, &cxt);
@@ -7090,7 +7206,12 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 		df_explain_collate_c = -1;
 		df_explain_ctype_c = -1;
 	}
-	if (root->init_plan)
+	if (root->init_plan && IsA(root->root, Motion))
+		/* only gathers the rows its slices below compute, as a query's top */
+		appendStringInfo(out, "DataFusion: slice %d not eligible: receives rows from a %s "
+						 "with nothing to compute on them\n", root->index,
+						 df_plan_name(root->root));
+	else if (root->init_plan)
 		appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
 						 "which the coordinator runs before the query\n", root->index);
 	else if (df_check_slice(stmt, root->root, root->is_sender, NULL, reason, sizeof(reason)))

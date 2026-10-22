@@ -1724,6 +1724,264 @@ RESET datafusion.motion_batches;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
+-- x IN (subquery) as a hashed SubPlan (SP1, TPC-DS Q10, Q45: under an OR,
+-- or as a column): the subquery's rows come from a Motion, which the
+-- slice reads whole first into a set; each x is looked up in it.  Not
+-- found, x gives NULL where the set holds a NULL; a NULL x gives NULL,
+-- or FALSE against no rows.  Floats compare with -0 as 0 and NaN as NaN,
+-- character(n) without trailing blanks, varchar as text.  The slices
+-- sending the subquery's rows are reported too.
+CREATE TABLE df_sp_o (id int, k int, t char(5), v varchar, c float8) DISTRIBUTED BY (id);
+CREATE TABLE df_sp_i (w int, k int, t char(3), v varchar, c float8) DISTRIBUTED BY (w);
+CREATE TABLE df_sp_n (w int, k int) DISTRIBUTED BY (w);
+CREATE TABLE df_sp_e (w int, k int) DISTRIBUTED BY (w);
+INSERT INTO df_sp_o SELECT i, i % 40, (i % 13)::text, (i % 17)::text, (i % 9) - 4.0 FROM generate_series(1, 3000) i;
+INSERT INTO df_sp_o VALUES (3001, NULL, NULL, NULL, NULL), (3002, 3, '3  ', '3 ', '-0'), (3003, 4, 'x', 'x', 'NaN');
+INSERT INTO df_sp_i SELECT i, i % 7 * 3, (i % 5)::text, (i % 4)::text, (i % 3)::float8 FROM generate_series(1, 500) i;
+INSERT INTO df_sp_i VALUES (501, 1000, 'x  ', 'x  ', 'NaN'), (502, 1001, 'zz', 'zz', '0');
+INSERT INTO df_sp_n SELECT i, i % 7 FROM generate_series(1, 300) i;
+INSERT INTO df_sp_n VALUES (301, NULL);
+ANALYZE df_sp_o; ANALYZE df_sp_i; ANALYZE df_sp_n; ANALYZE df_sp_e;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+                              QUERY PLAN                               
+-----------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_sp_o
+                     Filter: ((hashed SubPlan 1) OR (id < 100))
+                     SubPlan 1
+                       ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                             ->  Seq Scan on df_sp_i
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_sp_o
+                     Filter: ((hashed SubPlan 1) OR (hashed SubPlan 2) OR (hashed SubPlan 3))
+                     SubPlan 1
+                       ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                             ->  Seq Scan on df_sp_i
+                     SubPlan 2
+                       ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                             ->  Seq Scan on df_sp_i df_sp_i_1
+                     SubPlan 3
+                       ->  Broadcast Motion 3:3  (slice4; segments: 3)
+                             ->  Seq Scan on df_sp_i df_sp_i_2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+ DataFusion: slice 4 eligible
+(20 rows)
+
+-- a correlated subquery stays on PostgreSQL
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o o WHERE k IN (SELECT k FROM df_sp_i i WHERE i.w = o.id) OR id < 100;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_sp_o o
+                     Filter: ((SubPlan 1) OR (id < 100))
+                     SubPlan 1
+                       ->  Result
+                             Filter: (i.w = o.id)
+                             ->  Materialize
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                         ->  Seq Scan on df_sp_i i
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: subquery other than a hashed IN
+ DataFusion: slice 2 eligible
+(15 rows)
+
+-- an init plan whose top slice only gathers its rows is reported as a
+-- query's top slice that does (TPC-DS Q58's)
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE k = (SELECT k FROM df_sp_i WHERE w = 7);
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Gather Motion 1:1  (slice3; segments: 1)
+           ->  Seq Scan on df_sp_i
+                 Filter: (w = 7)
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_sp_o
+                     Filter: (k = $0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 3 eligible
+(14 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+ count |  sum   
+-------+--------
+   605 | 791648
+(1 row)
+
+SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+ count 
+-------
+  2060
+(1 row)
+
+SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? | ?column? 
+------+----------+----------+----------
+  500 | f        | f        | t
+ 1000 | f        | f        | f
+ 1500 | f        | f        | t
+ 2000 | f        | f        | f
+ 2500 | t        | t        | f
+ 3000 | f        | f        | f
+ 3001 |          |          | 
+ 3002 | t        | f        | t
+ 3003 | t        | f        | t
+(9 rows)
+
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? | ?column? 
+------+----------+----------+----------
+    1 | t        | f        | f
+  501 |          | f        | f
+ 1001 | t        | f        | f
+ 1501 |          | f        | f
+ 2001 | t        | f        | f
+ 2501 |          | f        | f
+ 3000 | t        | t        | f
+ 3001 |          |          | f
+ 3002 | t        | t        | f
+ 3003 | t        | f        | f
+(10 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+ count |  sum   
+-------+--------
+   605 | 791648
+(1 row)
+
+SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
+ count 
+-------
+  2060
+(1 row)
+
+SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? | ?column? 
+------+----------+----------+----------
+  500 | f        | f        | t
+ 1000 | f        | f        | f
+ 1500 | f        | f        | t
+ 2000 | f        | f        | f
+ 2500 | t        | t        | f
+ 3000 | f        | f        | f
+ 3001 |          |          | 
+ 3002 | t        | f        | t
+ 3003 | t        | f        | t
+(9 rows)
+
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? | ?column? 
+------+----------+----------+----------
+    1 | t        | f        | f
+  501 |          | f        | f
+ 1001 | t        | f        | f
+ 1501 |          | f        | f
+ 2001 | t        | f        | f
+ 2501 |          | f        | f
+ 3000 | t        | t        | f
+ 3001 |          |          | f
+ 3002 | t        | t        | f
+ 3003 | t        | f        | f
+(10 rows)
+
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Result
+                     Filter: ((hashed SubPlan 1) OR (df_sp_o.id < 100))
+                     ->  Seq Scan on df_sp_o
+                     SubPlan 1
+                       ->  Result
+                             ->  Materialize
+                                   ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                         ->  Seq Scan on df_sp_i
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible
+(15 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+ count |  sum   
+-------+--------
+   605 | 791648
+(1 row)
+
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? 
+------+----------+----------
+    1 | t        | f
+  501 |          | f
+ 1001 | t        | f
+ 1501 |          | f
+ 2001 | t        | f
+ 2501 |          | f
+ 3000 | t        | t
+ 3001 |          | 
+ 3002 | t        | t
+ 3003 | t        | f
+(10 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
+ count |  sum   
+-------+--------
+   605 | 791648
+(1 row)
+
+SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
+  id  | ?column? | ?column? 
+------+----------+----------
+    1 | t        | f
+  501 |          | f
+ 1001 | t        | f
+ 1501 |          | f
+ 2001 | t        | f
+ 2501 |          | f
+ 3000 | t        | t
+ 3001 |          | 
+ 3002 | t        | t
+ 3003 | t        | f
+(10 rows)
+
+SET optimizer = off;
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
 -- A hash join's build side coming from another join (JE1,
 -- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
