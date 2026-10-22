@@ -563,6 +563,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | CU2 | Comparisons and min/max of strings under a libc collation of a language, by strcoll_l |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
+| MJ1 | Merge Joins whose order no one reads, as hash joins |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
 | WT1 | Numeric values received as tuples with up to 76 digits |
@@ -687,6 +688,16 @@ inner side, often a Materialize, which passes its child's rows on, and
 streams the outer one, so the inner side is fed first and must fit the
 inner node's budget.  A parameterized one, which scans its inner side again
 for each outer row, stays on PostgreSQL.
+
+MJ1: a Merge Join whose order of rows no one reads above it (TPC-DS Q51
+under GPORCA: a full join of two running sums, below a Redistribute
+Motion) runs as DataFusion's hash join on its merge clauses, building on
+the inner side and spilling as a Hash Join does; the Sorts below it,
+there for the merge, under a Materialize or not, are left out.  Inner,
+outer (with a join filter, and NULL keys on both sides of a full join),
+semi and anti joins; not a NOT IN anti join.  One whose order a node
+reads (a sorted Gather Motion above it, a Limit) stays on PostgreSQL.
+Q51 under GPORCA now runs wholly in DataFusion.
 
 ### Aggregates below a join or another aggregate
 

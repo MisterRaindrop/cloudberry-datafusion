@@ -2738,8 +2738,13 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			}
 
 		case T_HashJoin:
+		case T_MergeJoin:
 			{
+				/* MJ1: a Merge Join as a hash join on its merge clauses */
 				HashJoin   *hj = (HashJoin *) plan;
+				List	   *clauses = IsA(plan, HashJoin) ? hj->hashclauses :
+					((MergeJoin *) plan)->mergeclauses;
+				bool		null_equal = IsA(plan, HashJoin) && hj->hashqualclauses != NIL;
 				ListCell   *lc;
 				bool		first = true;
 				const char *type;
@@ -2750,7 +2755,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				 * right, so the join type turns around.  Its hash clauses read
 				 * outer = inner.
 				 */
-				switch (hj->join.jointype)
+				switch (((Join *) plan)->jointype)
 				{
 					case JOIN_INNER:
 						type = "inner";
@@ -2783,7 +2788,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				}
 				if (plan->qual != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
-				if (hj->join.jointype == JOIN_LASJ_NOTIN)
+				if (((Join *) plan)->jointype == JOIN_LASJ_NOTIN)
 				{
 					/*
 					 * NJ1: NOT IN.  PostgreSQL returns nothing if the inner
@@ -2793,7 +2798,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					 * builds its table there.  So the outer side is the left
 					 * one, fed first, and the keys read outer, inner.
 					 */
-					OpExpr	   *op = linitial_node(OpExpr, hj->hashclauses);
+					OpExpr	   *op = linitial_node(OpExpr, clauses);
 					Node	   *outer = linitial(op->args);
 					Node	   *inner = lsecond(op->args);
 					Oid			ktype = df_join_key_type(exprType(inner), exprType(outer));
@@ -2822,14 +2827,14 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					return;
 				}
 				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",%s\"left\":", type,
-								 hj->hashqualclauses != NIL ? "\"null_equal\":true," : "");
+								 null_equal ? "\"null_equal\":true," : "");
 				df_emit_node(b, out, innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
 				df_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"on\":[");
 				b->ctx = plan;
 				b->join_sides = true;
-				foreach(lc, hj->hashclauses)
+				foreach(lc, clauses)
 				{
 					OpExpr	   *op = lfirst_node(OpExpr, lc);
 					Node	   *inner = lsecond(op->args);
@@ -2848,7 +2853,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				}
 				appendStringInfoString(out, "],\"filter\":");
 				b->ctx = plan;
-				df_emit_qual(b, out, hj->join.joinqual, DF_LEVEL_SCAN);
+				df_emit_qual(b, out, ((Join *) plan)->joinqual, DF_LEVEL_SCAN);
 				b->join_sides = false;
 				appendStringInfoString(out, "}}");
 				if (plan->qual != NIL)

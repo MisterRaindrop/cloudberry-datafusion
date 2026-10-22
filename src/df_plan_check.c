@@ -1682,6 +1682,18 @@ df_distinct_problem(DfCheckContext *cxt, Aggref *agg)
 	return NULL;
 }
 
+/*
+ * MJ1: the Sort that orders side 'side' of a Merge Join for the merge,
+ * under a Materialize or not, or NULL: DataFusion's hash join leaves it out.
+ */
+static Plan *
+df_merge_sort(Plan *side)
+{
+	if (side != NULL && IsA(side, Material))
+		side = outerPlan(side);
+	return side != NULL && IsA(side, Sort) ? side : NULL;
+}
+
 /* Add the Aggrefs of 'node' to 'aggs'. */
 bool
 df_collect_aggrefs(Node *node, List **aggs)
@@ -3046,9 +3058,9 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	}
 	if (IsA(plan, SeqScan))
 		return true;
-	if (IsA(plan, Hash) || IsA(plan, Material))
+	if (IsA(plan, Hash) || IsA(plan, Material) || IsA(plan, Sort))
 		return inner == NULL && df_plain_outputs(outerPlan(plan), outer);
-	if (IsA(plan, HashJoin) || IsA(plan, NestLoop))
+	if (IsA(plan, HashJoin) || IsA(plan, NestLoop) || IsA(plan, MergeJoin))
 		return (outer == NULL || df_plain_outputs(outerPlan(plan), outer)) &&
 			(inner == NULL || df_plain_outputs(innerPlan(plan), inner));
 	return false;
@@ -5176,11 +5188,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 		case T_HashJoin:
 		case T_NestLoop:
+		case T_MergeJoin:
 			{
 				HashJoin   *hj = IsA(plan, HashJoin) ? (HashJoin *) plan : NULL;
+				MergeJoin  *mj = IsA(plan, MergeJoin) ? (MergeJoin *) plan : NULL;
 				bool		spills;
 				Join	   *join = (Join *) plan;
-				List	   *hashclauses = hj ? hj->hashclauses : NIL;
+				List	   *hashclauses = hj ? hj->hashclauses : mj ? mj->mergeclauses : NIL;
 				Plan	   *outer = outerPlan(plan);
 				Plan	   *inner = innerPlan(plan);
 				Bitmapset  *outer_needed = NULL;
@@ -5189,7 +5203,28 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 																 * side resets it */
 				ListCell   *lc;
 
-				if (hj == NULL)
+				if (mj != NULL)
+				{
+					/*
+					 * MJ1: a Merge Join whose order of rows no one reads, as
+					 * DataFusion's hash join on its merge clauses, building
+					 * on the inner side; the Sorts below it, there for the
+					 * merge, are left out (TPC-DS Q51 under GPORCA, a full
+					 * join below a Redistribute Motion)
+					 */
+					if (!order_free)
+					{
+						df_reject(cxt, "Merge Join whose order of rows is read");
+						return;
+					}
+					if (join->jointype == JOIN_LASJ_NOTIN || mj->mergeclauses == NIL ||
+						inner == NULL || outer == NULL)
+					{
+						df_reject(cxt, "this kind of Merge Join");
+						return;
+					}
+				}
+				else if (hj == NULL)
 				{
 					/*
 					 * NL1: a Nested Loop, as DataFusion's nested loop join,
@@ -5257,13 +5292,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (!IsA(op, OpExpr) || list_length(op->args) != 2 ||
 						(name = get_opname(op->opno)) == NULL || strcmp(name, "=") != 0)
 					{
-						df_reject(cxt, "Hash Join condition other than =");
+						df_reject(cxt, "%s condition other than =", df_plan_name(plan));
 						return;
 					}
 					if (!OidIsValid(df_join_key_type(exprType(linitial(op->args)),
 													 exprType(lsecond(op->args)))))
 					{
-						df_reject(cxt, "Hash Join on %s = %s",
+						df_reject(cxt, "%s on %s = %s", df_plan_name(plan),
 								  format_type_be(exprType(linitial(op->args))),
 								  format_type_be(exprType(lsecond(op->args))));
 						return;
@@ -5274,7 +5309,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * anti join (null-aware) and a nested loop
 				 */
 				spills = df_join_estimates == DF_JOIN_ESTIMATES_SPILL &&
-					hj != NULL && join->jointype != JOIN_LASJ_NOTIN;
+					(hj != NULL || mj != NULL) && join->jointype != JOIN_LASJ_NOTIN;
 				if (!spills && df_hash_estimate(inner) > df_hash_budget(inner))
 				{
 					df_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
@@ -5407,9 +5442,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * side's.
 				 */
 				cxt->order_free = true;
+				if (mj != NULL)
+					cxt->skipped_sort = df_merge_sort(inner);
 				df_check_plan(inner, cxt, inner_needed, false);
 				cxt->join_input = true;
-				cxt->order_free = hj != NULL || order_free;
+				cxt->order_free = hj != NULL || mj != NULL || order_free;
+				if (mj != NULL)
+					cxt->skipped_sort = df_merge_sort(outer);
 				df_check_plan(outer, cxt, outer_needed, false);
 				cxt->join_input = false;
 				return;

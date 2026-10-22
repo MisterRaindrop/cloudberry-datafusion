@@ -475,6 +475,64 @@ SET optimizer = off;
 SET datafusion.mode = off;
 DROP TABLE df_sc;
 
+-- A Merge Join whose order of rows no one reads runs as DataFusion's hash
+-- join on its merge clauses (MJ1, TPC-DS Q51 under GPORCA), the Sorts
+-- below it, there for the merge, left out: inner on two keys (one a date),
+-- left with a join filter, full with NULL keys on both sides.  One whose
+-- order a sorted Gather reads stays on PostgreSQL.
+CREATE TABLE df_mj_a (id int, k int, d date, t text, v int) DISTRIBUTED BY (id);
+CREATE TABLE df_mj_b (id int, k int, d date, t text, w int) DISTRIBUTED BY (id);
+INSERT INTO df_mj_a SELECT i, CASE WHEN i % 97 = 0 THEN NULL ELSE i % 300 END,
+  date '2001-01-01' + i % 20, 'k' || (i % 7), i FROM generate_series(1, 6000) i;
+INSERT INTO df_mj_b SELECT i, CASE WHEN i % 89 = 0 THEN NULL ELSE i % 400 END,
+  date '2001-01-01' + i % 25, 'k' || (i % 9), i FROM generate_series(1, 5000) i;
+ANALYZE df_mj_a;
+ANALYZE df_mj_b;
+SET enable_hashjoin = off;
+SET enable_nestloop = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
+EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
+EXPLAIN (COSTS OFF) SELECT a.k, b.w FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k WHERE a.id < 50 ORDER BY a.k LIMIT 5;
+SET datafusion.mode = off;
+SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
+SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
+SET datafusion.mode = on;
+SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
+SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
+-- semi and anti, with a join filter or not
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+SET datafusion.mode = off;
+SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+SELECT count(*), sum(w) FROM df_mj_b b WHERE EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k AND a.t = b.t);
+SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+SELECT count(*), sum(w) FROM df_mj_b b WHERE NOT EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k);
+SET datafusion.mode = on;
+SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+SELECT count(*), sum(w) FROM df_mj_b b WHERE EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k AND a.t = b.t);
+SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
+SELECT count(*), sum(w) FROM df_mj_b b WHERE NOT EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k);
+RESET enable_hashagg;
+RESET enable_hashjoin;
+RESET enable_nestloop;
+SET optimizer = on;
+SET optimizer_enable_hashjoin = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
+SET datafusion.mode = off;
+SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
+SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t GROUP BY 1, 2 ORDER BY 1, 2;
+SET datafusion.mode = on;
+SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
+SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t GROUP BY 1, 2 ORDER BY 1, 2;
+RESET optimizer_enable_hashjoin;
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_mj_a, df_mj_b;
+
 -- A hash join's build side coming from another join (JE1,
 -- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
