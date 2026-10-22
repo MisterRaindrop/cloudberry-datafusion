@@ -1075,6 +1075,26 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 	}
 	switch (nodeTag(node))
 	{
+		case T_SubPlan:
+			{
+				/* SP2: beside the value of a scalar subquery, from its tuple */
+				SubPlan    *sp = (SubPlan *) node;
+				Plan	   *top;
+				TargetEntry *tle;
+				int			j,
+							k;
+
+				if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
+				{
+					df_fail(b, "the display scale of a subquery");
+					return;
+				}
+				j = df_add_set_input(b, top);
+				k = df_input_column(b, j, tle->resno, INT4OID, DF_SCALE_DSCALE);
+				if (k >= 0)
+					appendStringInfo(out, "{\"scalar_of\":%d,\"col\":%d}", j, k);
+				return;
+			}
 		case T_Var:
 			{
 				Var		   *var = (Var *) node;
@@ -1468,6 +1488,30 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				Oid			type;
 				int			j;
 
+				if (sp->subLinkType == EXPR_SUBLINK)
+				{
+					/*
+					 * SP2: the value of a scalar subquery, its one row's
+					 * column, collected before the plan runs as SP1's set
+					 * is: NULL without a row, an error with more than one
+					 * where it is evaluated
+					 */
+					TargetEntry *tle;
+					int			k;
+
+					if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
+					{
+						df_fail(b, "a subquery");
+						return;
+					}
+					j = df_add_set_input(b, top);
+					k = df_input_column(b, j, tle->resno, exprType((Node *) tle->expr),
+										df_scale_of(top, (Node *) tle->expr));
+					if (k < 0)
+						return;
+					appendStringInfo(out, "{\"scalar_of\":%d,\"col\":%d}", j, k);
+					return;
+				}
 				if (df_subplan_in_set(df_numeric_stmt, sp, &arg) != NULL ||
 					(top = df_subplan_rows(df_numeric_stmt, sp)) == NULL)
 				{

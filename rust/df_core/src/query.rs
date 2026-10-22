@@ -138,6 +138,10 @@
 //!                                 (<expr> = ANY (the rows of input j, a
 //!                                 subquery's, marked "set": true and read
 //!                                 whole before the plan runs; pgset, SP1)
+//!         | {"scalar_of": j, "col": k}   (column k of the one row of
+//!                                 input j, a scalar subquery's, read as a
+//!                                 set's; NULL without a row, an error with
+//!                                 more than one; pgset, SP2)
 //! ```
 
 use std::collections::hash_map::Entry;
@@ -194,7 +198,7 @@ use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
 use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
-use crate::pgset::{InSet, SetHolder, SetKey};
+use crate::pgset::{InSet, ScalarOf, SetHolder, SetKey};
 use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
@@ -511,6 +515,14 @@ impl Drop for SetsBuilding {
 }
 
 fn expr(v: &Value) -> Result<Expr, String> {
+    if let Some(j) = v.get("scalar_of") {
+        let j = index(j)?;
+        let h = SETS
+            .with(|s| s.borrow().get(&j).cloned())
+            .ok_or("plan spec: scalar_of an input that is not a set")?;
+        let udf = ScalarOf::udf(h, index(field(v, "col")?)?).map_err(|e| e.to_string())?;
+        return Ok(udf.call(vec![]));
+    }
     if let Some(e) = v.get("in_set") {
         let j = index(field(v, "set")?)?;
         let key = SetKey::parse(v.get("key").and_then(Value::as_str).unwrap_or(""))
@@ -2524,7 +2536,7 @@ impl Query {
                     return Err(internal(format!("subquery input {j} is not pushed")));
                 }
                 let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
-                sets.push((j, Arc::new(SetHolder::default()), rx));
+                sets.push((j, Arc::new(SetHolder::with_schema(schema.clone())), rx));
                 in_tx.push(Some(tx));
                 ipc_tx.push(None);
                 tables.push(None);

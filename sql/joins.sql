@@ -442,6 +442,39 @@ SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
 
+-- The value of an uncorrelated scalar subquery (SP2, TPC-DS Q44 under
+-- GPORCA), as GPORCA plans it when the subquery may return several rows:
+-- its rows come from a Motion, read whole first as SP1's set; the value
+-- is its one row's column, NULL without a row.  More than one row is
+-- PostgreSQL's error where the value is computed, not where no row needs
+-- it.  An avg compares exactly, its display scale coming with its value.
+CREATE TABLE df_sc (id int, k int, n numeric(7,2)) DISTRIBUTED BY (id);
+INSERT INTO df_sc SELECT i, i % 50, ((i * 7919) % 20001 - 10000) / 100.0 FROM generate_series(1, 20000) i;
+ANALYZE df_sc;
+SET optimizer = on;
+SET optimizer_enforce_subplans = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+SET datafusion.mode = off;
+SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
+SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 99 GROUP BY k);
+SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+SET datafusion.mode = on;
+SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
+SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 99 GROUP BY k);
+SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+RESET optimizer_enforce_subplans;
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_sc;
+
 -- A hash join's build side coming from another join (JE1,
 -- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at

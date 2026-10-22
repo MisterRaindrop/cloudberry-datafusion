@@ -91,6 +91,8 @@ int			df_join_estimates = DF_JOIN_ESTIMATES_SPILL;
 extern bool lc_collate_is_c(Oid collation);
 extern bool lc_ctype_is_c(Oid collation);
 
+static bool df_subplan_value(Node *node, Plan **top, Node **value);
+
 typedef struct DfCheckContext
 {
 	PlannedStmt *stmt;
@@ -761,6 +763,14 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 		return false;
 	switch (nodeTag(expr))
 	{
+		case T_SubPlan:
+			{
+				Plan	   *top;
+				Node	   *value;
+
+				return !df_subplan_value(expr, &top, &value) ||
+					df_numeric_may_be_infinite(top, value);
+			}
 		case T_Var:
 			{
 				Var		   *var = (Var *) expr;
@@ -1185,6 +1195,15 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 		return false;
 	switch (nodeTag(expr))
 	{
+		case T_SubPlan:
+			{
+				/* SP2: its column's, in the subquery */
+				Plan	   *top;
+				Node	   *value;
+
+				return df_subplan_value(expr, &top, &value) &&
+					df_numeric_range(top, value, precision, scale, dyn);
+			}
 		case T_Var:
 			{
 				Var		   *var = (Var *) expr;
@@ -1980,6 +1999,59 @@ df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
 	return NULL;
 }
 
+/*
+ * SP2: is SubPlan 'sp' the value of an uncorrelated scalar subquery, whose
+ * rows come from a Motion as they are (df_subplan_rows)?  PostgreSQL scans
+ * them where the expression is evaluated: no row is NULL, more than one an
+ * error.  Sets *top to the subplan's top node and *tle to its column.
+ * Returns the reason it is not, or NULL.
+ */
+const char *
+df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top, TargetEntry **tle)
+{
+	ListCell   *lc;
+
+	*tle = NULL;
+	if (sp->subLinkType != EXPR_SUBLINK)
+		return "subquery other than a hashed IN or a scalar subquery";
+	if (sp->args != NIL || sp->parParam != NIL || sp->setParam != NIL ||
+		sp->testexpr != NULL)
+		return "correlated scalar subquery";
+	if (!df_type_supported(sp->firstColType))
+		return "scalar subquery of an unsupported type";
+	if ((*top = df_subplan_rows(stmt, sp)) == NULL)
+		return "scalar subquery whose rows do not come from a Motion as they are";
+	foreach(lc, (*top)->targetlist)
+	{
+		TargetEntry *t = lfirst_node(TargetEntry, lc);
+
+		if (t->resjunk)
+			continue;
+		if (*tle != NULL)
+			return "scalar subquery of several columns";
+		*tle = t;
+	}
+	if (*tle == NULL || exprType((Node *) (*tle)->expr) != sp->firstColType)
+		return "scalar subquery whose column is not its value";
+	return NULL;
+}
+
+/*
+ * The node and the expression of the value of scalar SubPlan 'node', in
+ * the statement whose numeric values are being followed (df_numeric_stmt).
+ */
+static bool
+df_subplan_value(Node *node, Plan **top, Node **value)
+{
+	TargetEntry *tle;
+
+	if (!IsA(node, SubPlan) ||
+		df_subplan_scalar(df_numeric_stmt, (SubPlan *) node, top, &tle) != NULL)
+		return false;
+	*value = (Node *) tle->expr;
+	return true;
+}
+
 /* Expression walker: returns true to stop at the first unsupported node. */
 static bool
 df_check_expr(Node *node, DfCheckContext *cxt)
@@ -2507,9 +2579,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				/* SP1: x = ANY (rows of a subquery), against a set of them */
 				SubPlan    *sp = (SubPlan *) node;
 				Node	   *arg = NULL;
-				const char *problem = df_subplan_in_set(cxt->stmt, sp, &arg);
+				const char *problem;
 				const char *sproblem;
 
+				if (sp->subLinkType == EXPR_SUBLINK)
+				{
+					/* SP2: the value of a scalar subquery */
+					Plan	   *top;
+					TargetEntry *tle;
+
+					if ((problem = df_subplan_scalar(cxt->stmt, sp, &top, &tle)) != NULL)
+						df_reject(cxt, "%s", problem);
+					return cxt->failed;
+				}
+				problem = df_subplan_in_set(cxt->stmt, sp, &arg);
 				if (problem != NULL)
 					df_reject(cxt, "%s", problem);
 				else if (df_type_is_string(exprType(arg)) &&
@@ -3091,6 +3174,21 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 	}
 	if (IsA(node, WindowFunc) && df_window_avg((WindowFunc *) node))
 		return v->found = true; /* WIN2 */
+	if (IsA(node, SubPlan))
+	{
+		/* SP2: its column's, in the subquery */
+		Plan	   *saved = v->ctx;
+		Plan	   *top;
+		Node	   *value;
+
+		if (df_subplan_value(node, &top, &value))
+		{
+			v->ctx = top;
+			(void) df_numeric_varying_walker(value, v);
+			v->ctx = saved;
+		}
+		return v->found;
+	}
 	if (IsA(node, Var) && df_append_plans(v->ctx) != NIL && ((Var *) node)->varno == OUTER_VAR)
 	{
 		/* UA1: any input's */
@@ -3186,6 +3284,14 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 		return true;
 	switch (nodeTag(expr))
 	{
+		case T_SubPlan:
+			{
+				/* SP2: its row is PostgreSQL's tuple, which carries it */
+				Plan	   *top;
+				Node	   *value;
+
+				return df_subplan_value(expr, &top, &value);
+			}
 		case T_Var:
 			{
 				Var		   *var = (Var *) expr;

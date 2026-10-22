@@ -569,6 +569,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | NR1 | Numeric columns through Append, GPORCA's Sequence and Shared Scan; sums 19 digits wider than their argument |
 | PS1 | Partial sum and avg through tuples both ways: PostgreSQL's states, written and read by the C side |
 | SP1 | `x IN (subquery)` as a hashed SubPlan, against a set of the subquery's rows read first |
+| SP2 | The value of an uncorrelated scalar subquery left as a SubPlan, from its rows read first |
 
 JE1: DataFusion's hash join cannot spill: a build side larger than the
 memory pool fails the query ("out of memory") where PostgreSQL's would
@@ -652,6 +653,20 @@ PostgreSQL.  The set is not counted against the slice's memory.  The
 slices sending a SubPlan's rows are reported by EXPLAIN too; before, they
 ran as any other slice does but were left out of its list.  TPC-DS SF1: Q10 under the Postgres planner
 and Q45 under both now run wholly in DataFusion.
+
+SP2: the value of an uncorrelated scalar subquery, `(SELECT ...)`, that
+GPORCA leaves as a SubPlan (where the subquery may return several rows
+and it does not join it under an Assert: TPC-DS Q44's `avg(ss_net_profit)
+> 0.9 * (select avg(ss_net_profit) ... group by ss_store_sk)`) comes from
+its rows read first as SP1's: the column of its one row, NULL without a
+row.  More than one row is PostgreSQL's error (21000, "more than one row
+returned by a subquery used as an expression"), raised where DataFusion
+computes the value, as ExecScanSubPlan raises it where the expression is
+evaluated: a filter whose other conditions leave no row to compute it for
+(`id < 0 AND id < (...)`) gives no error, in both.  Its numeric value has
+the digits and display scale of the subquery's column (an avg's, from its
+tuple), so `avg(x) > 0.9 * (...)` compares exactly.  Q44 under GPORCA now
+runs wholly in DataFusion.
 
 NL1: a Nested Loop without parameters (GPORCA's TPC-H Q11 compares each
 group with a broadcast total in its join filter) runs as DataFusion's

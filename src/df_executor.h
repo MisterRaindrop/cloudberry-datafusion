@@ -239,6 +239,8 @@ extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, 
 extern bool df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale);
 extern Plan *df_subplan_rows(PlannedStmt *stmt, SubPlan *sp);
 extern const char *df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg);
+extern const char *df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top,
+									 TargetEntry **tle);
 /* AVG1: does it depend on an avg returning numeric (of an output column)? */
 extern bool df_numeric_varying(Plan *ctx, Node *expr);
 extern bool df_output_varying(Plan *ctx, Node *expr);

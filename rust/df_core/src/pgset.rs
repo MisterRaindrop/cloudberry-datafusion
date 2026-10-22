@@ -25,6 +25,11 @@
 //! hook lets through: integers, dates and booleans as integers, floats with
 //! -0 as 0 and every NaN alike, strings byte by byte (a deterministic
 //! collation), character(n) without its trailing blanks.
+//!
+//! SP2: the value of a scalar subquery, `(SELECT ...)`, from such an input
+//! too: its one row's column, NULL without a row; more than one row is
+//! PostgreSQL's error (21000), raised where the value is computed, as
+//! ExecScanSubPlan raises it where the expression is evaluated.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -33,10 +38,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray, BooleanBuilder};
 use datafusion::arrow::datatypes::{
-    DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    DataType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, SchemaRef,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
+
+use crate::pgfunc::PgError;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
@@ -110,11 +117,16 @@ struct SetData {
     vals: HashSet<Val>,
     has_null: bool,
     rows: usize,
+    /// the first row, for a scalar subquery's value (SP2)
+    first: Option<RecordBatch>,
 }
 
 /// The set of one subquery's rows, collected once, read by every partition.
 pub struct SetHolder {
     key: Mutex<SetKey>,
+    /// whether `in_set` reads it, which needs the set of values
+    as_set: std::sync::atomic::AtomicBool,
+    schema: Mutex<Option<SchemaRef>>,
     building: Mutex<SetData>,
     data: OnceLock<SetData>,
 }
@@ -129,6 +141,8 @@ impl Default for SetHolder {
     fn default() -> Self {
         SetHolder {
             key: Mutex::new(SetKey::Plain),
+            as_set: std::sync::atomic::AtomicBool::new(false),
+            schema: Mutex::new(None),
             building: Mutex::new(SetData::default()),
             data: OnceLock::new(),
         }
@@ -136,24 +150,48 @@ impl Default for SetHolder {
 }
 
 impl SetHolder {
+    /// A holder of the rows of an input of schema `schema`.
+    pub fn with_schema(schema: SchemaRef) -> SetHolder {
+        let h = SetHolder::default();
+        if let Ok(mut s) = h.schema.lock() {
+            *s = Some(schema);
+        }
+        h
+    }
+
+    /// The type of column `k` of its rows.
+    pub fn column_type(&self, k: usize) -> Option<DataType> {
+        let s = self.schema.lock().ok()?;
+        s.as_ref()
+            .and_then(|s| s.fields().get(k).map(|f| f.data_type().clone()))
+    }
+
     pub fn set_key(&self, key: SetKey) {
         if let Ok(mut k) = self.key.lock() {
             *k = key;
         }
+        self.as_set.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn key(&self) -> SetKey {
         self.key.lock().map(|k| *k).unwrap_or(SetKey::Plain)
     }
 
-    /// Add the values of the first column of `batch`.
+    /// Add the rows of `batch`: the values of its first column to the set.
     pub fn add(&self, batch: &RecordBatch) -> Result<()> {
         let key = self.key();
-        let col = batch.column(0);
         let mut d = self
             .building
             .lock()
             .map_err(|_| DataFusionError::Internal("set lock poisoned".into()))?;
+        if d.first.is_none() && batch.num_rows() > 0 {
+            d.first = Some(batch.slice(0, 1));
+        }
+        if !self.as_set.load(std::sync::atomic::Ordering::Relaxed) {
+            d.rows += batch.num_rows();
+            return Ok(());
+        }
+        let col = batch.column(0);
         for i in 0..batch.num_rows() {
             d.rows += 1;
             match value(col, i, key)? {
@@ -193,6 +231,87 @@ impl SetHolder {
             });
         }
         Ok(Arc::new(out.finish()))
+    }
+}
+
+impl SetHolder {
+    /// SP2: column `k` of its one row, NULL of `ty` without a row.
+    pub fn scalar(&self, k: usize, ty: &DataType) -> Result<ScalarValue> {
+        let d = self.data.get().ok_or_else(|| {
+            DataFusionError::Internal("a subquery's value was read before it was complete".into())
+        })?;
+        if d.rows > 1 {
+            return Err(DataFusionError::External(Box::new(PgError::new(
+                "21000",
+                "more than one row returned by a subquery used as an expression",
+            ))));
+        }
+        match &d.first {
+            Some(b) => ScalarValue::try_from_array(b.column(k), 0),
+            None => ScalarValue::try_from(ty),
+        }
+    }
+}
+
+/// `scalar_of()`: the value of a scalar subquery, column `col` of the one
+/// row of `holder` (SP2).
+#[derive(Debug)]
+pub struct ScalarOf {
+    holder: Arc<SetHolder>,
+    col: usize,
+    ty: DataType,
+    signature: Signature,
+}
+
+impl PartialEq for ScalarOf {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.holder, &other.holder) && self.col == other.col
+    }
+}
+
+impl Eq for ScalarOf {}
+
+impl Hash for ScalarOf {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.holder) as usize).hash(state);
+        self.col.hash(state);
+    }
+}
+
+impl ScalarOf {
+    pub fn udf(holder: Arc<SetHolder>, col: usize) -> Result<ScalarUDF> {
+        let ty = holder.column_type(col).ok_or_else(|| {
+            DataFusionError::Internal(format!("a subquery has no column {col}"))
+        })?;
+        Ok(ScalarUDF::new_from_impl(ScalarOf {
+            holder,
+            col,
+            ty,
+            // known only once the subquery's rows are in, and an error
+            // wherever it is computed if there are several
+            signature: Signature::exact(vec![], Volatility::Volatile),
+        }))
+    }
+}
+
+impl ScalarUDFImpl for ScalarOf {
+    fn name(&self) -> &str {
+        "pg_scalar_subquery"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(self.ty.clone())
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args.number_rows == 0 {
+            return Ok(ColumnarValue::Array(datafusion::arrow::array::new_empty_array(&self.ty)));
+        }
+        Ok(ColumnarValue::Scalar(self.holder.scalar(self.col, &self.ty)?))
     }
 }
 
@@ -289,6 +408,25 @@ mod tests {
         let t = holder(SetKey::Plain, Arc::new(StringArray::from(vec!["ab  "])));
         let x: ArrayRef = Arc::new(StringArray::from(vec!["ab", "ab  "]));
         assert_eq!(look(&t, x), vec![Some(false), Some(true)]);
+    }
+
+    #[test]
+    fn a_scalar_subquery_has_one_row() {
+        let one = holder_rows(Arc::new(Int32Array::from(vec![7])));
+        assert_eq!(one.scalar(0, &DataType::Int32).unwrap(), ScalarValue::Int32(Some(7)));
+        let none = holder_rows(Arc::new(Int32Array::from(Vec::<i32>::new())));
+        assert_eq!(none.scalar(0, &DataType::Int32).unwrap(), ScalarValue::Int32(None));
+        let two = holder_rows(Arc::new(Int32Array::from(vec![1, 2])));
+        let e = two.scalar(0, &DataType::Int32).unwrap_err().to_string();
+        assert!(e.contains("more than one row"), "{e}");
+    }
+
+    fn holder_rows(col: ArrayRef) -> SetHolder {
+        let schema = Arc::new(Schema::new(vec![Field::new("c", col.data_type().clone(), true)]));
+        let h = SetHolder::with_schema(schema.clone());
+        h.add(&RecordBatch::try_new(schema, vec![col]).unwrap()).unwrap();
+        h.finish();
+        h
     }
 
     #[test]

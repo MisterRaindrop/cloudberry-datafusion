@@ -1982,6 +1982,216 @@ SET optimizer = off;
 SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
+-- The value of an uncorrelated scalar subquery (SP2, TPC-DS Q44 under
+-- GPORCA), as GPORCA plans it when the subquery may return several rows:
+-- its rows come from a Motion, read whole first as SP1's set; the value
+-- is its one row's column, NULL without a row.  More than one row is
+-- PostgreSQL's error where the value is computed, not where no row needs
+-- it.  An avg compares exactly, its display scale coming with its value.
+CREATE TABLE df_sc (id int, k int, n numeric(7,2)) DISTRIBUTED BY (id);
+INSERT INTO df_sc SELECT i, i % 50, ((i * 7919) % 20001 - 10000) / 100.0 FROM generate_series(1, 20000) i;
+ANALYZE df_sc;
+SET optimizer = on;
+SET optimizer_enforce_subplans = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_sc.k
+   ->  Result
+         ->  Sort
+               Sort Key: df_sc.k
+               ->  Result
+                     Filter: ((avg(df_sc.n)) > (0.9 * (SubPlan 1)))
+                     ->  Finalize HashAggregate
+                           Group Key: df_sc.k
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: df_sc.k
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: df_sc.k
+                                       ->  Seq Scan on df_sc
+                     SubPlan 1
+                       ->  Materialize
+                             ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                   ->  Finalize HashAggregate
+                                         Group Key: df_sc_1.k
+                                         ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                               Hash Key: df_sc_1.k
+                                               ->  Streaming Partial HashAggregate
+                                                     Group Key: df_sc_1.k
+                                                     ->  Seq Scan on df_sc df_sc_1
+                                                           Filter: (k = 3)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+ DataFusion: slice 4 eligible
+(31 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_sc
+                     Filter: (id < ((SubPlan 1) - 9000))
+                     SubPlan 1
+                       ->  Materialize
+                             ->  Broadcast Motion 3:3  (slice2; segments: 3)
+                                   ->  Finalize GroupAggregate
+                                         Group Key: df_sc_1.k
+                                         ->  Sort
+                                               Sort Key: df_sc_1.k
+                                               ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                                     Hash Key: df_sc_1.k
+                                                     ->  Streaming Partial HashAggregate
+                                                           Group Key: df_sc_1.k
+                                                           ->  Seq Scan on df_sc df_sc_1
+                                                                 Filter: (k = 3)
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(23 rows)
+
+SET datafusion.mode = off;
+SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+ k  |           avg           
+----+-------------------------
+  0 |  0.56302500000000000000
+  5 |  0.19117500000000000000
+  6 | -0.12280000000000000000
+  7 |  0.06325000000000000000
+  8 |  0.24930000000000000000
+  9 |  0.43535000000000000000
+ 10 |  0.62140000000000000000
+ 14 | -0.13447500000000000000
+ 15 |  0.05157500000000000000
+ 17 |  0.42367500000000000000
+ 18 |  0.10970000000000000000
+ 19 |  0.29575000000000000000
+ 20 |  0.98182500000000000000
+ 22 | -0.14615000000000000000
+ 25 |  0.41200000000000000000
+ 27 |  0.28407500000000000000
+ 28 |  0.47012500000000000000
+ 29 |  0.15615000000000000000
+ 30 |  0.84222500000000000000
+ 33 | -0.09970000000000000000
+ 35 |  0.27240000000000000000
+ 36 | -0.04157500000000000000
+ 37 |  0.14447500000000000000
+ 38 |  0.33052500000000000000
+ 39 |  0.51657500000000000000
+ 40 |  0.70262500000000000000
+ 44 | -0.05325000000000000000
+ 45 |  0.13280000000000000000
+ 47 |  0.50490000000000000000
+ 48 |  0.19092500000000000000
+ 49 |  0.37697500000000000000
+(31 rows)
+
+SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
+ k |           avg           |           a3            
+---+-------------------------+-------------------------
+ 0 |  0.56302500000000000000 | -0.18092500000000000000
+ 1 | -0.55302500000000000000 | -0.18092500000000000000
+ 2 | -0.36697500000000000000 | -0.18092500000000000000
+(3 rows)
+
+SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+ count |   sum    
+-------+----------
+ 10952 | 59978628
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 99 GROUP BY k);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+ERROR:  more than one row returned by a subquery used as an expression
+SET datafusion.mode = on;
+SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
+ k  |           avg           
+----+-------------------------
+  0 |  0.56302500000000000000
+  5 |  0.19117500000000000000
+  6 | -0.12280000000000000000
+  7 |  0.06325000000000000000
+  8 |  0.24930000000000000000
+  9 |  0.43535000000000000000
+ 10 |  0.62140000000000000000
+ 14 | -0.13447500000000000000
+ 15 |  0.05157500000000000000
+ 17 |  0.42367500000000000000
+ 18 |  0.10970000000000000000
+ 19 |  0.29575000000000000000
+ 20 |  0.98182500000000000000
+ 22 | -0.14615000000000000000
+ 25 |  0.41200000000000000000
+ 27 |  0.28407500000000000000
+ 28 |  0.47012500000000000000
+ 29 |  0.15615000000000000000
+ 30 |  0.84222500000000000000
+ 33 | -0.09970000000000000000
+ 35 |  0.27240000000000000000
+ 36 | -0.04157500000000000000
+ 37 |  0.14447500000000000000
+ 38 |  0.33052500000000000000
+ 39 |  0.51657500000000000000
+ 40 |  0.70262500000000000000
+ 44 | -0.05325000000000000000
+ 45 |  0.13280000000000000000
+ 47 |  0.50490000000000000000
+ 48 |  0.19092500000000000000
+ 49 |  0.37697500000000000000
+(31 rows)
+
+SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
+ k |           avg           |           a3            
+---+-------------------------+-------------------------
+ 0 |  0.56302500000000000000 | -0.18092500000000000000
+ 1 | -0.55302500000000000000 | -0.18092500000000000000
+ 2 | -0.36697500000000000000 | -0.18092500000000000000
+(3 rows)
+
+SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
+ count |   sum    
+-------+----------
+ 10952 | 59978628
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 99 GROUP BY k);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
+ERROR:  more than one row returned by a subquery used as an expression
+RESET optimizer_enforce_subplans;
+SET optimizer = off;
+SET datafusion.mode = off;
+DROP TABLE df_sc;
 -- A hash join's build side coming from another join (JE1,
 -- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
