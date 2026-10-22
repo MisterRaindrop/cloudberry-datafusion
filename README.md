@@ -1582,6 +1582,17 @@ Q58).  DataFusion projects, then sorts by the columns the Result passes
 the Sort's keys on as, and a Limit above applies after; a key the Result
 does not pass on keeps the slice on PostgreSQL.
 
+S3: what GPORCA sorts again of a Limit's rows stays on PostgreSQL too, and
+EXPLAIN reports it as a slice with nothing to compute, as the merge below
+it: a Sort over the coordinator's Limit over a Gather Motion (TPC-DS Q5,
+Q77 and nine more), and a Sort over a Sequence whose last input receives
+such a Limit's rows, sent back to the segments, while the Shared Scan
+producers' inputs run in DataFusion or only store rows received (Q1, Q14a,
+Q47 and seven more).  Sorting at most the Limit's count of rows, there is
+nothing to gain from starting a plan for it.  A Limit of an OFFSET alone
+lets any number of rows through, and the Sort over it is reported as
+before.
+
 | Sort key | Order |
 |---|---|
 | integers, bool, date, time, timestamp, timestamptz | as stored; date and timestamp infinities at the ends |

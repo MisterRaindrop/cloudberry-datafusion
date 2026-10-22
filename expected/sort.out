@@ -184,6 +184,41 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT a FROM df_so ORDER BY a LIMIT 5
  DataFusion: slice 1 eligible
 (11 rows)
 
+-- sorting the few rows of a Limit is nothing to compute, as a Gather is;
+-- an OFFSET alone lets any number through
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT id, b FROM df_so ORDER BY id LIMIT 5) s ORDER BY b DESC;
+                                                               QUERY PLAN                                                               
+----------------------------------------------------------------------------------------------------------------------------------------
+ Sort
+   Sort Key: df_so.b DESC
+   ->  Limit
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: df_so.id
+               ->  Limit
+                     ->  Sort
+                           Sort Key: df_so.id
+                           ->  Seq Scan on df_so
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: sorts at most 5 rows of a Limit, received from a Gather Motion, with nothing else to compute on them
+ DataFusion: slice 1 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT id, b FROM df_so ORDER BY id OFFSET 29995) s ORDER BY b DESC;
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Sort
+   Sort Key: df_so.b DESC
+   ->  Limit
+         ->  Gather Motion 3:1  (slice1; segments: 3)
+               Merge Key: df_so.id
+               ->  Sort
+                     Sort Key: df_so.id
+                     ->  Seq Scan on df_so
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: Limit below the top of the slice
+ DataFusion: slice 1 eligible
+(11 rows)
+
 -- a LIMIT from a parameter (a generic plan) stays on PostgreSQL
 PREPARE df_top(int8) AS SELECT id FROM df_so ORDER BY id DESC LIMIT $1;
 SET plan_cache_mode = force_generic_plan;

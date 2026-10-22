@@ -7184,6 +7184,93 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 	pfree(cxt.roots);
 }
 
+/* The rows Limit 'plan' lets through at most: its constant count, else -1. */
+static int64
+df_limit_rows(Plan *plan)
+{
+	Limit	   *limit = (Limit *) plan;
+	int64		count;
+	int64		offset;
+
+	if (plan == NULL || !IsA(plan, Limit) || limit->limitOption != LIMIT_OPTION_COUNT ||
+		!df_passes_through(plan) ||
+		!df_limit_value(limit->limitCount, &count) ||
+		!df_limit_value(limit->limitOffset, &offset))
+		return -1;
+	return count;
+}
+
+/*
+ * Where all that the slice part 'compute' leaves to PostgreSQL is sorting
+ * the few rows of a Limit, the number of them at most, and the Motion they
+ * come from; else -1.  GPORCA puts a Sort over the coordinator's Limit over
+ * a Gather Motion, whose rows are sorted already, and a Sort over a
+ * Sequence whose last input receives the rows of such a Limit, sent back to
+ * the segments, while DataFusion runs the inputs of the Sequence's Shared
+ * Scan producers ('points', T2) or they only store rows they receive.  Neither has anything worth computing on
+ * the rows it receives, as a Gather Motion has not.
+ */
+static int64
+df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
+{
+	Plan	   *below;
+	Plan	   *body;
+	ListCell   *lc;
+
+	if (compute == NULL || !IsA(compute, Sort) || !df_passes_through(compute))
+		return -1;
+	below = outerPlan(compute);
+	if (IsA(below, Limit))
+	{
+		if (points != NIL || outerPlan(below) == NULL || !IsA(outerPlan(below), Motion))
+			return -1;
+		*motion = (Motion *) outerPlan(below);
+		return df_limit_rows(below);
+	}
+	/* through the Sequences, some within others, to the last input */
+	for (; IsA(below, Sequence); below = body)
+	{
+		body = llast(((Sequence *) below)->subplans);
+		if (below->qual != NIL || list_length(below->targetlist) != list_length(body->targetlist))
+			return -1;
+		foreach(lc, below->targetlist)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, lc);
+			Var		   *var = (Var *) tle->expr;
+
+			if (!IsA(var, Var) || var->varno != OUTER_VAR || var->varattno != tle->resno)
+				return -1;
+		}
+		/*
+		 * every producer's input runs wholly in DataFusion, or only
+		 * receives rows to store
+		 */
+		foreach(lc, ((Sequence *) below)->subplans)
+		{
+			Plan	   *sub = lfirst(lc);
+			ListCell   *pc;
+			bool		found = false;
+
+			if (sub == body)
+				continue;
+			if (!IsA(sub, ShareInputScan) || outerPlan(sub) == NULL)
+				return -1;
+			if (IsA(outerPlan(sub), Motion))
+				continue;
+			foreach(pc, points)
+				if (((DfAttach *) lfirst(pc))->plan == outerPlan(sub))
+					found = true;
+			if (!found)
+				return -1;
+		}
+	}
+	if (below == outerPlan(compute) || !IsA(below, Motion))
+		return -1;
+	body = below;
+	*motion = (Motion *) body;
+	return df_limit_rows(outerPlan(body));
+}
+
 /*
  * The "DataFusion: slice N ..." line of slice 'root'.  CL2: a slice the
  * segments run is reported as they check it, by their default collation,
@@ -7245,6 +7332,14 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 		List	   *points = df_slice_attach_points(stmt, compute, df_batch_motions(stmt));
 		ListCell   *lc;
 
+		Motion	   *motion = NULL;
+		int64		rows = df_sorts_limited_rows(compute, points, &motion);
+
+		if (rows >= 0)
+			snprintf(reason, sizeof(reason),
+					 "sorts at most " INT64_FORMAT " rows of a Limit, received from a %s, "
+					 "with nothing else to compute on them",
+					 rows, df_plan_name((Plan *) motion));
 		if (points == NIL)
 			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
 							 root->index, reason);

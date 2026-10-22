@@ -62,6 +62,10 @@ EXPLAIN (COSTS OFF) SELECT relnatts, count(*) FROM pg_class GROUP BY relnatts OR
 EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY a FETCH FIRST 3 ROWS WITH TIES;
 EXPLAIN (COSTS OFF) SELECT id FROM df_so ORDER BY t USING ~<~ LIMIT 3;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT a FROM df_so ORDER BY a LIMIT 5) s;
+-- sorting the few rows of a Limit is nothing to compute, as a Gather is;
+-- an OFFSET alone lets any number through
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT id, b FROM df_so ORDER BY id LIMIT 5) s ORDER BY b DESC;
+EXPLAIN (COSTS OFF) SELECT * FROM (SELECT id, b FROM df_so ORDER BY id OFFSET 29995) s ORDER BY b DESC;
 
 -- a LIMIT from a parameter (a generic plan) stays on PostgreSQL
 PREPARE df_top(int8) AS SELECT id FROM df_so ORDER BY id DESC LIMIT $1;

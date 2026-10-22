@@ -108,6 +108,11 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w;
 EXPLAIN (COSTS OFF) SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t);
+-- the Sort over the Sequence only sorts the rows of the coordinator's
+-- Limit, sent back to the segments: nothing to compute on them (TPC-DS Q1)
+EXPLAIN (COSTS OFF) WITH c AS (SELECT id % 500 AS g, k, sum(v) AS s FROM df_pt GROUP BY id % 500, k)
+SELECT x.g, x.s FROM c x, (SELECT k, avg(s) AS a FROM c GROUP BY k) y
+WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
 SET datafusion.mode = off;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
@@ -116,6 +121,9 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w ORDER BY 1, 2, 3, 4, 5, 6;
 SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+WITH c AS (SELECT id % 500 AS g, k, sum(v) AS s FROM df_pt GROUP BY id % 500, k)
+SELECT x.g, x.s FROM c x, (SELECT k, avg(s) AS a FROM c GROUP BY k) y
+WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
 SET datafusion.mode = on;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
@@ -124,6 +132,9 @@ SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, x.w, x.v, y.k, y.w, y.v FROM c x JOIN c y ON x.k = y.w ORDER BY 1, 2, 3, 4, 5, 6;
 SELECT k, t, count(*), sum(v) FROM df_pt GROUP BY ROLLUP (k, t) ORDER BY 1, 2 LIMIT 5;
+WITH c AS (SELECT id % 500 AS g, k, sum(v) AS s FROM df_pt GROUP BY id % 500, k)
+SELECT x.g, x.s FROM c x, (SELECT k, avg(s) AS a FROM c GROUP BY k) y
+WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
 SET optimizer = off;
 
 -- Numeric values of display scales of their own (an avg, a sum of
