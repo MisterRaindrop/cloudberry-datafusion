@@ -115,6 +115,29 @@ pub extern "C" fn df_ffi_debug_panic(buf: *mut c_char, buflen: usize) -> i32 {
     guard(buf, buflen, || panic!("datafusion_debug_panic requested"))
 }
 
+/// CM1: set the case maps of the backend's LC_CTYPE: `nupper` and `nlower`
+/// pairs (code point, mapped code point), flattened.
+///
+/// # Safety
+/// `upper` and `lower` point to 2 * `nupper` and 2 * `nlower` values.
+#[no_mangle]
+pub unsafe extern "C" fn df_ffi_set_case_maps(
+    upper: *const u32,
+    nupper: usize,
+    lower: *const u32,
+    nlower: usize,
+) {
+    let pairs = |p: *const u32, n: usize| -> Vec<(u32, u32)> {
+        if p.is_null() || n == 0 {
+            return Vec::new();
+        }
+        let v = std::slice::from_raw_parts(p, 2 * n);
+        v.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+    };
+    let (u, l) = (pairs(upper, nupper), pairs(lower, nlower));
+    let _ = catch_unwind(AssertUnwindSafe(|| df_core::pgstr::set_case_maps(&u, &l)));
+}
+
 // ---------------------------------------------------------------------------
 // Runtime
 // ---------------------------------------------------------------------------

@@ -20,7 +20,8 @@
 //! (like_match.c, UTF8_MatchText) and the functions of varlena.c and
 //! oracle_compat.c the planner hook lets through.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, BooleanBuilder, Int32Array, Int32Builder, StringArray,
@@ -443,6 +444,54 @@ pub enum StrFn {
     StartsWith,
     Lower,
     Upper,
+    /// CM1: under a libc locale's LC_CTYPE, as its towlower and towupper
+    LowerLocale,
+    UpperLocale,
+}
+
+/// CM1: the case maps of the backend's LC_CTYPE, code point to code point
+/// where towupper (towlower) changes it, as str_toupper (str_tolower)
+/// applies them character by character under the default collation of a
+/// UTF-8 database.  The backend reads them from its own C library once and
+/// sets them here before a plan uses them.
+struct CaseMaps {
+    upper: HashMap<char, char>,
+    lower: HashMap<char, char>,
+}
+
+static CASE_MAPS: RwLock<Option<Arc<CaseMaps>>> = RwLock::new(None);
+
+/// Set the case maps from pairs (code point, mapped code point).
+pub fn set_case_maps(upper: &[(u32, u32)], lower: &[(u32, u32)]) {
+    let map = |pairs: &[(u32, u32)]| -> HashMap<char, char> {
+        pairs
+            .iter()
+            .filter_map(|&(a, b)| Some((char::from_u32(a)?, char::from_u32(b)?)))
+            .collect()
+    };
+    let maps = CaseMaps {
+        upper: map(upper),
+        lower: map(lower),
+    };
+    if let Ok(mut m) = CASE_MAPS.write() {
+        *m = Some(Arc::new(maps));
+    }
+}
+
+fn case_maps() -> Result<Arc<CaseMaps>> {
+    CASE_MAPS
+        .read()
+        .ok()
+        .and_then(|m| m.clone())
+        .ok_or_else(|| DataFusionError::Internal("the locale's case maps are not set".into()))
+}
+
+/// `s` with each character mapped by `map`, borrowed where none changes.
+fn map_case<'a>(s: &'a str, map: &HashMap<char, char>) -> Text<'a> {
+    if !s.chars().any(|c| map.contains_key(&c)) {
+        return Text::Slice(s);
+    }
+    Text::Owned(s.chars().map(|c| *map.get(&c).unwrap_or(&c)).collect())
 }
 
 impl StrFn {
@@ -468,6 +517,8 @@ impl StrFn {
             "starts_with" => StrFn::StartsWith,
             "lower" => StrFn::Lower,
             "upper" => StrFn::Upper,
+            "lower_locale" => StrFn::LowerLocale,
+            "upper_locale" => StrFn::UpperLocale,
             _ => return None,
         })
     }
@@ -502,6 +553,8 @@ impl StrFn {
             StrFn::StartsWith => "pg_starts_with",
             StrFn::Lower => "pg_lower",
             StrFn::Upper => "pg_upper",
+            StrFn::LowerLocale => "pg_lower_locale",
+            StrFn::UpperLocale => "pg_upper_locale",
         }
     }
 
@@ -763,6 +816,8 @@ fn call_text<'a>(f: StrFn, args: &[Arg<'a>], r: usize) -> Result<Option<Text<'a>
                 Text::Slice(s)
             }
         }
+        StrFn::LowerLocale => map_case(t(0)?, &case_maps()?.lower),
+        StrFn::UpperLocale => map_case(t(0)?, &case_maps()?.upper),
         _ => {
             return Err(DataFusionError::Internal(format!(
                 "{f:?} is not a text function"

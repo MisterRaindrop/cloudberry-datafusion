@@ -34,6 +34,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <wctype.h>
 
 #include "catalog/pg_tablespace_d.h"
 #include "common/file_utils.h"
@@ -298,4 +299,54 @@ df_task_wait_interruptible(DfTask *task, char *buf, size_t buflen)
 
 	df_ffi_task_free(task);
 	return status;
+}
+
+/*
+ * CM1: give DataFusion the case maps of this backend's LC_CTYPE, once: each
+ * code point that towupper (towlower) changes, with what it makes of it.
+ * Under the default collation of a libc provider in a UTF-8 database,
+ * str_toupper and str_tolower map each character so (the default
+ * collation has no locale_t of its own: the process's LC_CTYPE).  About
+ * 1.1 million calls, a few milliseconds.
+ */
+void
+df_case_maps_ensure(void)
+{
+	static bool done = false;
+	uint32_t   *upper;
+	uint32_t   *lower;
+	size_t		nupper = 0;
+	size_t		nlower = 0;
+	uint32_t	cp;
+
+	if (done)
+		return;
+	upper = palloc(sizeof(uint32_t) * 2 * 8192);
+	lower = palloc(sizeof(uint32_t) * 2 * 8192);
+	for (cp = 0; cp < 0x110000; cp++)
+	{
+		wint_t		u,
+					l;
+
+		if (cp >= 0xD800 && cp <= 0xDFFF)
+			continue;
+		u = towupper((wint_t) cp);
+		l = towlower((wint_t) cp);
+		if (u != (wint_t) cp && nupper < 8192)
+		{
+			upper[2 * nupper] = cp;
+			upper[2 * nupper++ + 1] = (uint32_t) u;
+		}
+		if (l != (wint_t) cp && nlower < 8192)
+		{
+			lower[2 * nlower] = cp;
+			lower[2 * nlower++ + 1] = (uint32_t) l;
+		}
+	}
+	if (nupper >= 8192 || nlower >= 8192)
+		elog(ERROR, "datafusion: more case mappings than expected");
+	df_ffi_set_case_maps(upper, nupper, lower, nlower);
+	pfree(upper);
+	pfree(lower);
+	done = true;
 }

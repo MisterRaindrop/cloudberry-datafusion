@@ -1964,7 +1964,15 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					df_fail(b, "a function call");
 					return;
 				}
-				appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"%s\",\"args\":", f->name, tag);
+				if (f->rule == DF_COLL_CTYPE_C && !df_ctype_is_c(fe->inputcollid))
+				{
+					/* CM1: as the node's LC_CTYPE maps each character */
+					df_case_maps_ensure();
+					appendStringInfo(out, "{\"call\":\"%s_locale\",\"type\":\"%s\",\"args\":",
+									 f->name, tag);
+				}
+				else
+					appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"%s\",\"args\":", f->name, tag);
 				df_emit_list(b, out, fe->args, level);
 				appendStringInfoChar(out, '}');
 				return;

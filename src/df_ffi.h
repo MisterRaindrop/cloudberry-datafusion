@@ -58,6 +58,10 @@
 extern int32_t df_ffi_version(char *buf, size_t buflen);
 extern int32_t df_ffi_debug_panic(char *buf, size_t buflen);
 
+/* CM1: the case maps of the backend's LC_CTYPE, pairs of code points */
+extern void df_ffi_set_case_maps(const uint32_t *upper, size_t nupper,
+								 const uint32_t *lower, size_t nlower);
+
 /*
  * Per-backend runtime.  The caller must block all signals around
  * df_ffi_runtime_init so that the runtime's threads start with every signal

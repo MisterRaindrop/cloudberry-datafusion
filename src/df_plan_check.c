@@ -445,6 +445,18 @@ df_database_provider(void)
 }
 
 /*
+ * CM1: does case mapping under the default collation map each character as
+ * towupper and towlower of the node's LC_CTYPE do (str_toupper,
+ * str_tolower): a libc provider in a UTF-8 database?  Their maps are given
+ * to DataFusion (df_case_maps_ensure).
+ */
+bool
+df_default_case_maps(void)
+{
+	return df_database_provider() == COLLPROVIDER_LIBC && GetDatabaseEncoding() == PG_UTF8;
+}
+
+/*
  * Does this node compare strings under the database's default collation
  * by their bytes?  Under C or POSIX, or (CU1) under libc's C.UTF-8 where
  * strcoll orders df_bytewise_pairs as their bytes.
@@ -543,7 +555,7 @@ df_collation_locale(Oid collation)
 	return locale;
 }
 
-static bool
+bool
 df_ctype_is_c(Oid collation)
 {
 	if (collation == DEFAULT_COLLATION_OID && df_explain_ctype_c >= 0)
@@ -712,9 +724,12 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 		case DF_COLL_CTYPE_C:
 			if (collation == DEFAULT_COLLATION_OID)
 				cxt->locale_dependent = true;
-			if (!OidIsValid(collation) || !df_ctype_is_c(collation))
-				return "under a collation other than C";
-			return NULL;
+			if (!OidIsValid(collation))
+				return "without a collation";
+			if (df_ctype_is_c(collation) ||
+				(collation == DEFAULT_COLLATION_OID && df_default_case_maps()))
+				return NULL;	/* ASCII under C, else the locale's maps (CM1) */
+			return "under a collation other than C";
 	}
 	return NULL;
 }

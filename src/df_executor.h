@@ -404,6 +404,9 @@ df_below_sort(Plan *plan)
 
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);
+extern void df_case_maps_ensure(void);
+extern bool df_default_case_maps(void);
+extern bool df_ctype_is_c(Oid collation);
 extern const char *df_spill_dir(void);
 extern void df_vmem_sync(int64 headroom);
 extern void df_vmem_trim(void);

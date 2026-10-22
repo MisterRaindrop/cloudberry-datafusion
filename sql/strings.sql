@@ -165,6 +165,32 @@ SELECT count(repeat(s, 1000000000)) FROM df_sf;
 SELECT count(lpad(s, 300000000, 'x')) FROM df_sf;
 \set VERBOSITY default
 
+-- lower() and upper() under the default collation (CM1): under C, ASCII
+-- letters only; under another libc locale of a UTF-8 database (C.UTF-8,
+-- en_US.UTF-8), each character as the node's towlower and towupper map it,
+-- one for one, from maps each backend reads from its own C library.  Every
+-- code point, and words of characters whose full mappings differ from the
+-- simple ones (ß, ǅ, ᾀ, İ, ﬀ) or that newer Unicode maps: PostgreSQL's
+-- results, made on the segments as the rows are inserted, against
+-- DataFusion's.
+CREATE TABLE df_cm_cp (i int) DISTRIBUTED BY (i);
+INSERT INTO df_cm_cp SELECT i FROM generate_series(1, 1114111) i WHERE i < 55296 OR i > 57343;
+CREATE TABLE df_cm (i int, c text, u text, l text) DISTRIBUTED BY (i);
+INSERT INTO df_cm SELECT i, chr(i), upper(chr(i)), lower(chr(i)) FROM df_cm_cp;
+INSERT INTO df_cm SELECT -p.i, t.w, upper(t.w), lower(t.w) FROM df_cm_cp p,
+  unnest(ARRAY['straße ẞ', 'ǆ ǅ Ǆ', 'ᾀ ᾈ ΐ ΰ', 'İ ı i I', 'Σσς', 'ﬀ ŉ ǰ', 'Ω K Å', 'ƛ ɤ ᲊ',
+               '中文 😀 abcXYZ', '']) WITH ORDINALITY AS t(w, n) WHERE p.i = t.n;
+ANALYZE df_cm;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <> l;
+SET datafusion.mode = on;
+SELECT count(*) AS rows, count(*) FILTER (WHERE upper(c) <> u) AS upper_differs,
+  count(*) FILTER (WHERE lower(c) <> l) AS lower_differs FROM df_cm;
+SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <> l;
+SELECT count(*) FROM df_cm WHERE i < 0 AND upper(c || c) = u || u AND lower(c || 'X') = l || 'x';
+SET datafusion.mode = off;
+DROP TABLE df_cm_cp, df_cm;
+
 -- Strings handed out row by row through a cursor (rows arrive from the
 -- segments in any order, so they are all alike).
 BEGIN;

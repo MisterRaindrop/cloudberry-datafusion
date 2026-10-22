@@ -899,7 +899,7 @@ wherever PostgreSQL does:
 |---|---|
 | `length`, `char_length`, `octet_length`, `substr`/`substring(s, n [, len])`, `text \|\| text`, `concat` of text, `btrim`/`ltrim`/`rtrim`, `left`, `right`, `reverse`, `repeat`, `lpad`, `rpad` | any |
 | `strpos`/`position`, `replace`, `split_part`, `starts_with` | deterministic (PostgreSQL rejects the others) |
-| `lower`, `upper` | C or POSIX (ASCII letters only, as PostgreSQL maps them there) |
+| `lower`, `upper` | C or POSIX (ASCII letters only, as PostgreSQL maps them there); the default collation of a libc provider in a UTF-8 database (CM1) |
 
 Their errors keep PostgreSQL's SQLSTATEs (negative substring length 22011,
 field position zero 22023, results over 1 GB 54000), and calls that can
@@ -915,6 +915,20 @@ DataFusion off and on: identical.  Over 20 million rows,
 `upper(city COLLATE "C") || '/' || btrim(cust, 'c') = ...` took 0.27 s
 against 1.00 s in PostgreSQL, grouping by `split_part(city, '-', 2)` 0.25 s
 against 1.02 s.
+
+CM1: under the default collation of a libc provider in a UTF-8 database
+other than C (C.UTF-8, en_US.UTF-8), PostgreSQL maps each character with
+`towlower` and `towupper` of the node's LC_CTYPE, one for one
+(`str_tolower`, `str_toupper`): ß stays ß, ǅ becomes Ǆ, ᾀ becomes ᾈ, not
+Unicode's full mappings to several characters.  Rust's mappings are
+those, and of a newer Unicode than the C library's (244 code points
+differ with glibc 2.34's C.UTF-8), so each backend reads its own maps once,
+the code points `towupper` and `towlower` change (about 1.1 million calls,
+a few milliseconds), and hands them to DataFusion, which maps by them.  A
+test compares every code point and words of the characters that differ,
+PostgreSQL's results made on the segments against DataFusion's: none
+differs.  TPC-DS Q24a and Q24b (`upper(c_birth_country)`) under GPORCA
+now run wholly in DataFusion.
 
 Redistribute Motions by a `text` or `varchar` key carry batches too (X2):
 cdbhash calls `hashtext` with the default collation, which is always
