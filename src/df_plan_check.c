@@ -1682,6 +1682,24 @@ df_collect_aggrefs(Node *node, List **aggs)
 }
 
 /*
+ * CS1: are the transition states of all calls of Agg 'agg' plain values,
+ * which a combining stage reads as any column (df_agg_state)?
+ */
+static bool
+df_agg_plain_states(Agg *agg)
+{
+	List	   *aggs = NIL;
+	ListCell   *lc;
+
+	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
+	foreach(lc, aggs)
+		if (df_agg_state(lfirst_node(Aggref, lc)) != DF_AGG_PLAIN)
+			return false;
+	return true;
+}
+
+/*
  * The kept side's hash key of semi join 'hj' that inner column 'var' equals
  * exactly (a hash clause outer = var of a type whose equal values are the
  * same: integers, dates and times, bool), or NULL.
@@ -4687,11 +4705,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * aggregates is a plain value (count, sum and min/max of the
 				 * supported types).  Or the combining stage, reading those
 				 * states straight from the Motion that gathers them; other
-				 * combining stages stay on PostgreSQL.
+				 * combining stages stay on PostgreSQL.  CS1: where every
+				 * state is a plain value (count, min, max, a sum of
+				 * integers), the combining stage reads it as any column,
+				 * also through what lies between it and the Motion: GPORCA
+				 * joins partial counts before combining them (TPC-DS Q95).
 				 */
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
-					if (child == NULL || !IsA(df_below_sort(child), Motion))
+					if ((child == NULL || !IsA(df_below_sort(child), Motion)) &&
+						!df_agg_plain_states(agg))
 					{
 						df_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
 						return;

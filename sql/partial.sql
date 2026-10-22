@@ -170,6 +170,31 @@ SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
 SET optimizer = off;
 DROP TABLE df_ps;
 
+-- GPORCA combines partial aggregates after a join (CS1, TPC-DS Q95): the
+-- partial stage groups one side by the join key, the join may repeat its
+-- rows, and the combining stage adds up their counts.  Where every state
+-- is a plain value (count, min, max, a sum of integers), DataFusion reads
+-- it through the join as any column; an avg's state stays on PostgreSQL.
+CREATE TABLE df_cs_s (o int, w int) DISTRIBUTED BY (w);
+CREATE TABLE df_cs_r (o int, x int) DISTRIBUTED BY (x);
+INSERT INTO df_cs_s SELECT i % 3000, CASE WHEN i % 23 = 0 THEN NULL ELSE i % 7 END FROM generate_series(1, 60000) i;
+INSERT INTO df_cs_r SELECT i * 3, i FROM generate_series(1, 400) i;
+INSERT INTO df_cs_r VALUES (3, 401), (6, 402), (6, 403);
+ANALYZE df_cs_s;
+ANALYZE df_cs_r;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o;
+EXPLAIN (COSTS OFF) SELECT r.o, count(*), avg(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o;
+SET datafusion.mode = off;
+SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
+SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, count(*) c, count(s.w) cw, sum(s.w) sw, min(s.w) mn, max(s.w) mx FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) t;
+SET datafusion.mode = on;
+SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
+SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, count(*) c, count(s.w) cw, sum(s.w) sw, min(s.w) mn, max(s.w) mx FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) t;
+SET optimizer = off;
+DROP TABLE df_cs_s, df_cs_r;
+
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

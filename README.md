@@ -412,6 +412,17 @@ DataFusion, values that are not exact in binary may differ from
 PostgreSQL's in the last digits, the rows being added in another order (as
 they are between PostgreSQL plans with different parallelism).
 
+CS1: a combining stage reads the partial states from the Motion that
+gathers them, right below it.  GPORCA may join them first: TPC-DS Q95
+under GPORCA groups one side of a join by the join key, partial counts,
+joins, and combines the counts per group of the other side, the join
+repeating a partial row for each match.  Where every state is a plain
+value (count, min, max, a sum of integers), DataFusion reads it through
+the join as any column and the combining stage adds or compares as over a
+Motion; a state of two columns or PostgreSQL's own (an avg, a numeric
+sum) keeps such a stage on PostgreSQL.  Q95 under GPORCA now runs wholly
+in DataFusion.
+
 A slice that only receives, such as the coordinator returning a Gather's
 rows to the client, stays on tuples, and its Gather with it.  Running it in
 DataFusion just to decode batches was tried and measured: results matched,
@@ -514,6 +525,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M7b | Arrow IPC batches through Gather Motions between DataFusion slices |
 | M7c | Redistribute Motions with batches, routed by a checked transcription of cdbhash |
 | M7d | Split avg through batch Motions with DataFusion's state |
+| CS1 | Combining aggregates of plain states read through a join |
 | J1 | Plan tree over several inputs (groundwork for joins) |
 | J2 | Inner hash joins over local scans, with a memory guard |
 | J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
