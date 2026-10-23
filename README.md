@@ -1716,6 +1716,13 @@ segments this way): EXPLAIN reports it as passing on those rows with
 nothing else to compute, and lists what runs below its producers.  Only
 the report changes; the producers' inputs ran in DataFusion before.
 
+RS1: and so is a slice that only passes on the rows a Shared Scan reader
+reads to a Motion of tuples, through Results that pick its columns and
+may filter them (GPORCA's TPC-DS Q4, Q74 and Q80 send shared year totals
+so, each slice filtering one year; an avg's columns go as tuples).
+Pulling the rows into DataFusion only to filter them and hand them back
+gains nothing.
+
 | Sort key | Order |
 |---|---|
 | integers, bool, date, time, timestamp, timestamptz | as stored; date and timestamp infinities at the ends |

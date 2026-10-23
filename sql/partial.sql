@@ -212,6 +212,29 @@ SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(
 SET optimizer = off;
 DROP TABLE df_cs_s, df_cs_r;
 
+-- RS1: a slice that only passes on rows a Shared Scan reader reads,
+-- filtered, to a Motion of tuples (an avg's columns go as tuples) is
+-- reported as passing them on with nothing else to compute (GPORCA's
+-- TPC-DS Q4, Q74, Q80).
+CREATE TABLE df_rs (id int, c int, y int, a numeric(7,2)) DISTRIBUTED BY (id);
+INSERT INTO df_rs SELECT i, i % 500, 2000 + i % 3, (i % 977) * 0.13 FROM generate_series(1, 30000) i;
+ANALYZE df_rs;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
+SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
+WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
+SET datafusion.mode = off;
+WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
+SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
+WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
+SET datafusion.mode = on;
+WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
+SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
+WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
+SET optimizer = off;
+DROP TABLE df_rs;
+
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

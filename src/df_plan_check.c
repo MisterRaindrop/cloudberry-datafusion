@@ -7792,6 +7792,38 @@ df_forwards_motion(Plan *compute, List *points)
 }
 
 /*
+ * RS1: does the slice part 'compute' only pass on rows a Shared Scan reader
+ * reads, through Results that pick its columns and may filter them, and
+ * set *filtered if one does?  GPORCA's TPC-DS Q4, Q74 and Q80 send the
+ * rows of shared year totals so, each slice filtering one year.
+ */
+static bool
+df_passes_reader(Plan *compute, bool *filtered)
+{
+	Plan	   *p = compute;
+
+	*filtered = false;
+	while (p != NULL && IsA(p, Result))
+	{
+		ListCell   *lc;
+
+		if (((Result *) p)->resconstantqual != NULL || outerPlan(p) == NULL)
+			return false;
+		foreach(lc, p->targetlist)
+		{
+			Var		   *var = (Var *) lfirst_node(TargetEntry, lc)->expr;
+
+			if (!IsA(var, Var) || var->varno != OUTER_VAR)
+				return false;
+		}
+		if (p->qual != NIL)
+			*filtered = true;
+		p = outerPlan(p);
+	}
+	return p != NULL && IsA(p, ShareInputScan) && outerPlan(p) == NULL && p->qual == NIL;
+}
+
+/*
  * The "DataFusion: slice N ..." line of slice 'root'.  CL2: a slice the
  * segments run is reported as they check it, by their default collation,
  * which can differ from the coordinator's (C and C.UTF-8).
@@ -7853,6 +7885,7 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 		ListCell   *lc;
 
 		Motion	   *motion = NULL;
+		bool		filtered;
 		int64		rows = df_sorts_limited_rows(compute, points, &motion);
 
 		if (rows >= 0)
@@ -7860,6 +7893,14 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 					 "sorts at most " INT64_FORMAT " rows of a Limit, received from a %s, "
 					 "with nothing else to compute on them",
 					 rows, df_plan_name((Plan *) motion));
+		else if (points == NIL && root->is_sender && df_passes_reader(compute, &filtered))
+		{
+			/* RS1: as a receiving slice that only passes rows on */
+			appendStringInfo(out, "DataFusion: slice %d not eligible: passes on rows read from "
+							 "a Shared Scan%s, with nothing else to compute on them\n",
+							 root->index, filtered ? ", filtered" : "");
+			return;
+		}
 		else if ((motion = df_forwards_motion(compute, points)) != NULL)
 		{
 			/* FW1: what runs below its Shared Scan producers, all of it */
