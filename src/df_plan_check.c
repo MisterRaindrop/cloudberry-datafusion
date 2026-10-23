@@ -1391,6 +1391,19 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 			}
 		case T_NullIfExpr:
 			return df_numeric_range(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn);
+		case T_RelabelType:
+			{
+				/*
+				 * RL1: numeric_support makes a coercion to numeric(p, s) of
+				 * a value of that scale and at most p digits a relabeling
+				 * of it (TPC-DS Q18's cast(cs_list_price as
+				 * decimal(12,2))): its value's range
+				 */
+				Node	   *arg = (Node *) ((RelabelType *) expr)->arg;
+
+				return exprType(expr) == NUMERICOID && exprType(arg) == NUMERICOID &&
+					df_numeric_ps(ctx, arg, precision, scale);
+			}
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) expr;
@@ -2861,6 +2874,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				if (df_type_is_string(r->resulttype) &&
 					(r->resulttype == exprType((Node *) r->arg) ||
 					 (r->resulttype == TEXTOID && exprType((Node *) r->arg) == VARCHAROID)))
+					break;
+				/* RL1: numeric relabeled with a wider type modifier, the same value */
+				if (r->resulttype == NUMERICOID && exprType((Node *) r->arg) == NUMERICOID)
 					break;
 				df_reject(cxt, "type cast");
 				return true;

@@ -567,6 +567,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
 | STD1 | stddev and variance of int2 and int4, in one stage |
+| RL1 | numeric coerced to a wider numeric(p, s) of its scale |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
@@ -1096,6 +1097,14 @@ columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
 against 2.31 s in PostgreSQL.
+
+RL1: a coercion to `numeric(p, s)` of a value of scale s and at most p
+digits does not change it, so numeric_support makes it a relabeling
+(RelabelType) of its argument: TPC-DS Q18's `avg(cast(cs_list_price as
+decimal(12,2)))` of a `numeric(7,2)` column.  It has its argument's
+precision and scale and is computed as its argument; one to another
+scale stays a call of `numeric(numeric, int4)` (E2).  Q18 under both
+planners now runs wholly in DataFusion.
 
 A CASE or COALESCE whose branches have different scales (`CASE WHEN
 p_type LIKE 'PROMO%' THEN price * (1 - disc) ELSE 0 END` in TPC-H Q8 and

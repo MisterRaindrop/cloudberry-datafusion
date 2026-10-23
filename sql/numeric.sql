@@ -655,6 +655,38 @@ RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_sd;
 
+-- RL1: a coercion to numeric(p, s) of a value of scale s and at most p
+-- digits is a relabeling of it (numeric_support), which keeps the value's
+-- range: an avg of one with ROLLUP, in two stages (TPC-DS Q18), a sum, an
+-- output column, a comparison, under both planners.  A coercion to another
+-- scale rounds (E2).
+CREATE TABLE df_rl (k int, g int, a numeric(7,2), b numeric(5,0)) DISTRIBUTED BY (k);
+INSERT INTO df_rl SELECT i, i % 7, CASE WHEN i % 13 = 0 THEN NULL ELSE ((i * 7919) % 199999 - 99999) / 100.0 END,
+  (i * 31) % 99999 - 49999 FROM generate_series(1, 5000) i;
+ANALYZE df_rl;
+SET datafusion.motion_batches = on;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, avg(a::numeric(12,2)), avg(b::decimal(9,0)) FROM df_rl GROUP BY ROLLUP (g) ORDER BY g;
+EXPLAIN (COSTS OFF) SELECT k, a::numeric(12,2), b::numeric(10,0) FROM df_rl WHERE a::numeric(9,2) > 900 ORDER BY k;
+SET datafusion.mode = off;
+SELECT g, avg(a::numeric(12,2)), avg(b::decimal(9,0)) FROM df_rl GROUP BY ROLLUP (g) ORDER BY g;
+SELECT g, sum(a::numeric(12,2)), sum(b::numeric(10,0)) FROM df_rl GROUP BY g ORDER BY g;
+SELECT k, a::numeric(12,2), b::numeric(10,0), a::numeric(12,3) FROM df_rl WHERE a::numeric(9,2) > 990 ORDER BY k;
+SET datafusion.mode = on;
+SELECT g, avg(a::numeric(12,2)), avg(b::decimal(9,0)) FROM df_rl GROUP BY ROLLUP (g) ORDER BY g;
+SELECT g, sum(a::numeric(12,2)), sum(b::numeric(10,0)) FROM df_rl GROUP BY g ORDER BY g;
+SELECT k, a::numeric(12,2), b::numeric(10,0), a::numeric(12,3) FROM df_rl WHERE a::numeric(9,2) > 990 ORDER BY k;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, avg(a::numeric(12,2)), avg(b::decimal(9,0)) FROM df_rl GROUP BY ROLLUP (g) ORDER BY g;
+SET datafusion.mode = on;
+SELECT g, avg(a::numeric(12,2)), avg(b::decimal(9,0)) FROM df_rl GROUP BY ROLLUP (g) ORDER BY g;
+SELECT k, a::numeric(12,2), b::numeric(10,0), a::numeric(12,3) FROM df_rl WHERE a::numeric(9,2) > 990 ORDER BY k;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_rl;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
