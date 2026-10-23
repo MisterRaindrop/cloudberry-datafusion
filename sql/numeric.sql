@@ -666,6 +666,99 @@ RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_sd;
 
+-- QM1: a quotient's scale and digits follow from its operands' least
+-- nonzero magnitude: a standard deviation of int4 values is above 10^-10
+-- (a variance at least 1 / n) and below 10^10, an avg of them above
+-- 10^-19, so stddev / avg is within 76 digits at scale 44, computed in an
+-- output column, a filter, in one stage and two; and TPC-DS Q39's cov,
+-- computed by PostgreSQL in a Shared Scan producer, is a column DataFusion
+-- can receive above its readers (GPORCA).  Groups at the bounds: one
+-- value 1 among zeros (the least variance and avg, 1 / n), one -1 among
+-- zeros, int4's extremes (the largest standard deviation), extremes adding
+-- up to 1 among zeros, all alike (0, a zero avg left to the guard).
+CREATE TABLE df_qm (id int, k int, mo int, a int4, b int2) DISTRIBUTED BY (id);
+CREATE TEMP TABLE df_qm0 (id int, k int, a int4, b int2);
+INSERT INTO df_qm0 SELECT i, 1, CASE WHEN i = 7 THEN 1 ELSE 0 END, 0 FROM generate_series(1, 5000) i;
+INSERT INTO df_qm0 SELECT 5000 + i, 2, CASE WHEN i = 3 THEN -1 ELSE 0 END, (i % 2)::int2 FROM generate_series(1, 3000) i;
+INSERT INTO df_qm0 VALUES (8001, 3, 2147483647, 32767), (8002, 3, -2147483648, -32768);
+INSERT INTO df_qm0 SELECT 8100 + i, 4, CASE WHEN i = 1 THEN 2147483647 WHEN i = 2 THEN -2147483646 ELSE 0 END, 1
+  FROM generate_series(1, 10000) i;
+INSERT INTO df_qm0 SELECT 18200 + i, 5, 0, 3 FROM generate_series(1, 50) i;
+INSERT INTO df_qm0 SELECT 18300 + i, 6, i % 7 - 3, (i % 5)::int2 FROM generate_series(1, 700) i;
+INSERT INTO df_qm SELECT id, k, 4, a, b FROM df_qm0 UNION ALL SELECT 100000 + id, k % 6 + 1, 5, a, b FROM df_qm0;
+DROP TABLE df_qm0;
+ANALYZE df_qm;
+SET datafusion.motion_batches = on;
+SET optimizer = off;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+EXPLAIN (COSTS OFF) SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1;
+EXPLAIN (COSTS OFF) SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k;
+RESET gp_enable_multiphase_agg;
+EXPLAIN (COSTS OFF) SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+SET optimizer = on;
+EXPLAIN (COSTS OFF) WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+SET optimizer = off;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = off;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+SET datafusion.mode = on;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+RESET gp_enable_multiphase_agg;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+SET optimizer = on;
+SET datafusion.mode = off;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+SET datafusion.mode = on;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+-- QM1: a quotient's digits are those of the largest dividend over the
+-- smallest nonzero divisor, none more for rounding: TPC-DS Q66's sum of
+-- monthly sums of price * quantity (MS1, 34 digits) over an int4 square
+-- footage is 66 digits at scale 32, a sum PostgreSQL can add up within 76.
+CREATE TABLE df_qs (id int, w int, sq int, m int, price numeric(7,2), qty int) DISTRIBUTED BY (id);
+INSERT INTO df_qs SELECT i, i % 4, CASE i % 4 WHEN 0 THEN 1 WHEN 1 THEN 2147483647 WHEN 2 THEN -3 ELSE 977 END,
+  i % 3, CASE WHEN i % 17 = 0 THEN 99999.99 ELSE ((i * 7919) % 2000001 - 1000000) / 100.0 END,
+  CASE WHEN i % 23 = 0 THEN 2147483647 ELSE i % 100 END FROM generate_series(1, 3000) i;
+ANALYZE df_qs;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+SET optimizer = off;
+EXPLAIN (COSTS OFF) SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+SET datafusion.mode = off;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+SET datafusion.mode = on;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+SET optimizer = on;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+DROP TABLE df_qs;
+SET optimizer = off;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_qm;
+
 -- RL1: a coercion to numeric(p, s) of a value of scale s and at most p
 -- digits is a relabeling of it (numeric_support), which keeps the value's
 -- range: an avg of one with ROLLUP, in two stages (TPC-DS Q18), a sum, an

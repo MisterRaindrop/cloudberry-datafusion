@@ -140,30 +140,64 @@ pub fn pg_div_rscale(x: i256, sx: i8, dx: i32, y: i256, sy: i8, dy: i32) -> i32 
 /// DN1: numeric_div of `x` (an integer of scale `sx`) by nonzero `y` (of
 /// scale `sy`) as div_var computes it: the quotient rounded half away from
 /// zero to `rscale`, given at scale `to` (not below `rscale`).  None beyond
-/// Decimal256, which the planner hook's bounds rule out.
+/// Decimal256, which the planner hook's bounds rule out for the quotient;
+/// the dividend or divisor scaled on the way may be beyond it.
 pub fn pg_div(x: i256, sx: i8, y: i256, sy: i8, rscale: i32, to: i8) -> Option<i256> {
     if rscale > to as i32 || y == i256::ZERO {
         return None;
     }
     // |x| / |y| * 10^(rscale - sx + sy), exactly, then rounded
     let e = rscale - sx as i32 + sy as i32;
-    let mut num = x.checked_abs()?;
-    let mut den = y.checked_abs()?;
-    if e >= 0 {
-        num = num.checked_mul(pow10(e as u32))?;
-    } else {
-        den = den.checked_mul(pow10((-e) as u32))?;
-    }
-    let mut q = num / den;
-    if (num % den).checked_mul(i256::from_i128(2))? >= den {
-        q = q.checked_add(i256::ONE)?;
-    }
+    let q = match div_scaled(x, y, e) {
+        Some(q) => q,
+        None => div_scaled_exact(x, y, e)?,
+    };
     let q = q.checked_mul(pow10((to as i32 - rscale) as u32))?;
     Some(if (x < i256::ZERO) != (y < i256::ZERO) {
         q.wrapping_neg()
     } else {
         q
     })
+}
+
+/// |x| / |y| * 10^e rounded half away from zero, where |x| or |y| times
+/// 10^|e| is within Decimal256.
+fn div_scaled(x: i256, y: i256, e: i32) -> Option<i256> {
+    let mut num = x.checked_abs()?;
+    let mut den = y.checked_abs()?;
+    if e >= 0 {
+        num = num.checked_mul(i256::from_i128(10).checked_pow(e as u32)?)?;
+    } else {
+        den = den.checked_mul(i256::from_i128(10).checked_pow((-e) as u32)?)?;
+    }
+    let mut q = num / den;
+    if (num % den).checked_mul(i256::from_i128(2))? >= den {
+        q = q.checked_add(i256::ONE)?;
+    }
+    Some(q)
+}
+
+/// div_scaled in arbitrary precision (QM1: the dividend of a quotient
+/// whose bound comes from the divisor's smallest value may scale beyond
+/// Decimal256); None if the quotient is beyond it.
+fn div_scaled_exact(x: i256, y: i256, e: i32) -> Option<i256> {
+    let (mut num, mut den) = (magnitude(x), magnitude(y));
+    if e >= 0 {
+        num *= ten(e);
+    } else {
+        den *= ten(-e);
+    }
+    let mut q = &num / &den;
+    if (num % &den) * 2u32 >= den {
+        q += 1u32;
+    }
+    let b = q.to_bytes_be();
+    if b.len() > 31 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a[32 - b.len()..].copy_from_slice(&b);
+    Some(i256::from_be_bytes(a))
 }
 
 /// AVG1: numeric_div(sum, count) as numeric_avg computes it, `sum` an
@@ -1287,6 +1321,20 @@ mod tests {
                 "{x}e-{sx} / {y}e-{sy}"
             );
         }
+        // QM1: a dividend scaled beyond Decimal256 on the way to a
+        // quotient within it: a stddev's 3037000499.97... at scale 44 over
+        // an avg's 1.08e-19 (1 / (2^63 - 1)) at scale 36, rounded at 44
+        let x = pow10(53).wrapping_sub(i(7));
+        let y = i(108) * pow10(15);
+        assert!(x.checked_mul(pow10(36)).is_none());
+        let r = pg_div_rscale(x, 44, 44, y, 36, 36);
+        assert_eq!(r, 44);
+        let q = pg_div(x, 44, y, 36, r, 44).unwrap();
+        assert_eq!(Exact::quotient(x, 44, 44, y, 36, 36).unwrap(), Exact::value(q, 44));
+        let q2 = pg_div(i(-1), 44, y, 36, r, 44).unwrap();
+        assert_eq!(Exact::quotient(i(-1), 44, 44, y, 36, 36).unwrap(), Exact::value(q2, 44));
+        // still None where the quotient itself is beyond it
+        assert_eq!(pg_div(pow10(75), 0, i(1), 40, 40, 40), None);
         // a quotient beyond 76 digits: 10^60 / 10^-40 at scale 40 (the
         // larger display scale), and one more digit than its neighbour
         let big = pow10(60);

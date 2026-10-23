@@ -1234,6 +1234,34 @@ df_floor_div(int a, int b)
 	return a >= 0 ? a / b : -((-a + b - 1) / b);
 }
 
+static bool df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale,
+								  bool *dyn, int *least);
+
+/*
+ * QM1: df_numeric_range, and the least magnitude of its nonzero values,
+ * at least 10^-least: for a value of display scale d, 10^-d, unless the
+ * expression bounds it closer to 1 (an avg, a standard deviation), so
+ * that a quotient by it is bound closer.  0 <= least <= scale.
+ */
+static bool
+df_numeric_range_f(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn, int *least)
+{
+	*least = -1;
+	if (!df_numeric_range_body(ctx, expr, precision, scale, dyn, least))
+		return false;
+	if (*least < 0 || *least > *scale)
+		*least = *scale;
+	return true;
+}
+
+bool
+df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
+{
+	int			least;
+
+	return df_numeric_range_f(ctx, expr, precision, scale, dyn, &least);
+}
+
 /*
  * Precision and scale of numeric expression 'expr' of plan node 'ctx', if
  * DataFusion can carry it as Decimal128(38, scale): a column of a declared
@@ -1242,8 +1270,9 @@ df_floor_div(int a, int b)
  * digits more, at most 38, the scale of its argument).  A partial avg's sum counts
  * as such a sum.  Anything else (an avg's result, arithmetic) has none.
  */
-bool
-df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
+static bool
+df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn,
+					  int *least)
 {
 	*dyn = false;
 	if (expr == NULL || exprType(expr) == InvalidOid)
@@ -1257,7 +1286,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				Node	   *value;
 
 				return df_subplan_value(expr, &top, &value) &&
-					df_numeric_range(top, value, precision, scale, dyn);
+					df_numeric_range_f(top, value, precision, scale, dyn, least);
 			}
 		case T_Var:
 			{
@@ -1275,7 +1304,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					Plan	   *sub = ((SubqueryScan *) ctx)->subplan;
 
 					tle = get_tle_by_resno(sub->targetlist, var->varattno);
-					return tle != NULL && df_numeric_range(sub, (Node *) tle->expr, precision, scale, dyn);
+					return tle != NULL && df_numeric_range_f(sub, (Node *) tle->expr, precision, scale, dyn, least);
 				}
 				if (IsA(ctx, ShareInputScan))
 				{
@@ -1291,7 +1320,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 
 					child = producer ? outerPlan(producer) : NULL;
 					tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
+					return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 				}
 				if (var->varno == OUTER_VAR && df_append_plans(ctx) != NIL)
 					return df_numeric_append_range(df_append_plans(ctx), var->varattno,
@@ -1301,7 +1330,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					/* GPORCA's Sequence returns its last input's rows */
 					child = llast(((Sequence *) ctx)->subplans);
 					tle = get_tle_by_resno(child->targetlist, var->varattno);
-					return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
+					return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 				}
 				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 					return var->vartype == NUMERICOID &&
@@ -1310,7 +1339,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				if (child == NULL)
 					return false;
 				tle = get_tle_by_resno(child->targetlist, var->varattno);
-				return tle != NULL && df_numeric_range(child, (Node *) tle->expr, precision, scale, dyn);
+				return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 			}
 		case T_Const:
 			if (((Const *) expr)->consttype != NUMERICOID)
@@ -1329,8 +1358,10 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				char	   *name = get_opname(op->opno);
 				int			lp,
 							ls,
+							lf,
 							rp,
-							rs;
+							rs,
+							rf;
 				bool		ldyn,
 							rdyn;
 
@@ -1338,8 +1369,8 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					name == NULL || op->opno >= FirstGenbkiObjectId ||
 					exprType(linitial(op->args)) != NUMERICOID ||
 					exprType(lsecond(op->args)) != NUMERICOID ||
-					!df_numeric_range(ctx, linitial(op->args), &lp, &ls, &ldyn) ||
-					!df_numeric_range(ctx, lsecond(op->args), &rp, &rs, &rdyn))
+					!df_numeric_range_f(ctx, linitial(op->args), &lp, &ls, &ldyn, &lf) ||
+					!df_numeric_range_f(ctx, lsecond(op->args), &rp, &rs, &rdyn, &rf))
 					return false;
 				*dyn = ldyn || rdyn;
 				if (strcmp(name, "+") == 0 || strcmp(name, "-") == 0)
@@ -1359,27 +1390,32 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				{
 					*scale = ls + rs;	/* mul_var's rscale */
 					*precision = lp + rp;
+					*least = lf + rf;	/* QM1: mul_var is exact */
 				}
 				else if (strcmp(name, "/") == 0)
 				{
 					/*
 					 * DN1: select_div_scale picks the scale by the values, 16
 					 * significant digits of the quotient but not below either
-					 * display scale: at most for the smallest dividend, 10^-ls
-					 * (NBASE weight floor(-ls / 4)), over the largest divisor,
-					 * below 10^(rp - rs) (weight floor((rp - rs - 1) / 4)),
-					 * one weight less where the first digits are alike.  The
-					 * quotient is below 10^(lp - ls + rs), plus a digit its
-					 * rounding may add.  pgnum::pg_div multiplies the divisor
-					 * by up to 10^(scale - rs) as well.
+					 * display scale: at most for the smallest nonzero
+					 * dividend, 10^-lf (QM1; NBASE weight floor(-lf / 4)),
+					 * over the largest divisor, below 10^(rp - rs) (weight
+					 * floor((rp - rs - 1) / 4)), one weight less where the
+					 * first digits are alike.  A dividend of display scale d
+					 * is at most 10^(lp - ls) - 10^-d, the divisor at least
+					 * 10^-rf: the quotient is at most 10^(lp - ls + rf) -
+					 * 10^(rf - d), and rounding at a scale not below d adds
+					 * less than that.  It is above 10^(4 * qweight), so
+					 * rounding keeps a nonzero one at least 10^-lf over
+					 * 10^(rp - rs).  pgnum::pg_div scales the operands in
+					 * arbitrary precision where Decimal256 cannot.
 					 */
-					int			qweight = df_floor_div(-ls, 4) - df_floor_div(rp - rs - 1, 4) - 1;
+					int			qweight = df_floor_div(-lf, 4) - df_floor_div(rp - rs - 1, 4) - 1;
 
 					*scale = Min(Max(16 - 4 * qweight, Max(ls, rs)), 1000);
-					*precision = (lp - ls) + rs + 1 + *scale;
+					*precision = (lp - ls) + rf + *scale;
+					*least = lf + (rp - rs);
 					*dyn = true;
-					if ((rp - rs) + ls + *scale > DF_NUMERIC_MAX_EXPR_PRECISION)
-						return false;
 				}
 				else
 					return false;	/* %: not done */
@@ -1409,17 +1445,20 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				int			digits = 1;
 
 				*scale = 0;
+				*least = 0;
 				foreach(lc, results)
 				{
 					Node	   *e = lfirst(lc);
 					int			p,
-								s;
+								s,
+								f;
 					bool		edyn;
 
 					if (IsA(e, Const) && ((Const *) e)->constisnull)
 						continue;
-					if (!df_numeric_range(ctx, e, &p, &s, &edyn))
+					if (!df_numeric_range_f(ctx, e, &p, &s, &edyn, &f))
 						return false;
+					*least = Max(*least, f);
 					if (edyn || (found && s != *scale))
 						*dyn = true;
 					digits = Max(digits, p - s);
@@ -1430,7 +1469,8 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 			}
 		case T_NullIfExpr:
-			return df_numeric_range(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn);
+			return df_numeric_range_f(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn,
+									  least);
 		case T_RelabelType:
 			{
 				/*
@@ -1470,7 +1510,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					case F_ABS_NUMERIC:
 					case F_NUMERIC_ABS:
 						/* numeric_abs keeps the digits and display scale */
-						return df_numeric_range(ctx, linitial(fe->args), precision, scale, dyn);
+						return df_numeric_range_f(ctx, linitial(fe->args), precision, scale, dyn, least);
 					case F_ROUND_NUMERIC:
 					case F_ROUND_NUMERIC_INT4:
 						{
@@ -1520,9 +1560,10 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				 */
 				if (wf->winagg && name != NULL && strcmp(name, "sum") == 0 &&
 					list_length(wf->args) == 1 && df_sums_groups(ctx, linitial(wf->args)))
-					return df_numeric_range(ctx, linitial(wf->args), precision, scale, dyn);
+					return df_numeric_range_f(ctx, linitial(wf->args), precision, scale, dyn, least);
 				return wf->winagg &&
-					df_numeric_range(ctx, (Node *) df_window_aggref(wf), precision, scale, dyn);
+					df_numeric_range_f(ctx, (Node *) df_window_aggref(wf), precision, scale, dyn,
+									   least);
 			}
 		case T_Aggref:
 			{
@@ -1530,21 +1571,31 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				char	   *name = get_func_name(agg->aggfnoid);
 				Node	   *arg;
 				int			p,
-							s;
+							s,
+							f;
+				bool		variance;
 
 				if (name == NULL || agg->aggfnoid >= FirstGenbkiObjectId ||
 					list_length(agg->args) != 1)
 					return false;
 				arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				if (df_stddev_agg(agg, NULL, NULL))
+				if (df_stddev_agg(agg, NULL, &variance))
 				{
 					/*
-					 * STD1: a variance of int4 values is below 2^62, 19
-					 * digits, at a display scale of its own of at most
-					 * STDDEV_MAX_SCALE
+					 * STD1: a variance of int4 values is at most range^2 / 2
+					 * (Popoviciu's inequality, for a sample of 2), below
+					 * 2^63: 19 digits, and a standard deviation 10, at a
+					 * display scale of its own of at most STDDEV_MAX_SCALE.
+					 * QM1: n * sum(x^2) - sum(x)^2 is the sum of (x_i -
+					 * x_j)^2 over pairs, at least n - 1 if any two differ (0
+					 * else, which PostgreSQL gives as 0): a variance of at
+					 * least 1 / n, or (n - 1) / n^2 for a population, above
+					 * 10^-20 for n < 2^63, and a standard deviation above
+					 * 10^-10.
 					 */
-					*precision = 19 + DF_STDDEV_MAX_SCALE;
+					*precision = (variance ? 19 : 10) + DF_STDDEV_MAX_SCALE;
 					*scale = DF_STDDEV_MAX_SCALE;
+					*least = variance ? 20 : 10;
 					*dyn = true;
 					return true;
 				}
@@ -1552,25 +1603,26 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
 					/* the argument is the partial result below, of the same scale */
-					if (!df_numeric_range(ctx, arg, &p, &s, dyn))
+					if (!df_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
 						return false;
 				}
 				else if (exprType(arg) == INT8OID && strcmp(name, "sum") == 0)
-					p = 19, s = 0;
+					p = 19, s = 0, f = 0;
 				else if (exprType(arg) == INT8OID || exprType(arg) == INT4OID ||
 						 exprType(arg) == INT2OID)
 				{
 					/* avg of integers: its numeric sum, or the avg (below) */
 					if (strcmp(name, "avg") != 0)
 						return false;
-					p = 19, s = 0;
+					p = 19, s = 0, f = 0;
 				}
-				else if (!df_numeric_range(ctx, arg, &p, &s, dyn))
+				else if (!df_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
 					return false;
 				if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
 				{
 					*precision = p;
 					*scale = s;
+					*least = f;
 					return true;
 				}
 				if (strcmp(name, "sum") == 0 ||
@@ -1597,21 +1649,33 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					 */
 					int			digits = p - s;
 
+					/* QM1: an avg of integers is within their type's digits */
+					if (exprType(arg) == INT2OID || exprType(arg) == INT4OID)
+						digits = exprType(arg) == INT2OID ? 5 : 10;
 					if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 					{
 						Plan	   *pctx = ctx;
 						Aggref	   *partial = df_partial_below(&pctx, arg);
+						Node	   *parg = partial ? (Node *) linitial_node(TargetEntry, partial->args)->expr : NULL;
 						int			pp,
 									ps;
 
-						if (partial != NULL &&
-							exprType((Node *) linitial_node(TargetEntry, partial->args)->expr) == NUMERICOID &&
-							df_numeric_ps(pctx, (Node *) linitial_node(TargetEntry, partial->args)->expr,
-										  &pp, &ps))
+						if (parg != NULL && exprType(parg) == NUMERICOID &&
+							df_numeric_ps(pctx, parg, &pp, &ps))
 							digits = pp - ps;
+						else if (parg != NULL)
+							digits = exprType(parg) == INT2OID ? 5 :
+								exprType(parg) == INT4OID ? 10 :
+								exprType(parg) == INT8OID ? 19 : digits;
 					}
 					*scale = df_avg_scale(s);
 					*precision = digits + *scale;
+					/*
+					 * QM1: a nonzero sum is at least 10^-s, over fewer than
+					 * 2^63 rows: above 10^-(s + 19), which select_div_scale's
+					 * 16 digits keep
+					 */
+					*least = s + 19;
 					return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
 				}
 				return false;

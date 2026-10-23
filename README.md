@@ -581,6 +581,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | STD1 | stddev and variance of int2 and int4, in one stage |
 | STD2 | stddev and variance of int2 and int4 in two stages, through batch Motions |
 | RL1 | numeric coerced to a wider numeric(p, s) of its scale |
+| QM1 | numeric quotients bounded by their operands' least nonzero magnitude |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
@@ -1183,7 +1184,7 @@ The largest scale is bounded by the operands' precision and scale, not
 by their values: a quotient's is that of the smallest dividend, 10^-s1,
 over the largest divisor, below 10^(p2 - s2) (TPC-DS Q36's
 `sum(net_profit) / sum(ext_sales_price)` over `numeric(7,2)`, 44 digits
-after the point, 71 in all), and the planner hook keeps an expression
+after the point, 70 in all), and the planner hook keeps an expression
 whose bound passes 76 digits on PostgreSQL, so nothing overflows at run
 time.  df_core::pgnum::pg_div divides as div_var does, exactly and
 rounding half away from zero at that row's scale; 0 as a divisor raises
@@ -1213,6 +1214,32 @@ BY key).  GROUP BY of a quotient (Q49's ratios) and Q75 under the
 Postgres planner now run wholly in DataFusion: TPC-DS SF1 coverage 147
 -> 150 of 206 executions by EXPLAIN, results unchanged apart from Q71's
 ties.
+
+QM1: a quotient's bound also follows from the least magnitude of its
+operands' nonzero values, which the planner hook keeps beside precision
+and scale: 10^-s for a value of scale s, unless the expression bounds it
+closer to 1.  An avg of fewer than 2^63 values of scale s is above
+10^-(s + 19) where not 0; a variance of int2 or int4 values, n * sum(x^2)
+- sum(x)^2 over n * (n - 1) (or n^2), has as numerator the sum of (x_i -
+x_j)^2 over pairs, at least n - 1 where any two differ: at least 1/n
+(above 10^-20), and a standard deviation above 10^-10.  The same
+inequality bounds them from above (Popoviciu's: a variance at most
+range^2 / 2): 19 digits for a variance, 10 for a standard deviation; an
+avg of integers is within its type's digits.  select_div_scale's 16
+digits keep such a value rounded at least that large, a product's is the
+product of its operands', a quotient's that of its dividend over the
+divisor's largest value.  A quotient's scale is that of the smallest
+nonzero dividend over the largest divisor, and its integer digits those
+of the largest dividend over the smallest nonzero divisor, without a
+digit more for rounding (a dividend of display scale d is at most 10^p -
+10^-d, and rounding at a scale not below d adds less than the quotient's
+distance to 10^(p + f)).  TPC-DS Q39's `stddev_samp / avg` of int4 is
+within 73 digits at scale 44, not 108 at 72, and Q66's monthly sums
+(34 digits) over an int4 square footage 66, a sum within 76.
+df_core::pgnum::pg_div scales the dividend or divisor with big integers
+where Decimal256 cannot hold them on the way to a quotient that it holds.
+Q39a and Q39b under GPORCA and Q66 under both planners now run wholly in
+DataFusion: TPC-DS SF1 coverage 190 -> 194 of 206 executions by EXPLAIN.
 
 Over 20 million rows of `numeric(15,2)`, `sum(price) / sum(qty)` per
 group took 0.42 s against 0.92 s, `sum(disc / 3)` 1.17 s against 1.38 s,

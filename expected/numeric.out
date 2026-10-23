@@ -5809,6 +5809,372 @@ SELECT stddev_samp(a), var_pop(b), stddev_samp(a) / avg(a) FROM df_sd;
 RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_sd;
+-- QM1: a quotient's scale and digits follow from its operands' least
+-- nonzero magnitude: a standard deviation of int4 values is above 10^-10
+-- (a variance at least 1 / n) and below 10^10, an avg of them above
+-- 10^-19, so stddev / avg is within 76 digits at scale 44, computed in an
+-- output column, a filter, in one stage and two; and TPC-DS Q39's cov,
+-- computed by PostgreSQL in a Shared Scan producer, is a column DataFusion
+-- can receive above its readers (GPORCA).  Groups at the bounds: one
+-- value 1 among zeros (the least variance and avg, 1 / n), one -1 among
+-- zeros, int4's extremes (the largest standard deviation), extremes adding
+-- up to 1 among zeros, all alike (0, a zero avg left to the guard).
+CREATE TABLE df_qm (id int, k int, mo int, a int4, b int2) DISTRIBUTED BY (id);
+CREATE TEMP TABLE df_qm0 (id int, k int, a int4, b int2);
+NOTICE:  Table doesn't have 'DISTRIBUTED BY' clause -- Using column named 'id' as the Apache Cloudberry data distribution key for this table.
+HINT:  The 'DISTRIBUTED BY' clause determines the distribution of data. Make sure column(s) chosen are the optimal data distribution key to minimize skew.
+INSERT INTO df_qm0 SELECT i, 1, CASE WHEN i = 7 THEN 1 ELSE 0 END, 0 FROM generate_series(1, 5000) i;
+INSERT INTO df_qm0 SELECT 5000 + i, 2, CASE WHEN i = 3 THEN -1 ELSE 0 END, (i % 2)::int2 FROM generate_series(1, 3000) i;
+INSERT INTO df_qm0 VALUES (8001, 3, 2147483647, 32767), (8002, 3, -2147483648, -32768);
+INSERT INTO df_qm0 SELECT 8100 + i, 4, CASE WHEN i = 1 THEN 2147483647 WHEN i = 2 THEN -2147483646 ELSE 0 END, 1
+  FROM generate_series(1, 10000) i;
+INSERT INTO df_qm0 SELECT 18200 + i, 5, 0, 3 FROM generate_series(1, 50) i;
+INSERT INTO df_qm0 SELECT 18300 + i, 6, i % 7 - 3, (i % 5)::int2 FROM generate_series(1, 700) i;
+INSERT INTO df_qm SELECT id, k, 4, a, b FROM df_qm0 UNION ALL SELECT 100000 + id, k % 6 + 1, 5, a, b FROM df_qm0;
+DROP TABLE df_qm0;
+ANALYZE df_qm;
+SET datafusion.motion_batches = on;
+SET optimizer = off;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: k
+   ->  Sort
+         Sort Key: k
+         ->  HashAggregate
+               Group Key: k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: k
+                     ->  Seq Scan on df_qm
+                           Filter: (mo = 4)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1;
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: k, mo
+         Filter: (CASE WHEN (avg(a) = '0'::numeric) THEN '0'::numeric ELSE (stddev_samp(a) / avg(a)) END > '1'::numeric)
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: k, mo
+               ->  Seq Scan on df_qm
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(11 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: k
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: k
+               ->  Seq Scan on df_qm
+                     Filter: (mo = 4)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(11 rows)
+
+RESET gp_enable_multiphase_agg;
+EXPLAIN (COSTS OFF) SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: k
+   ->  Sort
+         Sort Key: k
+         ->  Finalize HashAggregate
+               Group Key: k
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: k
+                     ->  Streaming Partial HashAggregate
+                           Group Key: k
+                           ->  Seq Scan on df_qm
+                                 Filter: (mo = 4)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(16 rows)
+
+SET optimizer = on;
+EXPLAIN (COSTS OFF) WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+                                                                                    QUERY PLAN                                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: share0_ref3.k, share0_ref3.mean, share0_ref3.cov, share0_ref2.cov
+   ->  Sort
+         Sort Key: share0_ref3.k, share0_ref3.mean, share0_ref3.cov, share0_ref2.cov
+         ->  Sequence
+               ->  Shared Scan (share slice:id 1:0)
+                     ->  Result
+                           Filter: ((CASE (avg(df_qm.a)) WHEN '0'::numeric THEN '0'::numeric ELSE ((stddev_samp(df_qm.a)) / (avg(df_qm.a))) END > '1'::numeric) OR (df_qm.k > 2))
+                           ->  Finalize HashAggregate
+                                 Group Key: df_qm.k, df_qm.mo
+                                 ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                       Hash Key: df_qm.k, df_qm.mo
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_qm.k, df_qm.mo
+                                             ->  Seq Scan on df_qm
+                                                   Filter: ((mo = 4) OR (mo = 5))
+               ->  Hash Join
+                     Hash Cond: (share0_ref3.k = share0_ref2.k)
+                     ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                           Hash Key: share0_ref3.k
+                           ->  Result
+                                 Filter: (share0_ref3.mo = 4)
+                                 ->  Shared Scan (share slice:id 3:0)
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                                 Hash Key: share0_ref2.k
+                                 ->  Result
+                                       Filter: (share0_ref2.mo = 5)
+                                       ->  Shared Scan (share slice:id 4:0)
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible; below its Shared Scan producers: Aggregate
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 not eligible: passes on rows read from a Shared Scan, filtered, with nothing else to compute on them
+ DataFusion: slice 4 not eligible: passes on rows read from a Shared Scan, filtered, with nothing else to compute on them
+(35 rows)
+
+SET optimizer = off;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = off;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+ k |               ?column?                
+---+---------------------------------------
+ 1 |               70.71067811865475245000
+ 2 |              -54.77225575051661160772
+ 3 |      -6074000998.00000000000000000000
+ 4 | 303715235927.000000000000000000000000
+ 5 |                                      
+ 6 |                                      
+(6 rows)
+
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+ k | mo | count 
+---+----+-------
+ 1 |  4 |  5000
+ 2 |  5 |  5000
+ 4 |  4 | 10000
+ 5 |  5 | 10000
+(4 rows)
+
+SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+ k |             ?column?             |               ?column?                
+---+----------------------------------+---------------------------------------
+ 1 |                                  |               70.70360669725413660000
+ 2 |           0.50000000000000000000 |              -54.76312628037227058763
+ 3 | -2147418112.50000000000000000000 |      -4294967294.00000000000000000000
+ 4 |           0.00000000000000000000 | 303700049785.000000000000000000000000
+ 5 |           0.00000000000000000000 |                                      
+ 6 |           1.00000000000000000000 |                                      
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+ k |               ?column?                
+---+---------------------------------------
+ 1 |               70.71067811865475245000
+ 2 |              -54.77225575051661160772
+ 3 |      -6074000998.00000000000000000000
+ 4 | 303715235927.000000000000000000000000
+ 5 |                                      
+ 6 |                                      
+(6 rows)
+
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+ k | mo | count 
+---+----+-------
+ 1 |  4 |  5000
+ 2 |  5 |  5000
+ 4 |  4 | 10000
+ 5 |  5 | 10000
+(4 rows)
+
+SELECT k, var_pop(b) / NULLIF(avg(b), 0), stddev_pop(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+ k |             ?column?             |               ?column?                
+---+----------------------------------+---------------------------------------
+ 1 |                                  |               70.70360669725413660000
+ 2 |           0.50000000000000000000 |              -54.76312628037227058763
+ 3 | -2147418112.50000000000000000000 |      -4294967294.00000000000000000000
+ 4 |           0.00000000000000000000 | 303700049785.000000000000000000000000
+ 5 |           0.00000000000000000000 |                                      
+ 6 |           1.00000000000000000000 |                                      
+(6 rows)
+
+RESET gp_enable_multiphase_agg;
+SELECT k, stddev_samp(a) / NULLIF(avg(a), 0) FROM df_qm WHERE mo = 4 GROUP BY k ORDER BY k;
+ k |               ?column?                
+---+---------------------------------------
+ 1 |               70.71067811865475245000
+ 2 |              -54.77225575051661160772
+ 3 |      -6074000998.00000000000000000000
+ 4 | 303715235927.000000000000000000000000
+ 5 |                                      
+ 6 |                                      
+(6 rows)
+
+SELECT k, mo, count(*) FROM df_qm GROUP BY k, mo HAVING CASE WHEN avg(a) = 0 THEN 0 ELSE stddev_samp(a) / avg(a) END > 1 ORDER BY k, mo;
+ k | mo | count 
+---+----+-------
+ 1 |  4 |  5000
+ 2 |  5 |  5000
+ 4 |  4 | 10000
+ 5 |  5 | 10000
+(4 rows)
+
+SET optimizer = on;
+SET datafusion.mode = off;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+ k | mo |            mean            |                  cov                  | mo |            mean            |                  cov                  
+---+----+----------------------------+---------------------------------------+----+----------------------------+---------------------------------------
+ 3 |  4 |    -0.50000000000000000000 |      -6074000998.00000000000000000000 |  5 |    -0.00033333333333333333 |              -54.77225575051661160772
+ 4 |  4 | 0.000100000000000000000000 | 303715235927.000000000000000000000000 |  5 |    -0.50000000000000000000 |      -6074000998.00000000000000000000
+ 5 |  4 |     0.00000000000000000000 |                                       |  5 | 0.000100000000000000000000 | 303715235927.000000000000000000000000
+ 6 |  4 |     0.00000000000000000000 |                                       |  5 |     0.00000000000000000000 |                                      
+(4 rows)
+
+SET datafusion.mode = on;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_qm GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k > 2)
+  SELECT v1.k, v1.mo, v1.mean, v1.cov, v2.mo, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.cov;
+ k | mo |            mean            |                  cov                  | mo |            mean            |                  cov                  
+---+----+----------------------------+---------------------------------------+----+----------------------------+---------------------------------------
+ 3 |  4 |    -0.50000000000000000000 |      -6074000998.00000000000000000000 |  5 |    -0.00033333333333333333 |              -54.77225575051661160772
+ 4 |  4 | 0.000100000000000000000000 | 303715235927.000000000000000000000000 |  5 |    -0.50000000000000000000 |      -6074000998.00000000000000000000
+ 5 |  4 |     0.00000000000000000000 |                                       |  5 | 0.000100000000000000000000 | 303715235927.000000000000000000000000
+ 6 |  4 |     0.00000000000000000000 |                                       |  5 |     0.00000000000000000000 |                                      
+(4 rows)
+
+-- QM1: a quotient's digits are those of the largest dividend over the
+-- smallest nonzero divisor, none more for rounding: TPC-DS Q66's sum of
+-- monthly sums of price * quantity (MS1, 34 digits) over an int4 square
+-- footage is 66 digits at scale 32, a sum PostgreSQL can add up within 76.
+CREATE TABLE df_qs (id int, w int, sq int, m int, price numeric(7,2), qty int) DISTRIBUTED BY (id);
+INSERT INTO df_qs SELECT i, i % 4, CASE i % 4 WHEN 0 THEN 1 WHEN 1 THEN 2147483647 WHEN 2 THEN -3 ELSE 977 END,
+  i % 3, CASE WHEN i % 17 = 0 THEN 99999.99 ELSE ((i * 7919) % 2000001 - 1000000) / 100.0 END,
+  CASE WHEN i % 23 = 0 THEN 2147483647 ELSE i % 100 END FROM generate_series(1, 3000) i;
+ANALYZE df_qs;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: w
+   ->  Finalize GroupAggregate
+         Group Key: w
+         ->  Sort
+               Sort Key: w
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: w
+                     ->  Streaming Partial HashAggregate
+                           Group Key: w
+                           ->  Finalize HashAggregate
+                                 Group Key: w, sq
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: w, sq
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: w, sq
+                                             ->  Seq Scan on df_qs
+ Optimizer: GPORCA
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(22 rows)
+
+SET optimizer = off;
+EXPLAIN (COSTS OFF) SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: x.w
+   ->  GroupAggregate
+         Group Key: x.w
+         ->  Sort
+               Sort Key: x.w
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: x.w
+                     ->  Subquery Scan on x
+                           ->  Finalize HashAggregate
+                                 Group Key: df_qs.w, df_qs.sq
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: df_qs.w, df_qs.sq
+                                       ->  Streaming Partial HashAggregate
+                                             Group Key: df_qs.w, df_qs.sq
+                                             ->  Seq Scan on df_qs
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible, sends Arrow batches
+(21 rows)
+
+SET datafusion.mode = off;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+ w |          sum          |          sum           
+---+-----------------------+------------------------
+ 0 |  211593842937879.7000 |   -16656048048286.5300
+ 1 |    77147.036425761039 | -7650.8990555834626106
+ 2 |    5602202967312.7967 |   -71960545528383.4300
+ 3 | 200715388064.58539406 |  191937891939.55050154
+(4 rows)
+
+SET datafusion.mode = on;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+ w |          sum          |          sum           
+---+-----------------------+------------------------
+ 0 |  211593842937879.7000 |   -16656048048286.5300
+ 1 |    77147.036425761039 | -7650.8990555834626106
+ 2 |    5602202967312.7967 |   -71960545528383.4300
+ 3 | 200715388064.58539406 |  191937891939.55050154
+(4 rows)
+
+SET optimizer = on;
+SELECT w, sum(js / sq), sum(fs / sq) FROM (SELECT w, sq, sum(CASE WHEN m = 1 THEN price * qty ELSE 0 END) js,
+  sum(CASE WHEN m = 2 THEN price * qty ELSE 0 END) fs FROM df_qs GROUP BY w, sq) x GROUP BY w ORDER BY w;
+ w |          sum          |          sum           
+---+-----------------------+------------------------
+ 0 |  211593842937879.7000 |   -16656048048286.5300
+ 1 |    77147.036425761039 | -7650.8990555834626106
+ 2 |    5602202967312.7967 |   -71960545528383.4300
+ 3 | 200715388064.58539406 |  191937891939.55050154
+(4 rows)
+
+DROP TABLE df_qs;
+SET optimizer = off;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_qm;
 -- RL1: a coercion to numeric(p, s) of a value of scale s and at most p
 -- digits is a relabeling of it (numeric_support), which keeps the value's
 -- range: an avg of one with ROLLUP, in two stages (TPC-DS Q18), a sum, an
