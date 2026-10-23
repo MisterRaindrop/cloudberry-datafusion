@@ -579,6 +579,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
 | STD1 | stddev and variance of int2 and int4, in one stage |
+| STD2 | stddev and variance of int2 and int4 in two stages, through batch Motions |
 | RL1 | numeric coerced to a wider numeric(p, s) of its scale |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
@@ -1274,8 +1275,13 @@ so it may be an output column, compared or divided (TPC-DS Q17's
 `stddev_samp(ss_quantity) / avg(ss_quantity)`).  Its unit test holds
 values PostgreSQL computed, a test compares every function over 41
 groups (NULL, one value, alike values, int4's extremes) with PostgreSQL's
-output.  A split one, whose partial state PostgreSQL serializes, and one
-of int8 (sums beyond Decimal256) stay on PostgreSQL.  TPC-DS Q17 under
+output.  One of int8 (sums beyond Decimal256) stays on PostgreSQL.  STD2:
+a split one passes DataFusion's state through a batch Motion, as a split
+avg does (M7d): the exact sum, the count and the exact sum of squares,
+three stream columns, which the combining stage adds up before
+pg_stddev; TPC-DS Q35 under the Postgres planner now runs wholly in
+DataFusion.  Without batch Motions, PostgreSQL's serialized state
+(numeric_poly_serialize) stays on PostgreSQL.  TPC-DS Q17 under
 both planners and Q35 under GPORCA now run wholly in DataFusion.
 
 ### Expressions

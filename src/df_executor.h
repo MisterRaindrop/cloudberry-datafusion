@@ -150,9 +150,12 @@ typedef enum DfAggState
 	DF_AGG_SUM_INT8,			/* sum(int8): numeric sum */
 	DF_AGG_SUM_NUMERIC,			/* sum(numeric(p <= 28, s)): numeric sum */
 	DF_AGG_AVG_NUMERIC,			/* avg(numeric(p <= 28, s)): numeric sum, count */
-	DF_AGG_SUM_NUMERIC_MIXED	/* sum of a CASE or COALESCE whose branches
+	DF_AGG_SUM_NUMERIC_MIXED,	/* sum of a CASE or COALESCE whose branches
 								 * differ in scale (MS1): numeric sum at the
 								 * largest, int4 largest scale added up */
+	DF_AGG_STDDEV				/* split stddev or variance of int2/4 (STD2):
+								 * numeric sum, int8 count, numeric sum of
+								 * squares */
 } DfAggState;
 
 /* sum and avg of numeric(p, s): p digits added up must stay within 76 */

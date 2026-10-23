@@ -157,6 +157,7 @@ static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
 static bool df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups);
 static bool df_name_in(const char *name, const char *const *list);
 static bool df_state_var(Plan *ctx, Var *var, Bitmapset *batches);
+static bool df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches);
 static bool df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches);
 static bool df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
 static void df_check_numcmp_term(Node *node, DfCheckContext *cxt);
@@ -1786,7 +1787,9 @@ df_stddev_agg(Aggref *agg, bool *sample, bool *variance)
 		s = false, v = true;
 	else
 		return false;
-	if ((argtype != INT2OID && argtype != INT4OID) || agg->aggsplit != AGGSPLIT_SIMPLE ||
+	if ((argtype != INT2OID && argtype != INT4OID) ||
+		(agg->aggsplit != AGGSPLIT_SIMPLE && agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
+		 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL) ||
 		agg->aggdistinct != NIL || agg->aggfilter != NULL || agg->aggorder != NIL)
 		return false;
 	if (sample)
@@ -2506,8 +2509,31 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "aggregate %s of %s or in stages", name,
 							  format_type_be(list_length(agg->aggargtypes) == 1 ?
 											 linitial_oid(agg->aggargtypes) : InvalidOid));
-				else if (df_stddev_agg(agg, NULL, NULL))
+				else if (df_stddev_agg(agg, NULL, NULL) && agg->aggsplit == AGGSPLIT_SIMPLE)
 					return cxt->failed || df_check_expr((Node *) agg->args, cxt);
+				else if (df_stddev_agg(agg, NULL, NULL))
+				{
+					/*
+					 * STD2: split, DataFusion's state (sum, count, sum of
+					 * squares) passes through a batch Motion; PostgreSQL's
+					 * serialized one stays on PostgreSQL
+					 */
+					if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? !cxt->partial_states :
+						!(cxt->final_states ||
+						  (cxt->through_states && df_state_through(cxt->node, agg, cxt->batches))))
+						df_reject(cxt, "%s aggregate %s without batch Motions",
+								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining",
+								  name);
+					else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
+					{
+						/* its argument is the state column of the Motion below */
+						if (list_length(agg->args) != 1 ||
+							!IsA(linitial_node(TargetEntry, agg->args)->expr, Var))
+							df_reject(cxt, "combining aggregate %s over an expression", name);
+						return cxt->failed;
+					}
+					return cxt->failed || df_check_expr((Node *) agg->args, cxt);
+				}
 				else if (agg->aggorder != NIL)
 					df_reject(cxt, "ORDER BY inside aggregate %s", name);
 				else if (agg->aggdistinct != NIL && cxt->agg_sets)
@@ -7258,6 +7284,8 @@ df_agg_state(Aggref *agg)
 		return DF_AGG_SUM_NUMERIC;
 	if (argtype == NUMERICOID && strcmp(name, "avg") == 0)
 		return DF_AGG_AVG_NUMERIC;
+	if (agg->aggsplit != AGGSPLIT_SIMPLE && df_stddev_agg(agg, NULL, NULL))
+		return DF_AGG_STDDEV;
 	return DF_AGG_PLAIN;
 }
 
@@ -7489,6 +7517,8 @@ df_agg_state_ncols(DfAggState state)
 {
 	switch (state)
 	{
+		case DF_AGG_STDDEV:
+			return 3;
 		case DF_AGG_AVG_FLOAT:
 		case DF_AGG_AVG_INT:
 		case DF_AGG_AVG_NUMERIC:

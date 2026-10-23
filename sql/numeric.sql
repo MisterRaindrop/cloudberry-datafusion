@@ -625,8 +625,10 @@ DROP TABLE df_dn;
 -- scale and the root sqrt_var's, each value with that display scale: NULL
 -- for no value (or one, for a sample), 0 where all are alike, int4's
 -- extremes.  Over an output column, in an expression (TPC-DS Q17's
--- stddev / avg, a comparison), below a join.  In two stages, or of int8,
--- they stay on PostgreSQL.
+-- stddev / avg, a comparison), below a join.  Of int8 they stay on
+-- PostgreSQL.  STD2: in two stages (TPC-DS Q35), the partial sum, count
+-- and sum of squares pass through a batch Motion; without batch Motions
+-- (PostgreSQL's serialized state) they stay on PostgreSQL.
 CREATE TABLE df_sd (id int, g int, a int4, b int2, c int8) DISTRIBUTED BY (id);
 INSERT INTO df_sd SELECT i, i % 37, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 7919) % 100003 - 50000 END,
   (i % 9)::int2, i FROM generate_series(1, 20000) i;
@@ -641,6 +643,9 @@ EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a) / avg(a) AS cov, stddev_samp(b) > 2
 EXPLAIN (COSTS OFF) SELECT g, stddev_samp(c) FROM df_sd GROUP BY g;
 RESET gp_enable_multiphase_agg;
 EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a) FROM df_sd GROUP BY g;
+SET datafusion.motion_batches = off;
+EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a) FROM df_sd GROUP BY g;
+SET datafusion.motion_batches = on;
 SET gp_enable_multiphase_agg = off;
 SET datafusion.mode = off;
 SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
@@ -651,6 +656,12 @@ SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), var
 SELECT g, stddev_samp(a) / avg(a) AS cov, stddev_samp(b) > 2.58 AS wide FROM df_sd GROUP BY g HAVING stddev_pop(a) > 28800 OR g > 99 ORDER BY g;
 SELECT x.g, x.s, y.n FROM (SELECT g, stddev_samp(a) s FROM df_sd GROUP BY g) x JOIN (SELECT g, count(*) n FROM df_sd GROUP BY g) y ON x.g = y.g WHERE x.g % 9 = 1 OR x.g > 99 ORDER BY 1;
 RESET gp_enable_multiphase_agg;
+SET datafusion.mode = off;
+SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
+SELECT stddev_samp(a), var_pop(b), stddev_samp(a) / avg(a) FROM df_sd;
+SET datafusion.mode = on;
+SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
+SELECT stddev_samp(a), var_pop(b), stddev_samp(a) / avg(a) FROM df_sd;
 RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_sd;

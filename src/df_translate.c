@@ -834,13 +834,16 @@ df_emit_stddev(DfBuilder *b, StringInfo out, Aggref *agg, bool dscale)
 	bool		sample,
 				variance;
 
+	bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+
 	(void) df_stddev_agg(agg, &sample, &variance);
 	appendStringInfo(out, "{\"%s\":[", dscale ? "stddev_numeric_scale" : "stddev_numeric");
-	df_emit_call_ref(b, out, agg, "count");
+	/* STD2: a combining one's, the partial states added up */
+	df_emit_call_ref(b, out, agg, combine ? "merge_count" : "count");
 	appendStringInfoChar(out, ',');
-	df_emit_call_ref(b, out, agg, "sum_numeric");
+	df_emit_call_ref(b, out, agg, combine ? "merge_sum" : "sum_numeric");
 	appendStringInfoChar(out, ',');
-	df_emit_call_ref(b, out, agg, "sum_sq");
+	df_emit_call_ref(b, out, agg, combine ? "merge_sumsq" : "sum_sq");
 	appendStringInfo(out, "],\"sample\":%s,\"variance\":%s", sample ? "true" : "false",
 					 variance ? "true" : "false");
 	if (!dscale)
@@ -2478,13 +2481,17 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 
 					if (df_stddev_agg(lfirst(lc), NULL, NULL))
 					{
-						/* STD1: its count, sum and sum of squares */
+						/* STD1: its count, sum and sum of squares; STD2: merged */
+						bool		combine = ((Aggref *) lfirst(lc))->aggsplit == AGGSPLIT_FINAL_DESERIAL;
+
 						if (!list_member(na->aggrefs, lfirst(lc)))
 						{
 							na->aggrefs = lappend(lappend(lappend(na->aggrefs, lfirst(lc)),
 														  lfirst(lc)), lfirst(lc));
-							na->aggfns = lappend(lappend(lappend(na->aggfns, (void *) "count"),
-														 (void *) "sum_numeric"), (void *) "sum_sq");
+							na->aggfns = lappend(lappend(lappend(na->aggfns,
+																 (void *) (combine ? "merge_count" : "count")),
+														 (void *) (combine ? "merge_sum" : "sum_numeric")),
+												 (void *) (combine ? "merge_sumsq" : "sum_sq"));
 						}
 					}
 					else if (df_avg_parts(lfirst(lc), &sfn, &cfn))
@@ -3057,6 +3064,17 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			}
 			child = (Plan *) motion;
 			pos = df_motion_stream_column(motion, resno);
+			if (df_agg_state(agg) == DF_AGG_STDDEV)
+			{
+				/* STD2: the stream's sum, count and sum of squares, added up */
+				bool		sq = fn != NULL && strcmp(fn, "merge_sumsq") == 0;
+
+				appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":", count ? "sum" : "sum_decimal");
+				df_emit_column(b, aggs, df_input_of(b, child), pos + (count ? 2 : sq ? 3 : 1),
+							   count ? INT8OID : NUMERICOID, 0);
+				appendStringInfoChar(aggs, '}');
+				continue;
+			}
 			appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":",
 							 count ? "sum" : mixed ? "max" : "sum_decimal");
 			df_emit_column(b, aggs, df_input_of(b, child), pos + (count || mixed ? 2 : 1),
@@ -3255,6 +3273,21 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 				state == DF_AGG_SUM_NUMERIC_MIXED;
 			int			scale = df_scale_of(ctx, (Node *) agg);
 
+			if (state == DF_AGG_STDDEV)
+			{
+				/* STD2: exact sum, count, exact sum of squares */
+				spec->out_types[i++] = NUMERICOID;
+				spec->out_types[i++] = INT8OID;
+				spec->out_types[i++] = NUMERICOID;
+				appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"},"
+								 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"},"
+								 "{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
+								 i > 3 ? "," : "",
+								 df_agg_ref(b, agg, "sum_numeric"), df_tag(NUMERICOID, 0),
+								 df_agg_ref(b, agg, "count"),
+								 df_agg_ref(b, agg, "sum_sq"), df_tag(NUMERICOID, 0));
+				continue;
+			}
 			/* PS1: what the C side makes of it for tuples */
 			if (b->tuples && (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC))
 				spec->out_kinds[i] = DF_OUT_STATE_NUMERIC;
