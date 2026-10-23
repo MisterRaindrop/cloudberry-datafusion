@@ -1709,6 +1709,13 @@ nothing to gain from starting a plan for it.  A Limit of an OFFSET alone
 lets any number of rows through, and the Sort over it is reported as
 before.
 
+FW1: so is a slice that, below its Sequences, only passes on the rows of a
+Motion it receives while its Shared Scan producers' inputs run in
+DataFusion (GPORCA's TPC-DS Q23a and Q23b send a Limit's rows back to the
+segments this way): EXPLAIN reports it as passing on those rows with
+nothing else to compute, and lists what runs below its producers.  Only
+the report changes; the producers' inputs ran in DataFusion before.
+
 | Sort key | Order |
 |---|---|
 | integers, bool, date, time, timestamp, timestamptz | as stored; date and timestamp infinities at the ends |

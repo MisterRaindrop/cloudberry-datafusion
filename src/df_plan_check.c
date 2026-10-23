@@ -7686,45 +7686,29 @@ df_limit_rows(Plan *plan)
 }
 
 /*
- * Where all that the slice part 'compute' leaves to PostgreSQL is sorting
- * the few rows of a Limit, the number of them at most, and the Motion they
- * come from; else -1.  GPORCA puts a Sort over the coordinator's Limit over
- * a Gather Motion, whose rows are sorted already, and a Sort over a
- * Sequence whose last input receives the rows of such a Limit, sent back to
- * the segments, while DataFusion runs the inputs of the Sequence's Shared
- * Scan producers ('points', T2) or they only store rows they receive.  Neither has anything worth computing on
- * the rows it receives, as a Gather Motion has not.
+ * The last input of Sequences 'below', some within others, each passing its
+ * last input's columns on, and whose Shared Scan producers' inputs run
+ * wholly in DataFusion (attach points 'points') or only receive rows to
+ * store; 'below' itself if not a Sequence; NULL otherwise.
  */
-static int64
-df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
+static Plan *
+df_through_producers(Plan *below, List *points)
 {
-	Plan	   *below;
 	Plan	   *body;
 	ListCell   *lc;
 
-	if (compute == NULL || !IsA(compute, Sort) || !df_passes_through(compute))
-		return -1;
-	below = outerPlan(compute);
-	if (IsA(below, Limit))
-	{
-		if (points != NIL || outerPlan(below) == NULL || !IsA(outerPlan(below), Motion))
-			return -1;
-		*motion = (Motion *) outerPlan(below);
-		return df_limit_rows(below);
-	}
-	/* through the Sequences, some within others, to the last input */
 	for (; IsA(below, Sequence); below = body)
 	{
 		body = llast(((Sequence *) below)->subplans);
 		if (below->qual != NIL || list_length(below->targetlist) != list_length(body->targetlist))
-			return -1;
+			return NULL;
 		foreach(lc, below->targetlist)
 		{
 			TargetEntry *tle = lfirst_node(TargetEntry, lc);
 			Var		   *var = (Var *) tle->expr;
 
 			if (!IsA(var, Var) || var->varno != OUTER_VAR || var->varattno != tle->resno)
-				return -1;
+				return NULL;
 		}
 		/*
 		 * every producer's input runs wholly in DataFusion, or only
@@ -7739,21 +7723,72 @@ df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
 			if (sub == body)
 				continue;
 			if (!IsA(sub, ShareInputScan) || outerPlan(sub) == NULL)
-				return -1;
+				return NULL;
 			if (IsA(outerPlan(sub), Motion))
 				continue;
 			foreach(pc, points)
 				if (((DfAttach *) lfirst(pc))->plan == outerPlan(sub))
 					found = true;
 			if (!found)
-				return -1;
+				return NULL;
 		}
 	}
+	return below;
+}
+
+/*
+ * Where all that the slice part 'compute' leaves to PostgreSQL is sorting
+ * the few rows of a Limit, the number of them at most, and the Motion they
+ * come from; else -1.  GPORCA puts a Sort over the coordinator's Limit over
+ * a Gather Motion, whose rows are sorted already, and a Sort over a
+ * Sequence whose last input receives the rows of such a Limit, sent back to
+ * the segments, while DataFusion runs the inputs of the Sequence's Shared
+ * Scan producers ('points', T2) or they only store rows they receive.  Neither has anything worth computing on
+ * the rows it receives, as a Gather Motion has not.
+ */
+static int64
+df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
+{
+	Plan	   *below;
+	Plan	   *body;
+
+	if (compute == NULL || !IsA(compute, Sort) || !df_passes_through(compute))
+		return -1;
+	below = outerPlan(compute);
+	if (IsA(below, Limit))
+	{
+		if (points != NIL || outerPlan(below) == NULL || !IsA(outerPlan(below), Motion))
+			return -1;
+		*motion = (Motion *) outerPlan(below);
+		return df_limit_rows(below);
+	}
+	/* through the Sequences, some within others, to the last input */
+	below = df_through_producers(below, points);
+	if (below == NULL)
+		return -1;
 	if (below == outerPlan(compute) || !IsA(below, Motion))
 		return -1;
 	body = below;
 	*motion = (Motion *) body;
 	return df_limit_rows(outerPlan(body));
+}
+
+/*
+ * FW1: where all that the slice part 'compute' leaves to PostgreSQL is
+ * passing on the rows of a Motion it receives, as the last input of
+ * Sequences whose Shared Scan producers' inputs DataFusion runs, that
+ * Motion; else NULL.  GPORCA's TPC-DS Q23 computes its shared parts so, and
+ * sends a Limit's rows back to the segments to pass them on.
+ */
+static Motion *
+df_forwards_motion(Plan *compute, List *points)
+{
+	Plan	   *below;
+
+	if (compute == NULL || !IsA(compute, Sequence) || points == NIL)
+		return NULL;
+	below = df_through_producers(compute, points);
+	return below != NULL && IsA(below, Motion) ? (Motion *) below : NULL;
 }
 
 /*
@@ -7825,6 +7860,23 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 					 "sorts at most " INT64_FORMAT " rows of a Limit, received from a %s, "
 					 "with nothing else to compute on them",
 					 rows, df_plan_name((Plan *) motion));
+		else if ((motion = df_forwards_motion(compute, points)) != NULL)
+		{
+			/* FW1: what runs below its Shared Scan producers, all of it */
+			appendStringInfo(out, "DataFusion: slice %d not eligible: passes on rows received "
+							 "from a %s, with nothing else to compute on them; below its "
+							 "Shared Scan producers:", root->index,
+							 df_plan_name((Plan *) motion));
+			foreach(lc, points)
+			{
+				Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
+
+				appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
+								 df_plan_name(p) ? df_plan_name(p) : "?");
+			}
+			appendStringInfoChar(out, '\n');
+			return;
+		}
 		if (points == NIL)
 			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
 							 root->index, reason);

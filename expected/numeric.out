@@ -1504,7 +1504,7 @@ WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store)
                                                                            ->  Shared Scan (share slice:id 6:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate (above: receives rows from a Redistribute Motion with nothing to compute on them)
+ DataFusion: slice 1 not eligible: passes on rows received from a Redistribute Motion, with nothing else to compute on them; below its Shared Scan producers: Aggregate
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 eligible
  DataFusion: slice 4 eligible, sends Arrow batches
