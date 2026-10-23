@@ -174,10 +174,14 @@ DROP TABLE df_ps;
 -- partial stage groups one side by the join key, the join may repeat its
 -- rows, and the combining stage adds up their counts.  Where every state
 -- is a plain value (count, min, max, a sum of integers), DataFusion reads
--- it through the join as any column; an avg's state stays on PostgreSQL.
-CREATE TABLE df_cs_s (o int, w int) DISTRIBUTED BY (w);
+-- it through the join as any column.  CS2: other states (an avg's, a sum
+-- of numeric or int8, TPC-DS Q23) are read from the Motion below the join
+-- as DataFusion's columns, from batches or from PostgreSQL's states in
+-- tuples (PS1).
+CREATE TABLE df_cs_s (o int, w int, a numeric(7,2), b int8) DISTRIBUTED BY (w);
 CREATE TABLE df_cs_r (o int, x int) DISTRIBUTED BY (x);
-INSERT INTO df_cs_s SELECT i % 3000, CASE WHEN i % 23 = 0 THEN NULL ELSE i % 7 END FROM generate_series(1, 60000) i;
+INSERT INTO df_cs_s SELECT i % 3000, CASE WHEN i % 23 = 0 THEN NULL ELSE i % 7 END,
+  CASE WHEN i % 29 = 0 THEN NULL ELSE (i % 1000) * 0.37 END, i::int8 * 100000000 FROM generate_series(1, 60000) i;
 INSERT INTO df_cs_r SELECT i * 3, i FROM generate_series(1, 400) i;
 INSERT INTO df_cs_r VALUES (3, 401), (6, 402), (6, 403);
 ANALYZE df_cs_s;
@@ -192,6 +196,19 @@ SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, co
 SET datafusion.mode = on;
 SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, count(*) c, count(s.w) cw, sum(s.w) sw, min(s.w) mn, max(s.w) mx FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) t;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT max(t), min(t), sum(t) FROM (SELECT r.o, sum(s.a) t FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
+SET datafusion.motion_batches = off;
+EXPLAIN (COSTS OFF) SELECT max(t), min(t), sum(t) FROM (SELECT r.o, sum(s.a) t FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
+SET datafusion.mode = off;
+SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
+SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
+SET datafusion.mode = on;
+SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
+SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
+SET datafusion.motion_batches = on;
+SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
+SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
 SET optimizer = off;
 DROP TABLE df_cs_s, df_cs_r;
 

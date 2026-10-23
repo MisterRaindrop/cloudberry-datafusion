@@ -3039,17 +3039,23 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		{
 			/* sum(int8), avg(int): the stream's numeric sum and count columns */
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-			Plan	   *child = df_below_sort(outerPlan(aggnode));
+			Plan	   *pctx = (Plan *) aggnode;
+			Motion	   *motion = NULL;
+			AttrNumber	resno = InvalidAttrNumber;
+			Plan	   *child;
 			bool		count = fn != NULL && strcmp(fn, "merge_count") == 0;
 			bool		mixed = fn != NULL && strcmp(fn, "mixed_scale") == 0;
 			int			pos;
 
-			if (!IsA(child, Motion) || !IsA(arg, Var))
+			/* the Motion's state column, through any joins between (CS2) */
+			if (!IsA(arg, Var) || df_partial_path(&pctx, arg, &motion, &resno) == NULL ||
+				motion == NULL)
 			{
 				df_fail(b, "a combining aggregate");
 				return;
 			}
-			pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
+			child = (Plan *) motion;
+			pos = df_motion_stream_column(motion, resno);
 			appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":",
 							 count ? "sum" : mixed ? "max" : "sum_decimal");
 			df_emit_column(b, aggs, df_input_of(b, child), pos + (count || mixed ? 2 : 1),

@@ -122,6 +122,8 @@ typedef struct DfCheckContext
 	bool		pg_final_states;	/* this combining Agg reads PostgreSQL's
 									 * states from a Motion of tuples (PS1) */
 	bool		final_states;	/* this Agg may read DataFusion avg states */
+	bool		through_states; /* this combining Agg reads states through
+								 * joins above their Motions (CS2) */
 	bool		agg_to_batches; /* this Agg's results go into a batch Motion */
 	bool		locale_dependent;	/* the verdict depends on this node's locale */
 	Node	   *mixed_scales_ok;	/* a sum's argument whose branches may have
@@ -154,6 +156,7 @@ static bool df_check_expr(Node *node, DfCheckContext *cxt);
 static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
 static bool df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups);
 static bool df_name_in(const char *name, const char *const *list);
+static bool df_state_var(Plan *ctx, Var *var, Bitmapset *batches);
 static bool df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches);
 static bool df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
 static void df_check_numcmp_term(Node *node, DfCheckContext *cxt);
@@ -901,21 +904,11 @@ df_sum_mixed(Plan *ctx, Aggref *agg)
 	arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 	if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 	{
-		/* the partial sum, through the Motion and any Sort between */
+		/* the partial sum, through the Motion and any Sort between (CS2) */
 		Plan	   *child = ctx;
+		Aggref	   *partial = df_partial_path(&child, arg, NULL, NULL);
 
-		while (IsA(arg, Var) && ((Var *) arg)->varno == OUTER_VAR &&
-			   (child = outerPlan(child)) != NULL)
-		{
-			TargetEntry *tle = get_tle_by_resno(child->targetlist, ((Var *) arg)->varattno);
-
-			if (tle == NULL)
-				return false;
-			arg = (Node *) tle->expr;
-		}
-		return child != NULL && IsA(arg, Aggref) &&
-			((Aggref *) arg)->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
-			df_sum_mixed(child, (Aggref *) arg);
+		return partial != NULL && df_sum_mixed(child, partial);
 	}
 	{
 		int			p,
@@ -1016,21 +1009,67 @@ df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
 static Aggref *
 df_partial_below(Plan **ctx, Node *arg)
 {
-	Plan	   *child = *ctx;
+	return df_partial_path(ctx, arg, NULL, NULL);
+}
 
-	while (IsA(arg, Var) && ((Var *) arg)->varno == OUTER_VAR &&
-		   (child = outerPlan(child)) != NULL)
+/*
+ * The partial aggregate whose state reference 'arg' of a combining
+ * aggregate of node *ctx reads, through the Motion and any Sort between,
+ * or NULL; *ctx becomes its Agg.  CS2: also through joins between the
+ * combining Agg and the Motion (TPC-DS Q23 under GPORCA joins partial sums
+ * of numeric before combining them), not from a side an outer join may
+ * null, and the Hash, Material and Result nodes that pass the column on.
+ * *motion and *resno (if not NULL) become the one Motion it crosses and
+ * its column, or NULL.
+ */
+Aggref *
+df_partial_path(Plan **ctx, Node *arg, Motion **motion, AttrNumber *resno)
+{
+	Plan	   *cur = *ctx;
+	Motion	   *crossed = NULL;
+	AttrNumber	col = InvalidAttrNumber;
+
+	while (IsA(arg, Var) &&
+		   (((Var *) arg)->varno == OUTER_VAR || ((Var *) arg)->varno == INNER_VAR))
 	{
-		TargetEntry *tle = get_tle_by_resno(child->targetlist, ((Var *) arg)->varattno);
+		bool		inner = ((Var *) arg)->varno == INNER_VAR;
+		Plan	   *child = inner ? innerPlan(cur) : outerPlan(cur);
+		TargetEntry *tle;
 
+		if (child == NULL)
+			return NULL;
+		if (IsA(cur, HashJoin) || IsA(cur, NestLoop) || IsA(cur, MergeJoin))
+		{
+			JoinType	jt = ((Join *) cur)->jointype;
+
+			if (jt == JOIN_FULL || (inner ? jt != JOIN_INNER : jt == JOIN_RIGHT))
+				return NULL;
+		}
+		else if (inner ||
+				 (cur != *ctx && !IsA(cur, Motion) && !IsA(cur, Sort) && !IsA(cur, Hash) &&
+				  !IsA(cur, Material) && !IsA(cur, Result)))
+			return NULL;
+		if (IsA(child, Motion))
+		{
+			if (crossed != NULL)
+				return NULL;
+			crossed = (Motion *) child;
+			col = ((Var *) arg)->varattno;
+		}
+		tle = get_tle_by_resno(child->targetlist, ((Var *) arg)->varattno);
 		if (tle == NULL)
 			return NULL;
 		arg = (Node *) tle->expr;
+		cur = child;
 	}
-	if (child == NULL || !IsA(arg, Aggref) ||
+	if (cur == *ctx || !IsA(arg, Aggref) ||
 		((Aggref *) arg)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 		return NULL;
-	*ctx = child;
+	*ctx = cur;
+	if (motion)
+		*motion = crossed;
+	if (resno)
+		*resno = col;
 	return (Aggref *) arg;
 }
 
@@ -1790,6 +1829,67 @@ df_agg_plain_states(Agg *agg)
 }
 
 /*
+ * CS2: can combining aggregate 'agg' of Agg 'ctx' read its partial
+ * aggregate's state through what lies between it and their Motion
+ * (df_partial_path): DataFusion's state from a batch Motion, or
+ * PostgreSQL's from tuples that the C side reads (PS1)?
+ */
+static bool
+df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches)
+{
+	Plan	   *pctx = ctx;
+	Motion	   *motion = NULL;
+	AttrNumber	resno;
+
+	if (list_length(agg->args) != 1 ||
+		!IsA(linitial_node(TargetEntry, agg->args)->expr, Var) ||
+		df_partial_path(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr,
+						&motion, &resno) == NULL || motion == NULL)
+		return false;
+	if (bms_is_member(motion->motionID, batches))
+		return true;
+	return df_motion_pg_state(motion, resno) && df_pg_partial_readable(ctx, agg);
+}
+
+/*
+ * CS2: is column 'var' of node 'ctx' a partial aggregate's state that a
+ * Motion below carries as DataFusion's columns (from batches, or read from
+ * PostgreSQL's in tuples, PS1), passed on to a combining Agg above?  Its
+ * references follow it down to the Motion's columns.
+ */
+static bool
+df_state_var(Plan *ctx, Var *var, Bitmapset *batches)
+{
+	Plan	   *pctx = ctx;
+	Motion	   *motion = NULL;
+	AttrNumber	resno;
+
+	if (df_partial_path(&pctx, (Node *) var, &motion, &resno) == NULL || motion == NULL)
+		return false;
+	return bms_is_member(motion->motionID, batches) ?
+		df_motion_state_columns(motion, resno) > 0 : df_motion_pg_state(motion, resno);
+}
+
+/* CS2: does every call of combining Agg 'agg' read a plain or such a state? */
+static bool
+df_agg_states_through(Agg *agg, Bitmapset *batches)
+{
+	List	   *aggs = NIL;
+	ListCell   *lc;
+
+	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
+	foreach(lc, aggs)
+	{
+		Aggref	   *a = lfirst_node(Aggref, lc);
+
+		if (df_agg_state(a) != DF_AGG_PLAIN && !df_state_through((Plan *) agg, a, batches))
+			return false;
+	}
+	return true;
+}
+
+/*
  * The kept side's hash key of semi join 'hj' that inner column 'var' equals
  * exactly (a hash clause outer = var of a type whose equal values are the
  * same: integers, dates and times, bool), or NULL.
@@ -2207,7 +2307,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 											  var->varattno, true);
 					df_reject(cxt, "system column %s", attname ? attname : "reference");
 				}
-				else if (!df_type_supported(var->vartype))
+				else if (!df_type_supported(var->vartype) &&
+						 !(IS_SPECIAL_VARNO(var->varno) && df_state_var(cxt->node, var, cxt->batches)))
 					df_reject(cxt, "column of type %s", format_type_be(var->vartype));
 				else if (var->vartype == NUMERICOID)
 				{
@@ -2477,7 +2578,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						(cxt->pg_final_states &&
 						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
 						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT) &&
-						 df_pg_partial_readable(cxt->node, agg));
+						 df_pg_partial_readable(cxt->node, agg)) ||
+						/* CS2: through joins above the Motion */
+						(cxt->through_states && df_state_through(cxt->node, agg, cxt->batches));
 
 					if (!allowed)
 						df_reject(cxt, "%s aggregate %s without batch Motions",
@@ -4851,7 +4954,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
 					if ((child == NULL || !IsA(df_below_sort(child), Motion)) &&
-						!df_agg_plain_states(agg))
+						!df_agg_plain_states(agg) &&
+						!df_agg_states_through(agg, cxt->batches))
 					{
 						df_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
 						return;
@@ -4914,6 +5018,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(df_below_sort(child), Motion) &&
 					bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches);
+				cxt->through_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
+					(child == NULL || !IsA(df_below_sort(child), Motion));
 				cxt->pg_final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
 					IsA(df_below_sort(child), Motion) &&
 					!bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches) &&
@@ -4937,6 +5043,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->partial_states = false;
 				cxt->pg_states = false;
 				cxt->pg_final_states = false;
+				cxt->through_states = false;
 				cxt->final_states = false;
 				cxt->agg_to_batches = false;
 

@@ -350,6 +350,7 @@ extern void df_agg_groups(Agg *agg, DfAggGroups *g);
 extern int	df_agg_group_index(Agg *agg, AttrNumber attno);
 extern int	df_grouping_value(List *cols, Bitmapset *set);
 extern bool df_motion_pg_state(Motion *motion, AttrNumber resno);
+extern Aggref *df_partial_path(Plan **ctx, Node *arg, Motion **motion, AttrNumber *resno);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern int	df_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos);

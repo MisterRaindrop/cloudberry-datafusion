@@ -419,9 +419,18 @@ joins, and combines the counts per group of the other side, the join
 repeating a partial row for each match.  Where every state is a plain
 value (count, min, max, a sum of integers), DataFusion reads it through
 the join as any column and the combining stage adds or compares as over a
-Motion; a state of two columns or PostgreSQL's own (an avg, a numeric
-sum) keeps such a stage on PostgreSQL.  Q95 under GPORCA now runs wholly
-in DataFusion.
+Motion.  Q95 under GPORCA now runs wholly in DataFusion.
+
+CS2: the other states (an avg's, a sum of numeric or int8) are columns of
+the Motion: DataFusion's from batches, or PostgreSQL's in tuples, which
+the C side reads into the same columns (PS1).  The combining aggregate's
+argument is followed down through the joins, Hash, Material and Result
+nodes between it and the Motion (`df_partial_path`), not from a side an
+outer join may null, crossing that one Motion, and read there as when the
+stage is right above it; the columns in between pass on.  TPC-DS Q23
+under GPORCA joins partial sums of numeric by customer before combining
+them: that slice now runs in DataFusion (Q23a and Q23b give PostgreSQL's
+results).
 
 A slice that only receives, such as the coordinator returning a Gather's
 rows to the client, stays on tuples, and its Gather with it.  Running it in
@@ -526,6 +535,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | M7c | Redistribute Motions with batches, routed by a checked transcription of cdbhash |
 | M7d | Split avg through batch Motions with DataFusion's state |
 | CS1 | Combining aggregates of plain states read through a join |
+| CS2 | Combining aggregates of other states read through a join |
 | J1 | Plan tree over several inputs (groundwork for joins) |
 | J2 | Inner hash joins over local scans, with a memory guard |
 | J3 | Joins over Redistribute and Broadcast Motions; Broadcast batches |
