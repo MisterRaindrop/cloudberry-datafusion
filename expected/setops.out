@@ -2966,6 +2966,276 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
     |   425
 (9 rows)
 
+-- UQ1: a Unique (a DISTINCT, grouped sorted) whose order of rows no one
+-- reads, as a grouping by its columns without the Sort below it: below a
+-- join (TPC-DS Q54's, below a Redistribute Motion), an Agg, an unsorted
+-- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One whose order
+-- the Gather above merges, and one on numeric, stay on PostgreSQL.
+SET optimizer = off;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 60;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Join
+         Hash Cond: (x.k = (d.m + d.g))
+         ->  Broadcast Motion 3:3  (slice2; segments: 3)
+               ->  Seq Scan on df_u1 x
+                     Filter: (k < 60)
+         ->  Hash
+               ->  Subquery Scan on d
+                     ->  Unique
+                           Group Key: df_u1.g, ((df_u1.k % 50)), df_u1.t, df_u1.c
+                           ->  Sort
+                                 Sort Key: df_u1.g, ((df_u1.k % 50)), df_u1.t, df_u1.c
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: df_u1.g, ((df_u1.k % 50)), df_u1.t, df_u1.c
+                                       ->  Seq Scan on df_u1
+                                             Filter: ((k < 300) AND (((k % 50) + g) < 60))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(21 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Unique
+                     Group Key: ((df_u1.g + 1)), df_u1.t, df_u1.c
+                     ->  Sort
+                           Sort Key: ((df_u1.g + 1)), df_u1.t, df_u1.c
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: ((df_u1.g + 1)), df_u1.t, df_u1.c
+                                 ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Gather Motion 3:1  (slice3; segments: 3)
+           ->  Unique
+                 Group Key: ((df_u1_1.k % 5))
+                 ->  Sort
+                       Sort Key: ((df_u1_1.k % 5))
+                       ->  Redistribute Motion 3:3  (slice4; segments: 3)
+                             Hash Key: ((df_u1_1.k % 5))
+                             ->  Seq Scan on df_u1 df_u1_1
+                                   Filter: ((k < 10) AND (g = 3))
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_u1
+                     Filter: (g = $0)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+ DataFusion: slice 2 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 3 eligible
+ DataFusion: slice 4 eligible, sends Arrow batches
+(21 rows)
+
+EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 ORDER BY 1, 2;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: g, ((k % 50))
+   ->  Unique
+         Group Key: g, ((k % 50))
+         ->  Sort
+               Sort Key: g, ((k % 50))
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: g, ((k % 50))
+                     ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: sorted Gather Motion without a Sort below it
+ DataFusion: slice 2 eligible
+(13 rows)
+
+EXPLAIN (COSTS OFF) SELECT x.k FROM df_u1 x JOIN (SELECT DISTINCT g, a FROM df_u1) d ON x.k = d.g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Hash Join
+         Hash Cond: (x.k = d.g)
+         ->  Seq Scan on df_u1 x
+         ->  Hash
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: d.g
+                     ->  Subquery Scan on d
+                           ->  Unique
+                                 Group Key: df_u1.g, df_u1.a
+                                 ->  Sort
+                                       Sort Key: df_u1.g, df_u1.a
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: df_u1.g, df_u1.a
+                                             ->  Seq Scan on df_u1
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 not eligible: Unique on a column of type numeric
+ DataFusion: slice 3 eligible
+(20 rows)
+
+SET datafusion.mode = off;
+SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
+ k  | g | t  |  c   
+----+---+----+------
+  1 | 1 | t0 | c2  
+  2 | 2 | t0 | c4  
+  2 | 2 | t1 | c1  
+  2 | 2 | t2 | c0  
+  3 | 3 | t0 | c0  
+  3 | 3 | t1 | 
+  3 | 3 | t3 | c5  
+  4 | 4 | t0 | c2  
+  4 | 4 | t1 | c5  
+  4 | 4 | t2 | c2  
+  4 | 4 |    | c1  
+  4 | 4 |    | c4  
+  5 | 5 | t0 | c3  
+  5 | 5 | t0 | c4  
+  5 | 5 | t1 | c1  
+  5 | 5 | t2 | c4  
+  5 | 5 | t4 | 
+  6 | 6 | t0 | c5  
+  6 | 6 | t1 | c2  
+  6 | 6 | t1 | c3  
+  6 | 6 | t2 | 
+  6 | 6 | t3 | c3  
+  6 | 6 | t4 | c2  
+  7 | 0 | t0 | c1  
+  7 | 0 | t1 | c4  
+  7 | 0 | t1 | c5  
+  7 | 0 | t2 | c1  
+  7 | 0 | t2 | c2  
+  7 | 0 | t3 | c5  
+  8 | 1 | t0 | 
+  8 | 1 | t1 | c0  
+  8 | 1 | t2 | c3  
+  8 | 1 | t2 | c4  
+  8 | 1 | t3 | c1  
+  8 | 1 | t4 | c4  
+  9 | 2 | t1 | c2  
+  9 | 2 | t2 | c5  
+  9 | 2 | t3 | c2  
+  9 | 2 | t3 | 
+  9 | 2 | t4 | c0  
+  9 | 2 | t4 | c1  
+ 10 | 3 | t0 | c0  
+ 10 | 3 | t0 | c5  
+ 10 | 3 | t1 | c4  
+ 10 | 3 | t2 | c1  
+ 10 | 3 | t3 | c4  
+ 10 | 3 | t4 | c2  
+ 11 | 4 | t0 | c2  
+ 11 | 4 | t1 | c5  
+ 11 | 4 | t2 | c3  
+ 11 | 4 | t3 | c0  
+ 11 | 4 | t4 | c3  
+ 11 | 4 |    | c1  
+(53 rows)
+
+SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+ count | count | count 
+-------+-------+-------
+   294 |   245 |   252
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+ count 
+-------
+   429
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+ERROR:  more than one row returned by a subquery used as an expression
+SET datafusion.mode = on;
+SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
+ k  | g | t  |  c   
+----+---+----+------
+  1 | 1 | t0 | c2  
+  2 | 2 | t0 | c4  
+  2 | 2 | t1 | c1  
+  2 | 2 | t2 | c0  
+  3 | 3 | t0 | c0  
+  3 | 3 | t1 | 
+  3 | 3 | t3 | c5  
+  4 | 4 | t0 | c2  
+  4 | 4 | t1 | c5  
+  4 | 4 | t2 | c2  
+  4 | 4 |    | c1  
+  4 | 4 |    | c4  
+  5 | 5 | t0 | c3  
+  5 | 5 | t0 | c4  
+  5 | 5 | t1 | c1  
+  5 | 5 | t2 | c4  
+  5 | 5 | t4 | 
+  6 | 6 | t0 | c5  
+  6 | 6 | t1 | c2  
+  6 | 6 | t1 | c3  
+  6 | 6 | t2 | 
+  6 | 6 | t3 | c3  
+  6 | 6 | t4 | c2  
+  7 | 0 | t0 | c1  
+  7 | 0 | t1 | c4  
+  7 | 0 | t1 | c5  
+  7 | 0 | t2 | c1  
+  7 | 0 | t2 | c2  
+  7 | 0 | t3 | c5  
+  8 | 1 | t0 | 
+  8 | 1 | t1 | c0  
+  8 | 1 | t2 | c3  
+  8 | 1 | t2 | c4  
+  8 | 1 | t3 | c1  
+  8 | 1 | t4 | c4  
+  9 | 2 | t1 | c2  
+  9 | 2 | t2 | c5  
+  9 | 2 | t3 | c2  
+  9 | 2 | t3 | 
+  9 | 2 | t4 | c0  
+  9 | 2 | t4 | c1  
+ 10 | 3 | t0 | c0  
+ 10 | 3 | t0 | c5  
+ 10 | 3 | t1 | c4  
+ 10 | 3 | t2 | c1  
+ 10 | 3 | t3 | c4  
+ 10 | 3 | t4 | c2  
+ 11 | 4 | t0 | c2  
+ 11 | 4 | t1 | c5  
+ 11 | 4 | t2 | c3  
+ 11 | 4 | t3 | c0  
+ 11 | 4 | t4 | c3  
+ 11 | 4 |    | c1  
+(53 rows)
+
+SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+ count | count | count 
+-------+-------+-------
+   294 |   245 |   252
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+ count 
+-------
+   429
+(1 row)
+
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+ERROR:  more than one row returned by a subquery used as an expression
+RESET enable_hashagg;
+SET optimizer = on;
 -- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
 -- row passes, or the slice raises PostgreSQL's error (P0003).
 SET datafusion.mode = explain;

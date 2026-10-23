@@ -556,6 +556,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | WIN2 | avg of numeric and of integers over a frame, with its display scale |
 | UA1 | UNION ALL (Append) |
 | SO1 | INTERSECT and EXCEPT (SetOp) |
+| UQ1 | DISTINCT as Unique whose order no one reads |
 | AS1 | GPORCA's Assert of a scalar subquery's rows |
 | SR1 | D3 below Subquery Scans |
 | CL2 | EXPLAIN checks a segment slice by the segments' collation |
@@ -1552,6 +1553,19 @@ Postgres planner wholly in DataFusion (124 -> 126 of 206 executions by
 EXPLAIN), Q8, Q38 and Q87 giving PostgreSQL's results; Q38 and Q87 run
 slower than on PostgreSQL there (0.45 s and 0.64 s against 0.38 s and
 0.45 s).
+
+UQ1: a Unique (a DISTINCT the Postgres planner groups sorted) keeps the
+first of each run of equal rows its sorted input gives.  One whose order
+of rows no one reads (below an unsorted Gather, a Redistribute Motion, a
+join or an Agg, as D2 tells) runs as a grouping by the columns it tells
+duplicates by, named q<id>_g<k> as SO1's, without the Sort below it;
+NULLs make a group, as in the Unique.  Its output columns must be among
+those, of the types SO1 takes, so that a group's row is any of its
+members': not a DISTINCT ON, whose other columns come from the first row
+in order, nor a DISTINCT of numeric.  One whose order a merging Gather
+reads stays on PostgreSQL.  TPC-DS SF1: Q54 under the Postgres planner
+(a DISTINCT below a join, and two in init plans) now runs wholly in
+DataFusion; Q6's init plan does too.
 
 ### GPORCA's Assert
 

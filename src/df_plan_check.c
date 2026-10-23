@@ -3035,8 +3035,8 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	if (plan == NULL)
 		return false;
 	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp) ||
-		df_empty_result(plan) || IsA(plan, ShareInputScan))
-		return true;			/* UA1, SO1: columns of its union or grouping */
+		IsA(plan, Unique) || df_empty_result(plan) || IsA(plan, ShareInputScan))
+		return true;			/* UA1, SO1, UQ1: columns of its union or grouping */
 	if (IsA(plan, Result))
 	{
 		/* R1: its child's columns */
@@ -3889,6 +3889,39 @@ df_append_plans(Plan *plan)
 }
 
 /*
+ * SO1, UQ1: is the type of child column 'tle' one whose equal values look
+ * alike, so that any member of a group shows it?  Not floats (-0 and 0),
+ * numeric (1.0 and 1.00), character without a length.  character(n) holds
+ * every value padded to n; inputs of different lengths make the column one
+ * without a length.
+ */
+static bool
+df_alike_type(TargetEntry *tle)
+{
+	Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
+
+	return type == INT2OID || type == INT4OID || type == INT8OID ||
+		type == BOOLOID || type == DATEOID || type == TIMESTAMPOID ||
+		type == TEXTOID || type == VARCHAROID ||
+		(type == BPCHAROID && exprTypmod((Node *) tle->expr) > 0);
+}
+
+/*
+ * UQ1: the index among the columns Unique 'uq' tells duplicates by of its
+ * child's column 'attno', or -1.
+ */
+int
+df_unique_group(Unique *uq, AttrNumber attno)
+{
+	int			k;
+
+	for (k = 0; k < uq->numCols; k++)
+		if (uq->uniqColIdx[k] == attno)
+			return k;
+	return -1;
+}
+
+/*
  * SO1: the index among the columns SetOp 'setop' tells duplicates by of
  * its child's column 'attno', or -1.
  */
@@ -4648,7 +4681,8 @@ df_plan_computes(Plan *plan)
 	if (plan == NULL || IsA(plan, Motion))
 		return false;
 	if (IsA(plan, Agg) || IsA(plan, HashJoin) || IsA(plan, NestLoop) ||
-		IsA(plan, MergeJoin) || IsA(plan, WindowAgg) || IsA(plan, SetOp))
+		IsA(plan, MergeJoin) || IsA(plan, WindowAgg) || IsA(plan, SetOp) ||
+		IsA(plan, Unique))
 		return true;
 	if (IsA(plan, SubqueryScan))
 		return df_plan_computes(((SubqueryScan *) plan)->subplan);
@@ -5169,6 +5203,76 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				return;
 			}
 
+		case T_Unique:
+			{
+				/*
+				 * UQ1: a Unique whose order of rows no one reads (a
+				 * DISTINCT below an unsorted Motion: TPC-DS Q54's, Q6's in
+				 * init plans), as a grouping by the columns it tells
+				 * duplicates by, without the Sort below it.  Its output
+				 * columns are those it groups by, of types whose equal
+				 * values look alike (as SO1's), so that a group's row is
+				 * any of its members'; not a DISTINCT ON, whose other
+				 * columns come from the first row in order.
+				 */
+				Unique	   *uq = (Unique *) plan;
+				Plan	   *child = outerPlan(plan);
+				Bitmapset  *child_needed = NULL;
+				ListCell   *lc;
+				int			k;
+
+				if (plan->qual != NIL || child == NULL || uq->numCols <= 0)
+				{
+					df_reject(cxt, "Unique with a filter or without columns");
+					return;
+				}
+				if (!cxt->node_order_free)
+				{
+					df_reject(cxt, "Unique whose order of rows is read");
+					return;
+				}
+				for (k = 0; k < uq->numCols; k++)
+				{
+					TargetEntry *tle = get_tle_by_resno(child->targetlist, uq->uniqColIdx[k]);
+					const char *problem;
+
+					if (!df_alike_type(tle))
+					{
+						df_reject(cxt, "Unique on a column of type %s",
+								  tle ? format_type_be(exprType((Node *) tle->expr)) : "?");
+						return;
+					}
+					if (df_type_is_string(exprType((Node *) tle->expr)) &&
+						(problem = df_string_compare_problem(cxt, "=", uq->uniqCollations[k])) != NULL)
+					{
+						df_reject(cxt, "Unique on text %s", problem);
+						return;
+					}
+					child_needed = bms_add_member(child_needed, uq->uniqColIdx[k]);
+				}
+				foreach(lc, plan->targetlist)
+				{
+					TargetEntry *tle = lfirst_node(TargetEntry, lc);
+					Var		   *var = (Var *) tle->expr;
+
+					if (needed != NULL && !bms_is_member(tle->resno, needed))
+						continue;
+					if (!IsA(var, Var) || var->varno != OUTER_VAR ||
+						df_unique_group(uq, var->varattno) < 0)
+					{
+						df_reject(cxt, "Unique output other than its columns");
+						return;
+					}
+				}
+				if (IsA(child, Sort))
+					cxt->skipped_sort = child;	/* grouped hashed (D2) */
+				cxt->order_free = true;
+				cxt->agg_input = true;	/* a grouping, worth the Motions below */
+				df_check_plan(child, cxt, child_needed, false);
+				cxt->agg_input = false;
+				return;
+			}
+
 		case T_SetOp:
 			{
 				/*
@@ -5215,15 +5319,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
 					const char *problem;
 
-					/*
-					 * character(n) holds every value padded to n, so equal
-					 * values look alike; inputs of different lengths make
-					 * the column one without a length
-					 */
-					if (type != INT2OID && type != INT4OID && type != INT8OID &&
-						type != BOOLOID && type != DATEOID && type != TIMESTAMPOID &&
-						type != TEXTOID && type != VARCHAROID &&
-						!(type == BPCHAROID && exprTypmod((Node *) tle->expr) > 0))
+					if (!df_alike_type(tle))
 					{
 						df_reject(cxt, "INTERSECT or EXCEPT on a column of type %s",
 								  type == InvalidOid ? "?" : format_type_be(type));

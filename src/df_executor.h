@@ -391,6 +391,7 @@ extern bool df_null_equal_join(HashJoin *hj);
 extern int	df_one_time_value(Node *qual, bool evaluate);
 extern bool df_empty_result(Plan *plan);
 extern int	df_setop_group(SetOp *setop, AttrNumber attno);
+extern int	df_unique_group(Unique *uq, AttrNumber attno);
 
 /* IP1: init plan values for the translation of a slice that starts, or NULL */
 extern ParamExecData *df_param_values;

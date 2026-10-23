@@ -146,6 +146,32 @@ SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
 
+-- UQ1: a Unique (a DISTINCT, grouped sorted) whose order of rows no one
+-- reads, as a grouping by its columns without the Sort below it: below a
+-- join (TPC-DS Q54's, below a Redistribute Motion), an Agg, an unsorted
+-- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One whose order
+-- the Gather above merges, and one on numeric, stay on PostgreSQL.
+SET optimizer = off;
+SET enable_hashagg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 60;
+EXPLAIN (COSTS OFF) SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT x.k FROM df_u1 x JOIN (SELECT DISTINCT g, a FROM df_u1) d ON x.k = d.g;
+SET datafusion.mode = off;
+SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
+SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+SET datafusion.mode = on;
+SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
+SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
+SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+RESET enable_hashagg;
+SET optimizer = on;
+
 -- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
 -- row passes, or the slice raises PostgreSQL's error (P0003).
 SET datafusion.mode = explain;

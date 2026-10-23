@@ -979,9 +979,9 @@ df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 	else if (df_append_plans(child) != NIL)
 		/* UA1: a column of its union */
 		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
-	else if (IsA(child, SetOp))
+	else if (IsA(child, SetOp) || IsA(child, Unique))
 	{
-		/* SO1: its output column, a column it groups by */
+		/* SO1, UQ1: its output column, a column it groups by */
 		b->ctx = child;
 		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
 		b->ctx = saved;
@@ -1422,6 +1422,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					/* SO1: a column it groups by (df_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
 									 df_setop_group((SetOp *) b->ctx, var->varattno));
+				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Unique))
+					/* UQ1: a column it groups by (df_emit_plan_node) */
+					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
+									 df_unique_group((Unique *) b->ctx, var->varattno));
 				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
 					/* UA1: a column of its union (df_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", b->ctx->plan_node_id,
@@ -2575,6 +2579,30 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				appendStringInfoString(out, ",\"detail\":");
 				df_emit_json_string(out, detail, strlen(detail));
 				appendStringInfoString(out, "}}}");
+				return;
+			}
+
+		case T_Unique:
+			{
+				/*
+				 * UQ1: its child's rows grouped by the columns it tells
+				 * duplicates by, named q<plan_node_id>_g<k>
+				 */
+				Unique	   *uq = (Unique *) plan;
+				Plan	   *child = outerPlan(plan);
+				int			k;
+
+				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
+				df_emit_node(b, out, child);
+				appendStringInfoString(out, ",\"group\":[");
+				for (k = 0; k < uq->numCols; k++)
+				{
+					if (k > 0)
+						appendStringInfoChar(out, ',');
+					df_emit_output_of(b, out, child, uq->uniqColIdx[k]);
+				}
+				appendStringInfo(out, "],\"aggs\":[],\"having\":null,\"name\":\"q%d\"}}",
+								 plan->plan_node_id);
 				return;
 			}
 
