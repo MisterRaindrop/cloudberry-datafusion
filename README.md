@@ -574,6 +574,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | CU2 | Comparisons and min/max of strings under a libc collation of a language, by strcoll_l |
 | NJ1 | NOT IN anti joins, null-aware |
 | NL1 | Nested Loops without parameters; Materialize |
+| NL2 | Inner Nested Loops collecting their small outer side |
 | MJ1 | Merge Joins whose order no one reads, as hash joins |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
@@ -701,6 +702,15 @@ inner side, often a Materialize, which passes its child's rows on, and
 streams the outer one, so the inner side is fed first and must fit the
 inner node's budget.  A parameterized one, which scans its inner side again
 for each outer row, stays on PostgreSQL.
+
+NL2: an inner one whose inner side is estimated beyond that budget and its
+outer side within it collects the outer side instead and streams the inner
+one, fed in that order, where no one reads the order of its rows, which
+then follow the inner side.  GPORCA's TPC-DS Q54 joins date_dim's rows to
+two scalar subqueries, each one row below its Assert, so; the Nested Loop
+of one below the other's is a Hash Join's probe side.  Q54 under GPORCA
+now runs wholly in DataFusion.  Other join types so, whose types would
+turn around, stay on PostgreSQL.
 
 MJ1: a Merge Join whose order of rows no one reads above it (TPC-DS Q51
 under GPORCA: a full join of two running sums, below a Redistribute

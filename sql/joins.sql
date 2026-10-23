@@ -391,6 +391,47 @@ RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
 
+-- NL2: an inner Nested Loop whose inner side is estimated beyond the join's
+-- memory and its outer side within it (GPORCA's TPC-DS Q54: rows between
+-- two scalar subqueries, each one row below its Assert) collects the outer
+-- side and streams the inner one, where no one reads the order of its rows.
+-- A left join so stays on PostgreSQL.
+CREATE TABLE df_nl2 (id int, m int, v int) DISTRIBUTED BY (id);
+CREATE TABLE df_nl2s (id int, y int, m int) DISTRIBUTED BY (id);
+INSERT INTO df_nl2 SELECT i, i % 120, i % 1000 FROM generate_series(1, 20000) i;
+INSERT INTO df_nl2s SELECT i, 2000 + i % 10, i % 12 FROM generate_series(1, 200) i;
+ANALYZE df_nl2;
+ANALYZE df_nl2s;
+SET work_mem = 64;
+SET datafusion.motion_batches = on;
+SET optimizer = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_nl2
+WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
+  AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
+SET optimizer = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
+SET datafusion.mode = off;
+SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
+SET optimizer = on;
+SELECT count(*), sum(v) FROM df_nl2
+WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
+  AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
+SET datafusion.mode = on;
+SELECT count(*), sum(v) FROM df_nl2
+WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
+  AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
+SET optimizer = off;
+SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET datafusion.motion_batches;
+RESET work_mem;
+SET datafusion.mode = off;
+DROP TABLE df_nl2, df_nl2s;
+
 -- x IN (subquery) as a hashed SubPlan (SP1, TPC-DS Q10, Q45: under an OR,
 -- or as a column): the subquery's rows come from a Motion, which the
 -- slice reads whole first into a set; each x is looked up in it.  Not

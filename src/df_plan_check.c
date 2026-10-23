@@ -3323,6 +3323,27 @@ df_hash_budget(Plan *hash)
 }
 
 /*
+ * NL2: does DataFusion's nested loop join for Nested Loop 'plan' collect
+ * its outer side, streaming the inner one: an inner join whose inner side
+ * is estimated beyond the join's memory and its outer side within it
+ * (GPORCA's TPC-DS Q54 joins date_dim's rows to the one row of a scalar
+ * subquery, below its Assert)?  Its rows then come in the inner side's
+ * order, so no one may read their order.  Otherwise it collects the inner
+ * side, as PostgreSQL rescans it.
+ */
+bool
+df_nestloop_swapped(Plan *plan)
+{
+	Plan	   *outer = outerPlan(plan);
+	Plan	   *inner = innerPlan(plan);
+
+	return IsA(plan, NestLoop) && ((Join *) plan)->jointype == JOIN_INNER &&
+		outer != NULL && inner != NULL &&
+		df_hash_estimate(inner) > df_hash_budget(inner) &&
+		df_hash_estimate(outer) <= df_hash_budget(inner);
+}
+
+/*
  * WIN1: bytes a WindowAgg's input is estimated to take in DataFusion, as a
  * Hash node's table (df_hash_estimate), and the bytes PostgreSQL would
  * give its WindowAgg's tuplestore: min(operatorMemKB, work_mem).
@@ -5480,6 +5501,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Bitmapset  *inner_needed = NULL;
 				bool		order_free = cxt->node_order_free;	/* checking the inner
 																 * side resets it */
+				Plan	   *build;
 				ListCell   *lc;
 
 				if (mj != NULL)
@@ -5589,16 +5611,24 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				spills = df_join_estimates == DF_JOIN_ESTIMATES_SPILL &&
 					(hj != NULL || mj != NULL) && join->jointype != JOIN_LASJ_NOTIN;
-				if (!spills && df_hash_estimate(inner) > df_hash_budget(inner))
+				build = df_nestloop_swapped(plan) ? outer : inner;
+				if (build == outer && !order_free)
+				{
+					df_reject(cxt, "Nested Loop whose order of rows is read, its inner side "
+							  "of about %.0f kB beyond its %.0f kB",
+							  df_hash_estimate(inner) / 1024, df_hash_budget(inner) / 1024);
+					return;
+				}
+				if (!spills && df_hash_estimate(build) > df_hash_budget(inner))
 				{
 					df_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
-							  df_plan_name(plan), df_hash_estimate(inner) / 1024,
+							  df_plan_name(plan), df_hash_estimate(build) / 1024,
 							  df_hash_budget(inner) / 1024);
 					return;
 				}
 				{
 					double		bound = 0;
-					const char *doubt = spills ? NULL : df_hash_doubt(inner, &bound);
+					const char *doubt = spills ? NULL : df_hash_doubt(build, &bound);
 
 					if (doubt != NULL && bound > 0)
 					{

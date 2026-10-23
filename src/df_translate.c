@@ -2354,6 +2354,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				 */
 				Join	   *join = (Join *) plan;
 				const char *type;
+				bool		swapped = df_nestloop_swapped(plan);	/* NL2 */
 
 				switch (join->jointype)
 				{
@@ -2376,9 +2377,9 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				if (plan->qual != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
 				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
-				df_emit_node(b, out, innerPlan(plan));
+				df_emit_node(b, out, swapped ? outerPlan(plan) : innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
-				df_emit_node(b, out, outerPlan(plan));
+				df_emit_node(b, out, swapped ? innerPlan(plan) : outerPlan(plan));
 				appendStringInfoString(out, ",\"on\":[],\"filter\":");
 				b->ctx = plan;
 				b->join_sides = true;
