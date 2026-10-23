@@ -1483,6 +1483,18 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 					list_length(agg->args) != 1)
 					return false;
 				arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+				if (df_stddev_agg(agg, NULL, NULL))
+				{
+					/*
+					 * STD1: a variance of int4 values is below 2^62, 19
+					 * digits, at a display scale of its own of at most
+					 * STDDEV_MAX_SCALE
+					 */
+					*precision = 19 + DF_STDDEV_MAX_SCALE;
+					*scale = DF_STDDEV_MAX_SCALE;
+					*dyn = true;
+					return true;
+				}
 				/* arguments refer to the Agg's child (OUTER_VAR): 'ctx' is the Agg */
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
@@ -1692,6 +1704,44 @@ df_merge_sort(Plan *side)
 	if (side != NULL && IsA(side, Material))
 		side = outerPlan(side);
 	return side != NULL && IsA(side, Sort) ? side : NULL;
+}
+
+/*
+ * STD1: is 'agg' a standard deviation or variance of int2 or int4 values,
+ * in one stage, without DISTINCT, FILTER or ORDER BY?  DataFusion adds up
+ * their count, sum and sum of squares exactly and finishes as
+ * numeric_stddev_internal does (df_core pg_stddev).  Sets whether it is of
+ * a sample and whether a variance.
+ */
+bool
+df_stddev_agg(Aggref *agg, bool *sample, bool *variance)
+{
+	char	   *name = get_func_name(agg->aggfnoid);
+	Oid			argtype = list_length(agg->aggargtypes) == 1 ?
+		linitial_oid(agg->aggargtypes) : InvalidOid;
+	bool		s,
+				v;
+
+	if (name == NULL || agg->aggfnoid >= FirstGenbkiObjectId)
+		return false;
+	if (strcmp(name, "stddev_samp") == 0 || strcmp(name, "stddev") == 0)
+		s = true, v = false;
+	else if (strcmp(name, "stddev_pop") == 0)
+		s = false, v = false;
+	else if (strcmp(name, "var_samp") == 0 || strcmp(name, "variance") == 0)
+		s = true, v = true;
+	else if (strcmp(name, "var_pop") == 0)
+		s = false, v = true;
+	else
+		return false;
+	if ((argtype != INT2OID && argtype != INT4OID) || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		agg->aggdistinct != NIL || agg->aggfilter != NULL || agg->aggorder != NIL)
+		return false;
+	if (sample)
+		*sample = s;
+	if (variance)
+		*variance = v;
+	return true;
 }
 
 /* Add the Aggrefs of 'node' to 'aggs'. */
@@ -2104,7 +2154,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 	static const char *const operators[] =
 	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "~~", "!~~", "||", NULL};
 	static const char *const aggregates[] =
-	{"count", "sum", "min", "max", "avg", NULL};
+	{"count", "sum", "min", "max", "avg", "stddev_samp", "stddev", "stddev_pop",
+	"var_samp", "variance", "var_pop", NULL};
 
 	if (node == NULL)
 		return false;
@@ -2334,6 +2385,15 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					df_reject(cxt, "user-defined aggregate %s", name ? name : "?");
 				else if (name == NULL || !df_name_in(name, aggregates))
 					df_reject(cxt, "aggregate %s", name ? name : "?");
+				else if (agg->aggtype == NUMERICOID && strcmp(name, "avg") != 0 &&
+						 strcmp(name, "sum") != 0 && strcmp(name, "min") != 0 &&
+						 strcmp(name, "max") != 0 && !df_stddev_agg(agg, NULL, NULL))
+					/* STD1: of int2 or int4, in one stage, only */
+					df_reject(cxt, "aggregate %s of %s or in stages", name,
+							  format_type_be(list_length(agg->aggargtypes) == 1 ?
+											 linitial_oid(agg->aggargtypes) : InvalidOid));
+				else if (df_stddev_agg(agg, NULL, NULL))
+					return cxt->failed || df_check_expr((Node *) agg->args, cxt);
 				else if (agg->aggorder != NIL)
 					df_reject(cxt, "ORDER BY inside aggregate %s", name);
 				else if (agg->aggdistinct != NIL && cxt->agg_sets)

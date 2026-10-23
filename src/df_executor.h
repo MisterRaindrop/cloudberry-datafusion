@@ -159,6 +159,9 @@ typedef enum DfAggState
 #define DF_NUMERIC_MAX_SUM_PRECISION 66
 
 extern DfAggState df_agg_state(Aggref *agg);
+/* STD1: the largest display scale of a stddev or variance of int2/int4 */
+#define DF_STDDEV_MAX_SCALE 44
+extern bool df_stddev_agg(Aggref *agg, bool *sample, bool *variance);
 extern DfAggState df_agg_state_at(Plan *ctx, Aggref *agg);
 extern bool df_collect_aggrefs(Node *node, List **aggs);
 extern int	df_avg_scale(int s);

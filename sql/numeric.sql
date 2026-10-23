@@ -619,6 +619,42 @@ SET datafusion.mode = off;
 RESET datafusion.motion_batches;
 DROP TABLE df_dn;
 
+-- stddev and variance of int2 and int4 (STD1): DataFusion adds up their
+-- count, sum and sum of squares exactly and finishes as
+-- numeric_stddev_internal does, the variance rounded at select_div_scale's
+-- scale and the root sqrt_var's, each value with that display scale: NULL
+-- for no value (or one, for a sample), 0 where all are alike, int4's
+-- extremes.  Over an output column, in an expression (TPC-DS Q17's
+-- stddev / avg, a comparison), below a join.  In two stages, or of int8,
+-- they stay on PostgreSQL.
+CREATE TABLE df_sd (id int, g int, a int4, b int2, c int8) DISTRIBUTED BY (id);
+INSERT INTO df_sd SELECT i, i % 37, CASE WHEN i % 11 = 0 THEN NULL ELSE (i * 7919) % 100003 - 50000 END,
+  (i % 9)::int2, i FROM generate_series(1, 20000) i;
+INSERT INTO df_sd VALUES (20001, 100, 5, 5, 5), (20002, 101, 2147483647, 1, 1), (20003, 101, -2147483648, 2, 2),
+  (20004, 101, 0, 3, 3), (20005, 102, 7, 7, 7), (20006, 102, 7, 7, 7), (20007, 103, NULL, NULL, NULL);
+ANALYZE df_sd;
+SET datafusion.motion_batches = on;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
+EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a) / avg(a) AS cov, stddev_samp(b) > 2.58 AS wide FROM df_sd GROUP BY g HAVING stddev_pop(a) > 28800 OR g > 99 ORDER BY g;
+EXPLAIN (COSTS OFF) SELECT g, stddev_samp(c) FROM df_sd GROUP BY g;
+RESET gp_enable_multiphase_agg;
+EXPLAIN (COSTS OFF) SELECT g, stddev_samp(a) FROM df_sd GROUP BY g;
+SET gp_enable_multiphase_agg = off;
+SET datafusion.mode = off;
+SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
+SELECT g, stddev_samp(a) / avg(a) AS cov, stddev_samp(b) > 2.58 AS wide FROM df_sd GROUP BY g HAVING stddev_pop(a) > 28800 OR g > 99 ORDER BY g;
+SELECT x.g, x.s, y.n FROM (SELECT g, stddev_samp(a) s FROM df_sd GROUP BY g) x JOIN (SELECT g, count(*) n FROM df_sd GROUP BY g) y ON x.g = y.g WHERE x.g % 9 = 1 OR x.g > 99 ORDER BY 1;
+SET datafusion.mode = on;
+SELECT g, stddev_samp(a), stddev_pop(a), var_samp(b), var_pop(b), stddev(b), variance(a) FROM df_sd GROUP BY g ORDER BY g;
+SELECT g, stddev_samp(a) / avg(a) AS cov, stddev_samp(b) > 2.58 AS wide FROM df_sd GROUP BY g HAVING stddev_pop(a) > 28800 OR g > 99 ORDER BY g;
+SELECT x.g, x.s, y.n FROM (SELECT g, stddev_samp(a) s FROM df_sd GROUP BY g) x JOIN (SELECT g, count(*) n FROM df_sd GROUP BY g) y ON x.g = y.g WHERE x.g % 9 = 1 OR x.g > 99 ORDER BY 1;
+RESET gp_enable_multiphase_agg;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_sd;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

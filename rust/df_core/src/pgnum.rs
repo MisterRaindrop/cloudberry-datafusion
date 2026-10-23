@@ -195,6 +195,86 @@ pub fn pg_avg(sum: i256, from: i8, count: i64, to: i8) -> Option<i256> {
     })
 }
 
+/// STD1: the largest display scale pg_stddev gives values of int2 and
+/// int4: select_div_scale of a variance of at least 1/n, n < 2^63.
+pub const STDDEV_MAX_SCALE: i8 = 44;
+
+/// STD1: numeric_stddev_internal over integers: `n` values, their sum `sx`
+/// and sum of squares `sxx` (integers).  Its variance is (n * sxx - sx^2)
+/// / (n * (n - 1)), or / n^2 for a population, rounded half away from
+/// zero at select_div_scale's scale; the standard deviation is sqrt_var's
+/// root of that at the same scale: the integer square root of the variance
+/// carried to its NBASE digits, then rounded.  0 (of scale 0) where the
+/// numerator is not above 0.  The value at scale `to` and its display
+/// scale; Ok(None) where PostgreSQL's is NULL (no row, or one for a
+/// sample); Err beyond Decimal256 or a scale above `to`.
+pub fn pg_stddev(
+    n: i64,
+    sx: i256,
+    sxx: i256,
+    sample: bool,
+    variance: bool,
+    to: i8,
+) -> std::result::Result<Option<(i256, i32)>, ArrowError> {
+    if n == 0 || (sample && n <= 1) {
+        return Ok(None);
+    }
+    let nn = i256::from_i128(n as i128);
+    let num = nn
+        .checked_mul(sxx)
+        .and_then(|a| sx.checked_mul(sx).and_then(|b| a.checked_sub(b)))
+        .ok_or_else(beyond)?;
+    if num <= i256::ZERO {
+        return Ok(Some((i256::ZERO, 0)));
+    }
+    let den = nn
+        .checked_mul(if sample { nn - i256::ONE } else { nn })
+        .ok_or_else(beyond)?;
+    let rscale = pg_div_rscale(num, 0, 0, den, 0, 0);
+    if rscale > to as i32 {
+        return Err(beyond());
+    }
+    let var = pg_div(num, 0, den, 0, rscale, rscale as i8).ok_or_else(beyond)?;
+    let at_to = |v: i256| v.checked_mul(pow10((to as i32 - rscale) as u32)).ok_or_else(beyond);
+    if variance {
+        return Ok(Some((at_to(var)?, rscale)));
+    }
+    // sqrt_var: weight of the result, NBASE digits computed, input digits read
+    let (w, _) = weight_first(var, rscale as i8);
+    let res_weight = if w >= 0 { w / 2 } else { -((-w - 1) / 2 + 1) };
+    let res_ndigits = (res_weight + 1 + (rscale + 4) / 4).max(1);
+    let m = res_ndigits - res_weight - 1;
+    let src_ndigits = (w + 1 + 2 * m).max(1);
+    let k = src_ndigits - w - 1;
+    if k != 2 * m || m < 0 || 4 * m <= rscale {
+        return Err(beyond());
+    }
+    // the variance truncated to k NBASE digits after the point, as an integer
+    let shift = 4 * k - rscale;
+    let input = if shift >= 0 {
+        magnitude(var) * ten(shift)
+    } else {
+        magnitude(var) / ten(-shift)
+    };
+    let root = input.sqrt();
+    // root / NBASE^m, rounded half away from zero at rscale
+    let t = ten(4 * m - rscale);
+    let mut q = &root / &t;
+    if (&root % &t) * 2u32 >= t {
+        q += 1u32;
+    }
+    let q = i256::from_be_bytes({
+        let b = q.to_bytes_be();
+        if b.len() > 31 {
+            return Err(beyond());
+        }
+        let mut a = [0u8; 32];
+        a[32 - b.len()..].copy_from_slice(&b);
+        a
+    });
+    Ok(Some((at_to(q)?, rscale)))
+}
+
 /// RD1: numeric_round of `v`, of scale `from`, at scale `to`: round_var's
 /// rounding half away from zero; NaN stays NaN.  None beyond Decimal256,
 /// which the planner hook's bounds rule out.
@@ -256,6 +336,11 @@ pub enum NumericFn {
     Div { x: i8, y: i8, to: i8 },
     /// DN1: the display scale of that quotient (pg_div_rscale), int4.
     DivScale { x: i8, y: i8 },
+    /// STD1: stddev or variance (pg_stddev) of a count, a sum and a sum of
+    /// squares of integers, at scale `to`; NULL as PostgreSQL's.
+    Stddev { sample: bool, variance: bool, to: i8 },
+    /// STD1: its display scale, int4.
+    StddevScale { sample: bool, variance: bool },
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -272,6 +357,7 @@ impl PgNumeric {
             | NumericFn::Avg { .. }
             | NumericFn::AvgScale { .. } => 2,
             NumericFn::Div { .. } | NumericFn::DivScale { .. } => 4,
+            NumericFn::Stddev { .. } | NumericFn::StddevScale { .. } => 3,
             _ => 1,
         };
         ScalarUDF::new_from_impl(PgNumeric {
@@ -297,6 +383,8 @@ impl ScalarUDFImpl for PgNumeric {
             NumericFn::AvgScale { .. } => "pg_numeric_avg_scale",
             NumericFn::Div { .. } => "pg_numeric_div",
             NumericFn::DivScale { .. } => "pg_numeric_div_scale",
+            NumericFn::Stddev { .. } => "pg_numeric_stddev",
+            NumericFn::StddevScale { .. } => "pg_numeric_stddev_scale",
         }
     }
 
@@ -310,19 +398,59 @@ impl ScalarUDFImpl for PgNumeric {
             | NumericFn::Round { to, .. }
             | NumericFn::Arith { to, .. }
             | NumericFn::Avg { to, .. }
-            | NumericFn::Div { to, .. } => numeric_type(to),
+            | NumericFn::Div { to, .. }
+            | NumericFn::Stddev { to, .. } => numeric_type(to),
             NumericFn::IsNan => DataType::Boolean,
-            NumericFn::DivScale { .. } | NumericFn::AvgScale { .. } => DataType::Int32,
+            NumericFn::DivScale { .. }
+            | NumericFn::AvgScale { .. }
+            | NumericFn::StddevScale { .. } => DataType::Int32,
             _ => arg_types[0].clone(),
         })
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
+        let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
+        let stddev = match self.f {
+            NumericFn::Stddev { sample, variance, to } => Some((sample, variance, to, false)),
+            NumericFn::StddevScale { sample, variance } => {
+                Some((sample, variance, STDDEV_MAX_SCALE, true))
+            }
+            _ => None,
+        };
+        if let Some((sample, variance, to, scale_only)) = stddev {
+            // STD1: count (int8), sum and sum of squares (numeric of scale 0)
+            let c = args.args[0].to_array(n)?;
+            let counts = c.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+                DataFusionError::Internal(format!("stddev: count of type {}", c.data_type()))
+            })?;
+            let (a, b) = (args.args[1].to_array(n)?, args.args[2].to_array(n)?);
+            let (sums, squares) = (decimal(&a)?, decimal(&b)?);
+            let mut values = Vec::with_capacity(n);
+            let mut scales = Vec::with_capacity(n);
+            for r in 0..n {
+                let got = if counts.is_null(r) || sums.is_null(r) || squares.is_null(r) {
+                    None
+                } else {
+                    pg_stddev(counts.value(r), sums.value(r), squares.value(r), sample, variance, to)
+                        .map_err(arrow)?
+                };
+                values.push(got.map(|(v, _)| v));
+                scales.push(got.map(|(_, d)| d));
+            }
+            let out: ArrayRef = if scale_only {
+                Arc::new(PrimitiveArray::<Int32Type>::from(scales))
+            } else {
+                Arc::new(Decimal256Array::from(values).with_data_type(numeric_type(to)))
+            };
+            return Ok(ColumnarValue::Array(out));
+        }
         let x = args.args[0].to_array(n)?;
         let xs = decimal(&x)?;
-        let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
         let out: ArrayRef = match self.f {
+            NumericFn::Stddev { .. } | NumericFn::StddevScale { .. } => {
+                return Err(DataFusionError::Internal("stddev computed above".into()))
+            }
             NumericFn::Rescale { by, to } => {
                 let k = pow10(by as u32);
                 let a: Decimal256Array = xs
@@ -1243,5 +1371,31 @@ mod tests {
             (p.value(0), p.value(1), p.is_null(2), p.value(3)),
             (i256::from_i128(-150), NUMERIC_NAN, true, i256::from_i128(1))
         );
+    }
+
+    #[test]
+    fn stddev_as_postgresql() {
+        // PostgreSQL's values (scale-free integers at their display scales)
+        let v = |x: i128| i256::from_i128(x);
+        let at = |n, sx, sxx, sample, variance, to| {
+            pg_stddev(n, v(sx), v(sxx), sample, variance, to).unwrap()
+        };
+        // 1, 2, 3, 4: 1.2909944487358056, 1.6666666666666667,
+        // 1.1180339887498948, 1.2500000000000000
+        assert_eq!(at(4, 10, 30, true, false, 16), Some((v(12909944487358056), 16)));
+        assert_eq!(at(4, 10, 30, true, true, 16), Some((v(16666666666666667), 16)));
+        assert_eq!(at(4, 10, 30, false, false, 16), Some((v(11180339887498948), 16)));
+        assert_eq!(at(4, 10, 30, false, true, 16), Some((v(12500000000000000), 16)));
+        // 7, 7, 7: 0; 5 alone: NULL for a sample, 0 for a population
+        assert_eq!(at(3, 21, 147, true, false, 16), Some((v(0), 0)));
+        assert_eq!(at(1, 5, 25, true, false, 16), None);
+        assert_eq!(at(1, 5, 25, false, false, 16), Some((v(0), 0)));
+        // 0, 1000000: 707106.78118655, 500000000000.00000000
+        assert_eq!(at(2, 1_000_000, 1_000_000_000_000, true, false, 8), Some((v(70710678118655), 8)));
+        assert_eq!(at(2, 1_000_000, 1_000_000_000_000, true, true, 8), Some((v(50000000000000000000), 8)));
+        // 2147483647, -2147483648, 0: 2147483647, 3074457344186602838
+        let sxx = 2147483647i128 * 2147483647 + 2147483648i128 * 2147483648;
+        assert_eq!(at(3, -1, sxx, true, false, 0), Some((v(2147483647), 0)));
+        assert_eq!(at(3, -1, sxx, false, true, 0), Some((v(3074457344186602838), 0)));
     }
 }

@@ -566,6 +566,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | MJ1 | Merge Joins whose order no one reads, as hash joins |
 | TID1 | ctid and gp_segment_id of scans; tid columns |
 | AVG1 | avg returning numeric inside expressions and below the top |
+| STD1 | stddev and variance of int2 and int4, in one stage |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
@@ -1224,6 +1225,28 @@ in DataFusion 89 -> 95 of 206 executions, results unchanged apart from
 Q71's ties (205/206).  A UNION's dedup over a quotient (Q49) still stays
 on PostgreSQL: rows of equal values and different display scales are one
 group, shown as whichever PostgreSQL meets first.
+
+### stddev and variance of integers
+
+STD1: `stddev_samp`, `stddev_pop`, `var_samp`, `var_pop` (and `stddev`,
+`variance`) of int2 or int4 values, in one stage, without DISTINCT or
+FILTER.  PostgreSQL adds up the count, sum and sum of squares exactly and
+finishes in numeric_stddev_internal: the variance (n * sum of squares -
+sum^2) / (n * (n - 1)), or / n^2, rounded half away from zero at
+select_div_scale's scale, and for a standard deviation sqrt_var's root at
+that scale, the integer square root of the variance carried to its NBASE
+digits, then rounded; 0 of scale 0 where the numerator is not above 0,
+NULL for no value or one of a sample.  DataFusion adds up the same three
+exactly (the squares as int8) and finishes the same way with big integers
+(df_core::pgnum::pg_stddev); the value has a display scale of its own, at
+most 44 (a variance of at least 1/n), which goes beside it as DN1's do,
+so it may be an output column, compared or divided (TPC-DS Q17's
+`stddev_samp(ss_quantity) / avg(ss_quantity)`).  Its unit test holds
+values PostgreSQL computed, a test compares every function over 41
+groups (NULL, one value, alike values, int4's extremes) with PostgreSQL's
+output.  A split one, whose partial state PostgreSQL serializes, and one
+of int8 (sums beyond Decimal256) stay on PostgreSQL.  TPC-DS Q17 under
+both planners and Q35 under GPORCA now run wholly in DataFusion.
 
 ### Expressions
 

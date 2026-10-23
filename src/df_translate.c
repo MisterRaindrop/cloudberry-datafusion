@@ -823,6 +823,31 @@ df_avg_parts(Aggref *agg, const char **sfn, const char **cfn)
 	return true;
 }
 
+/*
+ * STD1: stddev or variance of int2 or int4 'agg' (or, 'dscale', its display
+ * scale): numeric_stddev_internal of its count, exact sum and exact sum of
+ * squares, calls of b->agg (df_core pg_stddev).
+ */
+static void
+df_emit_stddev(DfBuilder *b, StringInfo out, Aggref *agg, bool dscale)
+{
+	bool		sample,
+				variance;
+
+	(void) df_stddev_agg(agg, &sample, &variance);
+	appendStringInfo(out, "{\"%s\":[", dscale ? "stddev_numeric_scale" : "stddev_numeric");
+	df_emit_call_ref(b, out, agg, "count");
+	appendStringInfoChar(out, ',');
+	df_emit_call_ref(b, out, agg, "sum_numeric");
+	appendStringInfoChar(out, ',');
+	df_emit_call_ref(b, out, agg, "sum_sq");
+	appendStringInfo(out, "],\"sample\":%s,\"variance\":%s", sample ? "true" : "false",
+					 variance ? "true" : "false");
+	if (!dscale)
+		appendStringInfo(out, ",\"type\":\"%s\"", df_tag(NUMERICOID, DF_STDDEV_MAX_SCALE));
+	appendStringInfoChar(out, '}');
+}
+
 /* Call ('agg', 'fn') of b->agg: by name or index below the top (A1). */
 static void
 df_emit_call_ref(DfBuilder *b, StringInfo out, Aggref *agg, const char *fn)
@@ -1260,6 +1285,11 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				const char *sfn = NULL,
 						   *cfn = NULL;
 
+				if (level == DF_LEVEL_AGG && df_stddev_agg(agg, NULL, NULL))
+				{
+					df_emit_stddev(b, out, agg, true);
+					return;
+				}
 				if (level == DF_LEVEL_AGG && df_avg_parts(agg, &sfn, &cfn))
 				{
 					/* AV2: the scale numeric_avg picks from the sum and count */
@@ -1989,6 +2019,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				df_fail(b, "an aggregate outside the aggregate node");
 				return;
 			}
+			if (df_stddev_agg((Aggref *) node, NULL, NULL))
+			{
+				df_emit_stddev(b, out, (Aggref *) node, false);
+				return;
+			}
 			if (df_avg_parts((Aggref *) node, NULL, NULL))
 			{
 				/*
@@ -2436,7 +2471,18 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					const char *sfn = NULL,
 							   *cfn = NULL;
 
-					if (df_avg_parts(lfirst(lc), &sfn, &cfn))
+					if (df_stddev_agg(lfirst(lc), NULL, NULL))
+					{
+						/* STD1: its count, sum and sum of squares */
+						if (!list_member(na->aggrefs, lfirst(lc)))
+						{
+							na->aggrefs = lappend(lappend(lappend(na->aggrefs, lfirst(lc)),
+														  lfirst(lc)), lfirst(lc));
+							na->aggfns = lappend(lappend(lappend(na->aggfns, (void *) "count"),
+														 (void *) "sum_numeric"), (void *) "sum_sq");
+						}
+					}
+					else if (df_avg_parts(lfirst(lc), &sfn, &cfn))
 					{
 						/* AVG1: its sum and count */
 						if (!list_member(na->aggrefs, lfirst(lc)))
@@ -2982,6 +3028,23 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 						   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
 						   count || mixed ? 0 : df_scale_of((Plan *) aggnode, arg));
 			appendStringInfoChar(aggs, '}');
+			continue;
+		}
+		if (fn != NULL && strcmp(fn, "sum_sq") == 0)
+		{
+			/* STD1: the exact sum of the squares of int2 or int4 values */
+			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
+			int			k;
+
+			appendStringInfoString(aggs, "{\"fn\":\"sum_numeric\",\"arg\":{\"op\":\"*\",\"type\":\"int8\",\"args\":[");
+			for (k = 0; k < 2; k++)
+			{
+				b->ctx = (Plan *) aggnode;
+				appendStringInfoString(aggs, k > 0 ? ",{\"cast\":" : "{\"cast\":");
+				df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+				appendStringInfoString(aggs, ",\"type\":\"int8\"}");
+			}
+			appendStringInfoString(aggs, "]}}");
 			continue;
 		}
 		if (fn != NULL && strcmp(fn, "key_scale") == 0)

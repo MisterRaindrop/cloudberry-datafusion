@@ -132,6 +132,12 @@
 //!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
 //!                                 (numeric_avg of a sum of scale s, rounded
 //!                                 as PostgreSQL does, at scale S; pgnum)
+//!         | {"stddev_numeric": [<count>, <sum>, <sum of squares>],
+//!            "sample": b, "variance": b, "type": "numeric:S"}   (stddev or
+//!                                 variance of integers as PostgreSQL's
+//!                                 numeric_stddev_internal; STD1, pgnum)
+//!         | {"stddev_numeric_scale": [..], "sample": b, "variance": b}
+//!                                 (its display scale, int4)
 //!         | {"avg_numeric_scale": [<sum>, <count>], "scale": s}   (its display
 //!                                 scale, int4; AV2)
 //!         | {"in_set": <expr>, "set": j, "key": "plain" | "float" | "bpchar"}
@@ -789,6 +795,29 @@ fn expr(v: &Value) -> Result<Expr, String> {
         }
         let (l, r) = (expr(&a[0])?, expr(&a[1])?);
         return when(l.clone().gt_eq(r.clone()), l).otherwise(r).map_err(|e| e.to_string());
+    }
+    if let Some(a) = v
+        .get("stddev_numeric")
+        .or_else(|| v.get("stddev_numeric_scale"))
+        .and_then(Value::as_array)
+    {
+        // STD1: stddev or variance of integers from a count, a sum and a
+        // sum of squares, as numeric_stddev_internal; or its display scale
+        let sample = field(v, "sample")?.as_bool().ok_or("plan spec: bad stddev")?;
+        let variance = field(v, "variance")?.as_bool().ok_or("plan spec: bad stddev")?;
+        if a.len() != 3 {
+            return Err("plan spec: stddev takes a count, a sum and a sum of squares".into());
+        }
+        let f = if v.get("stddev_numeric").is_some() {
+            let to = match PgType::parse(field(v, "type")?.as_str().unwrap_or(""))? {
+                PgType::Numeric(s) => s,
+                _ => return Err("plan spec: stddev of a non-numeric type".into()),
+            };
+            NumericFn::Stddev { sample, variance, to }
+        } else {
+            NumericFn::StddevScale { sample, variance }
+        };
+        return Ok(PgNumeric::udf(f).call(vec![expr(&a[0])?, expr(&a[1])?, expr(&a[2])?]));
     }
     if let Some(a) = v.get("avg_numeric_scale").and_then(Value::as_array) {
         // AV2: the display scale numeric_avg gives a sum and a count
