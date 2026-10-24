@@ -214,6 +214,70 @@ df_init_params(DfCheckContext *cxt)
 	return cxt->init_params;
 }
 
+/* The init plan of 'plan' or below it that sets parameter 'paramid'. */
+static SubPlan *
+df_find_init_plan(Plan *plan, int paramid)
+{
+	ListCell   *lc;
+	SubPlan    *sp;
+
+	if (plan == NULL)
+		return NULL;
+	foreach(lc, plan->initPlan)
+		if (list_member_int(lfirst_node(SubPlan, lc)->setParam, paramid))
+			return lfirst_node(SubPlan, lc);
+	if ((sp = df_find_init_plan(outerPlan(plan), paramid)) != NULL ||
+		(sp = df_find_init_plan(innerPlan(plan), paramid)) != NULL)
+		return sp;
+	if (IsA(plan, SubqueryScan) &&
+		(sp = df_find_init_plan(((SubqueryScan *) plan)->subplan, paramid)) != NULL)
+		return sp;
+	foreach(lc, df_append_plans(plan))
+		if ((sp = df_find_init_plan(lfirst(lc), paramid)) != NULL)
+			return sp;
+	return NULL;
+}
+
+/*
+ * IP3: the plan and the expression of the value of init plan parameter
+ * 'node', in the statement whose numeric values are being followed
+ * (df_numeric_stmt): the column of its init plan's top node that sets it.
+ */
+static bool
+df_init_param_value(Node *node, Plan **top, Node **value)
+{
+	Param	   *param = (Param *) node;
+	SubPlan    *sp = NULL;
+	ListCell   *lc;
+	int			k;
+
+	if (!IsA(node, Param) || param->paramkind != PARAM_EXEC || df_numeric_stmt == NULL)
+		return false;
+	sp = df_find_init_plan(df_numeric_stmt->planTree, param->paramid);
+	foreach(lc, df_numeric_stmt->subplans)
+		if (sp == NULL)
+			sp = df_find_init_plan(lfirst(lc), param->paramid);
+	if (sp == NULL || sp->plan_id < 1 || sp->plan_id > list_length(df_numeric_stmt->subplans) ||
+		sp->subLinkType != EXPR_SUBLINK)
+		return false;
+	*top = list_nth(df_numeric_stmt->subplans, sp->plan_id - 1);
+	for (k = 0; list_nth_int(sp->setParam, k) != param->paramid; k++)
+		;
+	foreach(lc, (*top)->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+		if (k-- == 0)
+		{
+			*value = (Node *) tle->expr;
+			return exprType(*value) == param->paramtype;
+		}
+	}
+	return false;
+}
+
 /*
  * TID1: does 'stmt' carry ctid or gp_segment_id up to its result, as an
  * updatable cursor does for WHERE CURRENT OF?
@@ -793,6 +857,15 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				return !df_subplan_value(expr, &top, &value) ||
 					df_numeric_may_be_infinite(top, value);
 			}
+		case T_Param:
+			{
+				/* IP3: as its value */
+				Plan	   *top;
+				Node	   *value;
+
+				return !df_init_param_value(expr, &top, &value) ||
+					df_numeric_may_be_infinite(top, value);
+			}
 		case T_Var:
 			{
 				Var		   *var = (Var *) expr;
@@ -1351,6 +1424,15 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				Node	   *value;
 
 				return df_subplan_value(expr, &top, &value) &&
+					df_numeric_range_f(top, value, precision, scale, dyn, least);
+			}
+		case T_Param:
+			{
+				/* IP3: its value's, in its init plan */
+				Plan	   *top;
+				Node	   *value;
+
+				return df_init_param_value(expr, &top, &value) &&
 					df_numeric_range_f(top, value, precision, scale, dyn, least);
 			}
 		case T_Var:
@@ -3319,14 +3401,26 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				 * (computed on the coordinator and dispatched), as a constant
 				 */
 				Param	   *param = (Param *) node;
+				int			p,
+							s;
+				bool		dyn;
 
+				/*
+				 * IP3: a numeric one of the digits and scale of its init
+				 * plan's value, a constant of that scale
+				 */
 				if (param->paramkind != PARAM_EXEC ||
 					!bms_is_member(param->paramid, df_init_params(cxt)))
 					df_reject(cxt, "query parameter");
 				else if (!df_type_supported(param->paramtype))
 					df_reject(cxt, "query parameter of type %s", format_type_be(param->paramtype));
-				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok)
-					df_reject(cxt, "numeric query parameter other than compared with a numeric of known scale");
+				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok &&
+						 (!df_numeric_range(cxt->node, node, &p, &s, &dyn) ||
+						  p > DF_NUMERIC_MAX_EXPR_PRECISION))
+					df_reject(cxt, "numeric query parameter of unknown precision");
+				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok &&
+						 df_numeric_may_be_infinite(cxt->node, node))
+					df_reject(cxt, "numeric query parameter that may be infinite");
 				return cxt->failed;
 			}
 
@@ -3929,6 +4023,21 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 		}
 		return v->found;
 	}
+	if (IsA(node, Param))
+	{
+		/* IP3: its value's, in its init plan */
+		Plan	   *saved = v->ctx;
+		Plan	   *top;
+		Node	   *value;
+
+		if (df_init_param_value(node, &top, &value))
+		{
+			v->ctx = top;
+			(void) df_numeric_varying_walker(value, v);
+			v->ctx = saved;
+		}
+		return v->found;
+	}
 	if (IsA(node, Var) && df_append_plans(v->ctx) != NIL && ((Var *) node)->varno == OUTER_VAR)
 	{
 		/* UA1: any input's */
@@ -4038,6 +4147,14 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 					return true;
 				return df_subplan_value(expr, &top, &value) &&
 					df_dscale_ok(top, value, batches);
+			}
+		case T_Param:
+			{
+				/* IP3: its value's, known when the slice starts */
+				Plan	   *top;
+				Node	   *value;
+
+				return df_init_param_value(expr, &top, &value);
 			}
 		case T_Var:
 			{

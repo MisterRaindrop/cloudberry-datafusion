@@ -1141,6 +1141,17 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 	}
 	switch (nodeTag(node))
 	{
+		case T_Param:
+			{
+				/* IP3: its value's, known when the slice starts */
+				Const	   *c = df_param_const((Param *) node);
+				int			cs = 0;
+
+				if (!c->constisnull && !numeric_is_nan(DatumGetNumeric(c->constvalue)))
+					cs = DatumGetInt32(DirectFunctionCall1(numeric_scale, c->constvalue));
+				appendStringInfo(out, "{\"lit\":{\"type\":\"int4\",\"value\":%d}}", cs);
+				return;
+			}
 		case T_SubPlan:
 			{
 				/* SP2: beside the value of a scalar subquery, from its tuple */
@@ -1644,10 +1655,15 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			}
 
 		case T_Param:
-			/* IP1: an init plan's value (numeric only compared: above) */
+			/* IP1: an init plan's value */
 			if (((Param *) node)->paramtype == NUMERICOID)
 			{
-				df_fail(b, "a numeric parameter");
+				/*
+				 * IP3: a literal at the scale of its init plan's value,
+				 * which holds it
+				 */
+				df_emit_numeric_const(b, out, df_param_const((Param *) node),
+									  df_scale_of(df_level_ctx(b, level), node));
 				return;
 			}
 			df_emit(b, out, (Node *) df_param_const((Param *) node), level);

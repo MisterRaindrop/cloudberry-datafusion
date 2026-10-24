@@ -221,6 +221,35 @@ WHERE s = (SELECT max(s2) FROM (SELECT g, sum(a) AS s2 FROM df_nc WHERE id > 0 G
 SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t FROM df_nc GROUP BY g) r);
 SET datafusion.mode = off;
 
+-- A numeric init plan value anywhere in an expression (IP3, TPC-DS Q9,
+-- Q23 and Q44 under the Postgres planner): a constant of the digits and
+-- scale of its init plan's value, its display scale its own; NULL and NaN
+-- as they are.  One of unknown digits (an unconstrained numeric's max)
+-- stays on PostgreSQL.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+EXPLAIN (COSTS OFF) SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE b * 2 > (SELECT max(u) FROM df_nc) + 1;
+SET datafusion.mode = off;
+SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+SELECT count(*), sum(id) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc WHERE id > 0) > 0;
+SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+SELECT count(*) FROM df_nc WHERE a < 2 * (SELECT avg(a) FROM df_nc WHERE id < -100);
+SELECT count(*) FROM df_nc WHERE b < 0.5 * (SELECT avg(a) FROM df_nc);
+SET datafusion.mode = on;
+SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+SELECT count(*), sum(id) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc WHERE id > 0) > 0;
+SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+SELECT count(*) FROM df_nc WHERE a < 2 * (SELECT avg(a) FROM df_nc WHERE id < -100);
+SELECT count(*) FROM df_nc WHERE b < 0.5 * (SELECT avg(a) FROM df_nc);
+SET datafusion.mode = off;
+
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
 FROM df_nc WHERE id < 0 OR id % 9973 = 0 ORDER BY id;

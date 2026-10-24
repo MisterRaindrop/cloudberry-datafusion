@@ -598,6 +598,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | CL1 | Strings ordered by the default collation where it is C on every node |
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
+| IP3 | A numeric init plan value anywhere in an expression, of its init plan's digits and scale |
 | NR1 | Numeric columns through Append, GPORCA's Sequence and Shared Scan; sums 19 digits wider than their argument |
 | PS1 | Partial sum and avg through tuples both ways: PostgreSQL's states, written and read by the C side |
 | SP1 | `x IN (subquery)` as a hashed SubPlan, against a set of the subquery's rows read first |
@@ -1169,8 +1170,8 @@ An uncorrelated scalar subquery becomes an init plan whose value
 aggregate or a column with one.  Its value is known before a slice starts
 (the coordinator computes it before dispatching, `preprocess_initplans`,
 and the segments receive it), so DataFusion takes it as a constant.  A
-numeric value has no declared scale, so it is only compared, with a
-numeric of known scale and at most 38 digits: the value is rounded to that
+numeric value has no declared scale, so it was only compared (until
+IP3), with a numeric of known scale and at most 38 digits: the value is rounded to that
 scale (up for `<` and `>=`, down for `<=` and `>`; `=` and `<>` with a
 finer value are constant), and a value beyond every value of the other
 side becomes the infinity on its side, which keeps NaN above it as in
@@ -1190,6 +1191,18 @@ maximum revenue sums by supplier in DataFusion, the partial sums passing to
 the final ones as batches.  EXPLAIN lists these slices too.  A top slice
 that only gathers the rows its slices below compute (TPC-DS Q58's) is
 reported as a query's top slice that does, with nothing to compute.
+
+IP3: a numeric init plan value anywhere else in an expression (TPC-DS
+Q23's `sum(...) > (95/100.0) * $0`, Q44's `avg(...) > 0.9 * $0`, Q9's
+`case when $0 > 74129 then $1 else $2 end` as an output column) has the
+digits and scale of its init plan's value, as the planner hook follows
+them in that plan's top node: a constant of that scale when the slice
+starts, whose display scale is its own, so the expression's is as
+PostgreSQL's (DN1).  NULL and NaN are taken as they are; one of unknown
+digits, or that may be infinite, stays on PostgreSQL.  These queries
+still have init plans' top slices on PostgreSQL; now only those: the
+slices of Q9, Q23a, Q23b and Q44 under the Postgres planner that compute
+with the values run in DataFusion.
 
 ### numeric of display scales of their own
 

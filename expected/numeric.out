@@ -698,7 +698,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE a + (SELECT avg(a) FROM df_
                      Filter: ((a + $0) > '0'::numeric)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+ DataFusion: slice 1 eligible, sends Arrow batches
  DataFusion: slice 2 not eligible: the top slice of an init plan, which the coordinator runs before the query
  DataFusion: slice 3 eligible
 (15 rows)
@@ -904,6 +904,199 @@ SELECT count(*) FROM df_nc WHERE b < (SELECT min(t) FROM (SELECT g, sum(b) AS t 
  count 
 -------
      1
+(1 row)
+
+SET datafusion.mode = off;
+-- A numeric init plan value anywhere in an expression (IP3, TPC-DS Q9,
+-- Q23 and Q44 under the Postgres planner): a constant of the digits and
+-- scale of its init plan's value, its display scale its own; NULL and NaN
+-- as they are.  One of unknown digits (an unconstrained numeric's max)
+-- stays on PostgreSQL.
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: df_nc.g
+   InitPlan 1 (returns $0)  (slice3)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice4; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_1
+                             Filter: (id > 0)
+   ->  Sort
+         Sort Key: df_nc.g
+         ->  Finalize HashAggregate
+               Group Key: df_nc.g
+               Filter: (avg(df_nc.a) > (0.9 * $0))
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: df_nc.g
+                     ->  Streaming Partial HashAggregate
+                           Group Key: df_nc.g
+                           ->  Seq Scan on df_nc
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 4 eligible
+(24 rows)
+
+EXPLAIN (COSTS OFF) SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
+ Gather Motion 2:1  (slice1; segments: 2)
+   Merge Key: df_nc.id
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_1
+                             Filter: (id > 0)
+   InitPlan 2 (returns $1)  (slice4)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice5; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_2
+                             Filter: (id > 0)
+   InitPlan 3 (returns $2)  (slice6)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice7; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_3
+   InitPlan 4 (returns $3)  (slice8)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice9; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_4
+                             Filter: (id > 0)
+   InitPlan 5 (returns $4)  (slice10)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice11; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_5
+                             Filter: (id > 0)
+   ->  Sort
+         Sort Key: df_nc.id
+         ->  Seq Scan on df_nc
+               Filter: (id = ANY ('{7,-2,-7}'::integer[]))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 3 eligible
+ DataFusion: slice 4 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 5 eligible
+ DataFusion: slice 6 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 7 eligible
+ DataFusion: slice 8 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 9 eligible
+ DataFusion: slice 10 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 11 eligible
+(48 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_nc WHERE b * 2 > (SELECT max(u) FROM df_nc) + 1;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   InitPlan 1 (returns $0)  (slice2)
+     ->  Finalize Aggregate
+           ->  Gather Motion 3:1  (slice3; segments: 3)
+                 ->  Partial Aggregate
+                       ->  Seq Scan on df_nc df_nc_1
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_nc
+                     Filter: ((b * '2'::numeric) > ($0 + '1'::numeric))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: operator > on numeric of unknown precision
+ DataFusion: slice 2 not eligible: the top slice of an init plan, which the coordinator runs before the query
+ DataFusion: slice 3 not eligible: aggregate max returning numeric of unknown precision
+(15 rows)
+
+SET datafusion.mode = off;
+SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+ g  |           avg           
+----+-------------------------
+  0 |      2.4205390646877625
+  1 | -0.98814783704325913482
+  2 | -0.19657986840263194736
+  6 |  0.16974800503989920202
+ 90 |                     NaN
+ 92 |  0.00000000000000000000
+ 93 |  0.75000000000000000000
+(7 rows)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc WHERE id > 0) > 0;
+ count |    sum    
+-------+-----------
+ 24998 | 626325971
+(1 row)
+
+SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+ id |         avg         |  ?column?   |          ?column?          
+----+---------------------+-------------+----------------------------
+ -7 | -1.2050000000000000 | -54355.0000 |     1.50040459529530000000
+ -2 | -1.2050000000000000 | -54355.0000 |     1.50040459529530000000
+  7 | -1.2050000000000000 | -54355.0000 | -9445.66959540470470000000
+(3 rows)
+
+SELECT count(*) FROM df_nc WHERE a < 2 * (SELECT avg(a) FROM df_nc WHERE id < -100);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < 0.5 * (SELECT avg(a) FROM df_nc);
+ count 
+-------
+ 50005
+(1 row)
+
+SET datafusion.mode = on;
+SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
+ g  |           avg           
+----+-------------------------
+  0 |      2.4205390646877625
+  1 | -0.98814783704325913482
+  2 | -0.19657986840263194736
+  6 |  0.16974800503989920202
+ 90 |                     NaN
+ 92 |  0.00000000000000000000
+ 93 |  0.75000000000000000000
+(7 rows)
+
+SELECT count(*), sum(id) FROM df_nc WHERE a + (SELECT avg(a) FROM df_nc WHERE id > 0) > 0;
+ count |    sum    
+-------+-----------
+ 24998 | 626325971
+(1 row)
+
+SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
+  ELSE (SELECT avg(b) FROM df_nc) END, (SELECT sum(b) FROM df_nc WHERE id > 0) * 2,
+  a + (SELECT avg(d) FROM df_nc WHERE id > 0) FROM df_nc WHERE id IN (7, -2, -7) ORDER BY id;
+ id |         avg         |  ?column?   |          ?column?          
+----+---------------------+-------------+----------------------------
+ -7 | -1.2050000000000000 | -54355.0000 |     1.50040459529530000000
+ -2 | -1.2050000000000000 | -54355.0000 |     1.50040459529530000000
+  7 | -1.2050000000000000 | -54355.0000 | -9445.66959540470470000000
+(3 rows)
+
+SELECT count(*) FROM df_nc WHERE a < 2 * (SELECT avg(a) FROM df_nc WHERE id < -100);
+ count 
+-------
+     0
+(1 row)
+
+SELECT count(*) FROM df_nc WHERE b < 0.5 * (SELECT avg(a) FROM df_nc);
+ count 
+-------
+ 50005
 (1 row)
 
 SET datafusion.mode = off;
