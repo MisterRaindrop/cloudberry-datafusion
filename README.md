@@ -582,6 +582,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | STD2 | stddev and variance of int2 and int4 in two stages, through batch Motions |
 | RL1 | numeric coerced to a wider numeric(p, s) of its scale |
 | QM1 | numeric quotients bounded by their operands' least nonzero magnitude |
+| CN1 | CASE on a numeric value; a standard deviation's display scale in expressions |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
@@ -1332,6 +1333,20 @@ in PostgreSQL, not one column of one scale).  Other ANY/ALL operators
 (`> ALL`) stay on PostgreSQL.  Over 20 million rows, an IN list of five
 strings with a NOT IN of integers took 0.21 s against 0.86 s, a CASE with
 COALESCE and NULLIF grouped 0.26 s against 1.25 s.
+
+CN1: a CASE on a numeric value, `CASE x WHEN v THEN ...`, stayed on
+PostgreSQL, whose WHEN comparisons `x = v` refer to x through a
+placeholder (CaseTestExpr) of no known scale.  It now runs as the
+searched CASE it stands for, x in place of the placeholder in each WHEN,
+x computed for each WHEN as a CASE on a value of another type is; a value
+PostgreSQL computes once (a volatile function, a subquery) stays.  A
+standard deviation or variance (STD1) inside an expression that leaves
+DataFusion has its display scale beside it, as an avg's does (AV2), so
+TPC-DS Q39's `CASE mean WHEN 0 THEN NULL ELSE stdev / mean END` is an
+output column, sent through a Motion and sorted by, and GPORCA's Shared
+Scan producer computes its filter.  Q39a and Q39b under the Postgres
+planner now run wholly in DataFusion: TPC-DS SF1 coverage 194 -> 196 of
+206 executions by EXPLAIN.
 
 Casts (E2), known by the cast function's pg_proc OID:
 

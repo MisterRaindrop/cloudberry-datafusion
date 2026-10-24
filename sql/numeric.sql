@@ -759,6 +759,56 @@ RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_qm;
 
+-- CN1: a CASE on a numeric value, CASE x WHEN v THEN ..., runs as the
+-- searched CASE it stands for, x = v in each WHEN: on a column (NULL
+-- matches no WHEN), an avg, a quotient, nested, in an output column and
+-- a filter.  A standard deviation and an expression on one have their
+-- display scale beside them, so TPC-DS Q39's cov, CASE mean WHEN 0 THEN
+-- NULL ELSE stdev / mean END, is an output column under the Postgres
+-- planner too, sent through a Motion and sorted by, and GPORCA's Shared
+-- Scan producer computes its filter.  A value PostgreSQL computes once (a
+-- volatile function) stays on PostgreSQL.
+CREATE TABLE df_cn (id int, k int, mo int, a int4, x numeric(7,2), y numeric(5,1)) DISTRIBUTED BY (id);
+INSERT INTO df_cn SELECT i, i % 6, 4 + (i / 6) % 2, CASE WHEN i % 6 = 5 THEN 0 ELSE (i * 37) % 11 - 3 END,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i * 7) % 5) / 2.0 END, (i % 4) / 2.0 + 0.5 FROM generate_series(1, 3000) i;
+ANALYZE df_cn;
+SET datafusion.motion_batches = on;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT id, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END;
+EXPLAIN (COSTS OFF) SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k;
+EXPLAIN (COSTS OFF) SELECT CASE (random() * 0)::numeric WHEN 0 THEN 1 END FROM df_cn;
+EXPLAIN (COSTS OFF) WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+SET datafusion.mode = off;
+SELECT x, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END, count(*)
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END GROUP BY 1, 2, 3 ORDER BY 1, 3;
+SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k ORDER BY k;
+SELECT k, CASE avg(a) WHEN 0 THEN -1 ELSE CASE stddev_pop(a) WHEN 0 THEN 0 ELSE 1 END END FROM df_cn GROUP BY k ORDER BY k;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+SET datafusion.mode = on;
+SELECT x, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END, count(*)
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END GROUP BY 1, 2, 3 ORDER BY 1, 3;
+SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k ORDER BY k;
+SELECT k, CASE avg(a) WHEN 0 THEN -1 ELSE CASE stddev_pop(a) WHEN 0 THEN 0 ELSE 1 END END FROM df_cn GROUP BY k ORDER BY k;
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+DROP TABLE df_cn;
+
 -- RL1: a coercion to numeric(p, s) of a value of scale s and at most p
 -- digits is a relabeling of it (numeric_support), which keeps the value's
 -- range: an avg of one with ROLLUP, in two stages (TPC-DS Q18), a sum, an

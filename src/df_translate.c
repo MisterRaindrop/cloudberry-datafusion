@@ -1196,7 +1196,7 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 
 		case T_CaseExpr:
 			{
-				CaseExpr   *ce = (CaseExpr *) node;
+				CaseExpr   *ce = df_case_searched((CaseExpr *) node);	/* CN1 */
 				Node	   *saved_arg = b->case_arg;
 				ListCell   *lc;
 
@@ -1745,7 +1745,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_CaseExpr:
 			{
 				/* E1: {"case": [{"when": c, "then": r}, ...], "else": e} */
-				CaseExpr   *ce = (CaseExpr *) node;
+				CaseExpr   *ce = df_case_searched((CaseExpr *) node);	/* CN1 */
 				int			scale = df_scale_of(df_level_ctx(b, level), node);
 				Node	   *saved = b->case_arg;
 				ListCell   *lc;
@@ -2158,7 +2158,7 @@ df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, D
 
 	if (left || IsA(r, CaseExpr))
 	{
-		CaseExpr   *ce = (CaseExpr *) (left ? l : r);
+		CaseExpr   *ce = df_case_searched((CaseExpr *) (left ? l : r));
 		int			i;
 
 		appendStringInfoString(out, "{\"case\":[");

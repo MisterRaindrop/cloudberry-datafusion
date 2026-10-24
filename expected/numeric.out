@@ -5949,7 +5949,7 @@ EXPLAIN (COSTS OFF) WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN 
                                        ->  Shared Scan (share slice:id 4:0)
  Optimizer: GPORCA
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible; below its Shared Scan producers: Aggregate
+ DataFusion: slice 1 eligible; below its Shared Scan producers: Result
  DataFusion: slice 2 eligible, sends Arrow batches
  DataFusion: slice 3 not eligible: passes on rows read from a Shared Scan, filtered, with nothing else to compute on them
  DataFusion: slice 4 not eligible: passes on rows read from a Shared Scan, filtered, with nothing else to compute on them
@@ -6175,6 +6175,213 @@ SET optimizer = off;
 RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_qm;
+-- CN1: a CASE on a numeric value, CASE x WHEN v THEN ..., runs as the
+-- searched CASE it stands for, x = v in each WHEN: on a column (NULL
+-- matches no WHEN), an avg, a quotient, nested, in an output column and
+-- a filter.  A standard deviation and an expression on one have their
+-- display scale beside them, so TPC-DS Q39's cov, CASE mean WHEN 0 THEN
+-- NULL ELSE stdev / mean END, is an output column under the Postgres
+-- planner too, sent through a Motion and sorted by, and GPORCA's Shared
+-- Scan producer computes its filter.  A value PostgreSQL computes once (a
+-- volatile function) stays on PostgreSQL.
+CREATE TABLE df_cn (id int, k int, mo int, a int4, x numeric(7,2), y numeric(5,1)) DISTRIBUTED BY (id);
+INSERT INTO df_cn SELECT i, i % 6, 4 + (i / 6) % 2, CASE WHEN i % 6 = 5 THEN 0 ELSE (i * 37) % 11 - 3 END,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE ((i * 7) % 5) / 2.0 END, (i % 4) / 2.0 + 0.5 FROM generate_series(1, 3000) i;
+ANALYZE df_cn;
+SET datafusion.motion_batches = on;
+SET optimizer = off;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT id, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_cn
+         Filter: CASE x WHEN '0'::numeric THEN false ELSE true END
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(6 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: k
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: k
+               ->  Streaming Partial HashAggregate
+                     Group Key: k
+                     ->  Seq Scan on df_cn
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT CASE (random() * 0)::numeric WHEN 0 THEN 1 END FROM df_cn;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_cn
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: CASE on a numeric value PostgreSQL computes once
+(5 rows)
+
+EXPLAIN (COSTS OFF) WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: x.k, x.mean, (CASE x.mean WHEN '0'::numeric THEN NULL::numeric ELSE (x.stdev / x.mean) END), v2.mean, v2.cov
+   ->  Sort
+         Sort Key: x.k, x.mean, (CASE x.mean WHEN '0'::numeric THEN NULL::numeric ELSE (x.stdev / x.mean) END), v2.mean, v2.cov
+         ->  Hash Join
+               Hash Cond: (x.k = v2.k)
+               ->  Subquery Scan on x
+                     ->  Finalize HashAggregate
+                           Group Key: df_cn.k
+                           Filter: ((CASE avg(df_cn.a) WHEN '0'::numeric THEN '0'::numeric ELSE (stddev_samp(df_cn.a) / avg(df_cn.a)) END > '1'::numeric) OR (df_cn.k = 5))
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: df_cn.k
+                                 ->  Streaming Partial HashAggregate
+                                       Group Key: df_cn.k
+                                       ->  Seq Scan on df_cn
+                                             Filter: (mo = 4)
+               ->  Hash
+                     ->  Subquery Scan on v2
+                           ->  Subquery Scan on x_1
+                                 ->  Finalize HashAggregate
+                                       Group Key: df_cn_1.k
+                                       Filter: ((CASE avg(df_cn_1.a) WHEN '0'::numeric THEN '0'::numeric ELSE (stddev_samp(df_cn_1.a) / avg(df_cn_1.a)) END > '1'::numeric) OR (df_cn_1.k = 5))
+                                       ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                             Hash Key: df_cn_1.k
+                                             ->  Streaming Partial HashAggregate
+                                                   Group Key: df_cn_1.k
+                                                   ->  Seq Scan on df_cn df_cn_1
+                                                         Filter: (mo = 5)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(33 rows)
+
+SET datafusion.mode = off;
+SELECT x, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END, count(*)
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END GROUP BY 1, 2, 3 ORDER BY 1, 3;
+  x   | case | case | count 
+------+------+------+-------
+ 0.50 | c    | 0.50 |   139
+ 0.50 | c    |      |   415
+ 1.00 | c    | 1.00 |   139
+ 1.00 | c    |      |   415
+ 1.50 | a    | 1.50 |   139
+ 1.50 | a    |      |   415
+ 2.00 | b    | 2.00 |   139
+ 2.00 | b    |      |   415
+      | c    |      |   230
+(9 rows)
+
+SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k ORDER BY k;
+ k |        case        |      coalesce      
+---+--------------------+--------------------
+ 0 | 1.5740526048551414 | 1.5724777644359723
+ 1 | 1.5767268861515259 | 1.5751493701125811
+ 2 | 1.5801936539728035 | 1.5786126694309179
+ 3 | 1.5811388300841897 | 1.5795568998931314
+ 4 | 1.5865270954716925 | 1.5849397743184165
+ 5 |                    |                  0
+(6 rows)
+
+SELECT k, CASE avg(a) WHEN 0 THEN -1 ELSE CASE stddev_pop(a) WHEN 0 THEN 0 ELSE 1 END END FROM df_cn GROUP BY k ORDER BY k;
+ k | case 
+---+------
+ 0 |    1
+ 1 |    1
+ 2 |    1
+ 3 |    1
+ 4 |    1
+ 5 |   -1
+(6 rows)
+
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+ k |          mean          |        cov         |          mean          |        cov         
+---+------------------------+--------------------+------------------------+--------------------
+ 0 |     2.0200000000000000 | 1.5676515336925151 |     2.0000000000000000 | 1.5836767752650969
+ 1 |     2.0200000000000000 | 1.5676515336925151 |     1.9960000000000000 | 1.5890710214327688
+ 2 |     2.0160000000000000 | 1.5717166140926484 |     1.9920000000000000 | 1.5919402635410642
+ 3 |     2.0120000000000000 | 1.5732744574896117 |     1.9880000000000000 | 1.5922677104975346
+ 4 |     2.0080000000000000 | 1.5792554805646414 |     1.9840000000000000 | 1.5970668820618847
+ 5 | 0.00000000000000000000 |                    | 0.00000000000000000000 |                   
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT x, CASE x WHEN 1.5 THEN 'a' WHEN 2 THEN 'b' ELSE 'c' END, CASE x / y WHEN 1 THEN x END, count(*)
+  FROM df_cn WHERE CASE x WHEN 0 THEN false ELSE true END GROUP BY 1, 2, 3 ORDER BY 1, 3;
+  x   | case | case | count 
+------+------+------+-------
+ 0.50 | c    | 0.50 |   139
+ 0.50 | c    |      |   415
+ 1.00 | c    | 1.00 |   139
+ 1.00 | c    |      |   415
+ 1.50 | a    | 1.50 |   139
+ 1.50 | a    |      |   415
+ 2.00 | b    | 2.00 |   139
+ 2.00 | b    |      |   415
+      | c    |      |   230
+(9 rows)
+
+SELECT k, CASE avg(a) WHEN 0 THEN NULL ELSE stddev_samp(a) / avg(a) END,
+  coalesce(stddev_pop(a) / NULLIF(avg(a), 0), 0) FROM df_cn GROUP BY k ORDER BY k;
+ k |        case        |      coalesce      
+---+--------------------+--------------------
+ 0 | 1.5740526048551414 | 1.5724777644359723
+ 1 | 1.5767268861515259 | 1.5751493701125811
+ 2 | 1.5801936539728035 | 1.5786126694309179
+ 3 | 1.5811388300841897 | 1.5795568998931314
+ 4 | 1.5865270954716925 | 1.5849397743184165
+ 5 |                    |                  0
+(6 rows)
+
+SELECT k, CASE avg(a) WHEN 0 THEN -1 ELSE CASE stddev_pop(a) WHEN 0 THEN 0 ELSE 1 END END FROM df_cn GROUP BY k ORDER BY k;
+ k | case 
+---+------
+ 0 |    1
+ 1 |    1
+ 2 |    1
+ 3 |    1
+ 4 |    1
+ 5 |   -1
+(6 rows)
+
+WITH v AS (SELECT k, mo, stdev, mean, CASE mean WHEN 0 THEN NULL ELSE stdev / mean END cov
+  FROM (SELECT k, mo, stddev_samp(a) stdev, avg(a) mean FROM df_cn GROUP BY k, mo) x
+  WHERE CASE mean WHEN 0 THEN 0 ELSE stdev / mean END > 1 OR k = 5)
+  SELECT v1.k, v1.mean, v1.cov, v2.mean, v2.cov FROM v v1, v v2
+  WHERE v1.k = v2.k AND v1.mo = 4 AND v2.mo = 5 ORDER BY v1.k, v1.mean, v1.cov, v2.mean, v2.cov;
+ k |          mean          |        cov         |          mean          |        cov         
+---+------------------------+--------------------+------------------------+--------------------
+ 0 |     2.0200000000000000 | 1.5676515336925151 |     2.0000000000000000 | 1.5836767752650969
+ 1 |     2.0200000000000000 | 1.5676515336925151 |     1.9960000000000000 | 1.5890710214327688
+ 2 |     2.0160000000000000 | 1.5717166140926484 |     1.9920000000000000 | 1.5919402635410642
+ 3 |     2.0120000000000000 | 1.5732744574896117 |     1.9880000000000000 | 1.5922677104975346
+ 4 |     2.0080000000000000 | 1.5792554805646414 |     1.9840000000000000 | 1.5970668820618847
+ 5 | 0.00000000000000000000 |                    | 0.00000000000000000000 |                   
+(6 rows)
+
+DROP TABLE df_cn;
 -- RL1: a coercion to numeric(p, s) of a value of scale s and at most p
 -- digits is a relabeling of it (numeric_support), which keeps the value's
 -- range: an avg of one with ROLLUP, in two stages (TPC-DS Q18), a sum, an

@@ -1227,6 +1227,68 @@ df_sums_groups(Plan *ctx, Node *expr)
 	}
 }
 
+/*
+ * CN1: may the value of CASE 'ce' be computed for each WHEN?  Not if it
+ * calls a volatile function or runs a subquery, which PostgreSQL computes
+ * once.
+ */
+static bool
+df_case_value_once_ok(CaseExpr *ce)
+{
+	return !contain_volatile_functions((Node *) ce->arg) &&
+		!contain_subplans((Node *) ce->arg);
+}
+
+/*
+ * CN1: a CASE on a numeric value, CASE x WHEN v THEN ..., as the searched
+ * CASE it stands for, x in place of the CaseTestExpr of each WHEN's
+ * comparison (x = v), whose numeric operands then have their ranges; as a
+ * CASE on a value of another type runs (E1), x computed for each WHEN.
+ * Another CASE keeps its own CaseTestExprs.  Its results stay the nodes
+ * they are.  Any other CASE as it is.
+ */
+static Node *
+df_case_value_mutator(Node *node, Node *arg)
+{
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, CaseTestExpr))
+		return copyObject(arg);
+	if (IsA(node, CaseExpr))
+	{
+		CaseExpr   *c = copyObject((CaseExpr *) node);
+
+		c->arg = (Expr *) df_case_value_mutator((Node *) c->arg, arg);
+		return (Node *) c;
+	}
+	return expression_tree_mutator(node, df_case_value_mutator, arg);
+}
+
+CaseExpr *
+df_case_searched(CaseExpr *ce)
+{
+	CaseExpr   *s;
+	ListCell   *lc;
+
+	if (ce->arg == NULL || exprType((Node *) ce->arg) != NUMERICOID ||
+		!df_case_value_once_ok(ce))
+		return ce;
+	s = makeNode(CaseExpr);
+	*s = *ce;
+	s->arg = NULL;
+	s->args = NIL;
+	foreach(lc, ce->args)
+	{
+		CaseWhen   *w = lfirst_node(CaseWhen, lc);
+		CaseWhen   *n = makeNode(CaseWhen);
+
+		*n = *w;
+		n->expr = (Expr *) df_case_value_mutator((Node *) w->expr, (Node *) ce->arg);
+		s->args = lappend(s->args, n);
+	}
+	return s;
+}
+
 /* a / b rounded down, b > 0 */
 static int
 df_floor_div(int a, int b)
@@ -2953,7 +3015,19 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				}
 				if (ce->arg != NULL && exprType((Node *) ce->arg) == NUMERICOID)
 				{
-					df_reject(cxt, "CASE on a numeric value");
+					/* CN1: as its searched CASE, x = v in each WHEN */
+					CaseExpr   *searched = df_case_searched(ce);
+
+					if (searched == ce)
+					{
+						df_reject(cxt, "CASE on a numeric value PostgreSQL computes once");
+						return true;
+					}
+					if (cxt->mixed_scales_ok == node)
+						cxt->mixed_scales_ok = (Node *) searched;
+					(void) df_check_expr((Node *) searched, cxt);
+					if (cxt->mixed_scales_ok == (Node *) searched)
+						cxt->mixed_scales_ok = node;
 					return true;
 				}
 				foreach(lc, ce->args)
@@ -3714,6 +3788,8 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 					return false;
 				if (df_agg_state_at(ctx, agg) == DF_AGG_SUM_NUMERIC_MIXED)
 					return true;	/* MS1 */
+				if (df_stddev_agg(agg, NULL, NULL))
+					return agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;	/* STD1 */
 				return (df_agg_state(agg) == DF_AGG_AVG_NUMERIC ||
 						df_agg_state(agg) == DF_AGG_AVG_INT) &&
 					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;
@@ -3814,7 +3890,7 @@ df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
 			}
 		case T_CaseExpr:
 			{
-				CaseExpr   *ce = (CaseExpr *) node;
+				CaseExpr   *ce = df_case_searched((CaseExpr *) node);
 				ListCell   *lc;
 
 				if (ce->arg != NULL)
@@ -3857,14 +3933,15 @@ df_check_numcmp_term(Node *node, DfCheckContext *cxt)
 			return;
 		case T_CaseExpr:
 			{
+				CaseExpr   *ce = df_case_searched((CaseExpr *) node);
 				ListCell   *lc;
 
-				foreach(lc, ((CaseExpr *) node)->args)
+				foreach(lc, ce->args)
 				{
 					df_check_expr((Node *) lfirst_node(CaseWhen, lc)->expr, cxt);
 					df_check_numcmp_term((Node *) lfirst_node(CaseWhen, lc)->result, cxt);
 				}
-				df_check_numcmp_term((Node *) ((CaseExpr *) node)->defresult, cxt);
+				df_check_numcmp_term((Node *) ce->defresult, cxt);
 				return;
 			}
 		default:

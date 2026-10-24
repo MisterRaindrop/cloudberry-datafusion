@@ -242,6 +242,7 @@ extern PlannedStmt *df_numeric_stmt;
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 extern int	df_bpchar_length(Plan *ctx, Node *expr);
 extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);
+extern CaseExpr *df_case_searched(CaseExpr *ce);
 extern bool df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale);
 extern Plan *df_subplan_rows(PlannedStmt *stmt, SubPlan *sp);
 extern const char *df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg);
