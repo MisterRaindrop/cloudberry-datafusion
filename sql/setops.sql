@@ -149,26 +149,58 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
 -- UQ1: a Unique (a DISTINCT, grouped sorted) whose order of rows no one
 -- reads, as a grouping by its columns without the Sort below it: below a
 -- join (TPC-DS Q54's, below a Redistribute Motion), an Agg, an unsorted
--- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One whose order
--- the Gather above merges, and one on numeric, stay on PostgreSQL.
+-- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One on numeric
+-- stays on PostgreSQL.  UQ2: one whose order a sorted Gather above merges,
+-- under a Limit or not (TPC-DS Q41), runs hashed, its rows sorted by the
+-- Gather's keys, then limited: one row per group, so no ties.
 SET optimizer = off;
 SET enable_hashagg = off;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 60;
 EXPLAIN (COSTS OFF) SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
-EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT x.k FROM df_u1 x JOIN (SELECT DISTINCT g, a FROM df_u1) d ON x.k = d.g;
 SET datafusion.mode = off;
 SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
 SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
 SET datafusion.mode = on;
 SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
 SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
+SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
+RESET enable_hashagg;
+-- UQ2 under a Limit: a DISTINCT over rows a correlated subquery filters
+-- (TPC-DS Q41's), NULLs first or last, and of two columns with an OFFSET
+SET enable_groupagg = off;
+SET enable_hashagg = off;
+CREATE TABLE df_uq (k int, m int, f int, mf char(50), p char(50)) DISTRIBUTED BY (k);
+INSERT INTO df_uq SELECT i, i % 1000, i % 9, 'mf' || (i % 990),
+  CASE WHEN i % 1009 = 0 THEN NULL ELSE 'p' || (i * 7 % 18000) END FROM generate_series(1, 18000) i;
+ANALYZE df_uq;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+EXPLAIN (COSTS OFF) SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+SET datafusion.mode = off;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+SET datafusion.mode = on;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+RESET enable_groupagg;
 RESET enable_hashagg;
 SET optimizer = on;
 
@@ -184,6 +216,6 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
 RESET datafusion.mode;
 
-DROP TABLE df_u1, df_u2, df_up;
+DROP TABLE df_u1, df_u2, df_up, df_uq;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

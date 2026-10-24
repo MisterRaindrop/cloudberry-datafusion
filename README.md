@@ -567,6 +567,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | UA1 | UNION ALL (Append) |
 | SO1 | INTERSECT and EXCEPT (SetOp) |
 | UQ1 | DISTINCT as Unique whose order no one reads |
+| UQ2 | DISTINCT as Unique below a merging Gather, under a Limit or not |
 | AS1 | GPORCA's Assert of a scalar subquery's rows |
 | SR1 | D3 below Subquery Scans |
 | CL2 | EXPLAIN checks a segment slice by the segments' collation |
@@ -1650,10 +1651,18 @@ duplicates by, named q<id>_g<k> as SO1's, without the Sort below it;
 NULLs make a group, as in the Unique.  Its output columns must be among
 those, of the types SO1 takes, so that a group's row is any of its
 members': not a DISTINCT ON, whose other columns come from the first row
-in order, nor a DISTINCT of numeric.  One whose order a merging Gather
-reads stays on PostgreSQL.  TPC-DS SF1: Q54 under the Postgres planner
-(a DISTINCT below a join, and two in init plans) now runs wholly in
-DataFusion; Q6's init plan does too.
+in order, nor a DISTINCT of numeric.  TPC-DS SF1: Q54 under the Postgres
+planner (a DISTINCT below a join, and two in init plans) now runs wholly
+in DataFusion; Q6's init plan does too.
+
+UQ2: one whose order a merging Gather reads, over a Sort by the Gather's
+keys and perhaps under a Limit (TPC-DS Q41's `select distinct
+i_product_name ... order by i_product_name limit 100`), runs hashed as
+UQ1 and the slice sorts its rows by those keys before the Limit, as a
+GroupAggregate's (D4): one row per group, keys covering its columns, so
+no two rows tie.  Q41 under the Postgres planner, with SC1, now runs
+wholly in DataFusion: TPC-DS SF1 coverage 197 -> 198 of 206 executions
+by EXPLAIN.
 
 ### GPORCA's Assert
 

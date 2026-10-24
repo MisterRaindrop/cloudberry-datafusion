@@ -2969,8 +2969,10 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
 -- UQ1: a Unique (a DISTINCT, grouped sorted) whose order of rows no one
 -- reads, as a grouping by its columns without the Sort below it: below a
 -- join (TPC-DS Q54's, below a Redistribute Motion), an Agg, an unsorted
--- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One whose order
--- the Gather above merges, and one on numeric, stay on PostgreSQL.
+-- Gather in an init plan (TPC-DS Q6); NULLs make a group.  One on numeric
+-- stays on PostgreSQL.  UQ2: one whose order a sorted Gather above merges,
+-- under a Limit or not (TPC-DS Q41), runs hashed, its rows sorted by the
+-- Gather's keys, then limited: one row per group, so no ties.
 SET optimizer = off;
 SET enable_hashagg = off;
 SET datafusion.mode = explain;
@@ -3045,7 +3047,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 
  DataFusion: slice 4 eligible, sends Arrow batches
 (21 rows)
 
-EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 ORDER BY 1, 2;
+EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
@@ -3057,11 +3059,12 @@ EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 ORDER BY 1, 2;
                ->  Redistribute Motion 3:3  (slice2; segments: 3)
                      Hash Key: g, ((k % 50))
                      ->  Seq Scan on df_u1
+                           Filter: ((k % 10) = 0)
  Optimizer: Postgres query optimizer
  DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: sorted Gather Motion without a Sort below it
- DataFusion: slice 2 eligible
-(13 rows)
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(14 rows)
 
 EXPLAIN (COSTS OFF) SELECT x.k FROM df_u1 x JOIN (SELECT DISTINCT g, a FROM df_u1) d ON x.k = d.g;
                                               QUERY PLAN                                              
@@ -3161,6 +3164,46 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g =
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
 ERROR:  more than one row returned by a subquery used as an expression
+SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
+ g | ?column? 
+---+----------
+ 0 |        0
+ 0 |       10
+ 0 |       20
+ 0 |       30
+ 0 |       40
+ 1 |        0
+ 1 |       10
+ 1 |       20
+ 1 |       30
+ 1 |       40
+ 2 |        0
+ 2 |       10
+ 2 |       20
+ 2 |       30
+ 2 |       40
+ 3 |        0
+ 3 |       10
+ 3 |       20
+ 3 |       30
+ 3 |       40
+ 4 |        0
+ 4 |       10
+ 4 |       20
+ 4 |       30
+ 4 |       40
+ 5 |        0
+ 5 |       10
+ 5 |       20
+ 5 |       30
+ 5 |       40
+ 6 |        0
+ 6 |       10
+ 6 |       20
+ 6 |       30
+ 6 |       40
+(35 rows)
+
 SET datafusion.mode = on;
 SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
  k  | g | t  |  c   
@@ -3234,6 +3277,222 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g =
 
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
 ERROR:  more than one row returned by a subquery used as an expression
+SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
+ g | ?column? 
+---+----------
+ 0 |        0
+ 0 |       10
+ 0 |       20
+ 0 |       30
+ 0 |       40
+ 1 |        0
+ 1 |       10
+ 1 |       20
+ 1 |       30
+ 1 |       40
+ 2 |        0
+ 2 |       10
+ 2 |       20
+ 2 |       30
+ 2 |       40
+ 3 |        0
+ 3 |       10
+ 3 |       20
+ 3 |       30
+ 3 |       40
+ 4 |        0
+ 4 |       10
+ 4 |       20
+ 4 |       30
+ 4 |       40
+ 5 |        0
+ 5 |       10
+ 5 |       20
+ 5 |       30
+ 5 |       40
+ 6 |        0
+ 6 |       10
+ 6 |       20
+ 6 |       30
+ 6 |       40
+(35 rows)
+
+RESET enable_hashagg;
+-- UQ2 under a Limit: a DISTINCT over rows a correlated subquery filters
+-- (TPC-DS Q41's), NULLs first or last, and of two columns with an OFFSET
+SET enable_groupagg = off;
+SET enable_hashagg = off;
+CREATE TABLE df_uq (k int, m int, f int, mf char(50), p char(50)) DISTRIBUTED BY (k);
+INSERT INTO df_uq SELECT i, i % 1000, i % 9, 'mf' || (i % 990),
+  CASE WHEN i % 1009 = 0 THEN NULL ELSE 'p' || (i * 7 % 18000) END FROM generate_series(1, 18000) i;
+ANALYZE df_uq;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: o.p
+         ->  Limit
+               ->  Unique
+                     Group Key: o.p
+                     ->  Sort
+                           Sort Key: o.p
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: o.p
+                                 ->  Seq Scan on df_uq o
+                                       Filter: ((m >= 700) AND (m <= 714) AND ((SubPlan 1) > 0))
+                                       SubPlan 1
+                                         ->  Aggregate
+                                               ->  Result
+                                                     Filter: (i.mf = o.mf)
+                                                     ->  Materialize
+                                                           ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                                                 ->  Seq Scan on df_uq i
+                                                                       Filter: (f = ANY ('{1,5}'::integer[]))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible
+(25 rows)
+
+EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: o.p
+         ->  Limit
+               ->  Unique
+                     Group Key: o.p
+                     ->  Sort
+                           Sort Key: o.p DESC
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: o.p
+                                 ->  Seq Scan on df_uq o
+                                       Filter: ((m >= 700) AND (m <= 714) AND ((SubPlan 1) > 0))
+                                       SubPlan 1
+                                         ->  Aggregate
+                                               ->  Result
+                                                     Filter: (i.mf = o.mf)
+                                                     ->  Materialize
+                                                           ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                                                 ->  Seq Scan on df_uq i
+                                                                       Filter: (f = ANY ('{1,5}'::integer[]))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible
+(25 rows)
+
+EXPLAIN (COSTS OFF) SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: p, f
+         ->  Limit
+               ->  Unique
+                     Group Key: p, f
+                     ->  Sort
+                           Sort Key: p NULLS FIRST, f DESC
+                           ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                                 Hash Key: p, f
+                                 ->  Seq Scan on df_uq
+                                       Filter: (m < 30)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+(16 rows)
+
+SET datafusion.mode = off;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+                         p                          
+----------------------------------------------------
+ p10907                                            
+ p10942                                            
+ p10970                                            
+ p11914                                            
+ p11942                                            
+ p11977                                            
+ p12914                                            
+ p12949                                            
+ p12977                                            
+ p13921                                            
+(10 rows)
+
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+                         p                          
+----------------------------------------------------
+ p9970                                             
+ p9935                                             
+ p9907                                             
+ p970                                              
+ p935                                              
+ p907                                              
+ p8998                                             
+(7 rows)
+
+SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+                         p                          | f 
+----------------------------------------------------+---
+                                                    | 2
+                                                    | 1
+ p0                                                 | 0
+ p1000                                              | 4
+ p10000                                             | 4
+ p10007                                             | 5
+(6 rows)
+
+SET datafusion.mode = on;
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
+                         p                          
+----------------------------------------------------
+ p10907                                            
+ p10942                                            
+ p10970                                            
+ p11914                                            
+ p11942                                            
+ p11977                                            
+ p12914                                            
+ p12949                                            
+ p12977                                            
+ p13921                                            
+(10 rows)
+
+SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
+  AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
+                         p                          
+----------------------------------------------------
+ p9970                                             
+ p9935                                             
+ p9907                                             
+ p970                                              
+ p935                                              
+ p907                                              
+ p8998                                             
+(7 rows)
+
+SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
+                         p                          | f 
+----------------------------------------------------+---
+                                                    | 2
+                                                    | 1
+ p0                                                 | 0
+ p1000                                              | 4
+ p10000                                             | 4
+ p10007                                             | 5
+(6 rows)
+
+RESET enable_groupagg;
 RESET enable_hashagg;
 SET optimizer = on;
 -- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
@@ -3284,6 +3543,6 @@ SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
 ERROR:  one or more assertions failed  (seg0 slice1 172.17.0.3:40000 pid=43419)
 DETAIL:  Expected no more than one row to be returned by expression
 RESET datafusion.mode;
-DROP TABLE df_u1, df_u2, df_up;
+DROP TABLE df_u1, df_u2, df_up, df_uq;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

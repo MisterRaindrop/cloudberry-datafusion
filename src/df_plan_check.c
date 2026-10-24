@@ -4943,7 +4943,11 @@ df_group_input_order(Plan *plan, int *ncols, AttrNumber **cols, Oid **ops,
 static bool
 df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 {
-	Plan	   *input = agg != NULL && IsA(agg, Agg) ? outerPlan(agg) : NULL;
+	/* UQ2: also a Unique, a grouping by its columns (UQ1) */
+	bool		unique = agg != NULL && IsA(agg, Unique);
+	Plan	   *input = agg != NULL && (unique || IsA(agg, Agg)) ? outerPlan(agg) : NULL;
+	int			ngroups = unique ? ((Unique *) agg)->numCols : input ? agg->numCols : 0;
+	AttrNumber *grp = unique ? ((Unique *) agg)->uniqColIdx : input ? agg->grpColIdx : NULL;
 	Bitmapset  *groups = NULL;
 	Bitmapset  *keys = NULL;
 	int			ncols;
@@ -4954,9 +4958,9 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 	int			i,
 				k;
 
-	if (input == NULL || agg->aggstrategy != AGG_SORTED ||
+	if (input == NULL || (!unique && agg->aggstrategy != AGG_SORTED) ||
 		!df_group_input_order(input, &ncols, &cols, &ops, &collations, &nulls) ||
-		agg->numCols == 0)
+		ngroups <= 0)
 		return false;
 	if (motion != NULL && (motion->numSortCols == 0 || ncols < motion->numSortCols))
 		return false;
@@ -4966,20 +4970,20 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 	 * their NULLs sort last.  A tie with a NULL of the data goes to the
 	 * longer set first (df_emit_resort_by).
 	 */
-	if (agg->chain != NIL)
+	if (!unique && agg->chain != NIL)
 		return false;
-	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
+	for (i = 0; i < ncols && bms_num_members(groups) < ngroups; i++)
 	{
 		AttrNumber	col = df_output_of((Plan *) agg, cols[i]);
-		TargetEntry *tle = col > 0 ? get_tle_by_resno(agg->plan.targetlist, col) : NULL;
+		TargetEntry *tle = col > 0 ? get_tle_by_resno(((Plan *) agg)->targetlist, col) : NULL;
 		Oid			type;
 		bool		desc;
 
-		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != cols[i]; k++)
+		for (k = 0; k < ngroups && grp[k] != cols[i]; k++)
 			;
-		if (tle == NULL || k == agg->numCols)
+		if (tle == NULL || k == ngroups)
 			return false;
-		if (agg->groupingSets != NIL && (nulls[i] || cols[i] != agg->grpColIdx[i]))
+		if (!unique && agg->groupingSets != NIL && (nulls[i] || cols[i] != grp[i]))
 			return false;
 		groups = bms_add_member(groups, k);
 		type = exprType((Node *) tle->expr);
@@ -5006,7 +5010,7 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 		}
 		keys = bms_add_member(keys, col);
 	}
-	if (bms_num_members(groups) != agg->numCols ||
+	if (bms_num_members(groups) != ngroups ||
 		(motion != NULL && i < motion->numSortCols))
 		return false;
 	cxt->sort_keys = bms_union(cxt->sort_keys, keys);
@@ -5184,6 +5188,9 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 		if (below != NULL && IsA(below, WindowAgg))
 			return true;
 	}
+	/* UQ2: a Unique over a Sort, run hashed, sorted by the Motion's keys */
+	if (agg != NULL && IsA(agg, Unique))
+		return df_check_group_order(cxt, motion, agg);
 	/* SR1: also below Subquery Scans passing its columns on (TPC-DS Q24) */
 	while (agg != NULL && IsA(agg, SubqueryScan))
 		agg = (Agg *) ((SubqueryScan *) agg)->subplan;
@@ -5861,7 +5868,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					df_reject(cxt, "Unique with a filter or without columns");
 					return;
 				}
-				if (!cxt->node_order_free)
+				/* UQ2: or in the order the slice sorts its rows in */
+				if (!cxt->node_order_free && cxt->tails.resort_by != child)
 				{
 					df_reject(cxt, "Unique whose order of rows is read");
 					return;

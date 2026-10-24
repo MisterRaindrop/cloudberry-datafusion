@@ -3738,6 +3738,9 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 	Oid		   *ops;
 	bool	   *nulls;
 	Agg		   *agg = (Agg *) body;
+	/* UQ2: or a Unique, grouping by its columns */
+	int			ngroups = IsA(body, Unique) ? ((Unique *) body)->numCols : agg->numCols;
+	AttrNumber *grp = IsA(body, Unique) ? ((Unique *) body)->uniqColIdx : agg->grpColIdx;
 	Bitmapset  *groups = NULL;
 	int			i,
 				k;
@@ -3758,7 +3761,7 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 	}
 	appendStringInfoString(out, ",\"sort\":[");
 	/* up to the key that completes the groups, as df_check_group_order */
-	for (i = 0; i < ncols && bms_num_members(groups) < agg->numCols; i++)
+	for (i = 0; i < ncols && bms_num_members(groups) < ngroups; i++)
 	{
 		TargetEntry *tle = NULL;
 		ListCell   *lc;
@@ -3773,10 +3776,10 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 				((Var *) t->expr)->varattno == cols[i])
 				tle = t;
 		}
-		for (k = 0; k < agg->numCols && agg->grpColIdx[k] != cols[i]; k++)
+		for (k = 0; k < ngroups && grp[k] != cols[i]; k++)
 			;
 		groups = bms_add_member(groups, k);
-		if (tle == NULL || k == agg->numCols || spec->col_value[tle->resno - 1] < 0 ||
+		if (tle == NULL || k == ngroups || spec->col_value[tle->resno - 1] < 0 ||
 			!df_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
 		{
 			df_fail(b, "a sort key of the GroupAggregate");
@@ -3792,7 +3795,7 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 	 * NULLs; the rollup gives the longer set's first, its GROUPINGSET_ID()
 	 * the lower.
 	 */
-	if (agg->groupingSets != NIL)
+	if (IsA(body, Agg) && agg->groupingSets != NIL)
 		appendStringInfoString(out, ",{\"expr\":{\"name\":\"gset\"}}");
 	appendStringInfoChar(out, ']');
 }
