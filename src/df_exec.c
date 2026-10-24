@@ -1524,7 +1524,18 @@ df_exec_next(DfExec *x)
 			if (j == x->ninputs)
 				x->input_done = true;
 			else
+			{
 				df_exec_feed(x, &x->inputs[j], &pushed, &full);
+
+				/*
+				 * An input that has just ended is progress too: go on to the
+				 * next one at once.  Waiting for results first would wait in
+				 * vain, as long as DataFusion needs that next input to
+				 * produce any (a join's probe side after its build side).
+				 */
+				if (x->inputs[j].done)
+					pushed = true;
+			}
 		}
 
 		status = df_ffi_query_poll(x->query,
