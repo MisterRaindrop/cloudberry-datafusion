@@ -516,6 +516,51 @@ SET optimizer = off;
 SET datafusion.mode = off;
 DROP TABLE df_sc;
 
+-- A correlated scalar subquery that is one aggregate of rows equal to the
+-- outer row on some keys (SC1, TPC-DS Q6 and Q41 under the Postgres
+-- planner): its rows come from a Motion; the scan's rows are joined to
+-- that aggregate grouped by the keys.  A row of no group, or of a NULL
+-- key, gets the aggregate of no rows: NULL, or 0 for a count.  Keys of
+-- integers of two widths, character(n) of two lengths, varchar.  One
+-- correlated by other than =, on numeric, or outside a scan's filter
+-- stays on PostgreSQL.
+CREATE TABLE df_co (id int, k int, t char(5), v varchar, n numeric(7,2)) DISTRIBUTED BY (id);
+CREATE TABLE df_ci (w int, k int8, t char(3), v varchar, n numeric(7,2), f int) DISTRIBUTED BY (w);
+INSERT INTO df_co SELECT i, CASE WHEN i % 101 = 0 THEN NULL ELSE i % 40 END, (i % 13)::text,
+  (i % 7)::text, ((i * 7919) % 20001 - 10000) / 100.0 FROM generate_series(1, 3000) i;
+INSERT INTO df_co VALUES (3001, 3, '3  ', '3', 1.00), (3002, NULL, NULL, NULL, NULL);
+INSERT INTO df_ci SELECT i, CASE WHEN i % 53 = 0 THEN NULL ELSE i % 30 END, (i % 11)::text,
+  (i % 5)::text, CASE WHEN i % 17 = 0 THEN NULL ELSE ((i * 104729) % 20001 - 10000) / 100.0 END,
+  i % 6 FROM generate_series(1, 600) i;
+ANALYZE df_co; ANALYZE df_ci;
+SET optimizer = off;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
+-- stay on PostgreSQL
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > (SELECT max(w) FROM df_ci i WHERE i.k < o.k);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.n = o.n);
+EXPLAIN (COSTS OFF) SELECT id, (SELECT max(w) FROM df_ci i WHERE i.k = o.k) FROM df_co o WHERE id < 5;
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
+SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
+SELECT count(*), sum(id) FROM df_co o WHERE coalesce((SELECT sum(f) FROM df_ci i WHERE i.k = o.k), -1) = -1;
+SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
+SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE (i.k = o.k AND i.f = 1) OR (i.k = o.k AND i.f = 4)) > 3
+  AND n < (SELECT avg(n) FROM df_ci i WHERE i.t = o.t);
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
+SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
+SELECT count(*), sum(id) FROM df_co o WHERE coalesce((SELECT sum(f) FROM df_ci i WHERE i.k = o.k), -1) = -1;
+SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
+SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE (i.k = o.k AND i.f = 1) OR (i.k = o.k AND i.f = 4)) > 3
+  AND n < (SELECT avg(n) FROM df_ci i WHERE i.t = o.t);
+SET datafusion.mode = off;
+RESET datafusion.motion_batches;
+DROP TABLE df_co, df_ci;
+
 -- A Merge Join whose order of rows no one reads runs as DataFusion's hash
 -- join on its merge clauses (MJ1, TPC-DS Q51 under GPORCA), the Sorts
 -- below it, there for the merge, left out: inner on two keys (one a date),

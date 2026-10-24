@@ -114,6 +114,7 @@ typedef struct DfBuilder
 	int		   *out_col;		/* output column of each value
 								 * (df_emit_outputs) */
 	Bitmapset  *sort_values;	/* the values the slice sorts its output by */
+	List	   *correlated;		/* DfCorrelated, of the SubPlans joined (SC1) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -670,6 +671,43 @@ df_emit_result(DfBuilder *b, StringInfo out, Node *e, Oid type, int scale, DfLev
 		df_emit(b, out, e, level);
 }
 
+/*
+ * SC1: correlated scalar subquery 'sp' grouped (df_subplan_correlated),
+ * one for each SubPlan, whose Agg the join emits and the value reads by
+ * name; NULL if it is not one.
+ */
+static DfCorrelated *
+df_correlated_of(DfBuilder *b, SubPlan *sp)
+{
+	ListCell   *lc;
+	DfCorrelated *corr;
+
+	foreach(lc, b->correlated)
+		if (((DfCorrelated *) lfirst(lc))->sp == sp)
+			return lfirst(lc);
+	if (df_subplan_correlated(df_numeric_stmt, sp, &corr) != NULL)
+		return NULL;
+	b->correlated = lappend(b->correlated, corr);
+	return corr;
+}
+
+/* SC1: collect the correlated scalar subqueries in 'node'. */
+static bool
+df_collect_correlated(Node *node, List **sps)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, SubPlan))
+	{
+		SubPlan    *sp = (SubPlan *) node;
+
+		if (sp->subLinkType == EXPR_SUBLINK && sp->parParam != NIL)
+			*sps = list_append_unique_ptr(*sps, sp);
+		return false;
+	}
+	return expression_tree_walker(node, df_collect_correlated, sps);
+}
+
 /* Add an input reading 'leaf'; returns its index. */
 static int
 df_add_input(DfBuilder *b, Plan *leaf)
@@ -1112,6 +1150,22 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				int			j,
 							k;
 
+				if (sp->parParam != NIL)
+				{
+					/* SC1: the grouped aggregate's */
+					DfCorrelated *corr = df_correlated_of(b, sp);
+					Plan	   *saved = b->ctx;
+
+					if (corr == NULL || level != DF_LEVEL_SCAN || !IsA(saved, SeqScan))
+					{
+						df_fail(b, "the display scale of a correlated subquery");
+						return;
+					}
+					b->ctx = (Plan *) corr->top;
+					df_emit_dscale(b, out, corr->value, level);
+					b->ctx = saved;
+					return;
+				}
 				if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
 				{
 					df_fail(b, "the display scale of a subquery");
@@ -1536,6 +1590,25 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					TargetEntry *tle;
 					int			k;
 
+					if (sp->parParam != NIL)
+					{
+						/*
+						 * SC1: the grouped aggregate's value, joined to the
+						 * scan's rows (T_SeqScan above)
+						 */
+						DfCorrelated *corr = df_correlated_of(b, sp);
+						Plan	   *saved = b->ctx;
+
+						if (corr == NULL || level != DF_LEVEL_SCAN || !IsA(saved, SeqScan))
+						{
+							df_fail(b, "a correlated subquery");
+							return;
+						}
+						b->ctx = (Plan *) corr->top;
+						df_emit(b, out, corr->value, level);
+						b->ctx = saved;
+						return;
+					}
 					if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
 					{
 						df_fail(b, "a subquery");
@@ -2323,8 +2396,66 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 		case T_Motion:
 		case T_ShareInputScan:	/* a reader: its rows, pulled */
 			{
-				int			j = df_add_input(b, plan);
+				int			j;
+				List	   *sps = NIL;
+				ListCell   *lc;
 
+				if (IsA(plan, SeqScan))
+					(void) df_collect_correlated((Node *) plan->qual, &sps);
+				if (sps != NIL)
+				{
+					/*
+					 * SC1: its rows joined to each correlated scalar
+					 * subquery of its filter, grouped by its keys: those
+					 * with no group get NULLs, its value of no rows
+					 * (df_subplan_correlated).  The groups are the join's
+					 * build side, fed first, their columns read by name.
+					 */
+					appendStringInfoString(out, "{\"filter\":{\"input\":");
+					for (int i = list_length(sps) - 1; i >= 0; i--)
+					{
+						DfCorrelated *corr = df_correlated_of(b, list_nth(sps, i));
+
+						if (corr == NULL)
+						{
+							df_fail(b, "a correlated subquery");
+							return;
+						}
+						appendStringInfoString(out, "{\"join\":{\"type\":\"right\",\"left\":");
+						df_emit_node(b, out, (Plan *) corr->agg);
+						appendStringInfoString(out, ",\"right\":");
+					}
+					j = df_add_input(b, plan);
+					appendStringInfo(out, "{\"input\":%d}", j);
+					foreach(lc, sps)
+					{
+						DfCorrelated *corr = df_correlated_of(b, lfirst(lc));
+						ListCell   *lo,
+								   *li;
+
+						appendStringInfoString(out, ",\"on\":[");
+						forboth(lo, corr->outer, li, corr->inner)
+						{
+							Oid			type = df_join_key_type(exprType(lfirst(li)),
+																exprType(lfirst(lo)));
+
+							appendStringInfoString(out, foreach_current_index(lo) > 0 ? ",[" : "[");
+							b->ctx = (Plan *) corr->top;
+							df_emit_key(b, out, lfirst(li), type, 0);
+							appendStringInfoChar(out, ',');
+							b->ctx = plan;
+							df_emit_key(b, out, lfirst(lo), type, 0);
+							appendStringInfoChar(out, ']');
+						}
+						appendStringInfoString(out, "],\"filter\":null}}");
+					}
+					appendStringInfoString(out, ",\"pred\":");
+					b->ctx = plan;
+					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					appendStringInfoString(out, "}}");
+					return;
+				}
+				j = df_add_input(b, plan);
 				if (plan->qual == NIL)
 				{
 					appendStringInfo(out, "{\"input\":%d}", j);

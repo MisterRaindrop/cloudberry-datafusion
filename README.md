@@ -583,6 +583,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | RL1 | numeric coerced to a wider numeric(p, s) of its scale |
 | QM1 | numeric quotients bounded by their operands' least nonzero magnitude |
 | CN1 | CASE on a numeric value; a standard deviation's display scale in expressions |
+| SC1 | A correlated scalar subquery of one aggregate, as that aggregate grouped by its keys and joined |
 | WT1 | Numeric values received as tuples with up to 76 digits |
 | C1 | Direct PAX reader: strings (text, varchar, char(n)) |
 | C1b | Direct PAX reader: a micro-partition's groups read in parallel |
@@ -697,6 +698,25 @@ evaluated: a filter whose other conditions leave no row to compute it for
 the digits and display scale of the subquery's column (an avg's, from its
 tuple), so `avg(x) > 0.9 * (...)` compares exactly.  Q44 under GPORCA now
 runs wholly in DataFusion.
+
+SC1: a correlated scalar subquery that the Postgres planner leaves as a
+SubPlan in a scan's filter (TPC-DS Q6's `i_current_price > 1.2 * (select
+avg(j.i_current_price) from item j where j.i_category = i.i_category)`,
+Q41's `(select count(*) ...) > 0`), one aggregate over a filter `inner =
+outer` above rows that come from a Motion as they are, is that aggregate
+grouped by the inner sides and joined to the scan's rows on the outer
+ones: DataFusion's right join, the groups its build side, fed first.  A
+row of no group, or of a NULL key, which = matches with no row, gets the
+aggregate of no rows: NULL, or 0 for a count.  Keys of one type, or
+integers of two widths, other than numeric and floats; strings under a
+deterministic collation.  The planner pushes the subquery's other
+conditions below its Motion; one left above it, a key correlated by
+another operator, or such a subquery anywhere but a Seq Scan's filter
+stays on PostgreSQL.  The planner hook does not weigh the groups
+against the slice's memory as it does a Hash Join's build side: at most
+one per distinct key of the subquery's rows.  Q6 under the Postgres planner now runs wholly in DataFusion,
+0.10 s against 6.65 s: TPC-DS SF1 coverage 196 -> 197 of 206
+executions by EXPLAIN.
 
 NL1: a Nested Loop without parameters (GPORCA's TPC-H Q11 compares each
 group with a broadcast total in its join filter) runs as DataFusion's

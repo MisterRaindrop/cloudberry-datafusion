@@ -1640,6 +1640,10 @@ df_find_state(PlanState *ps, Plan *leaf)
 
 			if (sps->planstate != NULL && sps->planstate->plan == leaf)
 				return sps->planstate;
+			/* SC1: the Motion below a correlated one's aggregate */
+			if (sps->planstate != NULL &&
+				(found = df_find_state(sps->planstate, leaf)) != NULL)
+				return found;
 		}
 	}
 	if (IsA(ps, MotionState))

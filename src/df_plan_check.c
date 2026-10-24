@@ -92,6 +92,7 @@ extern bool lc_collate_is_c(Oid collation);
 extern bool lc_ctype_is_c(Oid collation);
 
 static bool df_subplan_value(Node *node, Plan **top, Node **value);
+static bool df_rows_from_motion(Plan *plan);
 
 typedef struct DfCheckContext
 {
@@ -114,6 +115,8 @@ typedef struct DfCheckContext
 								 * the Agg being checked */
 	bool		rowid_ok;		/* checking a scan's or join's targetlist,
 								 * where a RowIdExpr may be (RI1) */
+	bool		correlated_ok;	/* checking a Seq Scan's filter, where a
+								 * correlated scalar subquery may be (SC1) */
 	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
@@ -2260,14 +2263,253 @@ df_subplan_rows(PlannedStmt *stmt, SubPlan *sp)
 	if (stmt == NULL || sp->plan_id < 1 || sp->plan_id > list_length(stmt->subplans))
 		return NULL;
 	plan = list_nth(stmt->subplans, sp->plan_id - 1);
+	return df_rows_from_motion(plan) ? plan : NULL;
+}
+
+/*
+ * Do the rows of 'plan' come from a Motion this slice receives, through
+ * nodes that only pass them on (df_subplan_rows)?
+ */
+static bool
+df_rows_from_motion(Plan *plan)
+{
 	for (Plan *p = plan; p != NULL; p = outerPlan(p))
 	{
 		if (IsA(p, Motion))
-			return ((Motion *) p)->motionType != MOTIONTYPE_GATHER_SINGLE ? plan : NULL;
+			return ((Motion *) p)->motionType != MOTIONTYPE_GATHER_SINGLE;
 		if (!(IsA(p, Material) || (IsA(p, Result) && p->qual == NIL &&
 								   ((Result *) p)->resconstantqual == NULL)) ||
 			innerPlan(p) != NULL || p->initPlan != NIL)
-			return NULL;
+			return false;
+	}
+	return false;
+}
+
+/* Does 'node' read one of the PARAM_EXEC parameters 'params'? */
+static bool
+df_reads_params(Node *node, Bitmapset *params)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return ((Param *) node)->paramkind == PARAM_EXEC &&
+			bms_is_member(((Param *) node)->paramid, params);
+	return expression_tree_walker(node, df_reads_params, params);
+}
+
+/*
+ * SC1: is SubPlan 'sp' a correlated scalar subquery that is one aggregate
+ * of rows coming from a Motion as they are, filtered by conditions
+ * inner = outer, the outer side read from the outer row?  As PostgreSQL's
+ * planner leaves TPC-DS Q6's (select avg(j.i_current_price) from item j
+ * where j.i_category = i.i_category):
+ *
+ *   Aggregate                                (plain: one row)
+ *     Result  Filter: (j.i_category = $0)    ($0: i.i_category)
+ *       Materialize
+ *         Broadcast Motion
+ *
+ * That value, for each outer row, is the aggregate of the rows grouped
+ * by the inner sides, in the group whose
+ * keys equal the outer sides: a NULL outer side, which = matches with no
+ * row, or keys of no group are the aggregate of no rows, NULL, or 0 for
+ * a count.  Sets *corr to that aggregate grouped by the keys, read
+ * through a Result over it (DfCorrelated).  Returns the reason it is not
+ * such a subquery, or NULL.
+ */
+const char *
+df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
+{
+	Plan	   *plan;
+	Agg		   *agg;
+	Agg		   *grouped;
+	Result	   *filter;
+	Result	   *rows;
+	Result	   *top;
+	TargetEntry *value = NULL;
+	Aggref	   *call;
+	Bitmapset  *params = NULL;
+	List	   *outer = NIL;
+	List	   *inner = NIL;
+	List	   *ops = NIL;
+	List	   *collations = NIL;
+	ListCell   *lc;
+	int			ncols;
+	int			nkeys;
+	int			k;
+
+	*corr = NULL;
+	if (sp->subLinkType != EXPR_SUBLINK || sp->testexpr != NULL || sp->setParam != NIL ||
+		sp->useHashTable || sp->parParam == NIL ||
+		list_length(sp->parParam) != list_length(sp->args))
+		return "correlated scalar subquery";
+	if (stmt == NULL || sp->plan_id < 1 || sp->plan_id > list_length(stmt->subplans))
+		return "correlated scalar subquery";
+	plan = list_nth(stmt->subplans, sp->plan_id - 1);
+	agg = (Agg *) plan;
+	if (!IsA(plan, Agg) || agg->aggstrategy != AGG_PLAIN || agg->numCols != 0 ||
+		agg->groupingSets != NIL || agg->chain != NIL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		plan->qual != NIL || plan->initPlan != NIL)
+		return "correlated scalar subquery other than an aggregate";
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (tle->resjunk)
+			continue;
+		if (value != NULL)
+			return "correlated scalar subquery of several columns";
+		value = tle;
+	}
+	/* the value of no rows: NULL, or 0 for a count (below) */
+	call = value != NULL && IsA(value->expr, Aggref) ? (Aggref *) value->expr : NULL;
+	if (call == NULL || call->aggdistinct != NIL || call->aggorder != NIL ||
+		exprType((Node *) call) != sp->firstColType)
+		return "correlated scalar subquery other than one aggregate";
+	filter = (Result *) outerPlan(plan);
+	if (filter == NULL || !IsA(filter, Result) || filter->resconstantqual != NULL ||
+		innerPlan(filter) != NULL || filter->plan.initPlan != NIL ||
+		!df_rows_from_motion(outerPlan(filter)))
+		return "correlated scalar subquery whose rows do not come from a Motion as they are";
+	foreach(lc, sp->parParam)
+		params = bms_add_member(params, lfirst_int(lc));
+	/*
+	 * PostgreSQL computes the outer sides and the conditions again for each
+	 * outer row, the join once
+	 */
+	if (df_reads_params((Node *) plan->targetlist, params) ||
+		df_reads_params((Node *) filter->plan.targetlist, params) ||
+		contain_volatile_functions((Node *) sp->args) ||
+		contain_volatile_functions((Node *) filter->plan.qual) ||
+		contain_subplans((Node *) sp->args) || contain_subplans((Node *) filter->plan.qual))
+		return "correlated scalar subquery reading the outer row other than in its filter";
+	foreach(lc, filter->plan.qual)
+	{
+		Node	   *qual = lfirst(lc);
+		OpExpr	   *op = (OpExpr *) qual;
+		Node	   *l,
+				   *r,
+				   *p,
+				   *in,
+				   *out;
+		char	   *name;
+		int			i;
+
+		/*
+		 * The planner pushes the other conditions below the Motion
+		 * (distribute_qual_to_rels), leaving none here
+		 */
+		if (!df_reads_params(qual, params))
+			return "correlated scalar subquery with a condition of its own above its rows";
+		if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
+			return "correlated scalar subquery correlated other than by =";
+		l = linitial(op->args);
+		r = lsecond(op->args);
+		/* the parameter, perhaps relabeled (varchar as text) */
+		p = IsA(r, RelabelType) ? (Node *) ((RelabelType *) r)->arg : r;
+		if (IsA(p, Param) && !df_reads_params(l, params))
+			in = l;
+		else
+		{
+			p = IsA(l, RelabelType) ? (Node *) ((RelabelType *) l)->arg : l;
+			in = r;
+			r = l;
+			if (!IsA(p, Param) || df_reads_params(in, params))
+				return "correlated scalar subquery correlated other than by =";
+		}
+		name = get_opname(op->opno);
+		if (name == NULL || strcmp(name, "=") != 0 || op->opno >= FirstGenbkiObjectId ||
+			!bms_is_member(((Param *) p)->paramid, params))
+			return "correlated scalar subquery correlated other than by =";
+		for (i = 0; list_nth_int(sp->parParam, i) != ((Param *) p)->paramid; i++)
+			;
+		out = list_nth(sp->args, i);
+		if (r != p)
+		{
+			RelabelType *rt = copyObject((RelabelType *) r);
+
+			rt->arg = (Expr *) out;
+			out = (Node *) rt;
+		}
+		outer = lappend(outer, out);
+		inner = lappend(inner, in);
+		ops = lappend_oid(ops, op->opno);
+		collations = lappend_oid(collations, op->inputcollid);
+	}
+	if (inner == NIL)
+		return "correlated scalar subquery correlated other than by =";
+
+	/*
+	 * The filter, of no conditions left, outputs the inner sides after its
+	 * columns; the aggregate groups by them, outputting them and then the
+	 * value; the Result over it reads them.
+	 */
+	nkeys = list_length(inner);
+	ncols = list_length(filter->plan.targetlist);
+	rows = palloc(sizeof(Result));
+	memcpy(rows, filter, sizeof(Result));
+	rows->plan.qual = NIL;
+	rows->plan.targetlist = list_copy(filter->plan.targetlist);
+	foreach(lc, inner)
+		rows->plan.targetlist = lappend(rows->plan.targetlist,
+										makeTargetEntry(copyObject(lfirst(lc)),
+														ncols + foreach_current_index(lc) + 1,
+														NULL, false));
+	grouped = palloc(sizeof(Agg));
+	memcpy(grouped, agg, sizeof(Agg));
+	grouped->aggstrategy = AGG_HASHED;
+	grouped->numCols = nkeys;
+	grouped->grpColIdx = palloc(sizeof(AttrNumber) * nkeys);
+	grouped->grpOperators = palloc(sizeof(Oid) * nkeys);
+	grouped->grpCollations = palloc(sizeof(Oid) * nkeys);
+	grouped->plan.lefttree = (Plan *) rows;
+	grouped->plan.targetlist = NIL;
+	top = makeNode(Result);
+	top->plan.plan_node_id = plan->plan_node_id;
+	top->plan.lefttree = (Plan *) grouped;
+	for (k = 0; k < nkeys; k++)
+	{
+		Node	   *key = list_nth(inner, k);
+		Var		   *v;
+
+		grouped->grpColIdx[k] = ncols + k + 1;
+		grouped->grpOperators[k] = list_nth_oid(ops, k);
+		grouped->grpCollations[k] = list_nth_oid(collations, k);
+		v = makeVar(OUTER_VAR, ncols + k + 1, exprType(key), exprTypmod(key),
+					exprCollation(key), 0);
+		grouped->plan.targetlist = lappend(grouped->plan.targetlist,
+										   makeTargetEntry((Expr *) v, k + 1, NULL, false));
+		v = makeVar(OUTER_VAR, k + 1, exprType(key), exprTypmod(key), exprCollation(key), 0);
+		top->plan.targetlist = lappend(top->plan.targetlist,
+									   makeTargetEntry((Expr *) v, k + 1, NULL, false));
+	}
+	grouped->plan.targetlist = lappend(grouped->plan.targetlist,
+									   makeTargetEntry(copyObject(value->expr), nkeys + 1,
+													   NULL, false));
+
+	*corr = palloc0(sizeof(DfCorrelated));
+	(*corr)->sp = sp;
+	(*corr)->agg = grouped;
+	(*corr)->top = top;
+	(*corr)->outer = outer;
+	foreach(lc, top->plan.targetlist)
+		(*corr)->inner = lappend((*corr)->inner, lfirst_node(TargetEntry, lc)->expr);
+	(*corr)->value = (Node *) makeVar(OUTER_VAR, nkeys + 1, exprType((Node *) call),
+									  exprTypmod((Node *) call), exprCollation((Node *) call), 0);
+	top->plan.targetlist = lappend(top->plan.targetlist,
+								   makeTargetEntry((Expr *) (*corr)->value, nkeys + 1,
+												   NULL, false));
+	if (strcmp(get_func_name(call->aggfnoid), "count") == 0)
+	{
+		/* count of no rows */
+		CoalesceExpr *ce = makeNode(CoalesceExpr);
+
+		ce->coalescetype = INT8OID;
+		ce->args = list_make2((*corr)->value,
+							  makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+										Int64GetDatum(0), false, FLOAT8PASSBYVAL));
+		ce->location = -1;
+		(*corr)->value = (Node *) ce;
 	}
 	return NULL;
 }
@@ -2381,12 +2623,91 @@ static bool
 df_subplan_value(Node *node, Plan **top, Node **value)
 {
 	TargetEntry *tle;
+	DfCorrelated *corr;
 
-	if (!IsA(node, SubPlan) ||
-		df_subplan_scalar(df_numeric_stmt, (SubPlan *) node, top, &tle) != NULL)
+	if (!IsA(node, SubPlan))
 		return false;
-	*value = (Node *) tle->expr;
+	if (df_subplan_scalar(df_numeric_stmt, (SubPlan *) node, top, &tle) == NULL)
+	{
+		*value = (Node *) tle->expr;
+		return true;
+	}
+	/* SC1: the grouped aggregate's, joined */
+	if (df_subplan_correlated(df_numeric_stmt, (SubPlan *) node, &corr) != NULL)
+		return false;
+	*top = (Plan *) corr->top;
+	*value = corr->value;
 	return true;
+}
+
+/*
+ * SC1: may the Seq Scan being checked join its rows to correlated scalar
+ * subquery 'corr' grouped (df_subplan_correlated)?  Its outer sides are
+ * the scan's expressions, compared with the inner ones as = compares
+ * them: keys of one type, integers of two widths, strings under a
+ * deterministic collation.  The grouped aggregate is a node below a join,
+ * read by name (A1).
+ */
+static void
+df_check_correlated(DfCheckContext *cxt, DfCorrelated *corr)
+{
+	DfCheckContext saved = *cxt;
+	ListCell   *lo,
+			   *li;
+	bool		failed;
+	bool		locale_dependent;
+
+	forboth(lo, corr->outer, li, corr->inner)
+	{
+		Oid			ot = exprType(lfirst(lo));
+		Oid			it = exprType(lfirst(li));
+		Oid			type = df_join_key_type(ot, it);
+		const char *problem;
+
+		if (!df_type_supported(type) || type == NUMERICOID || type == FLOAT4OID ||
+			type == FLOAT8OID)
+		{
+			df_reject(cxt, "correlated scalar subquery by = on %s and %s",
+					  format_type_be(ot), format_type_be(it));
+			return;
+		}
+		if (df_type_is_string(type) &&
+			(problem = df_string_compare_problem(cxt, "=",
+												 corr->agg->grpCollations[foreach_current_index(lo)])) != NULL)
+		{
+			df_reject(cxt, "correlated scalar subquery by = on %s %s",
+					  format_type_be(type), problem);
+			return;
+		}
+		if (df_check_expr(lfirst(lo), cxt))
+			return;
+	}
+
+	/* the grouped aggregate, as a node below a join */
+	cxt->allow_aggref = false;
+	cxt->agg_sets = false;
+	cxt->agg_input = false;
+	cxt->join_input = true;
+	cxt->window_input = false;
+	cxt->union_input = false;
+	cxt->window = NULL;
+	cxt->inner_agg = false;
+	cxt->projection_input = false;
+	cxt->whole_aggs = NIL;
+	cxt->rowid_ok = false;
+	cxt->correlated_ok = false;
+	cxt->batch_sender = false;
+	cxt->mixed_scales_ok = NULL;
+	cxt->numeric_param_ok = NULL;
+	cxt->top = NULL;
+	cxt->output = NULL;
+	cxt->order_free = true;
+	df_check_plan((Plan *) corr->agg, cxt, NULL, false);
+	failed = cxt->failed;
+	locale_dependent = cxt->locale_dependent;
+	*cxt = saved;
+	cxt->failed = failed;
+	cxt->locale_dependent = locale_dependent;
 }
 
 /* Expression walker: returns true to stop at the first unsupported node. */
@@ -2961,8 +3282,18 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					Plan	   *top;
 					TargetEntry *tle;
 
-					if ((problem = df_subplan_scalar(cxt->stmt, sp, &top, &tle)) != NULL)
+					DfCorrelated *corr;
+
+					if ((problem = df_subplan_scalar(cxt->stmt, sp, &top, &tle)) == NULL)
+						return false;
+					if (sp->parParam == NIL)
 						df_reject(cxt, "%s", problem);
+					else if ((problem = df_subplan_correlated(cxt->stmt, sp, &corr)) != NULL)
+						df_reject(cxt, "%s", problem);
+					else if (!cxt->correlated_ok)
+						df_reject(cxt, "correlated scalar subquery other than in a scan's filter");
+					else
+						df_check_correlated(cxt, corr);
 					return cxt->failed;
 				}
 				problem = df_subplan_in_set(cxt->stmt, sp, &arg);
@@ -3695,11 +4026,18 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 	{
 		case T_SubPlan:
 			{
-				/* SP2: its row is PostgreSQL's tuple, which carries it */
+				/*
+				 * SP2: its row is PostgreSQL's tuple, which carries it; SC1:
+				 * the grouped aggregate's, as of any aggregate
+				 */
 				Plan	   *top;
 				Node	   *value;
+				TargetEntry *tle;
 
-				return df_subplan_value(expr, &top, &value);
+				if (df_subplan_scalar(df_numeric_stmt, (SubPlan *) expr, &top, &tle) == NULL)
+					return true;
+				return df_subplan_value(expr, &top, &value) &&
+					df_dscale_ok(top, value, batches);
 			}
 		case T_Var:
 			{
@@ -5043,7 +5381,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->rowid_ok = true;
 				df_check_targetlist(plan->targetlist, needed, cxt);
 				cxt->rowid_ok = false;
+				cxt->correlated_ok = true;
 				df_check_expr_list(plan->qual, cxt);
+				cxt->correlated_ok = false;
 				return;
 			}
 

@@ -248,6 +248,23 @@ extern Plan *df_subplan_rows(PlannedStmt *stmt, SubPlan *sp);
 extern const char *df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg);
 extern const char *df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top,
 									 TargetEntry **tle);
+
+/*
+ * SC1: a correlated scalar subquery, an aggregate of rows equal to the
+ * outer row on some keys, as that aggregate grouped by those keys and
+ * joined to the outer rows (df_subplan_correlated)
+ */
+typedef struct DfCorrelated
+{
+	SubPlan    *sp;
+	Agg		   *agg;			/* the aggregate, grouped by the keys */
+	Result	   *top;			/* over it, the node its columns are read in */
+	List	   *outer;			/* the outer row's side of each key */
+	List	   *inner;			/* the subquery's side, a Var over 'top' */
+	Node	   *value;			/* the subquery's value, over 'top' */
+} DfCorrelated;
+extern const char *df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp,
+										 DfCorrelated **corr);
 /* AVG1: does it depend on an avg returning numeric (of an output column)? */
 extern bool df_numeric_varying(Plan *ctx, Node *expr);
 extern bool df_output_varying(Plan *ctx, Node *expr);
