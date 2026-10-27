@@ -738,6 +738,170 @@ SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
  19996 |         -10249.48 |              61234567.4052345232 | -0.80003
 (9 rows)
 
+-- Conditions on cheap columns checked first (LM1): the filter right above
+-- a PAX scan has its conditions on integer and date columns evaluated on
+-- each decoded chunk before the other columns are built, which are then
+-- converted for the rows that pass only.  Chunks of 1000 rows where all,
+-- some and no rows pass; NULLs in the cheap columns; OR, NOT and IS NULL
+-- among the cheap conditions, and an OR mixing them with a numeric one,
+-- which is not cheap.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_lm (id int, k int2, dt date, a numeric(15,2), t text) USING pax DISTRIBUTED BY (id);
+INSERT INTO df_pd_lm SELECT i,
+  CASE WHEN i % 23 = 0 THEN NULL ELSE (i % 10)::int2 END,
+  CASE WHEN i % 29 = 0 THEN NULL ELSE date '2020-01-01' + i / 1000 END,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 2001 - 1000) * 0.25 END,
+  CASE WHEN i % 37 = 0 THEN NULL ELSE 'v' || i END
+FROM generate_series(1, 30000) i;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
+ count | count |    sum    |  min   |  max  
+-------+-------+-----------+--------+-------
+  4164 |  4164 | 521130.00 | v10003 | v9995
+(1 row)
+
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE dt >= date '2020-01-08' AND dt < date '2020-01-11' AND a IS NOT NULL;
+ count |   sum    |  max  
+-------+----------+-------
+  2804 | 15732.00 | v9999
+(1 row)
+
+SELECT count(*), sum(a), min(t) FROM df_pd_lm WHERE (k = 1 OR k IS NULL) AND NOT (dt < date '2020-01-20') AND a < 100;
+ count |    sum    |  min   
+-------+-----------+--------
+   995 | -72388.25 | v19001
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_lm WHERE k <> 2 AND id > k * 1000 AND a > 0;
+ count |    sum     
+-------+------------
+ 10527 | 1318019.25
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_lm WHERE id >= k AND (k = 4 OR a > 200);
+ count |    sum    
+-------+-----------
+  5371 | 563390.50
+(1 row)
+
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE k > 100 AND a > 0;
+ count | sum | max 
+-------+-----+-----
+     0 |     | 
+(1 row)
+
+SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND (a < -100 OR a IS NULL OR t IS NULL) ORDER BY id;
+  id  | k |     dt     |    a    |   t   
+------+---+------------+---------+-------
+ 7037 | 7 | 01-08-2020 |         | v7037
+ 7067 | 7 | 01-08-2020 |  111.25 | 
+ 7147 | 7 | 01-08-2020 | -249.00 | v7147
+ 7157 | 7 | 01-08-2020 | -231.50 | v7157
+ 7167 | 7 | 01-08-2020 | -214.00 | v7167
+ 7177 | 7 | 01-08-2020 | -196.50 | v7177
+ 7187 | 7 | 01-08-2020 | -179.00 | v7187
+ 7197 | 7 | 01-08-2020 | -161.50 | v7197
+ 7207 | 7 | 01-08-2020 | -144.00 | v7207
+ 7217 | 7 | 01-08-2020 | -126.50 | v7217
+ 7227 | 7 | 01-08-2020 | -109.00 | v7227
+ 7347 | 7 | 01-08-2020 |         | v7347
+ 7437 | 7 | 01-08-2020 | -241.75 | 
+ 7447 | 7 | 01-08-2020 | -224.25 | v7447
+ 7457 | 7 | 01-08-2020 | -206.75 | v7457
+ 7467 | 7 | 01-08-2020 | -189.25 | v7467
+ 7477 | 7 | 01-08-2020 | -171.75 | v7477
+ 7487 | 7 | 01-08-2020 | -154.25 | v7487
+ 7497 | 7 | 01-08-2020 | -136.75 | v7497
+ 7507 | 7 | 01-08-2020 | -119.25 | v7507
+ 7517 | 7 | 01-08-2020 | -101.75 | v7517
+ 7657 | 7 | 01-08-2020 |         | v7657
+ 7727 | 7 | 01-08-2020 | -234.50 | v7727
+ 7737 | 7 | 01-08-2020 | -217.00 | v7737
+ 7747 | 7 | 01-08-2020 | -199.50 | v7747
+ 7757 | 7 | 01-08-2020 | -182.00 | v7757
+ 7767 | 7 | 01-08-2020 | -164.50 | v7767
+ 7777 | 7 | 01-08-2020 | -147.00 | v7777
+ 7787 | 7 | 01-08-2020 | -129.50 | v7787
+ 7807 | 7 | 01-08-2020 |  -94.50 | 
+ 7967 | 7 | 01-08-2020 |         | v7967
+(31 rows)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
+ count | count |    sum    |  min   |  max  
+-------+-------+-----------+--------+-------
+  4164 |  4164 | 521130.00 | v10003 | v9995
+(1 row)
+
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE dt >= date '2020-01-08' AND dt < date '2020-01-11' AND a IS NOT NULL;
+ count |   sum    |  max  
+-------+----------+-------
+  2804 | 15732.00 | v9999
+(1 row)
+
+SELECT count(*), sum(a), min(t) FROM df_pd_lm WHERE (k = 1 OR k IS NULL) AND NOT (dt < date '2020-01-20') AND a < 100;
+ count |    sum    |  min   
+-------+-----------+--------
+   995 | -72388.25 | v19001
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_lm WHERE k <> 2 AND id > k * 1000 AND a > 0;
+ count |    sum     
+-------+------------
+ 10527 | 1318019.25
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_lm WHERE id >= k AND (k = 4 OR a > 200);
+ count |    sum    
+-------+-----------
+  5371 | 563390.50
+(1 row)
+
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE k > 100 AND a > 0;
+ count | sum | max 
+-------+-----+-----
+     0 |     | 
+(1 row)
+
+SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND (a < -100 OR a IS NULL OR t IS NULL) ORDER BY id;
+  id  | k |     dt     |    a    |   t   
+------+---+------------+---------+-------
+ 7037 | 7 | 01-08-2020 |         | v7037
+ 7067 | 7 | 01-08-2020 |  111.25 | 
+ 7147 | 7 | 01-08-2020 | -249.00 | v7147
+ 7157 | 7 | 01-08-2020 | -231.50 | v7157
+ 7167 | 7 | 01-08-2020 | -214.00 | v7167
+ 7177 | 7 | 01-08-2020 | -196.50 | v7177
+ 7187 | 7 | 01-08-2020 | -179.00 | v7187
+ 7197 | 7 | 01-08-2020 | -161.50 | v7197
+ 7207 | 7 | 01-08-2020 | -144.00 | v7207
+ 7217 | 7 | 01-08-2020 | -126.50 | v7217
+ 7227 | 7 | 01-08-2020 | -109.00 | v7227
+ 7347 | 7 | 01-08-2020 |         | v7347
+ 7437 | 7 | 01-08-2020 | -241.75 | 
+ 7447 | 7 | 01-08-2020 | -224.25 | v7447
+ 7457 | 7 | 01-08-2020 | -206.75 | v7457
+ 7467 | 7 | 01-08-2020 | -189.25 | v7467
+ 7477 | 7 | 01-08-2020 | -171.75 | v7477
+ 7487 | 7 | 01-08-2020 | -154.25 | v7487
+ 7497 | 7 | 01-08-2020 | -136.75 | v7497
+ 7507 | 7 | 01-08-2020 | -119.25 | v7507
+ 7517 | 7 | 01-08-2020 | -101.75 | v7517
+ 7657 | 7 | 01-08-2020 |         | v7657
+ 7727 | 7 | 01-08-2020 | -234.50 | v7727
+ 7737 | 7 | 01-08-2020 | -217.00 | v7737
+ 7747 | 7 | 01-08-2020 | -199.50 | v7747
+ 7757 | 7 | 01-08-2020 | -182.00 | v7757
+ 7767 | 7 | 01-08-2020 | -164.50 | v7767
+ 7777 | 7 | 01-08-2020 | -147.00 | v7777
+ 7787 | 7 | 01-08-2020 | -129.50 | v7787
+ 7807 | 7 | 01-08-2020 |  -94.50 | 
+ 7967 | 7 | 01-08-2020 |         | v7967
+(31 rows)
+
 -- Several inputs in one slice (C3): each PAX scan is read directly, the
 -- others through the table AM or their Motion; here two PAX tables joined
 -- on their distribution key, and one joined with a heap table.
@@ -864,6 +1028,6 @@ SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id =
 (1 row)
 
 RESET datafusion.motion_batches;
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap, df_pd_lm;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -182,12 +182,15 @@ use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::functions_aggregate::expr_fn::{avg, bool_or, count, max, min, sum};
 use datafusion::functions_window::expr_fn::{dense_rank, rank, row_number};
+use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr::WindowFunction;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{
     binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, GroupingSet, LogicalPlanBuilder,
     Operator, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
 };
+use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
 use datafusion::physical_plan::execute_stream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::streaming::PartitionStream;
@@ -1271,6 +1274,22 @@ pub struct PaxScan {
     /// true once the scan has ended (`close`); held shared by a partition
     /// calling into the scan, exclusively to end it
     ended: std::sync::RwLock<bool>,
+    /// LM1: conditions the reader checks before building the other columns
+    prefilter: Option<PaxPrefilter>,
+}
+
+/// LM1: conditions of the filter right above a PAX input on columns cheap
+/// to build (`cheap_conjuncts`), evaluated on each decoded chunk before
+/// its other columns are built, which are then built for the rows that
+/// pass only.  A numeric costs a conversion per value: in TPC-DS Q28's
+/// scans of store_sales ss_quantity alone keeps 5% of the rows.  The filter
+/// above still checks every condition of the rows that pass.
+struct PaxPrefilter {
+    /// the input columns the conditions read, ascending
+    cols: Vec<usize>,
+    /// their fields, which the expression's columns index
+    schema: SchemaRef,
+    expr: Arc<dyn PhysicalExpr>,
 }
 
 /// What the PAX scans of one query share: the account their decoding
@@ -1367,6 +1386,7 @@ impl PaxScan {
             shared: Arc::new(PaxShared::new(0)),
             max_readers: 0,
             ended: std::sync::RwLock::new(false),
+            prefilter: None,
         }
     }
 
@@ -1541,27 +1561,61 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
     let ctx = &mut *(ctx as *mut EmitContext);
     let result = catch_unwind(AssertUnwindSafe(|| {
         let n = nrows as usize;
+        let raw = |i: usize| {
+            let c = *cols.add(i);
+            RawColumn {
+                values: c.values,
+                nulls: c.nulls,
+                offsets: c.offsets,
+            }
+        };
+        let internal = |e: DataFusionError| PgError::internal(e.to_string());
+        let mut built: Vec<Option<ArrayRef>> = vec![None; ctx.types.len()];
+        // LM1: the rows that pass the cheap conditions, when not all do
+        let mut rows: Option<Vec<u32>> = None;
+        if let Some(p) = &ctx.scan.prefilter {
+            for &i in &p.cols {
+                built[i] = Some(build_array(ctx.types[i], raw(i), n)?);
+            }
+            let arrays = p.cols.iter().map(|&i| built[i].clone().unwrap()).collect();
+            let mask = p
+                .expr
+                .evaluate(&make_batch(&p.schema, arrays, n)?)
+                .and_then(|v| v.into_array(n))
+                .map_err(internal)?;
+            let mask = mask.as_boolean();
+            let keep: Vec<u32> = (0..n)
+                .filter(|&r| mask.is_valid(r) && mask.value(r))
+                .map(|r| r as u32)
+                .collect();
+            if keep.is_empty() {
+                return Ok(None);
+            }
+            if keep.len() < n {
+                rows = Some(keep);
+            }
+        }
+        let rows_array = rows.as_ref().map(|r| UInt32Array::from(r.clone()));
         let arrays = ctx
             .types
             .iter()
             .enumerate()
-            .map(|(i, ty)| {
-                let c = *cols.add(i);
-                let raw = RawColumn {
-                    values: c.values,
-                    nulls: c.nulls,
-                    offsets: c.offsets,
-                };
-                build_array(*ty, raw, n)
+            .map(|(i, ty)| match (built[i].take(), &rows_array) {
+                (Some(a), None) => Ok(a),
+                (Some(a), Some(r)) => {
+                    take(a.as_ref(), r, None).map_err(|e| PgError::internal(e.to_string()))
+                }
+                (None, _) => build_array_rows(*ty, raw(i), n, rows.as_deref()),
             })
             .collect::<Result<Vec<ArrayRef>, PgError>>()?;
-        make_batch(&ctx.schema, arrays, n)
+        make_batch(&ctx.schema, arrays, rows.as_ref().map_or(n, Vec::len)).map(Some)
     }));
     match result {
-        Ok(Ok(batch)) => {
+        Ok(Ok(Some(batch))) => {
             ctx.scan.push_batch(batch);
             0
         }
+        Ok(Ok(None)) => 0,
         Ok(Err(e)) => {
             ctx.error = Some(e.message);
             1
@@ -1913,6 +1967,140 @@ fn window(
         cols.push(value.alias(format!("{name}_w{i}")));
     }
     b.window(calls).map_err(df)?.project(cols).map_err(df)
+}
+
+/// LM1: the predicate of each filter right above an input, by input.
+fn input_filters<'a>(v: &'a Value, out: &mut HashMap<usize, &'a Value>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(f) = m.get("filter") {
+                if let (Some(Value::Object(i)), Some(pred)) = (f.get("input"), f.get("pred")) {
+                    if let (1, Some(j)) = (i.len(), i.get("input").and_then(Value::as_u64)) {
+                        out.insert(j as usize, pred);
+                    }
+                }
+            }
+            m.values().for_each(|x| input_filters(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| input_filters(x, out)),
+        _ => {}
+    }
+}
+
+/// LM1: the type of a column of input `j` or a literal, if it is one
+/// cheap to build and compare: an integer or a date.
+fn cheap_operand(v: &Value, j: usize, types: &[PgType]) -> Option<PgType> {
+    let ty = if let Some(k) = v.get("col") {
+        if v.get("input").map_or(Some(0), Value::as_u64)? as usize != j {
+            return None;
+        }
+        *types.get(k.as_u64()? as usize)?
+    } else {
+        PgType::parse(v.get("lit")?.get("type")?.as_str()?).ok()?
+    };
+    matches!(
+        ty,
+        PgType::Int2 | PgType::Int4 | PgType::Int8 | PgType::Date
+    )
+    .then_some(ty)
+}
+
+/// LM1: is `v` a condition on cheap columns of input `j` (`cheap_operand`)
+/// that cannot fail: comparisons of a column with a column or a literal
+/// of its own type, IS [NOT] NULL of one, and AND, OR and NOT of those?
+fn cheap_condition(v: &Value, j: usize, types: &[PgType]) -> bool {
+    if let Some(op) = v.get("op").and_then(Value::as_str) {
+        let Some(args) = v.get("args").and_then(Value::as_array) else {
+            return false;
+        };
+        return comparison(op).is_some()
+            && v.get("collate").is_none()
+            && args.len() == 2
+            && args.iter().any(|a| a.get("col").is_some())
+            && matches!(
+                (cheap_operand(&args[0], j, types), cheap_operand(&args[1], j, types)),
+                (Some(a), Some(b)) if a == b
+            );
+    }
+    if let Some(xs) = v
+        .get("and")
+        .or_else(|| v.get("or"))
+        .and_then(Value::as_array)
+    {
+        return !xs.is_empty() && xs.iter().all(|x| cheap_condition(x, j, types));
+    }
+    if let Some(x) = v.get("not") {
+        return cheap_condition(x, j, types);
+    }
+    match v.get("isnull").or_else(|| v.get("isnotnull")) {
+        Some(x) => x.get("col").is_some() && cheap_operand(x, j, types).is_some(),
+        None => false,
+    }
+}
+
+/// LM1: the conditions of `pred`, ANDed at its top, that are cheap
+/// (`cheap_condition`).  A row failing one fails `pred`.
+fn cheap_conjuncts<'a>(pred: &'a Value, j: usize, types: &[PgType], out: &mut Vec<&'a Value>) {
+    match pred.get("and").and_then(Value::as_array) {
+        Some(xs) => xs.iter().for_each(|x| cheap_conjuncts(x, j, types, out)),
+        None if cheap_condition(pred, j, types) => out.push(pred),
+        None => {}
+    }
+}
+
+fn spec_columns(v: &Value, out: &mut Vec<usize>) {
+    match v {
+        Value::Object(m) => {
+            if let Some(k) = m.get("col").and_then(Value::as_u64) {
+                out.push(k as usize);
+            }
+            m.values().for_each(|x| spec_columns(x, out));
+        }
+        Value::Array(a) => a.iter().for_each(|x| spec_columns(x, out)),
+        _ => {}
+    }
+}
+
+/// LM1: what the reader of PAX input `j` (columns `types`, fields
+/// `schema`) checks first, given the predicate of the filter right above
+/// it; nothing when every column is cheap anyway.
+fn pax_prefilter(
+    pred: &Value,
+    j: usize,
+    types: &[PgType],
+    schema: &SchemaRef,
+) -> Result<Option<PaxPrefilter>, String> {
+    let df = |e: DataFusionError| e.to_string();
+    let mut conjuncts = Vec::new();
+    cheap_conjuncts(pred, j, types, &mut conjuncts);
+    let mut cols = Vec::new();
+    conjuncts.iter().for_each(|c| spec_columns(c, &mut cols));
+    cols.sort_unstable();
+    cols.dedup();
+    if conjuncts.is_empty() || cols.len() == types.len() {
+        return Ok(None);
+    }
+    let e = conjuncts
+        .iter()
+        .map(|c| expr(c))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .reduce(Expr::and)
+        .unwrap();
+    let sub: SchemaRef = Arc::new(schema.project(&cols).map_err(|e| e.to_string())?);
+    let dfschema = DFSchema::try_from(sub.as_ref().clone()).map_err(df)?;
+    let expr = create_physical_expr(
+        &e,
+        &dfschema,
+        &ExecutionProps::new(),
+        &PhysicalPlanningContext::default(),
+    )
+    .map_err(df)?;
+    Ok(Some(PaxPrefilter {
+        cols,
+        schema: sub,
+        expr,
+    }))
 }
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
@@ -2531,6 +2719,8 @@ impl Query {
         }
 
         let plan_node = field(&spec, "plan").map_err(internal)?.clone();
+        let mut filters = HashMap::new();
+        input_filters(&plan_node, &mut filters);
         let consumers = memory_consumers(&plan_node) + usize::from(has_full_sort(&spec));
         let partitions = if consumers > 0 {
             partitions
@@ -2640,6 +2830,10 @@ impl Query {
                 Source::Pax(mut scan) => {
                     if let Some(shared) = &pax_shared {
                         scan.shared = shared.clone();
+                    }
+                    if let Some(pred) = filters.get(&j) {
+                        scan.prefilter =
+                            pax_prefilter(pred, j, &in_types[j], &schema).map_err(internal)?;
                     }
                     let scan = Arc::new(scan);
                     pax_scans.push(scan.clone());
@@ -3325,26 +3519,7 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
         PgType::Int8 => primitive::<Int64Type>(c, n, nulls),
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
-        PgType::Numeric(s) if !c.offsets.is_null() => {
-            // PostgreSQL's representation, as the direct PAX reader hands it
-            // out (C2): each row's bytes after the varlena header
-            let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
-            let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
-            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
-            let values = (0..n)
-                .map(|r| {
-                    if null_bytes[r] != 0 {
-                        return Ok(datafusion::arrow::datatypes::i256::ZERO);
-                    }
-                    let row = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
-                    crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)
-                })
-                .collect::<Result<Vec<_>, PgError>>()?;
-            Arc::new(
-                PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
-                    .with_data_type(crate::pgnum::numeric_type(s)),
-            )
-        }
+        PgType::Numeric(s) if !c.offsets.is_null() => numeric_rows(c, n, s, 0..n, nulls)?,
         PgType::Numeric(s) => {
             // 32 little-endian bytes each; palloc aligns to 8 only.
             let p = c.values as *const [u8; 32];
@@ -3362,6 +3537,75 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
         }
         _ => unreachable!(),
     })
+}
+
+/// A numeric array of rows `rows` of `n` in PostgreSQL's representation, as
+/// the direct PAX reader hands it out (C2): each row's bytes after the
+/// varlena header.
+///
+/// # Safety
+/// As `build_array`'s.
+unsafe fn numeric_rows(
+    c: RawColumn,
+    n: usize,
+    s: i8,
+    rows: impl Iterator<Item = usize>,
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef, PgError> {
+    let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
+    let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
+    let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+    let values = rows
+        .map(|r| {
+            if null_bytes[r] != 0 {
+                return Ok(datafusion::arrow::datatypes::i256::ZERO);
+            }
+            let row = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
+            crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)
+        })
+        .collect::<Result<Vec<_>, PgError>>()?;
+    Ok(Arc::new(
+        PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
+            .with_data_type(crate::pgnum::numeric_type(s)),
+    ))
+}
+
+/// `build_array` of rows `rows` (ascending) of the `n` only, or of all.
+/// LM1: a numeric is converted for those rows only; the others are built
+/// whole and the rows taken.
+///
+/// # Safety
+/// As `build_array`'s.
+unsafe fn build_array_rows(
+    ty: PgType,
+    c: RawColumn,
+    n: usize,
+    rows: Option<&[u32]>,
+) -> Result<ArrayRef, PgError> {
+    let Some(rows) = rows else {
+        return build_array(ty, c, n);
+    };
+    match ty.storage() {
+        PgType::Numeric(s) if !c.offsets.is_null() => {
+            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+            let nulls = if rows.iter().any(|&r| null_bytes[r as usize] != 0) {
+                Some(NullBuffer::from(
+                    rows.iter()
+                        .map(|&r| null_bytes[r as usize] == 0)
+                        .collect::<Vec<bool>>(),
+                ))
+            } else {
+                None
+            };
+            numeric_rows(c, n, s, rows.iter().map(|&r| r as usize), nulls)
+        }
+        _ => take(
+            build_array(ty, c, n)?.as_ref(),
+            &UInt32Array::from(rows.to_vec()),
+            None,
+        )
+        .map_err(|e| PgError::internal(e.to_string())),
+    }
 }
 
 #[cfg(test)]

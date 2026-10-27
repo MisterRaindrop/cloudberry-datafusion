@@ -251,6 +251,20 @@ micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
 and filtered on one thread, slower than through the table AM; on one
 segment it now takes 23 ms against 32 ms through the table AM.
 
+Conditions on cheap columns come first (LM1).  Converting a numeric costs
+far more than copying an integer, and a scan converted every row's
+numerics before the filter above it saw any: under TPC-DS Q28's
+`ss_quantity between 0 and 5 and (ss_list_price between 139 and 149 or
+ss_coupon_amt ... or ss_wholesale_cost ...)` each numeric column cost
+DataFusion about 70 ms of CPU over store_sales at scale factor 1, against
+30 ms for PostgreSQL, which compares the numerics of the 5% of rows
+`ss_quantity` lets through only.  Now the conditions of the filter right
+above a PAX scan that compare integer or date columns with each other or
+with literals of their own type (and AND, OR, NOT and IS NULL of those),
+which cannot fail, are evaluated on each decoded piece first; the other
+columns are built for the rows that pass only, a numeric converted for
+those rows alone.  The filter still checks all its conditions on them.
+
 The query ends its scans on the main thread as it is released, once any
 partition's call into a scan has returned; partitions then find nothing
 left.  The scan used to end when its last partition let it go: where a
@@ -594,6 +608,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
+| LM1 | Direct PAX reader: conditions on integer and date columns first, other columns built for the rows that pass |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | CL1 | Strings ordered by the default collation where it is C on every node |

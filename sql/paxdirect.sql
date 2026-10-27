@@ -117,6 +117,41 @@ SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d
 SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_vnum;
 SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
 
+-- Conditions on cheap columns checked first (LM1): the filter right above
+-- a PAX scan has its conditions on integer and date columns evaluated on
+-- each decoded chunk before the other columns are built, which are then
+-- converted for the rows that pass only.  Chunks of 1000 rows where all,
+-- some and no rows pass; NULLs in the cheap columns; OR, NOT and IS NULL
+-- among the cheap conditions, and an OR mixing them with a numeric one,
+-- which is not cheap.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_lm (id int, k int2, dt date, a numeric(15,2), t text) USING pax DISTRIBUTED BY (id);
+INSERT INTO df_pd_lm SELECT i,
+  CASE WHEN i % 23 = 0 THEN NULL ELSE (i % 10)::int2 END,
+  CASE WHEN i % 29 = 0 THEN NULL ELSE date '2020-01-01' + i / 1000 END,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 2001 - 1000) * 0.25 END,
+  CASE WHEN i % 37 = 0 THEN NULL ELSE 'v' || i END
+FROM generate_series(1, 30000) i;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE dt >= date '2020-01-08' AND dt < date '2020-01-11' AND a IS NOT NULL;
+SELECT count(*), sum(a), min(t) FROM df_pd_lm WHERE (k = 1 OR k IS NULL) AND NOT (dt < date '2020-01-20') AND a < 100;
+SELECT count(*), sum(a) FROM df_pd_lm WHERE k <> 2 AND id > k * 1000 AND a > 0;
+SELECT count(*), sum(a) FROM df_pd_lm WHERE id >= k AND (k = 4 OR a > 200);
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE k > 100 AND a > 0;
+SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND (a < -100 OR a IS NULL OR t IS NULL) ORDER BY id;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE dt >= date '2020-01-08' AND dt < date '2020-01-11' AND a IS NOT NULL;
+SELECT count(*), sum(a), min(t) FROM df_pd_lm WHERE (k = 1 OR k IS NULL) AND NOT (dt < date '2020-01-20') AND a < 100;
+SELECT count(*), sum(a) FROM df_pd_lm WHERE k <> 2 AND id > k * 1000 AND a > 0;
+SELECT count(*), sum(a) FROM df_pd_lm WHERE id >= k AND (k = 4 OR a > 200);
+SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE k > 100 AND a > 0;
+SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND (a < -100 OR a IS NULL OR t IS NULL) ORDER BY id;
+
 -- Several inputs in one slice (C3): each PAX scan is read directly, the
 -- others through the table AM or their Motion; here two PAX tables joined
 -- on their distribution key, and one joined with a heap table.
@@ -134,6 +169,6 @@ SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = 
 SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap, df_pd_lm;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
