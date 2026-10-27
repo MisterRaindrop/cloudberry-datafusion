@@ -225,7 +225,9 @@ SET datafusion.mode = off;
 -- Q23 and Q44 under the Postgres planner): a constant of the digits and
 -- scale of its init plan's value, its display scale its own; NULL and NaN
 -- as they are.  One of unknown digits (an unconstrained numeric's max)
--- stays on PostgreSQL.
+-- stays on PostgreSQL.  Without sorted grouping the HAVING stays below the
+-- Gather in a slice of its own, whichever plan ANALYZE's sample favours.
+SET enable_groupagg = off;
 SET datafusion.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, avg(a) FROM df_nc GROUP BY g HAVING avg(a) > 0.9 * (SELECT avg(a) FROM df_nc WHERE id > 0) ORDER BY g;
 EXPLAIN (COSTS OFF) SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELECT avg(a) FROM df_nc WHERE id > 0)
@@ -249,6 +251,7 @@ SELECT id, CASE WHEN (SELECT count(*) FROM df_nc WHERE id > 0) > 100 THEN (SELEC
 SELECT count(*) FROM df_nc WHERE a < 2 * (SELECT avg(a) FROM df_nc WHERE id < -100);
 SELECT count(*) FROM df_nc WHERE b < 0.5 * (SELECT avg(a) FROM df_nc);
 SET datafusion.mode = off;
+RESET enable_groupagg;
 
 -- + - * (N3), with the scales of numeric.c, up to 76 digits (c * c)
 SELECT id, a + b, a - b, a * b, a * 2, 1 - a, a * 0.5, c * c, d * d, a + id
