@@ -53,6 +53,12 @@
 
 #define DF_MSG_BUFLEN 1024
 
+/*
+ * Version of the plan IR df_ffi_query_start reads (docs/ir.md): the "ir"
+ * member of every plan.  Rust's query::IR_VERSION must match.
+ */
+#define DF_IR_VERSION 1
+
 #include <stdbool.h>
 
 extern int32_t df_ffi_version(char *buf, size_t buflen);

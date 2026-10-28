@@ -23,132 +23,9 @@
 //! directions go through bounded channels, so a slow consumer slows the
 //! producer instead of piling up memory.
 //!
-//! The plan arrives as JSON built by the C side (src/df_translate.c), as a
-//! tree over one or more inputs:
-//!
-//! ```text
-//! { "inputs":  [ { "columns": [ {"type": "int4"}, ... ],
-//!                  "motion_columns": [k, ...] }, ... ],   (motion_columns:
-//!                input from a Motion, the stream column behind each column)
-//!   "plan":    <node>,
-//!   "output":  [ {"expr": <expr>, "type": "int8"}, ... ],
-//!   "sort":    [ {"col": c, "desc": b, "nulls_first": b}, ... ],  (optional:
-//!                the order of the output, by output columns; floats as
-//!                PostgreSQL orders them, see pgfloat; {"expr": <expr>}
-//!                instead of "col": a column of the plan the output
-//!                leaves out, as the top aggregate's "gset")
-//!   "limit":   {"skip": n, "fetch": m},   (optional, after the sort; no
-//!                "fetch": all rows)
-//!   "route":   ... }                                   (as below)
-//!
-//! <node> := {"input": j}
-//!         | {"filter": {"input": <node>, "pred": <expr>}}
-//!         | {"aggregate": {"input": <node>, "group": [<expr>...],
-//!                          "aggs": [...], "having": <expr> | null,
-//!                          "name": s}}   (name: an aggregate below a join
-//!                          or another aggregate, its columns s_g<i> and
-//!                          s_a<i>; "sets": [[k, ...], ...], optional: the
-//!                          grouping sets, each by indexes into "group",
-//!                          and a column "gset" (s_gset) of each row's set,
-//!                          its place in "sets")
-//!         | {"window": {"input": <node>, "partition": [<expr>...],
-//!                       "order": [{"expr": <expr>, "desc": b, "nulls_first": b}...],
-//!                       "frame": "partition" | "range" | "rows",
-//!                       "funcs": [{"fn": "rank"} | <aggregate spec>
-//!                                 | {"fn": "avg_parts", "sum": <aggregate spec>,
-//!                                    "count": <aggregate spec>}...],
-//!                       "name": s}}   (its rows with a column s_w<i> for
-//!                       each function, and s_w<i>_n for an avg's count: an
-//!                       avg's s_w<i> is its sum, WIN2; see `window`)
-//!         | {"empty": {}}   (no rows: OF1)
-//!         | {"union": {"inputs": [<node>...], "columns": [[{"expr": <expr>,
-//!                     "dscale": <expr>}...]...], "name": s}}   (UNION ALL: each
-//!                input's rows as columns s_c<k>, and s_c<k>_s for a "dscale")
-//!         | {"rowid": {"input": <node>, "name": s, "base": n}}   (its rows
-//!                with a column s of numbers unique to each, above n: Cloudberry's
-//!                RowIdExpr)
-//!         | {"join": {"type": "inner" | "left" | "right" | "full" | "leftsemi"
-//!                           | "rightsemi" | "leftanti" | "rightanti",
-//!                     "left": <node>, "right": <node>,
-//!                     "on": [[<left expr>, <right expr>], ...],
-//!                     "filter": <expr> | null}}
-//!           (an equi-join; DataFusion builds its hash table on the left,
-//!           NULL keys match nothing, or each other with "null_equal": true
-//!           (IS NOT DISTINCT FROM keys, NE1); "null_aware": true with "leftanti" and
-//!           one key is NOT IN)
-//! ```
-//!
-//! {"col": k, "input": j} is column k of input j ("input" defaults to 0);
-//! every input column has a name of its own (`input_column`), which it
-//! keeps through any node.  The single-input form below is still accepted:
-//!
-//! ```text
-//! { "scan":      { "columns": [ {"type": "int4"}, ... ],
-//!                  "motion_columns": [k, ...] },   (input from a Motion: the
-//!                  0-based Motion column behind each input column)
-//!   "filter":    <expr> | null,
-//!   "aggregate": { "group": [<expr>...], "aggs": [ {"fn": "sum", "arg": <expr>} ... ] } | null,
-//!                fn: count, sum, min, max, avg, count_merge (adds up partial
-//!                counts, 0 without rows: PostgreSQL's combining count), or
-//!                avg_merge with "arg2" (sum of arg / sum of arg2, NULL when
-//!                that is 0: combines avg states of sum and count); min and
-//!                max of strings with "collate": l order them by libc
-//!                locale l (CU2, pgcoll)
-//!   "having":    <expr> | null,
-//!   "output":    [ {"expr": <expr>, "type": "int8"}, ... ],
-//!   "route":     { "kind": "hash", "keys": [ {"col": k, "hash": "int4"}, ... ],
-//!                  "segments": n, "workers": w } }   (optional, IPC output
-//!                through a Redistribute Motion: one stream per route)
-//!
-//! <expr> := {"col": i} | {"group": i} | {"agg": i} | {"name": s}
-//!         | {"lit": {"type": t, "value": v}} | {"lit": {"type": t, "null": true}}
-//!         | {"per_set": [v, ...], "set": <expr>}   (int4 v of the set
-//!                                 <expr> names: GROUPING() and the like)
-//!         | {"op": "+", "type": t, "args": [<expr>, <expr>]}
-//!         | {"op": "<", "type": "bool", "args": [..], "collate": l}   (<, <=,
-//!                                 >, >= of strings by libc locale l: CU2)
-//!         | {"and": [...]} | {"or": [...]} | {"not": <expr>}
-//!         | {"isnull": <expr>} | {"isnotnull": <expr>}
-//!         | {"cast": <expr>, "type": t}   (a widening one: int2/4/8, float4/8)
-//!         | {"floatkey": <expr>}   (a float as PostgreSQL compares it: -0 as
-//!                                 0, NaN as the positive NaN; see pgfloat)
-//!         | {"extract": <expr>, "field": "year"}   (of a date, as numeric
-//!                                 of scale 0; see pgdate)
-//!         | {"numdiv": [<x>, <x's display scale>, <y>, <y's>], "scales": [sx, sy],
-//!            "type": "numeric:S"}   (numeric_div, as pgnum::pg_div; DN1)
-//!         | {"numdiv_scale": [...], "scales": [sx, sy]}   (its display scale, int4)
-//!         | {"greatest": [<a>, <b>]}   (the larger of two int4)
-//!         | {"numabs": <expr>}   (numeric_abs; NaN stays NaN)
-//!         | {"numround": <expr>, "from": s, "type": "numeric:S"}   (round of a
-//!                                 numeric of scale s to S, as numeric_round; RD1)
-//!         | {"dateadd": [<date>, <int4>], "sign": 1 | -1}   (date_pli,
-//!                                 date_mii: 22008 beyond the dates; DT3)
-//!         | {"assert": <expr>, "detail": s}   (true, or GPORCA's Assert's
-//!                                 error where <expr> is false: AS1)
-//!         | {"numcmp": "<" | "<=" | "=" | "<>" | ">=" | ">", "left": <side>,
-//!            "right": <side>}   (exact, of any digits: pgnum::PgNumCmp)
-//!   <side> := {"value": <expr>, "scale": s}
-//!           | {"div": [<x>, <x's display scale>, <y>, <y's>], "scales": [sx, sy]}
-//!         | {"avg_numeric": [<sum>, <count>], "scale": s, "type": "numeric:S"}
-//!                                 (numeric_avg of a sum of scale s, rounded
-//!                                 as PostgreSQL does, at scale S; pgnum)
-//!         | {"stddev_numeric": [<count>, <sum>, <sum of squares>],
-//!            "sample": b, "variance": b, "type": "numeric:S"}   (stddev or
-//!                                 variance of integers as PostgreSQL's
-//!                                 numeric_stddev_internal; STD1, pgnum)
-//!         | {"stddev_numeric_scale": [..], "sample": b, "variance": b}
-//!                                 (its display scale, int4)
-//!         | {"avg_numeric_scale": [<sum>, <count>], "scale": s}   (its display
-//!                                 scale, int4; AV2)
-//!         | {"in_set": <expr>, "set": j, "key": "plain" | "float" | "bpchar"}
-//!                                 (<expr> = ANY (the rows of input j, a
-//!                                 subquery's, marked "set": true and read
-//!                                 whole before the plan runs; pgset, SP1)
-//!         | {"scalar_of": j, "col": k}   (column k of the one row of
-//!                                 input j, a scalar subquery's, read as a
-//!                                 set's; NULL without a row, an error with
-//!                                 more than one; pgset, SP2)
-//! ```
+//! The plan arrives as JSON built by the C side (src/df_translate.c),
+//! the plan IR that docs/ir.md specifies: a tree of nodes over one or more
+//! inputs, with PostgreSQL's semantics for every expression.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -210,6 +87,10 @@ use crate::pgnum::{CmpOp, CmpSide, MotionNumeric, NumOp, NumericFn, PgNumCmp, Pg
 use crate::pgset::{InSet, ScalarOf, SetHolder, SetKey};
 use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
+
+/// Version of the plan IR this engine reads (docs/ir.md); the C side's
+/// DF_IR_VERSION.
+pub const IR_VERSION: u64 = 1;
 
 /// Rows per input batch the main thread pushes.
 pub const BATCH_ROWS: usize = 8192;
@@ -1777,7 +1658,8 @@ pub enum Source {
 // ---------------------------------------------------------------------------
 
 /// The single-input spec form (one "scan", then "filter", "aggregate",
-/// "having") as the tree form.
+/// "having") as the tree form.  The C side no longer writes it and it is
+/// not part of the IR (docs/ir.md); the unit tests below still use it.
 fn normalize_spec(mut spec: Value) -> Result<Value, String> {
     if spec.get("plan").is_some() {
         return Ok(spec);
@@ -2681,6 +2563,13 @@ impl Query {
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
         let spec: Value = serde_json::from_str(spec)
             .map_err(|e| PgError::internal(format!("bad plan spec: {e}")))?;
+        let ir = spec.get("ir").and_then(Value::as_u64);
+        if ir != Some(IR_VERSION) {
+            return Err(PgError::internal(format!(
+                "plan IR version {} is not supported (this engine reads version {IR_VERSION})",
+                ir.map_or_else(|| "none".to_string(), |v| v.to_string())
+            )));
+        }
         let internal = |e: String| PgError::internal(format!("cannot build DataFusion plan: {e}"));
         let df = |e: DataFusionError| internal(e.to_string());
 
@@ -3777,6 +3666,30 @@ mod tests {
         }
     }
 
+    /// A plan of another IR version, or none, is refused before anything
+    /// is built.
+    #[test]
+    fn refuses_other_ir_versions() {
+        let body = r#""inputs":[{"columns":[{"type":"int4"}]}],"plan":{"input":0},
+            "output":[{"expr":{"col":0},"type":"int8"}]}"#;
+        for (spec, shown) in [
+            (format!("{{{body}"), "none"),
+            (format!(r#"{{"ir":2,{body}"#), "2"),
+        ] {
+            let e = run(&spec, vec![(vec![1], vec![0])], 1)
+                .err()
+                .expect("refused");
+            assert!(
+                e.message
+                    .contains(&format!("plan IR version {shown} is not supported")),
+                "{}",
+                e.message
+            );
+        }
+        let ok = run(&format!(r#"{{"ir":1,{body}"#), vec![(vec![7], vec![0])], 1).unwrap();
+        assert_eq!(ok, vec![vec![Some(7)]]);
+    }
+
     /// TPC-H Q7's join tree as ORCA plans it: inner joins with a filter
     /// over two of their inputs at the top, a large probe side (input 4)
     /// fed before a later build side (input 5).  The inputs are fed one
@@ -3785,7 +3698,7 @@ mod tests {
     /// the tree that way) never finished.
     #[test]
     fn joins_read_inputs_in_plan_order() {
-        let spec = r#"{"inputs":[
+        let spec = r#"{"ir":1,"inputs":[
             {"columns":[{"type":"int4"},{"type":"int4"}]},
             {"columns":[{"type":"int4"},{"type":"int4"}]},
             {"columns":[{"type":"int4"},{"type":"int4"}]},
@@ -3877,7 +3790,7 @@ mod tests {
 
     #[test]
     fn filter_and_sum() {
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},
             "filter":{"op":">","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":1}}]},
             "aggregate":{"group":[],"aggs":[{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
             "having":null,
@@ -3890,7 +3803,7 @@ mod tests {
     /// and ordered descending with NULLs first; the output sorted as given.
     #[test]
     fn window_up_to_peers() {
-        let spec = r#"{"inputs":[{"columns":[{"type":"int4"},{"type":"int4"}]}],
+        let spec = r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"},{"type":"int4"}]}],
             "plan":{"window":{"input":{"input":0},"partition":[{"col":0}],
                 "order":[{"expr":{"col":1},"desc":true,"nulls_first":true}],
                 "frame":"range",
@@ -3928,7 +3841,7 @@ mod tests {
     fn dates_compare_as_stored() {
         // Days from 2000-01-01; i32::MIN and i32::MAX are -infinity and
         // infinity, which compare below and above every date.
-        let spec = r#"{"scan":{"columns":[{"type":"date"}]},
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"date"}]},
             "filter":{"op":"<","type":"bool","args":[{"col":0},{"lit":{"type":"date","value":%D%}}]},
             "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}}]},
             "having":null,
@@ -3992,7 +3905,7 @@ mod tests {
 
     #[test]
     fn text_compares_bytes() {
-        let spec = r#"{"scan":{"columns":[{"type":"text"}]},
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"text"}]},
             "filter":{"op":"<>","type":"bool","args":[{"col":0},{"lit":{"type":"text","value":"b\"\\"}}]},
             "aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"text"}]}"#;
@@ -4013,7 +3926,7 @@ mod tests {
         assert_eq!(got, want);
 
         // min/max order bytes, as the C collation does.
-        let spec = r#"{"scan":{"columns":[{"type":"text"}]},"filter":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"text"}]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"max","arg":{"col":0}}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"text"}]}"#;
         assert_eq!(
@@ -4024,7 +3937,7 @@ mod tests {
 
     #[test]
     fn invalid_utf8_is_an_error() {
-        let spec = r#"{"scan":{"columns":[{"type":"text"}]},"filter":null,"aggregate":null,"having":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"text"}]},"filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"text"}]}"#;
         runtime::init(2).unwrap();
         let dir = std::env::temp_dir();
@@ -4043,7 +3956,7 @@ mod tests {
     fn count_merge_adds_partial_counts() {
         // Partial counts arrive as an int4 column here; HAVING sees the
         // combined count, and no rows give 0 where sum gives NULL.
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},
             "filter":{"op":">","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":%MIN%}}]},
             "aggregate":{"group":[],"aggs":[{"fn":"count_merge","arg":{"col":0}},{"fn":"sum","arg":{"col":0}}]},
             "having":{"op":">=","type":"bool","args":[{"agg":0},{"lit":{"type":"int8","value":0}}]},
@@ -4093,12 +4006,12 @@ mod tests {
     fn ipc_streams_carry_rows_between_queries() {
         // Two senders (routes) each send (a, a * 10) for their rows; one of
         // them has none.  The receiver reads only the second column.
-        let send = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+        let send = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"int4"},
                       {"expr":{"op":"*","type":"int8","args":[{"col":0},{"lit":{"type":"int8","value":10}}]},"type":"int8"}]}"#;
         let a = run_ipc_out(send, vec![(vec![1, 2, 3, 0], vec![0, 0, 0, 1])], 4);
         let b = run_ipc_out(send, vec![(vec![], vec![])], 0);
-        let recv = r#"{"scan":{"columns":[{"type":"int8"}],"motion_columns":[1]},"filter":null,
+        let recv = r#"{"ir":1,"scan":{"columns":[{"type":"int8"}],"motion_columns":[1]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"count_merge","arg":{"col":0}},{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
             "having":null,
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
@@ -4156,7 +4069,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let send = |trim: &str| {
             let spec = format!(
-                r#"{{"scan":{{"columns":[{{"type":"bpchar"}}]}},"filter":null,"aggregate":null,
+                r#"{{"ir":1,"scan":{{"columns":[{{"type":"bpchar"}}]}},"filter":null,"aggregate":null,
                 "having":null,"output":[{{"expr":{{"col":0}},"type":"bpchar"}}]{trim}}}"#
             );
             let mut q = Query::start_with(
@@ -4195,7 +4108,7 @@ mod tests {
             trimmed.len(),
             padded.len()
         );
-        let recv = r#"{"scan":{"columns":[{"type":"bpchar"}],"motion_columns":[0],"motion_pad":[6]},
+        let recv = r#"{"ir":1,"scan":{"columns":[{"type":"bpchar"}],"motion_columns":[0],"motion_pad":[6]},
             "filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"bpchar"}]}"#;
         let mut q = Query::start_with(recv, 2, 64 << 20, dir.to_str().unwrap(), Source::Ipc, false)
@@ -4235,7 +4148,7 @@ mod tests {
         // workers: every route's stream holds exactly the rows cdbhash
         // sends there.
         runtime::init(2).unwrap();
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"int4"}],
             "route":{"kind":"hash","keys":[{"col":0,"hash":"int4"}],"segments":3,"workers":2}}"#;
         let vals: Vec<i32> = (0..1000).collect();
@@ -4287,10 +4200,10 @@ mod tests {
 
     #[test]
     fn truncated_ipc_stream_fails() {
-        let send = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
-            "output":[{"expr":{"col":0},"type":"int4"}]}"#;
+        let send = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+            "output":[{"expr":{"col":0},"type":"int8"}]}"#;
         let a = run_ipc_out(send, vec![(vec![1, 2, 3], vec![0, 0, 0])], 3);
-        let recv = r#"{"scan":{"columns":[{"type":"int4"}],"motion_columns":[0]},"filter":null,
+        let recv = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}],"motion_columns":[0]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
         let dir = std::env::temp_dir();
@@ -4315,7 +4228,7 @@ mod tests {
         // a <> 0 AND 10 / a > 1.  Nine of the ten rows pass the guard, above
         // DataFusion's 20% pre-selection threshold, so without the CASE
         // rewrite the division would run on the a = 0 row too.
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},
             "filter":{"and":[
                 {"op":"<>","type":"bool","args":[{"col":0},{"lit":{"type":"int4","value":0}}]},
                 {"op":">","type":"bool","args":[
@@ -4350,7 +4263,7 @@ mod tests {
             )
         };
         let spec = format!(
-            r#"{{"scan":{{"columns":[{{"type":"int4"}}]}},
+            r#"{{"ir":1,"scan":{{"columns":[{{"type":"int4"}}]}},
                 "filter":{{"and":[{{"op":"<>","type":"bool","args":[{a},{{"lit":{{"type":"int4","value":0}}}}]}},{},{}]}},
                 "aggregate":{{"group":[],"aggs":[{{"fn":"count"}}]}},"having":null,
                 "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#,
@@ -4372,7 +4285,7 @@ mod tests {
     fn grouping_spills_within_a_small_budget() {
         // 200,000 distinct keys, grouped under a 1 MB budget.
         runtime::init(2).unwrap();
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,
             "aggregate":{"group":[{"col":0}],"aggs":[{"fn":"count"}]},"having":null,
             "output":[{"expr":{"group":0},"type":"int8"},{"expr":{"agg":0},"type":"int8"}]}"#;
         let dir = std::env::temp_dir();
@@ -4503,7 +4416,7 @@ mod tests {
     /// read by `partitions` partitions, and the scan's peak memory.
     fn run_fake_scan(fake: &FakeScan, nblocks: usize, partitions: usize) -> (Vec<i64>, u64) {
         runtime::init(2).unwrap();
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"count","arg":{"col":0}},{"fn":"sum","arg":{"col":0}},{"fn":"count"}]},
             "having":null,
             "output":[{"expr":{"agg":0},"type":"int8"},{"expr":{"agg":1},"type":"int8"},{"expr":{"agg":2},"type":"int8"}]}"#;
@@ -4558,7 +4471,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,
             "aggregate":{"group":[],"aggs":[{"fn":"count"}]},"having":null,
             "output":[{"expr":{"agg":0},"type":"int8"}]}"#;
         let ptr = &fake as *const FakeScan as *mut c_void;
@@ -4743,7 +4656,7 @@ mod tests {
 
     #[test]
     fn overflow_is_a_pg_error() {
-        let spec = r#"{"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
+        let spec = r#"{"ir":1,"scan":{"columns":[{"type":"int4"}]},"filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"op":"+","type":"int4","args":[{"col":0},{"lit":{"type":"int4","value":1}}]},"type":"int8"}]}"#;
         let err = run(spec, vec![(vec![i32::MAX], vec![0])], 1).unwrap_err();
         assert_eq!(err, PgError::new("22003", "integer out of range"));
