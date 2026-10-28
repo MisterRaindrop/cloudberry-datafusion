@@ -1897,6 +1897,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		StringInfoData json;
 		AttrNumber	r;
 		int			ntrim = 0;
+		int			nnarrow = 0;
 
 		x->send = send;
 		df_batch_head(x->tx_head, queryDesc->plannedstmt, motion);
@@ -1911,6 +1912,18 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 				appendStringInfo(&json, "%s%d", ntrim++ > 0 ? "," : ",\"trim\":[",
 								 df_motion_stream_column(motion, r));
 		if (ntrim > 0)
+			appendStringInfoChar(&json, ']');
+
+		/* NW1: numeric values go narrowed to their digits */
+		for (r = 1; r <= list_length(motion->plan.targetlist); r++)
+		{
+			int			digits = df_motion_numeric_digits(queryDesc->plannedstmt, motion, r);
+
+			if (digits > 0)
+				appendStringInfo(&json, "%s[%d,%d]", nnarrow++ > 0 ? "," : ",\"narrow\":[",
+								 df_motion_stream_column(motion, r), digits);
+		}
+		if (nnarrow > 0)
 			appendStringInfoChar(&json, ']');
 		x->send_nroutes = 1;
 		if (motion->motionType == MOTIONTYPE_HASH)

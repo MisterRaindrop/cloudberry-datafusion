@@ -206,7 +206,7 @@ use crate::cdbhash::{self, KeyHash};
 use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
-use crate::pgnum::{CmpOp, CmpSide, NumOp, NumericFn, PgNumCmp, PgNumeric};
+use crate::pgnum::{CmpOp, CmpSide, MotionNumeric, NumOp, NumericFn, PgNumCmp, PgNumeric};
 use crate::pgset::{InSet, ScalarOf, SetHolder, SetKey};
 use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
@@ -2794,6 +2794,31 @@ impl Query {
                             .collect::<Result<_, _>>()?,
                         None => vec![None; positions.len()],
                     };
+                    // NW1: the form each numeric column comes narrowed in
+                    let narrows: Vec<Option<MotionNumeric>> = match inputs[j].get("motion_narrow") {
+                        Some(p) => p
+                            .as_array()
+                            .filter(|p| p.len() == positions.len())
+                            .ok_or_else(|| internal("bad motion narrowing".into()))?
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| match v.as_i64() {
+                                Some(d) if d <= 0 => Ok(None),
+                                Some(d)
+                                    if matches!(
+                                        schema.field(i).data_type(),
+                                        DataType::Decimal256(..)
+                                    ) =>
+                                {
+                                    MotionNumeric::of_digits(d)
+                                        .map(Some)
+                                        .ok_or_else(|| internal("bad motion narrowing".into()))
+                                }
+                                _ => Err(internal("bad motion narrowing".into())),
+                            })
+                            .collect::<Result<_, _>>()?,
+                        None => vec![None; positions.len()],
+                    };
                     let (in_tx, in_rx) = mpsc::channel(CHANNEL_DEPTH);
                     let (tx, rx) = mpsc::channel(IPC_CHANNEL_DEPTH);
                     decoders.push(handle.spawn(decode_ipc(
@@ -2802,6 +2827,7 @@ impl Query {
                         schema.clone(),
                         positions,
                         pads,
+                        narrows,
                     )));
                     let partition = ChannelPartition {
                         schema: schema.clone(),
@@ -2895,6 +2921,31 @@ impl Query {
                     .alias(format!("o{i}")),
             );
             out_types.push(ty);
+        }
+        // NW1: numeric outputs sent narrowed, by their digits
+        let mut narrow: Vec<(usize, MotionNumeric)> = Vec::new();
+        match spec.get("narrow") {
+            Some(n) if ipc_output => {
+                for v in n
+                    .as_array()
+                    .ok_or_else(|| internal("bad narrowed columns".into()))?
+                {
+                    let pair = v.as_array().filter(|p| p.len() == 2);
+                    let (c, d) = match pair {
+                        Some(p) => (
+                            index(&p[0]).map_err(internal)?,
+                            p[1].as_i64().and_then(MotionNumeric::of_digits),
+                        ),
+                        None => return Err(internal("bad narrowed column".into())),
+                    };
+                    match (out_types.get(c), d) {
+                        (Some(PgType::Numeric(_)), Some(d)) => narrow.push((c, d)),
+                        _ => return Err(internal(format!("output {c} cannot be narrowed"))),
+                    }
+                }
+            }
+            Some(_) => return Err(internal("narrowing needs IPC output".into())),
+            None => {}
         }
         let mut b = b.project(out_exprs).map_err(df)?;
         // S1: the slice's Sort, by output columns, then its Limit.
@@ -3008,6 +3059,7 @@ impl Query {
                 }
                 let schema = physical.schema();
                 let mut stream = execute_stream(physical, ctx.task_ctx())?;
+                let wire = wire_schema(&schema, &narrow)?;
                 if let Some(route) = route {
                     // One stream per receiving route, opened on its first
                     // rows; a route without rows gets end-of-stream only.
@@ -3024,6 +3076,7 @@ impl Query {
                             .map(|(c, h)| (*h, batch.column(*c).clone()))
                             .collect();
                         let routes = cdbhash::routes(&keys, n, route.segments, route.workers);
+                        let batch = narrow_batch(&wire, batch, &narrow)?;
                         let mut rows: std::collections::BTreeMap<u32, Vec<u32>> =
                             Default::default();
                         for (i, r) in routes.iter().enumerate() {
@@ -3036,11 +3089,11 @@ impl Query {
                                 .iter()
                                 .map(|c| take(c.as_ref(), &idx, None))
                                 .collect::<Result<Vec<_>, _>>()?;
-                            let part = RecordBatch::try_new(schema.clone(), cols)?;
+                            let part = RecordBatch::try_new(wire.clone(), cols)?;
                             let w = match writers.entry(r) {
                                 Entry::Occupied(e) => e.into_mut(),
                                 Entry::Vacant(e) => {
-                                    e.insert(StreamWriter::try_new(Vec::new(), &schema)?)
+                                    e.insert(StreamWriter::try_new(Vec::new(), &wire)?)
                                 }
                             };
                             w.write(&part)?;
@@ -3062,13 +3115,13 @@ impl Query {
                 if ipc_output {
                     // Encode here, on a worker; the main thread only copies
                     // the bytes into the interconnect.
-                    let mut w = StreamWriter::try_new(Vec::new(), &schema)?;
+                    let mut w = StreamWriter::try_new(Vec::new(), &wire)?;
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         if batch.num_rows() == 0 {
                             continue;
                         }
-                        w.write(&batch)?;
+                        w.write(&narrow_batch(&wire, batch, &narrow)?)?;
                         let bytes = std::mem::take(w.get_mut());
                         if out_tx.send(Ok(Out::Bytes(NO_ROUTE, bytes))).await.is_err() {
                             return Ok(());
@@ -3403,12 +3456,53 @@ impl Drop for Query {
 /// feed their rows to the plan: input column i is the stream's column
 /// `positions[i]`, its character values padded back to `pads[i]`
 /// characters if given (CP1).  A malformed stream fails the plan.
+/// NW1: `schema` with the columns of `narrow` in their narrow forms.
+fn wire_schema(
+    schema: &SchemaRef,
+    narrow: &[(usize, MotionNumeric)],
+) -> Result<SchemaRef, DataFusionError> {
+    if narrow.is_empty() {
+        return Ok(schema.clone());
+    }
+    let mut fields: Vec<Field> = schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+    for (c, nw) in narrow {
+        let f = &fields[*c];
+        let scale = match f.data_type() {
+            DataType::Decimal256(_, s) => *s,
+            t => {
+                return Err(DataFusionError::Internal(format!(
+                    "narrowed output {c} is {t}"
+                )))
+            }
+        };
+        fields[*c] = Field::new(f.name(), nw.wire_type(scale), true);
+    }
+    Ok(Arc::new(Schema::new(fields)))
+}
+
+/// NW1: `batch` with the columns of `narrow` narrowed, as `wire`.
+fn narrow_batch(
+    wire: &SchemaRef,
+    batch: RecordBatch,
+    narrow: &[(usize, MotionNumeric)],
+) -> Result<RecordBatch, DataFusionError> {
+    if narrow.is_empty() {
+        return Ok(batch);
+    }
+    let mut cols = batch.columns().to_vec();
+    for (c, nw) in narrow {
+        cols[*c] = nw.narrow(&cols[*c])?;
+    }
+    Ok(RecordBatch::try_new(wire.clone(), cols)?)
+}
+
 async fn decode_ipc(
     mut rx: IpcReceiver,
     tx: BatchSender,
     schema: SchemaRef,
     positions: Vec<usize>,
     pads: Vec<Option<usize>>,
+    narrows: Vec<Option<MotionNumeric>>,
 ) {
     let mut decoders: HashMap<i32, StreamDecoder> = HashMap::new();
     let fail = |e: String| {
@@ -3431,8 +3525,24 @@ async fn decode_ipc(
             let n = batch.num_rows();
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(positions.len());
             for (i, &k) in positions.iter().enumerate() {
+                let field = schema.field(i).data_type();
+                match (batch.columns().get(k), narrows[i], field) {
+                    (Some(a), Some(nw), DataType::Decimal256(_, scale))
+                        if a.data_type() == &nw.wire_type(*scale) =>
+                    {
+                        match nw.widen(a, *scale) {
+                            Ok(w) => arrays.push(w),
+                            Err(e) => {
+                                let _ = tx.send(fail(e.to_string())).await;
+                                return;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
                 match batch.columns().get(k) {
-                    Some(a) if a.data_type() == schema.field(i).data_type() => match pads[i] {
+                    Some(a) if narrows[i].is_none() && a.data_type() == field => match pads[i] {
                         Some(len) => match bpchar_pad(a.as_string::<i32>(), len) {
                             Ok(p) => arrays.push(Arc::new(p)),
                             Err(e) => {

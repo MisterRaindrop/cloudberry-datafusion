@@ -4078,6 +4078,25 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 															  lfirst_int(lt) - 1));
 					appendStringInfoChar(&json, ']');
 				}
+
+				/*
+				 * NW1: the digits each column's numeric values come
+				 * narrowed by, -1 for the others
+				 */
+				foreach(lt, in->attnos)
+					if (df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf,
+												lfirst_int(lt) - 1) > 0)
+						break;
+				if (lt != NULL)
+				{
+					k = 0;
+					appendStringInfoString(&json, ",\"motion_narrow\":[");
+					foreach(lt, in->attnos)
+						appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "",
+										 df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf,
+																 lfirst_int(lt) - 1));
+					appendStringInfoChar(&json, ']');
+				}
 			}
 			appendStringInfoChar(&json, '}');
 		}

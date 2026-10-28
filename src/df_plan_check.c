@@ -8202,10 +8202,64 @@ df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos)
 }
 
 /*
+ * NW1: the digits of column 'resno' of batch Motion 'motion' when its
+ * values are numeric of one scale with at most 38 digits
+ * (df_numeric_ps), or -1.  Such a column goes through the Motion with its
+ * integers narrowed to 8 or 16 bytes instead of Decimal256's 32, and the
+ * receiver widens them back.
+ */
+int
+df_motion_numeric_digits(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
+{
+	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
+	PlannedStmt *volatile saved = df_numeric_stmt;
+	volatile int digits = -1;
+
+	if (tle == NULL || exprType((Node *) tle->expr) != NUMERICOID ||
+		df_motion_state_columns(motion, resno) > 0)
+		return -1;
+	/* a Shared Scan's reader leads to its producer */
+	df_numeric_stmt = stmt;
+	PG_TRY();
+	{
+		int			p,
+					s;
+
+		if (df_numeric_ps((Plan *) motion, (Node *) tle->expr, &p, &s) && p <= 38)
+			digits = p;
+	}
+	PG_FINALLY();
+	{
+		df_numeric_stmt = saved;
+	}
+	PG_END_TRY();
+	return digits;
+}
+
+/* NW1: df_motion_numeric_digits of the column at stream column 'pos'. */
+int
+df_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos)
+{
+	int			start = 0;
+	AttrNumber	r;
+
+	for (r = 1; r <= list_length(motion->plan.targetlist); r++)
+	{
+		int			width = df_motion_state_columns(motion, r);
+
+		if (start == pos)
+			return width > 0 ? -1 : df_motion_numeric_digits(stmt, motion, r);
+		start += Max(width, 1);
+	}
+	return -1;
+}
+
+/*
  * What both ends of a batch Motion must agree on, hashed (FNV-1a): the
- * Motion, the types of the columns it carries, and the length the
- * character(n) ones are padded back to (CP1).  The sender puts it at the
- * start of each stream and the receiver checks it.
+ * Motion, the types of the columns it carries, the length the
+ * character(n) ones are padded back to (CP1) and the digits the numeric
+ * ones are narrowed by (NW1).  The sender puts it at the start of each
+ * stream and the receiver checks it.
  */
 uint64
 df_motion_signature(PlannedStmt *stmt, Motion *motion)
@@ -8222,6 +8276,7 @@ df_motion_signature(PlannedStmt *stmt, Motion *motion)
 
 		DF_MIX(exprType((Node *) tle->expr));
 		DF_MIX(df_motion_bpchar_pad(stmt, motion, tle->resno));
+		DF_MIX(df_motion_numeric_digits(stmt, motion, tle->resno));
 	}
 #undef DF_MIX
 	return h;

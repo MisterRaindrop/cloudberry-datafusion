@@ -609,6 +609,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
 | LM1 | Direct PAX reader: conditions on integer and date columns first, other columns built for the rows that pass |
+| NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | CL1 | Strings ordered by the default collation where it is C on every node |
@@ -1079,6 +1080,21 @@ misreading.  A `char(1)` is sent as it is.  Over TPC-DS at scale factor
 1 (medians of three runs, both planners), DataFusion took 79.2 s
 against 83.3 s before; Q67 under GPORCA 1.42 s against 1.97, Q22 0.60 s
 against 0.82.
+
+A numeric of one scale and at most 38 digits crosses a batch Motion
+narrowed (NW1): its integers as `int8` up to 18 digits, as 16 bytes up
+to 38, instead of Decimal256's 32, and the receiver widens them back.
+NaN and the infinities go as the narrow type's largest, next largest
+and smallest integers, which no value of those digits reaches.  Both
+ends find the digits from the Motion's column as numeric precision is
+followed (`df_numeric_ps`), and they are part of its signature.  A
+Redistribute hashes the values before they are narrowed.  Under the
+Postgres planner TPC-DS Q64 is a chain of fifteen joins, each behind a
+Redistribute Motion of some 170 000 rows, that waits on the
+interconnect more than it computes; numerics were 46% of the bytes its
+Motions carried.  It now sends 1.47 GB per run instead of 2.26 (1.51 GB
+for PostgreSQL's tuples), and runs in 3.41 s against 3.65 s
+(prepared, without its 5 s of planning).
 
 ### numeric results of integer aggregates
 

@@ -31,7 +31,9 @@ use std::sync::Arc;
 use datafusion::arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Decimal256Array, PrimitiveArray,
 };
-use datafusion::arrow::datatypes::{i256, DataType, Decimal256Type, Int32Type, Int64Type};
+use datafusion::arrow::datatypes::{
+    i256, DataType, Decimal128Type, Decimal256Type, Int32Type, Int64Type,
+};
 use datafusion::arrow::error::ArrowError;
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
@@ -61,6 +63,102 @@ fn decimal(a: &ArrayRef) -> Result<&Decimal256Array> {
     a.as_primitive_opt::<Decimal256Type>().ok_or_else(|| {
         DataFusionError::Internal(format!("expected a numeric column, got {}", a.data_type()))
     })
+}
+
+/// NW1: how a numeric column of at most 38 digits goes through a batch
+/// Motion: its integers narrowed to 8 bytes (up to 18 digits) or 16 (up to
+/// 38) instead of Decimal256's 32.  In TPC-DS Q64 under the Postgres
+/// planner, numerics were 46% of the bytes the Motions carried.  NaN and
+/// the infinities, beyond any value of those digits, go as the narrow
+/// type's largest, next largest and smallest integers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MotionNumeric {
+    Int64,
+    Decimal128,
+}
+
+impl MotionNumeric {
+    /// The narrow form of values of `digits` digits, if any.
+    pub fn of_digits(digits: i64) -> Option<MotionNumeric> {
+        match digits {
+            1..=18 => Some(MotionNumeric::Int64),
+            19..=38 => Some(MotionNumeric::Decimal128),
+            _ => None,
+        }
+    }
+
+    /// The Arrow type the column goes as, for scale `scale`.
+    pub fn wire_type(self, scale: i8) -> DataType {
+        match self {
+            MotionNumeric::Int64 => DataType::Int64,
+            MotionNumeric::Decimal128 => DataType::Decimal128(38, scale),
+        }
+    }
+
+    /// Numeric column `a` in this form.  Err for a value it cannot hold,
+    /// which the planner hook's digits rule out.
+    pub fn narrow(self, a: &ArrayRef) -> Result<ArrayRef> {
+        let d = decimal(a)?;
+        let scale = d.scale();
+        let lost = || ArrowError::ComputeError("numeric value beyond its digits".into());
+        Ok(match self {
+            MotionNumeric::Int64 => Arc::new(d.try_unary::<_, Int64Type, _>(|v| {
+                Ok::<_, ArrowError>(if v == NUMERIC_NAN {
+                    i64::MAX
+                } else if v == NUMERIC_PINF {
+                    i64::MAX - 1
+                } else if v == NUMERIC_NINF {
+                    i64::MIN
+                } else {
+                    v.to_i128()
+                        .and_then(|v| i64::try_from(v).ok())
+                        .filter(|v| *v < i64::MAX - 1 && *v > i64::MIN)
+                        .ok_or_else(lost)?
+                })
+            })?),
+            MotionNumeric::Decimal128 => Arc::new(
+                d.try_unary::<_, Decimal128Type, _>(|v| {
+                    Ok::<_, ArrowError>(if v == NUMERIC_NAN {
+                        i128::MAX
+                    } else if v == NUMERIC_PINF {
+                        i128::MAX - 1
+                    } else if v == NUMERIC_NINF {
+                        i128::MIN
+                    } else {
+                        v.to_i128()
+                            .filter(|v| *v < i128::MAX - 1 && *v > i128::MIN)
+                            .ok_or_else(lost)?
+                    })
+                })?
+                .with_precision_and_scale(38, scale)?,
+            ),
+        })
+    }
+
+    /// Column `a` in this form back as numeric of scale `scale`.
+    pub fn widen(self, a: &ArrayRef, scale: i8) -> Result<ArrayRef> {
+        let wide = |v: i128, max: i128, min: i128| match v {
+            v if v == max => NUMERIC_NAN,
+            v if v == max - 1 => NUMERIC_PINF,
+            v if v == min => NUMERIC_NINF,
+            v => i256::from_i128(v),
+        };
+        let bad =
+            || DataFusionError::Internal(format!("unexpected Motion column {}", a.data_type()));
+        let d: Decimal256Array = match self {
+            MotionNumeric::Int64 => a
+                .as_primitive_opt::<Int64Type>()
+                .ok_or_else(bad)?
+                .unary(|v| wide(v as i128, i64::MAX as i128, i64::MIN as i128)),
+            MotionNumeric::Decimal128 => a
+                .as_primitive_opt::<Decimal128Type>()
+                .ok_or_else(bad)?
+                .unary(|v| wide(v, i128::MAX, i128::MIN)),
+        };
+        Ok(Arc::new(
+            d.with_precision_and_scale(NUMERIC_PRECISION, scale)?,
+        ))
+    }
 }
 
 fn pow10(k: u32) -> i256 {
@@ -987,6 +1085,48 @@ mod tests {
             b.extend(d.to_ne_bytes());
         }
         b
+    }
+
+    #[test]
+    fn narrows_motion_numerics() {
+        let values = vec![
+            Some(i256::from_i128(-999_999_999_999_999_999)),
+            None,
+            Some(i256::from_i128(12345)),
+            Some(NUMERIC_NAN),
+            Some(NUMERIC_PINF),
+            Some(NUMERIC_NINF),
+        ];
+        let a: ArrayRef = Arc::new(
+            Decimal256Array::from(values.clone())
+                .with_precision_and_scale(NUMERIC_PRECISION, 2)
+                .unwrap(),
+        );
+        for nw in [MotionNumeric::Int64, MotionNumeric::Decimal128] {
+            let n = nw.narrow(&a).unwrap();
+            assert_eq!(n.data_type(), &nw.wire_type(2));
+            let w = nw.widen(&n, 2).unwrap();
+            assert_eq!(w.data_type(), &numeric_type(2));
+            assert_eq!(decimal(&w).unwrap().iter().collect::<Vec<_>>(), values);
+        }
+        // beyond int8, within 16 bytes
+        let big: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![Some(i256::from_i128(10i128.pow(30)))])
+                .with_precision_and_scale(NUMERIC_PRECISION, 4)
+                .unwrap(),
+        );
+        assert!(MotionNumeric::Int64.narrow(&big).is_err());
+        let n = MotionNumeric::Decimal128.narrow(&big).unwrap();
+        assert_eq!(
+            MotionNumeric::Decimal128.widen(&n, 4).unwrap().as_ref(),
+            big.as_ref()
+        );
+        assert_eq!(MotionNumeric::of_digits(18), Some(MotionNumeric::Int64));
+        assert_eq!(
+            MotionNumeric::of_digits(19),
+            Some(MotionNumeric::Decimal128)
+        );
+        assert_eq!(MotionNumeric::of_digits(39), None);
     }
 
     #[test]

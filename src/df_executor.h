@@ -376,6 +376,8 @@ extern bool df_nestloop_swapped(Plan *plan);
 extern int	df_motion_stream_column(Motion *motion, AttrNumber resno);
 extern int	df_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno);
 extern int	df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos);
+extern int	df_motion_numeric_digits(PlannedStmt *stmt, Motion *motion, AttrNumber resno);
+extern int	df_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos);
 extern uint64 df_motion_signature(PlannedStmt *stmt, Motion *motion);
 extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **tag);
 

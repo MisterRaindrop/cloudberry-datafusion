@@ -873,6 +873,56 @@ RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_rl;
 
+-- NW1: between slices, batches carry a numeric of one scale and at most 18
+-- digits as int8 and of at most 38 as 16 bytes, not 32, and the receiver
+-- widens them back: a column of numeric(7,2) or (30,4), with NaN and the
+-- largest values, also as a hash key, and a sum of one (26 digits).  A
+-- numeric without a declared precision goes as it is.
+CREATE TABLE df_nw (id int, k int, a numeric(7,2), b numeric(30,4), n numeric) DISTRIBUTED BY (id);
+CREATE TABLE df_nw2 (k int, j int, b numeric(30,4)) DISTRIBUTED BY (j);
+INSERT INTO df_nw SELECT i, i % 37,
+  CASE WHEN i % 11 = 0 THEN NULL ELSE ((i * 7919) % 19999999 - 9999999) / 100.0 END,
+  CASE WHEN i % 13 = 0 THEN NULL ELSE (i % 500) * 123456789012345678.9012 * (1 - 2 * (i % 2)) END,
+  i / 7.0
+FROM generate_series(1, 20000) i;
+INSERT INTO df_nw VALUES (20001, 1, 99999.99, 99999999999999999999999999.9999, 1e40),
+  (20002, 2, -99999.99, -99999999999999999999999999.9999, -1e-40),
+  (20003, 3, 'NaN', 'NaN', 'NaN'), (20004, 3, 'NaN', 0, NULL);
+INSERT INTO df_nw2 SELECT i % 37, i % 7, (i % 500) * 123456789012345678.9012 FROM generate_series(1, 5000) i;
+ANALYZE df_nw;
+ANALYZE df_nw2;
+SET datafusion.motion_batches = on;
+SET optimizer = on;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), sum(c), sum(s) FROM (SELECT a, count(*) c, sum(b) s FROM df_nw GROUP BY a) t;
+SELECT a, count(*), sum(b), max(n) FROM df_nw GROUP BY a HAVING count(*) > 2 OR a = 'NaN' OR abs(a) > 99999 ORDER BY a;
+SELECT k, count(*), sum(a), sum(b), min(a), max(b), avg(a) FROM df_nw GROUP BY k ORDER BY k;
+SELECT y.j, count(*), sum(x.a), max(x.b), min(x.n) FROM df_nw x JOIN df_nw2 y ON x.k = y.k WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SELECT y.j, count(*), sum(x.a), min(x.b), max(y.b) FROM df_nw x JOIN df_nw2 y ON x.b = y.b WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SET datafusion.mode = on;
+SELECT count(*), sum(a), sum(c), sum(s) FROM (SELECT a, count(*) c, sum(b) s FROM df_nw GROUP BY a) t;
+SELECT a, count(*), sum(b), max(n) FROM df_nw GROUP BY a HAVING count(*) > 2 OR a = 'NaN' OR abs(a) > 99999 ORDER BY a;
+SELECT k, count(*), sum(a), sum(b), min(a), max(b), avg(a) FROM df_nw GROUP BY k ORDER BY k;
+SELECT y.j, count(*), sum(x.a), max(x.b), min(x.n) FROM df_nw x JOIN df_nw2 y ON x.k = y.k WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SELECT y.j, count(*), sum(x.a), min(x.b), max(y.b) FROM df_nw x JOIN df_nw2 y ON x.b = y.b WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SET optimizer = off;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), sum(c), sum(s) FROM (SELECT a, count(*) c, sum(b) s FROM df_nw GROUP BY a) t;
+SELECT a, count(*), sum(b), max(n) FROM df_nw GROUP BY a HAVING count(*) > 2 OR a = 'NaN' OR abs(a) > 99999 ORDER BY a;
+SELECT k, count(*), sum(a), sum(b), min(a), max(b), avg(a) FROM df_nw GROUP BY k ORDER BY k;
+SELECT y.j, count(*), sum(x.a), max(x.b), min(x.n) FROM df_nw x JOIN df_nw2 y ON x.k = y.k WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SELECT y.j, count(*), sum(x.a), min(x.b), max(y.b) FROM df_nw x JOIN df_nw2 y ON x.b = y.b WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SET datafusion.mode = on;
+SELECT count(*), sum(a), sum(c), sum(s) FROM (SELECT a, count(*) c, sum(b) s FROM df_nw GROUP BY a) t;
+SELECT a, count(*), sum(b), max(n) FROM df_nw GROUP BY a HAVING count(*) > 2 OR a = 'NaN' OR abs(a) > 99999 ORDER BY a;
+SELECT k, count(*), sum(a), sum(b), min(a), max(b), avg(a) FROM df_nw GROUP BY k ORDER BY k;
+SELECT y.j, count(*), sum(x.a), max(x.b), min(x.n) FROM df_nw x JOIN df_nw2 y ON x.k = y.k WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+SELECT y.j, count(*), sum(x.a), min(x.b), max(y.b) FROM df_nw x JOIN df_nw2 y ON x.b = y.b WHERE x.id < 20003 GROUP BY y.j ORDER BY y.j;
+RESET optimizer;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_nw, df_nw2;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;
