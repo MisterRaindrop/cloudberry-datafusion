@@ -4034,7 +4034,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 
 		/* inputs */
 		initStringInfo(&json);
-		appendStringInfo(&json, "{\"ir\":%d,\"inputs\":[", DF_IR_VERSION);
+		appendStringInfo(&json, "{\"ir\":%d,\"inputs\":[", VEC_IR_VERSION);
 		i = 0;
 		foreach(lc, b.inputs)
 		{

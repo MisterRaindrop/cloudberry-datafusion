@@ -71,7 +71,7 @@ df_runtime_atexit(int code, Datum arg)
 {
 	if (df_runtime_pid == MyProcPid)
 	{
-		df_ffi_runtime_shutdown(DF_SHUTDOWN_TIMEOUT_MS);
+		df_engine->runtime_shutdown(DF_SHUTDOWN_TIMEOUT_MS);
 		df_runtime_pid = 0;
 	}
 	if (df_spill_path[0] != '\0')
@@ -150,7 +150,7 @@ df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
 void
 df_vmem_sync(int64 headroom)
 {
-	int64		want = Max(df_ffi_heap_bytes(), 0) + headroom;
+	int64		want = Max(df_engine->heap_bytes(), 0) + headroom;
 
 	if (want > df_vmem_leased)
 	{
@@ -167,7 +167,7 @@ df_vmem_sync(int64 headroom)
 void
 df_vmem_trim(void)
 {
-	int64		want = Max(df_ffi_heap_bytes(), 0);
+	int64		want = Max(df_engine->heap_bytes(), 0);
 
 	if (want < df_vmem_leased)
 	{
@@ -189,7 +189,7 @@ df_vmem_leased_bytes(void)
 int
 df_runtime_ensure(void)
 {
-	char		buf[DF_MSG_BUFLEN];
+	VecError	err;
 	sigset_t	all;
 	sigset_t	saved;
 	uint32_t	workers = 0;
@@ -219,16 +219,16 @@ df_runtime_ensure(void)
 	if (rc != 0)
 		elog(ERROR, "pthread_sigmask failed: %s", strerror(rc));
 
-	status = df_ffi_runtime_init((uint32_t) df_worker_threads, &workers,
-								 buf, sizeof(buf));
+	DF_ERROR_INIT(err);
+	status = df_engine->runtime_init((uint32_t) df_worker_threads, &workers, &err);
 
 	rc = pthread_sigmask(SIG_SETMASK, &saved, NULL);
 	if (rc != 0)
 		elog(FATAL, "pthread_sigmask failed to restore the signal mask: %s",
 			 strerror(rc));
 
-	if (status != DF_OK)
-		df_raise(status, buf);
+	if (status != VEC_OK)
+		df_raise(status, err.message);
 
 	df_runtime_pid = MyProcPid;
 	df_runtime_workers = (int) workers;
@@ -242,17 +242,18 @@ df_runtime_ensure(void)
  * and free it.  Used while an error is propagating.
  */
 static void
-df_task_stop(DfTask *task)
+df_task_stop(VecTask *task)
 {
-	char		buf[DF_MSG_BUFLEN];
+	const VecEngineDebug *debug = df_engine->debug;
+	VecError	err;
 	int			waited;
 
-	df_ffi_task_cancel(task);
+	debug->task_cancel(task);
 	for (waited = 0; waited < DF_STOP_TIMEOUT_MS; waited += DF_WAIT_SLICE_MS)
 	{
-		if (df_ffi_task_wait(task, DF_WAIT_SLICE_MS, buf, sizeof(buf)) != DF_PENDING)
+		if (debug->task_wait(task, DF_WAIT_SLICE_MS, &err) != VEC_PENDING)
 		{
-			df_ffi_task_free(task);
+			debug->task_free(task);
 			return;
 		}
 	}
@@ -263,29 +264,30 @@ df_task_stop(DfTask *task)
 	 */
 	elog(LOG, "DataFusion tasks did not stop within %d ms after cancel",
 		 DF_STOP_TIMEOUT_MS);
-	df_ffi_task_free(task);
+	debug->task_free(task);
 }
 
 /*
  * Wait for 'task' to finish while servicing interrupts, then free it.
- * Returns the final status (never DF_PENDING), with the result text or
- * error message in buf.
+ * Returns the final status (never VEC_PENDING), with the result text or
+ * error in 'err'.
  *
  * If an interrupt raises an ERROR while waiting, the task is cancelled and
  * has stopped before the error propagates.  A FATAL (terminate) exits the
  * process directly; df_runtime_atexit then shuts the runtime down.
  */
 int32
-df_task_wait_interruptible(DfTask *task, char *buf, size_t buflen)
+df_task_wait_interruptible(VecTask *task, VecError *err)
 {
-	volatile int32 status = DF_PENDING;
+	const VecEngineDebug *debug = df_engine_debug();
+	volatile int32 status = VEC_PENDING;
 
 	PG_TRY();
 	{
 		for (;;)
 		{
-			status = df_ffi_task_wait(task, DF_WAIT_SLICE_MS, buf, buflen);
-			if (status != DF_PENDING)
+			status = debug->task_wait(task, DF_WAIT_SLICE_MS, err);
+			if (status != VEC_PENDING)
 				break;
 			CHECK_FOR_INTERRUPTS();
 		}
@@ -297,7 +299,7 @@ df_task_wait_interruptible(DfTask *task, char *buf, size_t buflen)
 	}
 	PG_END_TRY();
 
-	df_ffi_task_free(task);
+	debug->task_free(task);
 	return status;
 }
 
@@ -345,7 +347,7 @@ df_case_maps_ensure(void)
 	}
 	if (nupper >= 8192 || nlower >= 8192)
 		elog(ERROR, "datafusion: more case mappings than expected");
-	df_ffi_set_case_maps(upper, nupper, lower, nlower);
+	df_engine->set_case_maps(upper, nupper, lower, nlower);
 	pfree(upper);
 	pfree(lower);
 	done = true;

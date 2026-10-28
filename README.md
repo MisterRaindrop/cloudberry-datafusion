@@ -1894,13 +1894,15 @@ apache/datafusion#26264 (`rust/Cargo.toml`), DataFusion's main with that
 fix, which cargo fetches from GitHub; back to a release from crates.io once
 one has it.
 
-## FFI contract
+## Engine ABI
 
-Every function the Rust library exports never calls into PostgreSQL, never
-lets a panic escape, and reports failure as a status code plus a message in
-the caller's buffer. The C side raises the `ereport` after the call returns,
-so PostgreSQL's `longjmp` never unwinds through Rust frames. See
-`src/df_ffi.h`.
+The extension reaches the engine only through the table of functions
+`vec_engine_entry` returns (`src/vec_engine.h`); DataFusion's is in
+`rust/df_ffi`.  No function in it calls into PostgreSQL or lets a panic
+escape; each reports failure as a status code plus a SQLSTATE and message
+in the caller's `VecError`. The C side raises the `ereport` after the call
+returns, so PostgreSQL's `longjmp` never unwinds through Rust frames.
+Plans reach the engine as the IR of `docs/ir.md`.
 
 ## License
 

@@ -27,7 +27,7 @@
 #ifndef DF_EXECUTOR_H
 #define DF_EXECUTOR_H
 
-#include "df_ffi.h"
+#include "vec_engine.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
 #include "nodes/execnodes.h"
@@ -59,7 +59,13 @@ extern int	df_join_estimates;
 extern int	df_worker_threads;
 
 /* df_init.c */
+extern const VecEngine *df_engine;
+extern const VecEngineDebug *df_engine_debug(void);
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
+
+/* A VecError of no message yet, an internal error if the engine sets none. */
+#define DF_ERROR_INIT(e) \
+	(memcpy((e).sqlstate, "XX000", 6), (e).message[0] = '\0')
 
 /* One input of a slice: the rows of a Seq Scan or of a receiving Motion. */
 typedef struct DfSliceInput
@@ -291,7 +297,7 @@ extern bool df_exec_attach(QueryDesc *queryDesc, PlanState *root,
 						   char *reason, size_t reasonlen);
 extern PlanState *df_exec_find_state(PlanState *ps, Plan *plan);
 extern uint64 df_runs_completed;	/* slices DataFusion ran to the end */
-extern DfQueryStats df_last_run;	/* figures of the latest one */
+extern VecQueryStats df_last_run;	/* figures of the latest one */
 
 /* df_translate.c */
 extern const char *df_type_tag(Oid type);
@@ -328,9 +334,9 @@ typedef struct DfPaxReader
 	DfPaxBegin	begin;
 	DfPaxNBlocks nblocks;
 	DfPaxInfo	info;
-	DfPaxRead	read;
-	DfPaxEnd	end;
-	DfPaxGroups block_groups;
+	VecPaxRead	read;
+	VecPaxEnd	end;
+	VecPaxGroups block_groups;
 } DfPaxReader;
 
 extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */
@@ -440,6 +446,6 @@ extern const char *df_spill_dir(void);
 extern void df_vmem_sync(int64 headroom);
 extern void df_vmem_trim(void);
 extern int64 df_vmem_leased_bytes(void);
-extern int32 df_task_wait_interruptible(DfTask *task, char *buf, size_t buflen);
+extern int32 df_task_wait_interruptible(VecTask *task, VecError *err);
 
 #endif							/* DF_EXECUTOR_H */

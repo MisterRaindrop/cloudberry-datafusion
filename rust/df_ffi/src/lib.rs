@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! C ABI entry points of the datafusion_executor extension.
+//! The DataFusion engine behind the ABI of `src/vec_engine.h`.
 //!
-//! Every function exported here follows the contract in `src/df_ffi.h`:
-//! it never calls into PostgreSQL, it never lets a panic cross the FFI
-//! boundary, and it reports failure as a status code plus a message written
-//! into the caller's buffer.  The C side raises the ereport after the call
-//! returns, so PostgreSQL's longjmp never unwinds through Rust frames.
+//! The extension gets one table of functions from [`vec_engine_entry`].
+//! Every function in it never calls into PostgreSQL, never lets a panic
+//! cross the FFI boundary, and reports failure as a status code plus a
+//! SQLSTATE and message written into the caller's `VecError`.  The C side
+//! raises the ereport after the call returns, so PostgreSQL's longjmp never
+//! unwinds through Rust frames.
 
 // The entry points take raw pointers from C and dereference them after the
 // checks each SAFETY comment names.  Marking them `unsafe fn` would change
@@ -29,44 +30,75 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::any::Any;
-use std::ffi::c_char;
+use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::OnceLock;
 
 // catch_unwind only works when panics unwind.
 #[cfg(panic = "abort")]
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
-/// Status codes; keep in sync with `src/df_ffi.h`.
-pub const DF_OK: i32 = 0;
-pub const DF_ERROR: i32 = 1;
-pub const DF_PANIC: i32 = 2;
-/// `df_ffi_task_wait` only: the task is still running.
-pub const DF_PENDING: i32 = 3;
-/// `df_ffi_task_wait` only: the task stopped because it was cancelled.
-pub const DF_CANCELLED: i32 = 4;
-/// `df_ffi_query_poll` only: the query has produced all its rows.
-pub const DF_DONE: i32 = 5;
-/// df_ffi_query_poll: Arrow IPC bytes are available (df_ffi_query_bytes).
-pub const DF_BYTES: i32 = 6;
+/// Version of the ABI; keep in sync with `src/vec_engine.h`.
+pub const VEC_ENGINE_ABI: u32 = 1;
 
-/// Query flag: results leave as Arrow IPC streams (DF_BYTES).
-pub const DF_QUERY_IPC_OUTPUT: u32 = 2;
+/// Status codes; keep in sync with `src/vec_engine.h`.
+pub const VEC_OK: i32 = 0;
+pub const VEC_ERROR: i32 = 1;
+pub const VEC_PANIC: i32 = 2;
+/// Still running, or a queue is full.
+pub const VEC_PENDING: i32 = 3;
+/// `task_wait` only: the task stopped because it was cancelled.
+pub const VEC_CANCELLED: i32 = 4;
+/// `query_poll` only: the query has produced all its rows.
+pub const VEC_DONE: i32 = 5;
+/// `query_poll`: Arrow IPC bytes are available (`query_bytes`).
+pub const VEC_BYTES: i32 = 6;
 
-/// Copy `msg` into a C buffer of `buflen` bytes as a NUL-terminated string,
-/// truncating on a UTF-8 character boundary.
-fn write_message(buf: *mut c_char, buflen: usize, msg: &str) {
-    if buf.is_null() || buflen == 0 {
+/// Query flag: results leave as Arrow IPC streams (VEC_BYTES).
+pub const VEC_QUERY_IPC_OUTPUT: u32 = 2;
+
+const VEC_MSG_LEN: usize = 1024;
+
+/// A failure's SQLSTATE and message, which may be followed by a newline
+/// and a detail (the C side splits at the first newline).
+#[repr(C)]
+pub struct VecError {
+    pub sqlstate: [c_char; 6],
+    pub message: [c_char; VEC_MSG_LEN],
+}
+
+/// Copy `msg` into a C buffer as a NUL-terminated string, truncating on a
+/// UTF-8 character boundary.
+fn write_message(buf: &mut [c_char], msg: &str) {
+    if buf.is_empty() {
         return;
     }
-    let mut n = msg.len().min(buflen - 1);
+    let mut n = msg.len().min(buf.len() - 1);
     while n > 0 && !msg.is_char_boundary(n) {
         n -= 1;
     }
-    // SAFETY: the caller guarantees `buf` points to `buflen` writable bytes,
-    // and n + 1 <= buflen.
-    unsafe {
-        std::ptr::copy_nonoverlapping(msg.as_ptr(), buf.cast::<u8>(), n);
-        *buf.add(n) = 0;
+    for (d, s) in buf.iter_mut().zip(&msg.as_bytes()[..n]) {
+        *d = *s as c_char;
+    }
+    buf[n] = 0;
+}
+
+/// Fill `err` (if not null) with `sqlstate` and `msg`; returns `status`.
+fn fail(err: *mut VecError, status: i32, sqlstate: &str, msg: &str) -> i32 {
+    // SAFETY: the caller passes a valid VecError or null.
+    if let Some(e) = unsafe { err.as_mut() } {
+        write_message(&mut e.sqlstate, sqlstate);
+        write_message(&mut e.message, msg);
+    }
+    status
+}
+
+/// Fill `err` with the error's SQLSTATE, and its message followed, if it
+/// has one, by a newline and the detail.
+fn report(e: &df_core::pgfunc::PgError, err: *mut VecError) -> i32 {
+    match &e.detail {
+        Some(d) => fail(err, VEC_ERROR, e.sqlstate, &format!("{}\n{}", e.message, d)),
+        None => fail(err, VEC_ERROR, e.sqlstate, &e.message),
     }
 }
 
@@ -80,62 +112,43 @@ fn panic_message(payload: &(dyn Any + Send)) -> &str {
     }
 }
 
-/// Run `body` with panics caught, and report its outcome through `buf`.
-fn guard<F>(buf: *mut c_char, buflen: usize, body: F) -> i32
+fn report_panic(payload: Box<dyn Any + Send>, err: *mut VecError) -> i32 {
+    fail(err, VEC_PANIC, "XX000", panic_message(payload.as_ref()))
+}
+
+/// Run `body` with panics caught; an Err is an internal error (XX000).
+fn guard<F>(err: *mut VecError, body: F) -> i32
 where
-    F: FnOnce() -> Result<String, String>,
+    F: FnOnce() -> Result<(), String>,
 {
     match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(Ok(out)) => {
-            write_message(buf, buflen, &out);
-            DF_OK
-        }
-        Ok(Err(err)) => {
-            write_message(buf, buflen, &err);
-            DF_ERROR
-        }
-        Err(payload) => {
-            write_message(buf, buflen, panic_message(payload.as_ref()));
-            DF_PANIC
-        }
+        Ok(Ok(())) => VEC_OK,
+        Ok(Err(e)) => fail(err, VEC_ERROR, "XX000", &e),
+        Err(payload) => report_panic(payload, err),
     }
 }
 
-/// Writes "datafusion <version>" into `buf`.
-#[no_mangle]
-pub extern "C" fn df_ffi_version(buf: *mut c_char, buflen: usize) -> i32 {
-    guard(buf, buflen, || {
-        Ok(format!("datafusion {}", datafusion::DATAFUSION_VERSION))
-    })
-}
-
 /// Panics on purpose, so tests can check that a panic surfaces as an ERROR.
-#[no_mangle]
-pub extern "C" fn df_ffi_debug_panic(buf: *mut c_char, buflen: usize) -> i32 {
-    guard(buf, buflen, || panic!("datafusion_debug_panic requested"))
+extern "C" fn debug_panic(err: *mut VecError) -> i32 {
+    guard(err, || panic!("datafusion_debug_panic requested"))
 }
 
 /// CM1: set the case maps of the backend's LC_CTYPE: `nupper` and `nlower`
-/// pairs (code point, mapped code point), flattened.
-///
-/// # Safety
-/// `upper` and `lower` point to 2 * `nupper` and 2 * `nlower` values.
-#[no_mangle]
-pub unsafe extern "C" fn df_ffi_set_case_maps(
-    upper: *const u32,
-    nupper: usize,
-    lower: *const u32,
-    nlower: usize,
-) {
+/// pairs (code point, mapped code point), flattened.  `upper` and `lower`
+/// point to 2 * `nupper` and 2 * `nlower` values.
+extern "C" fn set_case_maps(upper: *const u32, nupper: usize, lower: *const u32, nlower: usize) {
     let pairs = |p: *const u32, n: usize| -> Vec<(u32, u32)> {
         if p.is_null() || n == 0 {
             return Vec::new();
         }
-        let v = std::slice::from_raw_parts(p, 2 * n);
+        // SAFETY: the caller passes 2 * n values.
+        let v = unsafe { std::slice::from_raw_parts(p, 2 * n) };
         v.chunks_exact(2).map(|c| (c[0], c[1])).collect()
     };
-    let (u, l) = (pairs(upper, nupper), pairs(lower, nlower));
-    let _ = catch_unwind(AssertUnwindSafe(|| df_core::pgstr::set_case_maps(&u, &l)));
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let (u, l) = (pairs(upper, nupper), pairs(lower, nlower));
+        df_core::pgstr::set_case_maps(&u, &l)
+    }));
 }
 
 // ---------------------------------------------------------------------------
@@ -145,113 +158,86 @@ pub unsafe extern "C" fn df_ffi_set_case_maps(
 /// Start the per-backend runtime with `workers` threads (0 = one per CPU) if
 /// it is not running yet, and store its actual worker count in `*out_workers`.
 /// The caller must block all signals around this call; see df_core::runtime.
-#[no_mangle]
-pub extern "C" fn df_ffi_runtime_init(
-    workers: u32,
-    out_workers: *mut u32,
-    buf: *mut c_char,
-    buflen: usize,
-) -> i32 {
-    guard(buf, buflen, || {
+extern "C" fn runtime_init(workers: u32, out_workers: *mut u32, err: *mut VecError) -> i32 {
+    guard(err, || {
         let n = df_core::runtime::init(workers as usize)?;
         if !out_workers.is_null() {
             // SAFETY: the caller passes a valid pointer or NULL.
             unsafe { *out_workers = n as u32 };
         }
-        Ok(String::new())
+        Ok(())
     })
 }
 
 /// Stop the runtime, waiting at most `timeout_ms` for running tasks.
 /// Never fails; a panic during shutdown is swallowed.
-#[no_mangle]
-pub extern "C" fn df_ffi_runtime_shutdown(timeout_ms: u32) {
+extern "C" fn runtime_shutdown(timeout_ms: u32) {
     let _ = catch_unwind(|| {
         df_core::runtime::shutdown(std::time::Duration::from_millis(timeout_ms as u64))
     });
+}
+
+/// Live bytes allocated by Rust code in this process, on any thread.
+extern "C" fn heap_bytes() -> i64 {
+    df_core::memory::heap_bytes()
 }
 
 // ---------------------------------------------------------------------------
 // Debug tasks (M1): spawn, wait, cancel, free
 // ---------------------------------------------------------------------------
 
-/// Opaque handle owned by the C caller; release it with `df_ffi_task_free`.
-pub struct DfTask(df_core::debug::Task);
+/// Opaque handle owned by the C caller; release it with `task_free`.
+pub struct VecTask(df_core::debug::Task);
 
 /// Start `ntasks` CPU-bound tasks that spin for `seconds` (`panic_in_worker`:
 /// the first one panics instead).  On success stores a handle in `*out_task`.
-#[no_mangle]
-pub extern "C" fn df_ffi_debug_spin_start(
+extern "C" fn debug_spin_start(
     seconds: f64,
     ntasks: u32,
     panic_in_worker: bool,
-    out_task: *mut *mut DfTask,
-    buf: *mut c_char,
-    buflen: usize,
+    out_task: *mut *mut VecTask,
+    err: *mut VecError,
 ) -> i32 {
-    guard(buf, buflen, || {
+    guard(err, || {
         if out_task.is_null() {
             return Err("out_task is NULL".into());
         }
         let task = df_core::debug::spin(seconds, ntasks as usize, panic_in_worker)?;
         // SAFETY: checked non-NULL above.
-        unsafe { *out_task = Box::into_raw(Box::new(DfTask(task))) };
-        Ok(String::new())
+        unsafe { *out_task = Box::into_raw(Box::new(VecTask(task))) };
+        Ok(())
     })
 }
 
-/// Wait up to `timeout_ms` for `task`.  Returns DF_PENDING if it is still
-/// running; otherwise DF_OK (result text in `buf`), DF_CANCELLED, DF_ERROR
-/// or DF_PANIC (message in `buf`).  After a non-pending return, do not wait
-/// on the same task again.
-#[no_mangle]
-pub extern "C" fn df_ffi_task_wait(
-    task: *mut DfTask,
-    timeout_ms: u32,
-    buf: *mut c_char,
-    buflen: usize,
-) -> i32 {
+/// Wait up to `timeout_ms` for `task`.  Returns VEC_PENDING if it is still
+/// running; otherwise VEC_OK (result text in the message), VEC_CANCELLED,
+/// VEC_ERROR or VEC_PANIC.  After a non-pending return, do not wait on the
+/// same task again.
+extern "C" fn debug_task_wait(task: *mut VecTask, timeout_ms: u32, err: *mut VecError) -> i32 {
     use df_core::debug::{Outcome, Poll};
     if task.is_null() {
-        write_message(buf, buflen, "task is NULL");
-        return DF_ERROR;
+        return fail(err, VEC_ERROR, "XX000", "task is NULL");
     }
-    // SAFETY: `task` came from df_ffi_debug_spin_start and is not yet freed.
+    // SAFETY: `task` came from debug_spin_start and is not yet freed.
     let task = unsafe { &*task };
     let polled = catch_unwind(AssertUnwindSafe(|| {
         task.0
             .wait(std::time::Duration::from_millis(timeout_ms as u64))
     }));
     match polled {
-        Ok(Poll::Pending) => DF_PENDING,
-        Ok(Poll::Ready(Outcome::Done(text))) => {
-            write_message(buf, buflen, &text);
-            DF_OK
-        }
-        Ok(Poll::Ready(Outcome::Cancelled)) => {
-            write_message(buf, buflen, "cancelled");
-            DF_CANCELLED
-        }
-        Ok(Poll::Ready(Outcome::Failed(msg))) => {
-            write_message(buf, buflen, &msg);
-            DF_ERROR
-        }
-        Ok(Poll::Ready(Outcome::Panicked(msg))) => {
-            write_message(buf, buflen, &msg);
-            DF_PANIC
-        }
-        Err(payload) => {
-            write_message(buf, buflen, panic_message(payload.as_ref()));
-            DF_PANIC
-        }
+        Ok(Poll::Pending) => VEC_PENDING,
+        Ok(Poll::Ready(Outcome::Done(text))) => fail(err, VEC_OK, "00000", &text),
+        Ok(Poll::Ready(Outcome::Cancelled)) => fail(err, VEC_CANCELLED, "57014", "cancelled"),
+        Ok(Poll::Ready(Outcome::Failed(msg))) => fail(err, VEC_ERROR, "XX000", &msg),
+        Ok(Poll::Ready(Outcome::Panicked(msg))) => fail(err, VEC_PANIC, "XX000", &msg),
+        Err(payload) => report_panic(payload, err),
     }
 }
 
 /// Ask `task` to stop.  Safe to call more than once.
-#[no_mangle]
-pub extern "C" fn df_ffi_task_cancel(task: *mut DfTask) {
+extern "C" fn debug_task_cancel(task: *mut VecTask) {
     if !task.is_null() {
-        // SAFETY: as in df_ffi_task_wait.
+        // SAFETY: as in debug_task_wait.
         let task = unsafe { &*task };
         let _ = catch_unwind(AssertUnwindSafe(|| task.0.cancel()));
     }
@@ -259,8 +245,7 @@ pub extern "C" fn df_ffi_task_cancel(task: *mut DfTask) {
 
 /// Release `task`, cancelling it if it is still running.  The running work
 /// owns what it uses, so it may finish after this returns.
-#[no_mangle]
-pub extern "C" fn df_ffi_task_free(task: *mut DfTask) {
+extern "C" fn debug_task_free(task: *mut VecTask) {
     if !task.is_null() {
         // SAFETY: `task` came from Box::into_raw and is freed exactly once.
         let task = unsafe { Box::from_raw(task) };
@@ -269,8 +254,7 @@ pub extern "C" fn df_ffi_task_free(task: *mut DfTask) {
 }
 
 /// Number of debug worker tasks still running on the runtime.
-#[no_mangle]
-pub extern "C" fn df_ffi_debug_active_tasks() -> u64 {
+extern "C" fn debug_active_tasks() -> u64 {
     df_core::debug::active_tasks() as u64
 }
 
@@ -278,145 +262,114 @@ pub extern "C" fn df_ffi_debug_active_tasks() -> u64 {
 // Queries (M3): one slice executed by DataFusion
 // ---------------------------------------------------------------------------
 
-/// Opaque handle owned by the C caller; release it with `df_ffi_query_free`.
-pub struct DfQuery(df_core::query::Query);
+/// Opaque handle owned by the C caller; release it with `query_free`.
+pub struct VecQuery(df_core::query::Query);
 
 /// Column buffers as exchanged with C: native values and one byte per row
 /// that is 1 for NULL.
 #[repr(C)]
-pub struct DfColumn {
+pub struct VecColumn {
     pub values: *const u8,
     pub nulls: *const u8,
     pub offsets: *const i32,
 }
 
-/// Write a five-character SQLSTATE plus NUL into `sqlstate` (6 bytes).
-fn write_sqlstate(sqlstate: *mut c_char, code: &str) {
-    write_message(sqlstate, 6, code);
-}
-
-/// Write the error's SQLSTATE, and its message followed, if it has one, by a
-/// newline and the detail (the C side splits at the first newline).
-fn report(
-    e: &df_core::pgfunc::PgError,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
-) -> i32 {
-    write_sqlstate(sqlstate, e.sqlstate);
-    match &e.detail {
-        Some(d) => write_message(buf, buflen, &format!("{}\n{}", e.message, d)),
-        None => write_message(buf, buflen, &e.message),
-    }
-    DF_ERROR
-}
-
-fn report_panic(
-    payload: Box<dyn Any + Send>,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
-) -> i32 {
-    write_sqlstate(sqlstate, "XX000");
-    write_message(buf, buflen, panic_message(payload.as_ref()));
-    DF_PANIC
-}
-
 /// An input DataFusion reads from PAX itself (C3): its scan and blocks, or
 /// a null scan.
 #[repr(C)]
-pub struct DfPaxInput {
+pub struct VecPaxInput {
     pub scan: *mut std::ffi::c_void,
     pub nblocks: u32,
 }
 
-/// Build the plan described by the JSON `spec` and start it with
-/// `partitions` parallel partitions, an operator memory budget of
-/// `memory_limit` bytes and spill files under `spill_dir`; `flags` are
-/// DF_QUERY_* bits.  The plan has `ninputs` inputs; bit j of `ipc_inputs`
-/// says input j arrives as Arrow IPC streams from a Motion
-/// (df_ffi_query_push_ipc), otherwise as pushed batches, unless `pax`
-/// (null, or one entry per input) gives it a PAX scan, which the workers
-/// read with `read`, `end` and `groups`, at most `pax_max_readers` groups
-/// at once (0: no limit), and which the query owns from the call on, even
-/// if it fails.  The runtime must be running.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_start(
-    spec: *const c_char,
-    partitions: u32,
-    memory_limit: u64,
-    spill_dir: *const c_char,
-    flags: u32,
-    ninputs: u32,
-    ipc_inputs: u64,
-    pax: *const DfPaxInput,
-    read: Option<df_core::query::PaxReadFn>,
-    end: Option<df_core::query::PaxEndFn>,
-    groups: Option<df_core::query::PaxGroupsFn>,
-    pax_max_readers: u32,
-    out_query: *mut *mut DfQuery,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
+/// What `query_start` needs; see `src/vec_engine.h`.
+#[repr(C)]
+pub struct VecQueryArgs {
+    pub ir: *const c_char,
+    pub partitions: u32,
+    pub memory_limit: u64,
+    pub spill_dir: *const c_char,
+    pub flags: u32,
+    pub ninputs: u32,
+    pub ipc_inputs: u64,
+    pub pax_inputs: *const VecPaxInput,
+    pub pax_read: Option<df_core::query::PaxReadFn>,
+    pub pax_end: Option<df_core::query::PaxEndFn>,
+    pub pax_groups: Option<df_core::query::PaxGroupsFn>,
+    pub pax_max_readers: u32,
+}
+
+/// Build the plan `args.ir` describes and start it with `partitions`
+/// parallel partitions, an operator memory budget of `memory_limit` bytes
+/// and spill files under `spill_dir`.  Bit j of `ipc_inputs` says input j
+/// arrives as Arrow IPC streams from a Motion (`query_push_ipc`), otherwise
+/// as pushed batches, unless `pax_inputs` (null, or one entry per input)
+/// gives it a PAX scan, which the workers read with `pax_read`, `pax_end`
+/// and `pax_groups`, at most `pax_max_readers` groups at once (0: no
+/// limit), and which the query owns from the call on, even if it fails.
+/// The runtime must be running.
+extern "C" fn query_start(
+    args: *const VecQueryArgs,
+    out_query: *mut *mut VecQuery,
+    err: *mut VecError,
 ) -> i32 {
+    // SAFETY: the caller passes valid arguments.
+    let a = unsafe { &*args };
     // The PAX scans are the query's from here on: wrapped first, so that
     // they are ended whatever fails below.
-    let sources: Vec<df_core::query::Source> = (0..ninputs as usize)
+    let sources: Vec<df_core::query::Source> = (0..a.ninputs as usize)
         .map(|j| {
-            // SAFETY: `pax` is null or holds `ninputs` entries.
-            let p = if pax.is_null() {
+            // SAFETY: `pax_inputs` is null or holds `ninputs` entries.
+            let p = if a.pax_inputs.is_null() {
                 None
             } else {
-                Some(unsafe { &*pax.add(j) })
+                Some(unsafe { &*a.pax_inputs.add(j) })
             };
-            match (p, read, end, groups) {
+            match (p, a.pax_read, a.pax_end, a.pax_groups) {
                 (Some(p), Some(read), Some(end), Some(groups)) if !p.scan.is_null() => {
                     df_core::query::Source::Pax(
                         df_core::query::PaxScan::new(p.scan, p.nblocks as usize, read, end, groups)
-                            .with_max_readers(pax_max_readers as usize),
+                            .with_max_readers(a.pax_max_readers as usize),
                     )
                 }
-                _ if j < 64 && ipc_inputs & (1u64 << j) != 0 => df_core::query::Source::Ipc,
+                _ if j < 64 && a.ipc_inputs & (1u64 << j) != 0 => df_core::query::Source::Ipc,
                 _ => df_core::query::Source::Pushed,
             }
         })
         .collect();
     let r = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: the caller passes a NUL-terminated string.
-        let spec = unsafe { std::ffi::CStr::from_ptr(spec) }.to_string_lossy();
-        let dir = unsafe { std::ffi::CStr::from_ptr(spill_dir) }.to_string_lossy();
+        // SAFETY: the caller passes NUL-terminated strings.
+        let ir = unsafe { CStr::from_ptr(a.ir) }.to_string_lossy();
+        let dir = unsafe { CStr::from_ptr(a.spill_dir) }.to_string_lossy();
         df_core::query::Query::start_multi(
-            &spec,
-            partitions as usize,
-            memory_limit as usize,
+            &ir,
+            a.partitions as usize,
+            a.memory_limit as usize,
             &dir,
             sources,
-            flags & DF_QUERY_IPC_OUTPUT != 0,
+            a.flags & VEC_QUERY_IPC_OUTPUT != 0,
         )
     }));
     match r {
         Ok(Ok(q)) => {
             // SAFETY: the caller passes a valid out pointer.
-            unsafe { *out_query = Box::into_raw(Box::new(DfQuery(q))) };
-            DF_OK
+            unsafe { *out_query = Box::into_raw(Box::new(VecQuery(q))) };
+            VEC_OK
         }
-        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
-        Err(p) => report_panic(p, sqlstate, buf, buflen),
+        Ok(Err(e)) => report(&e, err),
+        Err(p) => report_panic(p, err),
     }
 }
 
-/// Offer `nrows` rows in `ncols` columns.  DF_OK: taken.  DF_PENDING: the
+/// Offer `nrows` rows in `ncols` columns.  VEC_OK: taken.  VEC_PENDING: the
 /// input queue is full and nothing was taken; poll, then offer again.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_push(
-    query: *mut DfQuery,
+extern "C" fn query_push(
+    query: *mut VecQuery,
     input: u32,
-    cols: *const DfColumn,
+    cols: *const VecColumn,
     ncols: u32,
     nrows: u32,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
+    err: *mut VecError,
 ) -> i32 {
     // SAFETY: `query` is live; `cols` points to `ncols` columns of `nrows` rows.
     let q = unsafe { &mut (*query).0 };
@@ -433,34 +386,31 @@ pub extern "C" fn df_ffi_query_push(
     match catch_unwind(AssertUnwindSafe(|| unsafe {
         q.push_input(input as usize, &raw, nrows as usize)
     })) {
-        Ok(Ok(true)) => DF_OK,
-        Ok(Ok(false)) => DF_PENDING,
-        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
-        Err(p) => report_panic(p, sqlstate, buf, buflen),
+        Ok(Ok(true)) => VEC_OK,
+        Ok(Ok(false)) => VEC_PENDING,
+        Ok(Err(e)) => report(&e, err),
+        Err(p) => report_panic(p, err),
     }
 }
 
 /// A piece of a byte stream.
 #[repr(C)]
-pub struct DfSlice {
+pub struct VecSlice {
     pub data: *const u8,
     pub len: usize,
 }
 
 /// Offer Arrow IPC stream bytes received from Motion route `route`, as the
-/// `nparts` consecutive pieces `parts` (DF_QUERY_IPC_INPUT).  The bytes are
-/// copied.  DF_OK: taken.  DF_PENDING: the queue is full and nothing was
-/// taken; poll, then offer again.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_push_ipc(
-    query: *mut DfQuery,
+/// `nparts` consecutive pieces `parts`.  The bytes are copied.  VEC_OK:
+/// taken.  VEC_PENDING: the queue is full and nothing was taken; poll, then
+/// offer again.
+extern "C" fn query_push_ipc(
+    query: *mut VecQuery,
     input: u32,
     route: i32,
-    parts: *const DfSlice,
+    parts: *const VecSlice,
     nparts: u32,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
+    err: *mut VecError,
 ) -> i32 {
     // SAFETY: `query` is live; `parts` points to `nparts` readable pieces.
     let q = unsafe { &mut (*query).0 };
@@ -477,19 +427,18 @@ pub extern "C" fn df_ffi_query_push_ipc(
     match catch_unwind(AssertUnwindSafe(|| {
         q.push_ipc_input(input as usize, route, &pieces)
     })) {
-        Ok(Ok(true)) => DF_OK,
-        Ok(Ok(false)) => DF_PENDING,
-        Ok(Err(e)) => report(&e, sqlstate, buf, buflen),
-        Err(p) => report_panic(p, sqlstate, buf, buflen),
+        Ok(Ok(true)) => VEC_OK,
+        Ok(Ok(false)) => VEC_PENDING,
+        Ok(Err(e)) => report(&e, err),
+        Err(p) => report_panic(p, err),
     }
 }
 
-/// The Arrow IPC bytes returned by the last poll (DF_BYTES), valid until
+/// The Arrow IPC bytes returned by the last poll (VEC_BYTES), valid until
 /// the next poll, and their route: the Redistribute Motion's receiver, or
 /// -1 for a Motion's only stream.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_bytes(
-    query: *mut DfQuery,
+extern "C" fn query_bytes(
+    query: *mut VecQuery,
     route: *mut i32,
     data: *mut *const u8,
     len: *mut usize,
@@ -507,12 +456,12 @@ pub extern "C" fn df_ffi_query_bytes(
 /// Routes of `nrows` rows by Cloudberry's distribution hash, for checking
 /// the Rust transcription against cdbhash(): `kinds[i]` names the hash of
 /// key column `cols[i]` (0 bool, 1 int2, 2 int4, 3 int8, 4 float4,
-/// 5 float8, 6 text, 7 character, 8 + s numeric of scale s, 85 tid).  Writes `nrows` routes to `out`.  DF_OK, or DF_ERROR for an
-/// unknown kind.
-#[no_mangle]
-pub extern "C" fn df_ffi_cdbhash_routes(
+/// 5 float8, 6 text, 7 character, 8 + s numeric of scale s, 85 tid).
+/// Writes `nrows` routes to `out`.  VEC_OK, or VEC_ERROR for an unknown
+/// kind.
+extern "C" fn debug_cdbhash_routes(
     kinds: *const i32,
-    cols: *const DfColumn,
+    cols: *const VecColumn,
     nkeys: u32,
     nrows: u32,
     segments: i32,
@@ -559,41 +508,29 @@ pub extern "C" fn df_ffi_cdbhash_routes(
         Ok(Some(routes)) => {
             // SAFETY: `out` has room for `nrows` routes.
             unsafe { std::ptr::copy_nonoverlapping(routes.as_ptr(), out, routes.len()) };
-            DF_OK
+            VEC_OK
         }
-        _ => DF_ERROR,
+        _ => VEC_ERROR,
     }
 }
 
-/// Tell the query there is no more input.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_finish_input(query: *mut DfQuery) {
-    // SAFETY: `query` is live.
-    let q = unsafe { &mut (*query).0 };
-    let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input()));
-}
-
 /// Tell the query input `input` has no more rows.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_finish_input_at(query: *mut DfQuery, input: u32) {
+extern "C" fn query_finish_input(query: *mut VecQuery, input: u32) {
     // SAFETY: `query` is live.
     let q = unsafe { &mut (*query).0 };
     let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input_at(input as usize)));
 }
 
-/// Wait up to `timeout_ms` for the next result batch.  DF_OK: `*nrows` rows
-/// are available through df_ffi_query_column until the next poll.
-/// DF_BYTES: `*nrows` bytes of the result stream are available through
-/// df_ffi_query_bytes (DF_QUERY_IPC_OUTPUT).
-/// DF_PENDING, DF_DONE, or DF_ERROR / DF_PANIC with SQLSTATE and message.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_poll(
-    query: *mut DfQuery,
+/// Wait up to `timeout_ms` for the next result batch.  VEC_OK: `*nrows`
+/// rows are available through `query_column` until the next poll.
+/// VEC_BYTES: `*nrows` bytes of the result stream are available through
+/// `query_bytes` (VEC_QUERY_IPC_OUTPUT).  VEC_PENDING, VEC_DONE, or
+/// VEC_ERROR / VEC_PANIC with SQLSTATE and message.
+extern "C" fn query_poll(
+    query: *mut VecQuery,
     timeout_ms: u32,
     nrows: *mut u32,
-    sqlstate: *mut c_char,
-    buf: *mut c_char,
-    buflen: usize,
+    err: *mut VecError,
 ) -> i32 {
     use df_core::query::Poll;
     // SAFETY: `query` is live.
@@ -605,28 +542,23 @@ pub extern "C" fn df_ffi_query_poll(
         Ok(Poll::Batch(n)) => {
             // SAFETY: valid out pointer.
             unsafe { *nrows = n as u32 };
-            DF_OK
+            VEC_OK
         }
         Ok(Poll::Bytes(n)) => {
             // SAFETY: valid out pointer.
             unsafe { *nrows = n as u32 };
-            DF_BYTES
+            VEC_BYTES
         }
-        Ok(Poll::Pending) => DF_PENDING,
-        Ok(Poll::Done) => DF_DONE,
-        Ok(Poll::Failed(e)) => report(&e, sqlstate, buf, buflen),
-        Ok(Poll::Panicked(msg)) => {
-            write_sqlstate(sqlstate, "XX000");
-            write_message(buf, buflen, &msg);
-            DF_PANIC
-        }
-        Err(p) => report_panic(p, sqlstate, buf, buflen),
+        Ok(Poll::Pending) => VEC_PENDING,
+        Ok(Poll::Done) => VEC_DONE,
+        Ok(Poll::Failed(e)) => report(&e, err),
+        Ok(Poll::Panicked(msg)) => fail(err, VEC_PANIC, "XX000", &msg),
+        Err(p) => report_panic(p, err),
     }
 }
 
 /// Buffers of output column `col` of the batch returned by the last poll.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_column(query: *mut DfQuery, col: u32, out: *mut DfColumn) -> i32 {
+extern "C" fn query_column(query: *mut VecQuery, col: u32, out: *mut VecColumn) -> i32 {
     // SAFETY: `query` is live; `out` is valid.
     let q = unsafe { &(*query).0 };
     match q.output_column(col as usize) {
@@ -636,15 +568,15 @@ pub extern "C" fn df_ffi_query_column(query: *mut DfQuery, col: u32, out: *mut D
                 (*out).nulls = c.nulls;
                 (*out).offsets = c.offsets;
             }
-            DF_OK
+            VEC_OK
         }
-        None => DF_ERROR,
+        None => VEC_ERROR,
     }
 }
 
 /// Memory and spill figures of a query, for EXPLAIN ANALYZE.
 #[repr(C)]
-pub struct DfQueryStats {
+pub struct VecQueryStats {
     pub partitions: u64,
     pub memory_limit: u64,
     pub memory_peak: u64,
@@ -653,8 +585,7 @@ pub struct DfQueryStats {
     pub pax_decode_peak: u64,
 }
 
-#[no_mangle]
-pub extern "C" fn df_ffi_query_stats(query: *mut DfQuery, out: *mut DfQueryStats) {
+extern "C" fn query_stats(query: *mut VecQuery, out: *mut VecQueryStats) {
     // SAFETY: `query` is live; `out` is valid.
     let q = unsafe { &(*query).0 };
     let s = catch_unwind(AssertUnwindSafe(|| q.stats())).unwrap_or_default();
@@ -668,15 +599,8 @@ pub extern "C" fn df_ffi_query_stats(query: *mut DfQuery, out: *mut DfQueryStats
     }
 }
 
-/// Live bytes allocated by Rust code in this process, on any thread.
-#[no_mangle]
-pub extern "C" fn df_ffi_heap_bytes() -> i64 {
-    df_core::memory::heap_bytes()
-}
-
 /// Stop the query and release it.  Never blocks; running work is aborted.
-#[no_mangle]
-pub extern "C" fn df_ffi_query_free(query: *mut DfQuery) {
+extern "C" fn query_free(query: *mut VecQuery) {
     if !query.is_null() {
         // SAFETY: `query` came from Box::into_raw and is freed exactly once.
         let q = unsafe { Box::from_raw(query) };
@@ -684,38 +608,164 @@ pub extern "C" fn df_ffi_query_free(query: *mut DfQuery) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The table
+// ---------------------------------------------------------------------------
+
+/// What the host gives the engine.
+#[repr(C)]
+pub struct VecHost {
+    pub abi: u32,
+}
+
+/// The test functions of `src/vec_engine.h`.
+#[repr(C)]
+pub struct VecEngineDebug {
+    pub panic: extern "C" fn(*mut VecError) -> i32,
+    pub spin_start: extern "C" fn(f64, u32, bool, *mut *mut VecTask, *mut VecError) -> i32,
+    pub task_wait: extern "C" fn(*mut VecTask, u32, *mut VecError) -> i32,
+    pub task_cancel: extern "C" fn(*mut VecTask),
+    pub task_free: extern "C" fn(*mut VecTask),
+    pub active_tasks: extern "C" fn() -> u64,
+    pub cdbhash_routes:
+        extern "C" fn(*const i32, *const VecColumn, u32, u32, i32, i32, *mut u32) -> i32,
+}
+
+/// The engine's table of `src/vec_engine.h`.
+#[repr(C)]
+pub struct VecEngine {
+    pub abi: u32,
+    pub name: *const c_char,
+    pub version: *const c_char,
+    pub runtime_init: extern "C" fn(u32, *mut u32, *mut VecError) -> i32,
+    pub runtime_shutdown: extern "C" fn(u32),
+    pub heap_bytes: extern "C" fn() -> i64,
+    pub set_case_maps: extern "C" fn(*const u32, usize, *const u32, usize),
+    pub query_start: extern "C" fn(*const VecQueryArgs, *mut *mut VecQuery, *mut VecError) -> i32,
+    pub query_push:
+        extern "C" fn(*mut VecQuery, u32, *const VecColumn, u32, u32, *mut VecError) -> i32,
+    pub query_push_ipc:
+        extern "C" fn(*mut VecQuery, u32, i32, *const VecSlice, u32, *mut VecError) -> i32,
+    pub query_finish_input: extern "C" fn(*mut VecQuery, u32),
+    pub query_poll: extern "C" fn(*mut VecQuery, u32, *mut u32, *mut VecError) -> i32,
+    pub query_column: extern "C" fn(*mut VecQuery, u32, *mut VecColumn) -> i32,
+    pub query_bytes: extern "C" fn(*mut VecQuery, *mut i32, *mut *const u8, *mut usize),
+    pub query_stats: extern "C" fn(*mut VecQuery, *mut VecQueryStats),
+    pub query_free: extern "C" fn(*mut VecQuery),
+    pub debug: *const VecEngineDebug,
+}
+
+// SAFETY: the table only holds function pointers and pointers to strings
+// and a table that live as long as the process and are never written.
+unsafe impl Sync for VecEngine {}
+unsafe impl Send for VecEngine {}
+
+static NAME: &CStr = c"datafusion";
+
+static DEBUG: VecEngineDebug = VecEngineDebug {
+    panic: debug_panic,
+    spin_start: debug_spin_start,
+    task_wait: debug_task_wait,
+    task_cancel: debug_task_cancel,
+    task_free: debug_task_free,
+    active_tasks: debug_active_tasks,
+    cdbhash_routes: debug_cdbhash_routes,
+};
+
+/// "datafusion <version>", made once.
+fn version() -> &'static CStr {
+    static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
+    VERSION.get_or_init(|| {
+        std::ffi::CString::new(format!("datafusion {}", datafusion::DATAFUSION_VERSION))
+            .expect("version without NUL")
+    })
+}
+
+/// The table, or null if the host speaks another ABI.  Never panics.
+#[no_mangle]
+pub extern "C" fn vec_engine_entry(host_abi: u32, _host: *const VecHost) -> *const VecEngine {
+    static ENGINE: OnceLock<VecEngine> = OnceLock::new();
+    if host_abi != VEC_ENGINE_ABI {
+        return std::ptr::null();
+    }
+    catch_unwind(|| {
+        ENGINE.get_or_init(|| VecEngine {
+            abi: VEC_ENGINE_ABI,
+            name: NAME.as_ptr(),
+            version: version().as_ptr(),
+            runtime_init,
+            runtime_shutdown,
+            heap_bytes,
+            set_case_maps,
+            query_start,
+            query_push,
+            query_push_ipc,
+            query_finish_input,
+            query_poll,
+            query_column,
+            query_bytes,
+            query_stats,
+            query_free,
+            debug: &DEBUG,
+        }) as *const VecEngine
+    })
+    .unwrap_or(std::ptr::null())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn call(f: extern "C" fn(*mut c_char, usize) -> i32) -> (i32, String) {
-        let mut buf = vec![0 as c_char; 64];
-        let status = f(buf.as_mut_ptr(), buf.len());
-        let msg = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+    fn engine() -> &'static VecEngine {
+        let e = vec_engine_entry(VEC_ENGINE_ABI, std::ptr::null());
+        assert!(!e.is_null());
+        unsafe { &*e }
+    }
+
+    fn new_error() -> VecError {
+        VecError {
+            sqlstate: [0; 6],
+            message: [0; VEC_MSG_LEN],
+        }
+    }
+
+    fn text(buf: &[c_char]) -> String {
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
             .to_string_lossy()
-            .into_owned();
-        (status, msg)
+            .into_owned()
     }
 
     #[test]
     fn version_reports_datafusion() {
-        let (status, msg) = call(df_ffi_version);
-        assert_eq!(status, DF_OK);
-        assert!(msg.starts_with("datafusion "), "{msg}");
+        let e = engine();
+        assert_eq!(e.abi, VEC_ENGINE_ABI);
+        assert_eq!(
+            unsafe { CStr::from_ptr(e.name) }.to_str().unwrap(),
+            "datafusion"
+        );
+        let v = unsafe { CStr::from_ptr(e.version) }.to_str().unwrap();
+        assert!(v.starts_with("datafusion "), "{v}");
+    }
+
+    #[test]
+    fn other_abi_gets_no_table() {
+        assert!(vec_engine_entry(VEC_ENGINE_ABI + 1, std::ptr::null()).is_null());
+        assert!(vec_engine_entry(0, std::ptr::null()).is_null());
     }
 
     #[test]
     fn panic_is_caught() {
-        let (status, msg) = call(df_ffi_debug_panic);
-        assert_eq!(status, DF_PANIC);
-        assert_eq!(msg, "datafusion_debug_panic requested");
+        let mut err = new_error();
+        let status = (unsafe { &*engine().debug }.panic)(&mut err);
+        assert_eq!(status, VEC_PANIC);
+        assert_eq!(text(&err.sqlstate), "XX000");
+        assert_eq!(text(&err.message), "datafusion_debug_panic requested");
     }
 
     #[test]
     fn message_is_truncated_on_char_boundary() {
         let mut buf = [0 as c_char; 4];
-        write_message(buf.as_mut_ptr(), buf.len(), "a数据");
-        let msg = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
-        assert_eq!(msg.to_str().unwrap(), "a");
+        write_message(&mut buf, "a数据");
+        assert_eq!(text(&buf), "a");
     }
 }

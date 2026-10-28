@@ -122,7 +122,7 @@
 #define DF_MIN_HEADROOM		(1024 * 1024)
 
 uint64		df_runs_completed = 0;
-DfQueryStats df_last_run;
+VecQueryStats df_last_run;
 bool		df_pax_direct_read = true;
 int			df_pax_max_decoders = 0;
 int			df_slice_partitions = 0;
@@ -166,7 +166,7 @@ typedef struct DfInput
 	uint8	  **innulls;
 	int32	  **inoffsets;		/* string columns: DF_BATCH_ROWS + 1 offsets */
 	Size	   *incap;			/* string columns: bytes allocated */
-	DfColumn   *incols;
+	VecColumn   *incols;
 	int			batch_rows;
 	bool		batch_ready;	/* a filled batch waits to be pushed */
 	bool		ended;			/* no more rows to read */
@@ -177,7 +177,7 @@ typedef struct DfInput
 	uint8		rx_head[DF_BATCH_HEAD];	/* expected head of each stream */
 	TupleChunkListItem rx_items;	/* chunks received, not yet released */
 	int16		rx_route;
-	DfSlice    *rx_slices;		/* their payloads, past each stream's head */
+	VecSlice    *rx_slices;		/* their payloads, past each stream's head */
 	int			rx_nslices;
 	int			rx_maxslices;
 	bool		rx_eos;			/* the chunks end the route's stream */
@@ -211,7 +211,7 @@ typedef struct DfExec
 	int			slices_together;	/* slices of the plan running with ours */
 	int			host_segments;	/* primary segments on this host */
 
-	DfQuery    *query;			/* NULL until the first row is requested */
+	VecQuery    *query;			/* NULL until the first row is requested */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
 	DfPaxScanInfo pax_info;
 	bool		input_done;		/* every input is done */
@@ -223,7 +223,7 @@ typedef struct DfExec
 	ExprState **tail_states;	/* per column: what finishes it, or NULL */
 	ExprContext *tailcxt;
 	MemoryContext rowcxt;		/* the strings of the row handed out */
-	DfColumn   *outcols;
+	VecColumn   *outcols;
 	uint32		out_nrows;
 	uint32		out_row;
 	bool		done;
@@ -269,7 +269,7 @@ df_exec_release(void *arg)
 
 	if (x->query != NULL)
 	{
-		df_ffi_query_free(x->query);
+		df_engine->query_free(x->query);
 		x->query = NULL;
 		df_vmem_trim();
 	}
@@ -296,11 +296,13 @@ df_exec_lookup(PlanState *pstate)
 }
 
 static void
-df_raise_query(int32 status, const char *sqlstate, char *msg)
+df_raise_query(int32 status, VecError *err)
 {
+	char	   *msg = err->message;
+	const char *sqlstate = err->sqlstate;
 	char	   *detail = strchr(msg, '\n');
 
-	if (status == DF_PANIC)
+	if (status == VEC_PANIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion panicked: %s", msg)));
@@ -378,9 +380,9 @@ df_slice_memory(PlanState *root)
 static void
 df_exec_finished(DfExec *x)
 {
-	DfQueryStats s;
+	VecQueryStats s;
 
-	df_ffi_query_stats(x->query, &s);
+	df_engine->query_stats(x->query, &s);
 	df_last_run = s;
 	df_last_run_pax = x->pax_direct;
 	if (x->pax_direct)
@@ -398,7 +400,7 @@ df_exec_finished(DfExec *x)
 static uint32_t
 df_query_flags(DfExec *x)
 {
-	return x->send ? DF_QUERY_IPC_OUTPUT : 0;
+	return x->send ? VEC_QUERY_IPC_OUTPUT : 0;
 }
 
 /* Bit j set: input j arrives as batches from a Motion. */
@@ -582,8 +584,8 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 		{
 			in->rx_maxslices = Max(16, in->rx_maxslices * 2);
 			in->rx_slices = in->rx_slices ?
-				repalloc(in->rx_slices, sizeof(DfSlice) * in->rx_maxslices) :
-				MemoryContextAlloc(x->estate->es_query_cxt, sizeof(DfSlice) * in->rx_maxslices);
+				repalloc(in->rx_slices, sizeof(VecSlice) * in->rx_maxslices) :
+				MemoryContextAlloc(x->estate->es_query_cxt, sizeof(VecSlice) * in->rx_maxslices);
 		}
 		in->rx_slices[in->rx_nslices].data = data;
 		in->rx_slices[in->rx_nslices].len = len;
@@ -599,8 +601,7 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 static void
 df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 {
-	char		buf[DF_MSG_BUFLEN];
-	char		sqlstate[6] = "XX000";
+	VecError	err;
 	int16		motion_id = ((Motion *) in->motion->ps.plan)->motionID;
 	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
 	MotionNodeEntry *entry = &ml->mnEntries[motion_id - 1];
@@ -611,7 +612,7 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		{
 			/* every sender has ended its stream */
 			x->estate->active_recv_id = -1;
-			df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+			df_engine->query_finish_input(x->query, (uint32_t) in->index);
 			in->done = true;
 			return;
 		}
@@ -622,12 +623,14 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 
 	if (in->rx_nslices > 0)
 	{
-		int32		status = df_ffi_query_push_ipc(x->query, (uint32_t) in->index,
-												   in->rx_route, in->rx_slices,
-												   (uint32_t) in->rx_nslices,
-												   sqlstate, buf, sizeof(buf));
+		int32		status;
 
-		if (status == DF_PENDING)
+		DF_ERROR_INIT(err);
+		status = df_engine->query_push_ipc(x->query, (uint32_t) in->index,
+										   in->rx_route, in->rx_slices,
+										   (uint32_t) in->rx_nslices, &err);
+
+		if (status == VEC_PENDING)
 		{
 			/*
 			 * Still full after a short wait inside: keep the chunks and offer
@@ -636,8 +639,8 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 			*pushed = true;
 			return;
 		}
-		if (status != DF_OK)
-			df_raise_query(status, sqlstate, buf);
+		if (status != VEC_OK)
+			df_raise_query(status, &err);
 		*pushed = true;
 	}
 
@@ -689,10 +692,10 @@ df_input_scans_pax(DfInput *in)
  * empty.  The scan's min/max skipping is added to the slice's.
  */
 static bool
-df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, DfPaxInput *pax)
+df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInput *pax)
 {
 	Relation	rel;
-	char		buf[DF_MSG_BUFLEN];
+	char		buf[VEC_MSG_LEN];
 	DfPaxScanInfo info;
 	int		   *cols;
 	int		   *widths;
@@ -824,13 +827,13 @@ df_query_partitions(int workers, int slices, int segments)
 static void
 df_exec_begin(DfExec *x)
 {
-	char		buf[DF_MSG_BUFLEN];
-	char		sqlstate[6] = "XX000";
+	VecError	err;
 	int			workers;
 	int32		status;
 	int			j;
 	const DfPaxReader *reader = NULL;
-	DfPaxInput *pax = NULL;
+	VecPaxInput *pax = NULL;
+	VecQueryArgs args;
 
 	workers = df_runtime_ensure();
 	if (df_pax_direct_read)
@@ -842,7 +845,7 @@ df_exec_begin(DfExec *x)
 	}
 	if (reader != NULL)
 	{
-		pax = palloc0(sizeof(DfPaxInput) * x->ninputs);
+		pax = palloc0(sizeof(VecPaxInput) * x->ninputs);
 		for (j = 0; j < x->ninputs; j++)
 		{
 			PG_TRY();
@@ -862,21 +865,28 @@ df_exec_begin(DfExec *x)
 			PG_END_TRY();
 		}
 	}
+	memset(&args, 0, sizeof(args));
+	args.ir = x->spec.json;
+	args.partitions = (uint32_t) df_query_partitions(workers, x->slices_together,
+													 x->host_segments);
+	args.memory_limit = (uint64_t) x->memory_limit;
+	args.spill_dir = df_spill_dir();
+	args.flags = df_query_flags(x);
+	args.ninputs = (uint32_t) x->ninputs;
+	args.ipc_inputs = df_ipc_inputs(x);
+	args.pax_inputs = pax;
+	args.pax_read = reader ? reader->read : NULL;
+	args.pax_end = reader ? reader->end : NULL;
+	args.pax_groups = reader ? reader->block_groups : NULL;
+	args.pax_max_readers = (uint32_t) df_pax_max_decoders;
+
 	/* From here on the query owns the PAX scans, even if this fails. */
-	status = df_ffi_query_start(x->spec.json,
-								(uint32_t) df_query_partitions(workers, x->slices_together,
-															  x->host_segments),
-								(uint64_t) x->memory_limit, df_spill_dir(),
-								df_query_flags(x), (uint32_t) x->ninputs, df_ipc_inputs(x),
-								pax, reader ? reader->read : NULL,
-								reader ? reader->end : NULL,
-								reader ? reader->block_groups : NULL,
-								(uint32_t) df_pax_max_decoders,
-								&x->query, sqlstate, buf, sizeof(buf));
-	if (status != DF_OK)
+	DF_ERROR_INIT(err);
+	status = df_engine->query_start(&args, &x->query, &err);
+	if (status != VEC_OK)
 	{
 		x->query = NULL;
-		df_raise_query(status, sqlstate, buf);
+		df_raise_query(status, &err);
 	}
 	df_vmem_sync(x->headroom);
 
@@ -1161,7 +1171,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 	in->batch_ready = (n > 0);
 	if (in->ended && !in->batch_ready)
 	{
-		df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+		df_engine->query_finish_input(x->query, (uint32_t) in->index);
 		in->done = true;
 	}
 }
@@ -1173,8 +1183,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 static void
 df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 {
-	char		buf[DF_MSG_BUFLEN];
-	char		sqlstate[6] = "XX000";
+	VecError	err;
 	int32		status;
 
 	if (in->ipc)
@@ -1186,23 +1195,24 @@ df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		df_exec_fill(x, in);
 	if (!in->batch_ready)
 		return;
-	status = df_ffi_query_push(x->query, (uint32_t) in->index, in->incols,
-							   (uint32_t) in->spec->ncols, (uint32_t) in->batch_rows,
-							   sqlstate, buf, sizeof(buf));
-	if (status == DF_OK)
+	DF_ERROR_INIT(err);
+	status = df_engine->query_push(x->query, (uint32_t) in->index, in->incols,
+								   (uint32_t) in->spec->ncols, (uint32_t) in->batch_rows,
+								   &err);
+	if (status == VEC_OK)
 	{
 		*pushed = true;
 		in->batch_ready = false;
 		if (in->ended)
 		{
-			df_ffi_query_finish_input_at(x->query, (uint32_t) in->index);
+			df_engine->query_finish_input(x->query, (uint32_t) in->index);
 			in->done = true;
 		}
 	}
-	else if (status == DF_PENDING)
+	else if (status == VEC_PENDING)
 		*full = true;
 	else
-		df_raise_query(status, sqlstate, buf);
+		df_raise_query(status, &err);
 }
 
 /* Row 'r' of a Decimal256 column. */
@@ -1484,8 +1494,7 @@ df_exec_prerun(DfExec *x)
 static TupleTableSlot *
 df_exec_next(DfExec *x)
 {
-	char		buf[DF_MSG_BUFLEN];
-	char		sqlstate[6] = "XX000";
+	VecError	err;
 
 	if (x->query == NULL && !x->done)
 	{
@@ -1538,27 +1547,28 @@ df_exec_next(DfExec *x)
 			}
 		}
 
-		status = df_ffi_query_poll(x->query,
-								   pushed ? 0 : (full ? DF_POLL_FULL_MS : DF_POLL_IDLE_MS),
-								   &nrows, sqlstate, buf, sizeof(buf));
-		if (status == DF_OK)
+		DF_ERROR_INIT(err);
+		status = df_engine->query_poll(x->query,
+									   pushed ? 0 : (full ? DF_POLL_FULL_MS : DF_POLL_IDLE_MS),
+									   &nrows, &err);
+		if (status == VEC_OK)
 		{
 			int			c;
 
 			for (c = 0; c < x->spec.nout; c++)
-				if (df_ffi_query_column(x->query, (uint32_t) c, &x->outcols[c]) != DF_OK)
+				if (df_engine->query_column(x->query, (uint32_t) c, &x->outcols[c]) != VEC_OK)
 					elog(ERROR, "datafusion: result column %d is missing", c);
 			x->out_nrows = nrows;
 			x->out_row = 0;
 		}
-		else if (status == DF_BYTES)
+		else if (status == VEC_BYTES)
 		{
 			const uint8 *data;
 			size_t		len;
 			int32		route;
 
 			/* Our results, for one of the Motion's receivers. */
-			df_ffi_query_bytes(x->query, &route, &data, &len);
+			df_engine->query_bytes(x->query, &route, &data, &len);
 			if (route < 0)
 				route = 0;		/* a Gather's only receiver */
 			if (route >= x->send_nroutes)
@@ -1579,12 +1589,12 @@ df_exec_next(DfExec *x)
 				 */
 				x->send->stopRequested = true;
 				x->done = true;
-				df_ffi_query_free(x->query);
+				df_engine->query_free(x->query);
 				x->query = NULL;
 				df_vmem_trim();
 			}
 		}
-		else if (status == DF_DONE)
+		else if (status == VEC_DONE)
 		{
 			x->done = true;
 			df_exec_finished(x);
@@ -1596,8 +1606,8 @@ df_exec_next(DfExec *x)
 				x->send->sentEndOfStream = true;
 			}
 		}
-		else if (status != DF_PENDING)
-			df_raise_query(status, sqlstate, buf);
+		else if (status != VEC_PENDING)
+			df_raise_query(status, &err);
 
 		df_vmem_sync(x->headroom);
 		CHECK_FOR_INTERRUPTS();
@@ -1850,7 +1860,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
 		in->inoffsets = palloc0(sizeof(int32 *) * Max(in->spec->ncols, 1));
 		in->incap = palloc0(sizeof(Size) * Max(in->spec->ncols, 1));
-		in->incols = palloc0(sizeof(DfColumn) * Max(in->spec->ncols, 1));
+		in->incols = palloc0(sizeof(VecColumn) * Max(in->spec->ncols, 1));
 		for (c = 0; c < in->spec->ncols; c++)
 		{
 			if (df_type_is_string(in->spec->types[c]))
@@ -1959,7 +1969,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 											LocallyExecutingSliceIndex(estate));
 	x->host_segments = df_host_segments();
 
-	x->outcols = palloc0(sizeof(DfColumn) * Max(x->spec.nout, 1));
+	x->outcols = palloc0(sizeof(VecColumn) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
 	if (x->spec.col_tail != NULL)
 	{

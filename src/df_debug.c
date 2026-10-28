@@ -100,7 +100,7 @@ datafusion_debug_vmem(PG_FUNCTION_ARGS)
 {
 	int64		v[2];
 
-	v[0] = df_ffi_heap_bytes();
+	v[0] = df_engine->heap_bytes();
 	v[1] = df_vmem_leased_bytes();
 	PG_RETURN_DATUM(df_int8_record(fcinfo, 2, v));
 }
@@ -108,8 +108,8 @@ datafusion_debug_vmem(PG_FUNCTION_ARGS)
 static text *
 df_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
 {
-	char		buf[DF_MSG_BUFLEN];
-	DfTask	   *task = NULL;
+	VecError	err;
+	VecTask	   *task = NULL;
 	int32		status;
 
 	if (ntasks < 1)
@@ -119,17 +119,19 @@ df_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
 
 	df_runtime_ensure();
 
-	status = df_ffi_debug_spin_start(seconds, (uint32_t) ntasks,
-									 panic_in_worker, &task, buf, sizeof(buf));
-	if (status != DF_OK)
-		df_raise(status, buf);
+	DF_ERROR_INIT(err);
+	status = df_engine_debug()->spin_start(seconds, (uint32_t) ntasks,
+										   panic_in_worker, &task, &err);
+	if (status != VEC_OK)
+		df_raise(status, err.message);
 
-	status = df_task_wait_interruptible(task, buf, sizeof(buf));
-	if (status == DF_OK)
-		return cstring_to_text(buf);
-	if (status == DF_CANCELLED)
+	DF_ERROR_INIT(err);
+	status = df_task_wait_interruptible(task, &err);
+	if (status == VEC_OK)
+		return cstring_to_text(err.message);
+	if (status == VEC_CANCELLED)
 		elog(ERROR, "DataFusion tasks were cancelled");
-	df_raise(status, buf);
+	df_raise(status, err.message);
 }
 
 /* datafusion_debug_spin(seconds float8, ntasks int) returns text */
@@ -150,7 +152,7 @@ datafusion_debug_worker_panic(PG_FUNCTION_ARGS)
 Datum
 datafusion_debug_active_tasks(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64((int64) df_ffi_debug_active_tasks());
+	PG_RETURN_INT64((int64) df_engine_debug()->active_tasks());
 }
 
 #ifdef __linux__
@@ -320,7 +322,7 @@ datafusion_debug_last_pax(PG_FUNCTION_ARGS)
  */
 typedef struct DfKeyType
 {
-	int32		kind;			/* as df_ffi_cdbhash_routes numbers it */
+	int32		kind;			/* as the engine's cdbhash_routes numbers it */
 	Oid			hashfunc;
 	int			width;			/* 0: a string */
 } DfKeyType;
@@ -463,7 +465,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 	char	   *values[3];
 	int32	   *offsets[3];
 	uint8	   *nulls[3];
-	DfColumn	cols[3];
+	VecColumn	cols[3];
 	int32		kinds[3];
 	Oid			funcs[3];
 	uint32	   *routes = palloc(sizeof(uint32) * nrows);
@@ -520,8 +522,9 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 	h = makeCdbHash(segments, nkeys, funcs);
 	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);
 
-	if (df_ffi_cdbhash_routes(kinds, cols, nkeys, nrows, segments, workers, routes) != DF_OK)
-		elog(ERROR, "datafusion: df_ffi_cdbhash_routes failed");
+	if (df_engine_debug()->cdbhash_routes(kinds, cols, nkeys, nrows, segments, workers,
+										  routes) != VEC_OK)
+		elog(ERROR, "datafusion: the engine's cdbhash_routes failed");
 
 	for (r = 0; r < nrows; r++)
 	{

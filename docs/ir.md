@@ -15,7 +15,7 @@ arguments in).
 
 ## Versioning
 
-Every plan carries `"ir": 1`.  `DF_IR_VERSION` (`src/df_ffi.h`) and
+Every plan carries `"ir": 1`.  `VEC_IR_VERSION` (`src/vec_engine.h`) and
 `query::IR_VERSION` must match; an engine refuses a plan of any other
 version, or of none, before it builds anything.
 

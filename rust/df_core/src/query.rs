@@ -89,7 +89,7 @@ use crate::pgstr::{bpchar_key, bpchar_pad, PgLike, PgStrFn, StrFn};
 use crate::runtime;
 
 /// Version of the plan IR this engine reads (docs/ir.md); the C side's
-/// DF_IR_VERSION.
+/// VEC_IR_VERSION.
 pub const IR_VERSION: u64 = 1;
 
 /// Rows per input batch the main thread pushes.

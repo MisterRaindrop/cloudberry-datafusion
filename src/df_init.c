@@ -34,6 +34,11 @@
 
 PG_MODULE_MAGIC;
 
+/* The engine slices run in: DataFusion, linked in. */
+const VecEngine *df_engine = NULL;
+
+static const VecHost df_host = {VEC_ENGINE_ABI};
+
 void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(datafusion_version);
@@ -159,6 +164,14 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("datafusion");
 
+	/* The engine's table: no threads, nothing else starts here. */
+	df_engine = vec_engine_entry(VEC_ENGINE_ABI, &df_host);
+	if (df_engine == NULL || df_engine->abi != VEC_ENGINE_ABI)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("datafusion: the execution engine does not speak ABI version %d",
+						VEC_ENGINE_ABI)));
+
 	df_install_hooks();
 
 	/*
@@ -176,7 +189,7 @@ _PG_init(void)
 void
 df_raise(int32 status, const char *msg)
 {
-	if (status == DF_PANIC)
+	if (status == VEC_PANIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion panicked: %s", msg)));
@@ -186,28 +199,33 @@ df_raise(int32 status, const char *msg)
 			 errmsg("datafusion error: %s", msg)));
 }
 
+/* The engine's test functions, or an error if it has none. */
+const VecEngineDebug *
+df_engine_debug(void)
+{
+	if (df_engine->debug == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("datafusion: engine %s has no test functions", df_engine->name)));
+	return df_engine->debug;
+}
+
 Datum
 datafusion_version(PG_FUNCTION_ARGS)
 {
-	char		buf[DF_MSG_BUFLEN];
-	int32		status;
-
-	status = df_ffi_version(buf, sizeof(buf));
-	if (status != DF_OK)
-		df_raise(status, buf);
-
-	PG_RETURN_TEXT_P(cstring_to_text(buf));
+	PG_RETURN_TEXT_P(cstring_to_text(df_engine->version));
 }
 
 Datum
 datafusion_debug_panic(PG_FUNCTION_ARGS)
 {
-	char		buf[DF_MSG_BUFLEN];
+	VecError	err;
 	int32		status;
 
-	status = df_ffi_debug_panic(buf, sizeof(buf));
-	if (status != DF_OK)
-		df_raise(status, buf);
+	DF_ERROR_INIT(err);
+	status = df_engine_debug()->panic(&err);
+	if (status != VEC_OK)
+		df_raise(status, err.message);
 
 	PG_RETURN_VOID();
 }
