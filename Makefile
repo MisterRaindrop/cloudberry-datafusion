@@ -42,7 +42,7 @@ EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial storage parallel
+REGRESS = datafusion_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial storage parallel
 # The direct PAX reader is only tested when it is built.
 ifdef DF_PAX_SRC
 REGRESS += paxdirect
@@ -64,10 +64,16 @@ endif
 DF_CARGO_TARGET_DIR = $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/engines/datafusion/target)
 DF_RUST_LIB = $(DF_CARGO_TARGET_DIR)/$(DF_CARGO_OUTDIR)/libdf_ffi$(DLSUFFIX)
 DF_ENGINE = vec_engine_datafusion$(DLSUFFIX)
+# The null engine, for the tests: one of this ABI, one claiming version 1.
+DF_NULL_ENGINES = vec_engine_null$(DLSUFFIX) vec_engine_null_abi1$(DLSUFFIX)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+# PGXS does not track headers: every object takes the module's and the ABI's,
+# so that a change to a struct there rebuilds them all.
+$(OBJS): src/df_executor.h include/vec_engine.h
 
 # Must come after pgxs.mk so PORTNAME is defined.  The version script keeps
 # the module's symbols local but for what PostgreSQL looks up.
@@ -77,7 +83,7 @@ endif
 
 # The engine is a library of its own, which the module opens at first use
 # (datafusion.engine).  Cargo builds it; it exports only vec_engine_entry.
-all: $(DF_ENGINE)
+all: $(DF_ENGINE) $(DF_NULL_ENGINES)
 
 .PHONY: df-rust df-rust-test df-rust-clean
 df-rust:
@@ -96,12 +102,17 @@ df-rust-test:
 df-rust-clean:
 	-cd engines/datafusion && $(CARGO) clean
 
+vec_engine_null$(DLSUFFIX): engines/null/vec_engine_null.c include/vec_engine.h
+	$(CC) $(CFLAGS) $(CFLAGS_SL) -Iinclude -shared $< -o $@
+vec_engine_null_abi1$(DLSUFFIX): engines/null/vec_engine_null.c include/vec_engine.h
+	$(CC) $(CFLAGS) $(CFLAGS_SL) -Iinclude -DVEC_NULL_ABI=1 -shared $< -o $@
+
 install: install-engine
 .PHONY: install-engine
-install-engine: $(DF_ENGINE)
-	$(INSTALL_SHLIB) $(DF_ENGINE) '$(DESTDIR)$(pkglibdir)/'
+install-engine: $(DF_ENGINE) $(DF_NULL_ENGINES)
+	$(INSTALL_SHLIB) $(DF_ENGINE) $(DF_NULL_ENGINES) '$(DESTDIR)$(pkglibdir)/'
 
-EXTRA_CLEAN += $(DF_ENGINE)
+EXTRA_CLEAN += $(DF_ENGINE) $(DF_NULL_ENGINES)
 
 # ---------------------------------------------------------------------------
 # Experimental direct PAX reader, datafusion_pax.so.  Its source is a patch to

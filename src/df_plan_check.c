@@ -166,6 +166,7 @@ static bool df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
 static void df_check_numcmp_term(Node *node, DfCheckContext *cxt);
 static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
+static bool df_engine_has(DfCheckContext *cxt, uint64 feature);
 static void df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 							   bool root_is_sender);
 
@@ -350,7 +351,7 @@ df_type_supported(Oid type)
 			return GetDatabaseEncoding() == PG_UTF8;
 		case NUMERICOID:
 			/* of a known precision and scale: df_numeric_ps */
-			return true;
+			return df_engine_numeric();
 		default:
 			return false;
 	}
@@ -672,7 +673,8 @@ df_string_order_problem(DfCheckContext *cxt, const char *name, Oid collation)
 		return df_string_compare_problem(cxt, name, collation);
 	if (OidIsValid(collation) && GetDatabaseEncoding() == PG_UTF8 &&
 		df_collation_provider(collation) == COLLPROVIDER_LIBC &&
-		get_collation_isdeterministic(collation))
+		get_collation_isdeterministic(collation) &&
+		(df_engine_features() & VEC_F_COLLATE) != 0)
 		return NULL;
 	return df_string_compare_problem(cxt, name, collation);
 }
@@ -798,7 +800,8 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 			if (!OidIsValid(collation))
 				return "without a collation";
 			if (df_ctype_is_c(collation) ||
-				(collation == DEFAULT_COLLATION_OID && df_default_case_maps()))
+				(collation == DEFAULT_COLLATION_OID && df_default_case_maps() &&
+				 (df_engine_features() & VEC_F_COLLATE) != 0))
 				return NULL;	/* ASCII under C, else the locale's maps (CM1) */
 			return "under a collation other than C";
 	}
@@ -5472,11 +5475,55 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 	cxt->node = saved;
 }
 
+/*
+ * Does the engine have 'feature'?  If not, rejects the slice saying so.
+ */
+static bool
+df_engine_has(DfCheckContext *cxt, uint64 feature)
+{
+	if ((df_engine_features() & feature) != 0)
+		return true;
+	df_reject(cxt, "engine %s lacks %s", df_engine->name, df_feature_name(feature));
+	return false;
+}
+
+/* The engine feature running 'plan' takes beyond VEC_F_QUERIES, or 0. */
+static uint64
+df_plan_feature(Plan *plan)
+{
+	switch (nodeTag(plan))
+	{
+		case T_HashJoin:
+		case T_MergeJoin:
+		case T_NestLoop:
+			return VEC_F_JOIN;
+		case T_Sort:
+		case T_IncrementalSort:
+		case T_Limit:
+			return VEC_F_SORT;
+		case T_WindowAgg:
+			return VEC_F_WINDOW;
+		case T_Agg:
+			return ((Agg *) plan)->groupingSets != NIL ? VEC_F_GROUPING_SETS : 0;
+		case T_Append:
+		case T_MergeAppend:
+		case T_SetOp:
+			return VEC_F_SETOPS;
+		default:
+			return 0;
+	}
+}
+
 static void
 df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				   bool root_is_sender)
 {
+	uint64		feature;
+
 	if (plan == NULL || cxt->failed)
+		return;
+	feature = df_plan_feature(plan);
+	if (feature != 0 && !df_engine_has(cxt, feature))
 		return;
 
 	switch (nodeTag(plan))
@@ -6909,7 +6956,11 @@ df_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 		df_reject(&cxt, "row locking clauses are not supported");
 	else if (stmt->hasModifyingCTE)
 		df_reject(&cxt, "data-modifying WITH is not supported");
-	else
+	else if (VEC_IR_VERSION < df_engine_load()->caps.ir_min ||
+			 VEC_IR_VERSION > df_engine_load()->caps.ir_max)
+		df_reject(&cxt, "engine %s does not read IR version %d", df_engine->name,
+				  VEC_IR_VERSION);
+	else if (df_engine_has(&cxt, VEC_F_QUERIES))
 	{
 		cxt.top = root_is_sender ? outerPlan(root) : root;
 		cxt.output = cxt.top;
@@ -7682,7 +7733,8 @@ df_batch_motions_of(PlannedStmt *stmt)
 	bool		changed;
 	int			i;
 
-	if (!df_motion_batches || df_mode == DF_MODE_OFF)
+	if (!df_motion_batches || df_mode == DF_MODE_OFF ||
+		(df_engine_features() & VEC_F_IPC_MOTION) == 0)
 		return NULL;
 	df_list_motions(stmt->planTree, &motions);
 	for (i = 0; i < list_length(stmt->subplans); i++)
@@ -7747,6 +7799,7 @@ static struct
 	PlannedStmt *stmt;
 	bool		motion_batches;
 	int			mode;
+	int			features;		/* datafusion.debug_features_off */
 	int			collate_c;
 	int			ctype_c;
 	Bitmapset  *batches;		/* in TopMemoryContext */
@@ -7770,6 +7823,7 @@ df_batch_motions(PlannedStmt *stmt)
 	if (df_batches_cache.valid && df_batches_cache.stmt == stmt &&
 		df_batches_cache.motion_batches == df_motion_batches &&
 		df_batches_cache.mode == df_mode &&
+		df_batches_cache.features == df_debug_features_off &&
 		df_batches_cache.collate_c == df_explain_collate_c &&
 		df_batches_cache.ctype_c == df_explain_ctype_c)
 		return df_batches_cache.batches;
@@ -7791,6 +7845,7 @@ df_batch_motions(PlannedStmt *stmt)
 	df_batches_cache.stmt = stmt;
 	df_batches_cache.motion_batches = df_motion_batches;
 	df_batches_cache.mode = df_mode;
+	df_batches_cache.features = df_debug_features_off;
 	df_batches_cache.collate_c = df_explain_collate_c;
 	df_batches_cache.ctype_c = df_explain_ctype_c;
 	df_batches_cache.valid = true;

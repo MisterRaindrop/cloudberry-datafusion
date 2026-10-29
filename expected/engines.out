@@ -1,0 +1,426 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Engines (include/vec_engine.h): the null engine, which runs nothing; one
+-- that claims another ABI version; DataFusion with features turned off
+-- (datafusion.debug_features_off), whose slices that need them stay on
+-- PostgreSQL; and DataFusion's result batches given at an offset
+-- (datafusion.debug_result_offset), which must read the same.
+--
+CREATE EXTENSION datafusion_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+\c
+SET optimizer = off;
+CREATE TABLE df_en (a int, b text, c numeric(10,2), d bool, e date, f float8, g int8)
+  DISTRIBUTED BY (a);
+INSERT INTO df_en SELECT i, 'v' || (i % 7) || CASE WHEN i % 5 = 0 THEN 'é' ELSE '' END,
+  i * 1.25, i % 3 = 0, date '2024-01-01' + i, i / 4.0, i * 1000
+FROM generate_series(1, 3000) i;
+INSERT INTO df_en VALUES (NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+CREATE TABLE df_en2 (a int, w text) DISTRIBUTED BY (a);
+INSERT INTO df_en2 SELECT i, 'w' || (i % 3) FROM generate_series(1, 3000, 7) i;
+ANALYZE df_en;
+ANALYZE df_en2;
+-- The null engine: the slices stay on PostgreSQL, saying why.
+SET datafusion.engine = 'null';
+SET datafusion.mode = on;
+SELECT datafusion_version();
+ datafusion_version 
+--------------------
+ null 1
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*), sum(c) FROM df_en GROUP BY d;
+                         QUERY PLAN                          
+-------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: d
+         ->  Sort
+               Sort Key: d
+               ->  Streaming Partial HashAggregate
+                     Group Key: d
+                     ->  Seq Scan on df_en
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: engine null lacks queries
+ DataFusion: slice 1 not eligible: engine null lacks queries
+(12 rows)
+
+SELECT d, count(*), sum(c), min(b), max(e) FROM df_en GROUP BY d ORDER BY d;
+ d | count |    sum     | min |    max     
+---+-------+------------+-----+------------
+ f |  2000 | 3750000.00 | v0  | 03-18-2032
+ t |  1000 | 1876875.00 | v0  | 03-19-2032
+   |     1 |            |     | 
+(3 rows)
+
+SELECT datafusion_debug_panic();
+ERROR:  datafusion: engine null has no test functions
+-- An engine of another ABI version is refused.
+\c
+SET datafusion.engine = 'null_abi1';
+SELECT datafusion_version();
+ERROR:  datafusion: engine "null_abi1" speaks ABI version 1, this extension 3
+HINT:  Install the engine built with this extension.
+-- DataFusion without one feature: what needs it stays on PostgreSQL, the
+-- rest still runs in DataFusion.
+\c
+SET optimizer = off;
+SET datafusion.mode = on;
+SET datafusion.debug_features_off = 2;	-- joins
+EXPLAIN (COSTS OFF) SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: df_en2.w
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: df_en2.w
+               ->  Streaming Partial HashAggregate
+                     Group Key: df_en2.w
+                     ->  Hash Join
+                           Hash Cond: (df_en.a = df_en2.a)
+                           ->  Seq Scan on df_en
+                           ->  Hash
+                                 ->  Seq Scan on df_en2
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 not eligible: engine datafusion lacks joins
+(16 rows)
+
+SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w ORDER BY w;
+ w  | count 
+----+-------
+ w0 |   143
+ w1 |   143
+ w2 |   143
+(3 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_en GROUP BY d;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: d
+         ->  Sort
+               Sort Key: d
+               ->  Streaming Partial HashAggregate
+                     Group Key: d
+                     ->  Seq Scan on df_en
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(12 rows)
+
+SET datafusion.debug_features_off = 4;	-- sorts
+EXPLAIN (COSTS OFF) SELECT a, b FROM df_en ORDER BY g DESC LIMIT 3;
+                           QUERY PLAN                            
+-----------------------------------------------------------------
+ Limit
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: g
+         ->  Limit
+               ->  Sort
+                     Sort Key: g DESC
+                     ->  Seq Scan on df_en
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: engine datafusion lacks sorts
+ DataFusion: slice 1 not eligible: engine datafusion lacks sorts
+(10 rows)
+
+SELECT a, b FROM df_en ORDER BY g DESC NULLS LAST LIMIT 3;
+  a   |  b  
+------+-----
+ 3000 | v4é
+ 2999 | v3
+ 2998 | v2
+(3 rows)
+
+SET datafusion.debug_features_off = 8;	-- window functions
+EXPLAIN (COSTS OFF) SELECT a, sum(g) OVER (PARTITION BY d) FROM df_en WHERE a < 5;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  WindowAgg
+         Partition By: d
+         ->  Sort
+               Sort Key: d
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: d
+                     ->  Seq Scan on df_en
+                           Filter: (a < 5)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: engine datafusion lacks window functions
+ DataFusion: slice 2 eligible
+(13 rows)
+
+SELECT a, sum(g) OVER (PARTITION BY d) FROM df_en WHERE a < 5 ORDER BY a;
+ a | sum  
+---+------
+ 1 | 7000
+ 2 | 7000
+ 3 | 3000
+ 4 | 7000
+(4 rows)
+
+SET datafusion.debug_features_off = 16;	-- grouping sets
+EXPLAIN (COSTS OFF) SELECT d, b, count(*) FROM df_en WHERE a < 30 GROUP BY ROLLUP (d, b);
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: d, b, (GROUPINGSET_ID())
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d, b, (GROUPINGSET_ID())
+               ->  Partial MixedAggregate
+                     Hash Key: d, b
+                     Hash Key: d
+                     Group Key: ()
+                     ->  Seq Scan on df_en
+                           Filter: (a < 30)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible below the top: Seq Scan (above: engine datafusion lacks grouping sets)
+(15 rows)
+
+SELECT d, b, count(*) FROM df_en WHERE a < 30 GROUP BY ROLLUP (d, b) ORDER BY 1, 2;
+ d |  b  | count 
+---+-----+-------
+ f | v0  |     3
+ f | v1  |     4
+ f | v2  |     3
+ f | v3  |     1
+ f | v3é |     1
+ f | v4  |     2
+ f | v4é |     1
+ f | v5  |     2
+ f | v5é |     1
+ f | v6  |     1
+ f | v6é |     1
+ f |     |    20
+ t | v0  |     1
+ t | v1é |     1
+ t | v2  |     1
+ t | v3  |     2
+ t | v4  |     1
+ t | v5  |     1
+ t | v6  |     2
+ t |     |     9
+   |     |    29
+(21 rows)
+
+SET datafusion.debug_features_off = 32;	-- set operations
+EXPLAIN (COSTS OFF) SELECT a FROM df_en WHERE a < 3 UNION ALL SELECT a FROM df_en2 WHERE a < 9;
+                                                   QUERY PLAN                                                   
+----------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Append
+         ->  Seq Scan on df_en
+               Filter: (a < 3)
+         ->  Seq Scan on df_en2
+               Filter: (a < 9)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible below the top: Seq Scan, Seq Scan (above: engine datafusion lacks set operations)
+(9 rows)
+
+SELECT a FROM df_en WHERE a < 3 UNION ALL SELECT a FROM df_en2 WHERE a < 9 ORDER BY a;
+ a 
+---
+ 1
+ 1
+ 2
+ 8
+(4 rows)
+
+SET datafusion.motion_batches = on;
+SET datafusion.debug_features_off = 0;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g), max(f) FROM df_en WHERE a < 50;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_en
+                     Filter: (a < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(8 rows)
+
+SET datafusion.debug_features_off = 128;	-- batch Motions
+EXPLAIN (COSTS OFF) SELECT count(*), sum(g), max(f) FROM df_en WHERE a < 50;
+                   QUERY PLAN                   
+------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_en
+                     Filter: (a < 50)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+(8 rows)
+
+SELECT count(*), sum(g), max(f) FROM df_en WHERE a < 50;
+ count |   sum   |  max  
+-------+---------+-------
+    49 | 1225000 | 12.25
+(1 row)
+
+RESET datafusion.motion_batches;
+SET datafusion.debug_features_off = 1;	-- any slice
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_en GROUP BY d;
+                            QUERY PLAN                             
+-------------------------------------------------------------------
+ Finalize GroupAggregate
+   Group Key: d
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         Merge Key: d
+         ->  Sort
+               Sort Key: d
+               ->  Streaming Partial HashAggregate
+                     Group Key: d
+                     ->  Seq Scan on df_en
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: engine datafusion lacks queries
+ DataFusion: slice 1 not eligible: engine datafusion lacks queries
+(12 rows)
+
+RESET datafusion.debug_features_off;
+-- Result batches at an offset: bitmaps, strings and values read from
+-- there.  Each query runs with datafusion.mode off, then on.
+SET datafusion.debug_result_offset = 3;
+EXPLAIN (COSTS OFF) SELECT * FROM df_en WHERE a % 397 = 1 OR a IS NULL;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_en
+         Filter: (((a % 397) = 1) OR (a IS NULL))
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+(6 rows)
+
+SET datafusion.mode = off;
+SELECT * FROM df_en WHERE a % 397 = 1 OR a IS NULL ORDER BY a;
+  a   |  b  |    c    | d |     e      |   f    |    g    
+------+-----+---------+---+------------+--------+---------
+    1 | v1  |    1.25 | f | 01-02-2024 |   0.25 |    1000
+  398 | v6  |  497.50 | f | 02-02-2025 |   99.5 |  398000
+  795 | v4é |  993.75 | t | 03-06-2026 | 198.75 |  795000
+ 1192 | v2  | 1490.00 | f | 04-07-2027 |    298 | 1192000
+ 1589 | v0  | 1986.25 | f | 05-08-2028 | 397.25 | 1589000
+ 1986 | v5  | 2482.50 | t | 06-09-2029 |  496.5 | 1986000
+ 2383 | v3  | 2978.75 | f | 07-11-2030 | 595.75 | 2383000
+ 2780 | v1é | 3475.00 | f | 08-12-2031 |    695 | 2780000
+      |     |         |   |            |        |        
+(9 rows)
+
+SELECT b, d, count(*), sum(c), avg(f), min(e), max(g) FROM df_en GROUP BY b, d ORDER BY b, d;
+  b  | d | count |    sum    |        avg         |    min     |   max   
+-----+---+-------+-----------+--------------------+------------+---------
+ v0  | f |   229 | 430167.50 |  375.6921397379913 | 01-08-2024 | 2996000
+ v0  | t |   114 | 213228.75 |  374.0855263157895 | 01-22-2024 | 2982000
+ v0é | f |    57 | 106618.75 | 374.10087719298247 | 02-05-2024 | 2975000
+ v0é | t |    28 |  53287.50 |            380.625 | 04-15-2024 | 2940000
+ v1  | f |   229 | 426953.75 |  372.8853711790393 | 01-02-2024 | 2983000
+ v1  | t |   114 | 215366.25 |  377.8355263157895 | 02-06-2024 | 2997000
+ v1é | f |    57 | 107687.50 | 377.85087719298247 | 02-20-2024 | 2990000
+ v1é | t |    29 |  53831.25 |             371.25 | 01-16-2024 | 2955000
+ v2  | f |   230 | 431250.00 |                375 | 01-03-2024 | 2998000
+ v2  | t |   114 | 213750.00 |                375 | 01-10-2024 | 2991000
+ v2é | f |    56 | 105000.00 |                375 | 03-06-2024 | 2935000
+ v2é | t |    29 |  54375.00 |                375 | 01-31-2024 | 2970000
+ v3  | f |   229 | 431796.25 |  377.1146288209607 | 01-18-2024 | 2999000
+ v3  | t |   114 | 212133.75 |  372.1644736842105 | 01-04-2024 | 2964000
+ v3é | f |    57 | 106062.50 | 372.14912280701753 | 01-11-2024 | 2950000
+ v3é | t |    29 |  54918.75 |             378.75 | 02-15-2024 | 2985000
+ v4  | f |   229 | 428582.50 |  374.3078602620087 | 01-05-2024 | 2993000
+ v4  | t |   114 | 214271.25 |  375.9144736842105 | 01-19-2024 | 2979000
+ v4é | f |    57 | 107131.25 | 375.89912280701753 | 01-26-2024 | 2965000
+ v4é | t |    29 |  55462.50 |              382.5 | 03-01-2024 | 3000000
+ v5  | f |   227 | 425365.00 | 374.77092511013217 | 01-20-2024 | 2987000
+ v5  | t |   115 | 216423.75 |  376.3891304347826 | 01-13-2024 | 2994000
+ v5é | f |    58 | 108206.25 |            373.125 | 01-06-2024 | 2980000
+ v5é | t |    28 |  52237.50 |            373.125 | 03-16-2024 | 2910000
+ v6  | f |   227 | 425885.00 | 375.22907488986783 | 01-14-2024 | 2981000
+ v6  | t |   115 | 214826.25 |  373.6108695652174 | 01-07-2024 | 2988000
+ v6é | f |    58 | 109293.75 |            376.875 | 01-21-2024 | 2995000
+ v6é | t |    28 |  52762.50 |            376.875 | 03-31-2024 | 2925000
+     |   |     1 |           |                    |            |        
+(29 rows)
+
+SET datafusion.mode = on;
+SELECT * FROM df_en WHERE a % 397 = 1 OR a IS NULL ORDER BY a;
+  a   |  b  |    c    | d |     e      |   f    |    g    
+------+-----+---------+---+------------+--------+---------
+    1 | v1  |    1.25 | f | 01-02-2024 |   0.25 |    1000
+  398 | v6  |  497.50 | f | 02-02-2025 |   99.5 |  398000
+  795 | v4é |  993.75 | t | 03-06-2026 | 198.75 |  795000
+ 1192 | v2  | 1490.00 | f | 04-07-2027 |    298 | 1192000
+ 1589 | v0  | 1986.25 | f | 05-08-2028 | 397.25 | 1589000
+ 1986 | v5  | 2482.50 | t | 06-09-2029 |  496.5 | 1986000
+ 2383 | v3  | 2978.75 | f | 07-11-2030 | 595.75 | 2383000
+ 2780 | v1é | 3475.00 | f | 08-12-2031 |    695 | 2780000
+      |     |         |   |            |        |        
+(9 rows)
+
+SELECT b, d, count(*), sum(c), avg(f), min(e), max(g) FROM df_en GROUP BY b, d ORDER BY b, d;
+  b  | d | count |    sum    |        avg         |    min     |   max   
+-----+---+-------+-----------+--------------------+------------+---------
+ v0  | f |   229 | 430167.50 |  375.6921397379913 | 01-08-2024 | 2996000
+ v0  | t |   114 | 213228.75 |  374.0855263157895 | 01-22-2024 | 2982000
+ v0é | f |    57 | 106618.75 | 374.10087719298247 | 02-05-2024 | 2975000
+ v0é | t |    28 |  53287.50 |            380.625 | 04-15-2024 | 2940000
+ v1  | f |   229 | 426953.75 |  372.8853711790393 | 01-02-2024 | 2983000
+ v1  | t |   114 | 215366.25 |  377.8355263157895 | 02-06-2024 | 2997000
+ v1é | f |    57 | 107687.50 | 377.85087719298247 | 02-20-2024 | 2990000
+ v1é | t |    29 |  53831.25 |             371.25 | 01-16-2024 | 2955000
+ v2  | f |   230 | 431250.00 |                375 | 01-03-2024 | 2998000
+ v2  | t |   114 | 213750.00 |                375 | 01-10-2024 | 2991000
+ v2é | f |    56 | 105000.00 |                375 | 03-06-2024 | 2935000
+ v2é | t |    29 |  54375.00 |                375 | 01-31-2024 | 2970000
+ v3  | f |   229 | 431796.25 |  377.1146288209607 | 01-18-2024 | 2999000
+ v3  | t |   114 | 212133.75 |  372.1644736842105 | 01-04-2024 | 2964000
+ v3é | f |    57 | 106062.50 | 372.14912280701753 | 01-11-2024 | 2950000
+ v3é | t |    29 |  54918.75 |             378.75 | 02-15-2024 | 2985000
+ v4  | f |   229 | 428582.50 |  374.3078602620087 | 01-05-2024 | 2993000
+ v4  | t |   114 | 214271.25 |  375.9144736842105 | 01-19-2024 | 2979000
+ v4é | f |    57 | 107131.25 | 375.89912280701753 | 01-26-2024 | 2965000
+ v4é | t |    29 |  55462.50 |              382.5 | 03-01-2024 | 3000000
+ v5  | f |   227 | 425365.00 | 374.77092511013217 | 01-20-2024 | 2987000
+ v5  | t |   115 | 216423.75 |  376.3891304347826 | 01-13-2024 | 2994000
+ v5é | f |    58 | 108206.25 |            373.125 | 01-06-2024 | 2980000
+ v5é | t |    28 |  52237.50 |            373.125 | 03-16-2024 | 2910000
+ v6  | f |   227 | 425885.00 | 375.22907488986783 | 01-14-2024 | 2981000
+ v6  | t |   115 | 214826.25 |  373.6108695652174 | 01-07-2024 | 2988000
+ v6é | f |    58 | 109293.75 |            376.875 | 01-21-2024 | 2995000
+ v6é | t |    28 |  52762.50 |            376.875 | 03-31-2024 | 2925000
+     |   |     1 |           |                    |            |        
+(29 rows)
+
+RESET datafusion.debug_result_offset;
+DROP TABLE df_en;
+DROP TABLE df_en2;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION datafusion_executor;

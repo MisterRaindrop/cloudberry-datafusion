@@ -32,9 +32,11 @@
 use std::any::Any;
 use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 
-use arrow::array::Array;
+use arrow::array::{new_null_array, Array, ArrayData, AsArray, StructArray};
+use arrow::compute::concat;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
 // catch_unwind only works when panics unwind.
@@ -42,7 +44,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `include/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 2;
+pub const VEC_ENGINE_ABI: u32 = 3;
 
 /// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
@@ -557,6 +559,46 @@ extern "C" fn query_poll(
     }
 }
 
+/// Rows each result batch is offset by, for the host's tests (0: none).
+static RESULT_OFFSET: AtomicU32 = AtomicU32::new(0);
+
+extern "C" fn debug_result_offset(rows: u32) {
+    RESULT_OFFSET.store(rows, Ordering::Relaxed);
+}
+
+/// `r` with every column at an offset of `k` rows: `k` null rows, then its
+/// own, in buffers of all of them, the column's offset past the nulls (not
+/// folded into the buffers' addresses, as slicing would).
+fn offset_result(r: StructArray, k: usize) -> ArrayData {
+    if k == 0 {
+        return r.to_data();
+    }
+    let pad = new_null_array(r.data_type(), k);
+    let both = concat(&[pad.as_ref(), &r as &dyn Array]).expect("concat of one type");
+    let children = both
+        .as_struct()
+        .columns()
+        .iter()
+        .map(|c| {
+            // a fresh array: offset 0, and so its validity bitmap
+            let d = c.to_data();
+            let nulls = d.nulls().map(|n| n.buffer().clone());
+            d.into_builder()
+                .nulls(None)
+                .null_bit_buffer(nulls)
+                .offset(k)
+                .len(r.len())
+                .build()
+                .expect("a column of its own buffers")
+        })
+        .collect::<Vec<_>>();
+    ArrayData::builder(r.data_type().clone())
+        .len(r.len())
+        .child_data(children)
+        .build()
+        .expect("a struct of its own columns")
+}
+
 /// Move the batch of the last VEC_OK poll into `*out`, exported as a struct
 /// array the caller releases (its buffers are shared, not copied).
 /// VEC_ERROR without one.
@@ -564,7 +606,10 @@ extern "C" fn query_result(query: *mut VecQuery, out: *mut FFI_ArrowArray) -> i3
     // SAFETY: `query` is live; `out` is valid.
     let q = unsafe { &mut (*query).0 };
     match catch_unwind(AssertUnwindSafe(|| {
-        q.take_result().map(|r| FFI_ArrowArray::new(&r.to_data()))
+        q.take_result().map(|r| {
+            let k = RESULT_OFFSET.load(Ordering::Relaxed) as usize;
+            FFI_ArrowArray::new(&offset_result(r, k))
+        })
     })) {
         Ok(Some(array)) => {
             unsafe { std::ptr::write(out, array) };
@@ -635,7 +680,23 @@ pub struct VecEngineDebug {
         i32,
         *mut u32,
     ) -> i32,
+    pub result_offset: extern "C" fn(u32),
 }
+
+/// What the engine runs; see `include/vec_engine.h`.
+#[repr(C)]
+pub struct VecCaps {
+    pub ir_min: u32,
+    pub ir_max: u32,
+    pub numeric_digits: u32,
+    pub numeric_width: u32,
+    pub numeric_special: bool,
+    pub numeric_dynamic_scale: bool,
+    pub features: u64,
+}
+
+/// Every feature of `include/vec_engine.h`, VEC_F_QUERIES to VEC_F_PAX_DIRECT.
+pub const VEC_F_ALL: u64 = (1 << 9) - 1;
 
 /// The engine's table of `include/vec_engine.h`.
 #[repr(C)]
@@ -643,6 +704,7 @@ pub struct VecEngine {
     pub abi: u32,
     pub name: *const c_char,
     pub version: *const c_char,
+    pub caps: VecCaps,
     pub runtime_init: extern "C" fn(u32, *mut u32, *mut VecError) -> i32,
     pub runtime_shutdown: extern "C" fn(u32),
     pub heap_bytes: extern "C" fn() -> i64,
@@ -680,6 +742,7 @@ static DEBUG: VecEngineDebug = VecEngineDebug {
     task_free: debug_task_free,
     active_tasks: debug_active_tasks,
     cdbhash_routes: debug_cdbhash_routes,
+    result_offset: debug_result_offset,
 };
 
 /// "datafusion <version>", made once.
@@ -701,6 +764,15 @@ pub extern "C" fn vec_engine_entry(_host_abi: u32, _host: *const VecHost) -> *co
             abi: VEC_ENGINE_ABI,
             name: NAME.as_ptr(),
             version: version().as_ptr(),
+            caps: VecCaps {
+                ir_min: df_core::query::IR_VERSION as u32,
+                ir_max: df_core::query::IR_VERSION as u32,
+                numeric_digits: 76,
+                numeric_width: 32,
+                numeric_special: true,
+                numeric_dynamic_scale: true,
+                features: VEC_F_ALL,
+            },
             runtime_init,
             runtime_shutdown,
             heap_bytes,
@@ -755,6 +827,52 @@ mod tests {
         );
         let v = unsafe { CStr::from_ptr(e.version) }.to_str().unwrap();
         assert!(v.starts_with("datafusion "), "{v}");
+    }
+
+    #[test]
+    fn declares_every_feature() {
+        let c = &engine().caps;
+        assert_eq!((c.ir_min, c.ir_max), (1, 1));
+        assert_eq!((c.numeric_digits, c.numeric_width), (76, 32));
+        assert!(c.numeric_special && c.numeric_dynamic_scale);
+        assert_eq!(c.features, VEC_F_ALL);
+    }
+
+    #[test]
+    fn offset_results_keep_their_rows() {
+        use arrow::array::{BooleanArray, Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field};
+        let r = StructArray::new(
+            vec![
+                Field::new("b", DataType::Boolean, true),
+                Field::new("s", DataType::Utf8, true),
+                Field::new("i", DataType::Int64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(BooleanArray::from(vec![
+                    Some(true),
+                    None,
+                    Some(false),
+                    Some(true),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("bé"),
+                    None,
+                    Some("d"),
+                ])),
+                Arc::new(Int64Array::from(vec![None, Some(7), Some(-1), Some(9)])),
+            ],
+            None,
+        );
+        for k in [0, 1, 3, 9] {
+            let data = offset_result(r.clone(), k);
+            for child in data.child_data() {
+                assert_eq!(child.offset(), k, "k = {k}");
+            }
+            assert_eq!(StructArray::from(data), r, "k = {k}");
+        }
     }
 
     #[test]

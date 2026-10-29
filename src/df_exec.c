@@ -886,7 +886,9 @@ df_exec_begin(DfExec *x)
 	struct ArrowSchema out_schema;
 
 	workers = df_runtime_ensure();
-	if (df_pax_direct_read)
+	if (df_engine->debug != NULL)
+		df_engine->debug->result_offset((uint32_t) df_debug_result_offset);
+	if (df_pax_direct_read && (df_engine_features() & VEC_F_PAX_DIRECT) != 0)
 	{
 		/* loaded only once a PAX table is read: pax.so is loaded by then */
 		for (j = 0; j < x->ninputs && reader == NULL; j++)

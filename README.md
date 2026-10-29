@@ -1925,6 +1925,20 @@ threads it starts then never take the signals PostgreSQL acts on.  The
 stream of a batch Motion starts with a signature of the engine's name and
 the IR version, among the rest, so both ends must run the same engine.
 
+An engine declares what it runs in its table (`VecCaps`): the IR versions
+it reads, how it takes numeric, and coarse features (joins, sorts, window
+functions, grouping sets, set operations, locale collations, batch
+Motions, direct PAX reads).  A slice that needs what the engine lacks stays
+on PostgreSQL, and EXPLAIN says so (`engine X lacks joins`).  DataFusion
+declares everything.  `engines/null` builds `vec_engine_null.so`, an
+engine that runs nothing, which the regression tests load
+(`datafusion.engine = 'null'`) to check that every slice then stays on
+PostgreSQL with its results, together with a copy that claims another ABI
+version.  Two settings exist for the tests only:
+`datafusion.debug_features_off` treats engine features (`VEC_F_*` bits) as
+missing, and `datafusion.debug_result_offset` has an engine with test
+functions give its result batches at an offset.
+
 ## License
 
 Apache License 2.0. See `LICENSE`.

@@ -42,7 +42,8 @@
  * acts on.
  *
  * The DataFusion engine (engines/datafusion/df_ffi) implements this; keep
- * the two in sync.
+ * the two in sync.  engines/null is an engine that runs nothing, for the
+ * tests.
  *
  * include/vec_engine.h
  *
@@ -56,7 +57,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	2
+#define VEC_ENGINE_ABI	3
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -241,13 +242,61 @@ typedef struct VecEngineDebug
 	int32_t		(*cdbhash_routes) (const int32_t *kinds, const struct ArrowSchema *schema,
 								   const struct ArrowArray *keys,
 								   int32_t segments, int32_t workers, uint32_t *out);
+
+	/*
+	 * From now on, give each result batch with an offset of 'rows' (0:
+	 * none), so that the host's reading of offsets is tested.
+	 */
+	void		(*result_offset) (uint32_t rows);
 } VecEngineDebug;
+
+/*
+ * What an engine runs, as features: a slice that needs one the engine lacks
+ * stays on PostgreSQL, and EXPLAIN says which.  Coarse on purpose: an
+ * engine runs everything docs/ir.md gives under each feature it declares.
+ */
+#define VEC_F_QUERIES		(UINT64_C(1) << 0)	/* any slice: scans, filters,
+												 * projections, aggregates,
+												 * DISTINCT, shared scans */
+#define VEC_F_JOIN			(UINT64_C(1) << 1)	/* hash, merge and nested loop
+												 * joins */
+#define VEC_F_SORT			(UINT64_C(1) << 2)	/* Sort and Limit */
+#define VEC_F_WINDOW		(UINT64_C(1) << 3)	/* window functions */
+#define VEC_F_GROUPING_SETS (UINT64_C(1) << 4)	/* aggregates of grouping sets */
+#define VEC_F_SETOPS		(UINT64_C(1) << 5)	/* UNION ALL, INTERSECT, EXCEPT */
+#define VEC_F_COLLATE		(UINT64_C(1) << 6)	/* ordering strings by strcoll_l
+												 * and mapping case by
+												 * set_case_maps, under a libc
+												 * locale */
+#define VEC_F_IPC_MOTION	(UINT64_C(1) << 7)	/* Arrow IPC batches through
+												 * Motions (ipc_inputs,
+												 * VEC_QUERY_IPC_OUTPUT) */
+#define VEC_F_PAX_DIRECT	(UINT64_C(1) << 8)	/* reading PAX by pax_inputs */
+
+typedef struct VecCaps
+{
+	uint32_t	ir_min;			/* IR versions the engine reads */
+	uint32_t	ir_max;
+	/*
+	 * numeric as the IR has it: Decimal256 of up to 76 digits (32 bytes),
+	 * NaN and the infinities as sentinels, and columns of no declared
+	 * scale.  For an engine short of any of these the host takes numeric
+	 * for a type it cannot send, wherever it checks a value's type; other
+	 * widths are for a later version.
+	 */
+	uint32_t	numeric_digits; /* 76 */
+	uint32_t	numeric_width;	/* bytes: 32 */
+	bool		numeric_special;	/* NaN and the infinities */
+	bool		numeric_dynamic_scale;	/* numeric of no declared scale */
+	uint64_t	features;		/* VEC_F_* */
+} VecCaps;
 
 typedef struct VecEngine
 {
 	uint32_t	abi;			/* VEC_ENGINE_ABI */
 	const char *name;			/* "datafusion" */
 	const char *version;		/* "datafusion 50.0.0" */
+	VecCaps		caps;
 
 	/*
 	 * The engine's threads for this backend, 'workers' of them (0: one per

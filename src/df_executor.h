@@ -63,9 +63,16 @@ extern int	df_worker_threads;
 /* GUC datafusion.engine */
 extern char *df_engine_name;
 
+/* GUCs datafusion.debug_features_off, datafusion.debug_result_offset */
+extern int	df_debug_features_off;
+extern int	df_debug_result_offset;
+
 /* df_init.c */
 extern const VecEngine *df_engine;	/* NULL until df_engine_load */
 extern const VecEngine *df_engine_load(void);
+extern uint64 df_engine_features(void);
+extern bool df_engine_numeric(void);
+extern const char *df_feature_name(uint64 feature);
 extern const VecEngineDebug *df_engine_debug(void);
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
 

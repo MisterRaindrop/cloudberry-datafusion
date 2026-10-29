@@ -38,6 +38,8 @@
 PG_MODULE_MAGIC;
 
 char	   *df_engine_name = NULL;
+int			df_debug_features_off = 0;
+int			df_debug_result_offset = 0;
 
 /* The engine slices run in, once loaded: the one datafusion.engine names. */
 const VecEngine *df_engine = NULL;
@@ -183,6 +185,24 @@ _PG_init(void)
 							   GUC_GPDB_NEED_SYNC,
 							   df_check_engine, NULL, NULL);
 
+	DefineCustomIntVariable("datafusion.debug_features_off",
+							"Test setting: engine features (VEC_F_* bits) to treat as missing.",
+							NULL,
+							&df_debug_features_off,
+							0, 0, INT_MAX,
+							PGC_SUSET,
+							GUC_GPDB_NEED_SYNC | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("datafusion.debug_result_offset",
+							"Test setting: rows the engine offsets its result batches by.",
+							"Only for an engine with test functions.",
+							&df_debug_result_offset,
+							0, 0, 1024,
+							PGC_SUSET,
+							GUC_GPDB_NEED_SYNC | GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
+
 	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();
@@ -285,6 +305,55 @@ df_engine_load(void)
 	strlcpy(df_engine_loaded, df_engine_name, sizeof(df_engine_loaded));
 	df_engine = engine;
 	return df_engine;
+}
+
+/* The engine's features, but those datafusion.debug_features_off turns off. */
+uint64
+df_engine_features(void)
+{
+	const VecEngine *engine = df_engine_load();
+
+	if (VEC_IR_VERSION < engine->caps.ir_min || VEC_IR_VERSION > engine->caps.ir_max)
+		return 0;
+	return engine->caps.features & ~(uint64) df_debug_features_off;
+}
+
+/* Does the engine take numeric as the IR has it (vec_engine.h)? */
+bool
+df_engine_numeric(void)
+{
+	const VecCaps *caps = &df_engine_load()->caps;
+
+	return caps->numeric_digits >= 76 && caps->numeric_width == 32 &&
+		caps->numeric_special && caps->numeric_dynamic_scale;
+}
+
+/* What EXPLAIN calls a feature an engine lacks. */
+const char *
+df_feature_name(uint64 feature)
+{
+	switch (feature)
+	{
+		case VEC_F_QUERIES:
+			return "queries";
+		case VEC_F_JOIN:
+			return "joins";
+		case VEC_F_SORT:
+			return "sorts";
+		case VEC_F_WINDOW:
+			return "window functions";
+		case VEC_F_GROUPING_SETS:
+			return "grouping sets";
+		case VEC_F_SETOPS:
+			return "set operations";
+		case VEC_F_COLLATE:
+			return "locale collations";
+		case VEC_F_IPC_MOTION:
+			return "batch Motions";
+		case VEC_F_PAX_DIRECT:
+			return "direct PAX reads";
+	}
+	return "?";
 }
 
 /*
