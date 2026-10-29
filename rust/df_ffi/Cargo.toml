@@ -27,4 +27,5 @@ crate-type = ["staticlib"]
 
 [dependencies]
 datafusion.workspace = true
+arrow.workspace = true
 df_core.workspace = true

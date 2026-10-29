@@ -162,11 +162,13 @@ typedef struct DfInput
 	MemoryContext statecxt;
 
 	/* batch being assembled or offered */
-	char	  **invalues;		/* string columns: their bytes */
-	uint8	  **innulls;
+	char	  **invalues;		/* string columns: their bytes; bool: a bitmap */
+	uint8	  **invalid;		/* validity bitmaps, 1: not NULL */
+	int64	   *innull;			/* NULLs in the batch */
 	int32	  **inoffsets;		/* string columns: DF_BATCH_ROWS + 1 offsets */
 	Size	   *incap;			/* string columns: bytes allocated */
-	VecColumn   *incols;
+	struct ArrowArray inbatch;	/* the batch, lent to the engine */
+	struct ArrowSchema inschema;
 	int			batch_rows;
 	bool		batch_ready;	/* a filled batch waits to be pushed */
 	bool		ended;			/* no more rows to read */
@@ -223,7 +225,8 @@ typedef struct DfExec
 	ExprState **tail_states;	/* per column: what finishes it, or NULL */
 	ExprContext *tailcxt;
 	MemoryContext rowcxt;		/* the strings of the row handed out */
-	VecColumn   *outcols;
+	struct ArrowArray outbatch;	/* the engine's result batch, until released */
+	DfOutCol   *outcols;		/* its columns */
 	uint32		out_nrows;
 	uint32		out_row;
 	bool		done;
@@ -261,12 +264,56 @@ df_type_width(Oid type)
 	}
 }
 
+/* Bytes of each value of a result column of 'type': 0 a bool, -1 a string. */
+static int
+df_out_width(Oid type)
+{
+	if (type == BOOLOID)
+		return 0;
+	if (df_type_is_string(type))
+		return -1;
+	return df_type_width(type);
+}
+
+/* Release the result batch the engine handed out, if any. */
+static void
+df_release_out(DfExec *x)
+{
+	if (x->outbatch.release != NULL)
+		x->outbatch.release(&x->outbatch);
+	x->outbatch.release = NULL;
+}
+
+/* Do the engine's result batches have the columns the slice reads? */
+static void
+df_check_out_schema(DfExec *x, struct ArrowSchema *schema)
+{
+	int			c;
+	char	   *bad = NULL;
+
+	if (schema->n_children != x->spec.nout)
+		bad = psprintf("%d columns, not %d", (int) schema->n_children, x->spec.nout);
+	for (c = 0; bad == NULL && c < x->spec.nout; c++)
+	{
+		const char *want = df_arrow_format(x->spec.out_types[c], x->spec.out_scales[c]);
+
+		if (strcmp(schema->children[c]->format, want) != 0)
+			bad = psprintf("column %d is \"%s\", not \"%s\"", c,
+						   schema->children[c]->format, want);
+	}
+	if (schema->release != NULL)
+		schema->release(schema);
+	if (bad != NULL)
+		elog(ERROR, "datafusion: the engine's result batches: %s", bad);
+}
+
 static void
 df_exec_release(void *arg)
 {
 	DfExec	   *x = (DfExec *) arg;
 	DfExec	  **link;
 
+	df_release_out(x);
 	if (x->query != NULL)
 	{
 		df_engine->query_free(x->query);
@@ -834,6 +881,8 @@ df_exec_begin(DfExec *x)
 	const DfPaxReader *reader = NULL;
 	VecPaxInput *pax = NULL;
 	VecQueryArgs args;
+	struct ArrowSchema *schemas;
+	struct ArrowSchema out_schema;
 
 	workers = df_runtime_ensure();
 	if (df_pax_direct_read)
@@ -865,8 +914,12 @@ df_exec_begin(DfExec *x)
 			PG_END_TRY();
 		}
 	}
+	schemas = palloc(sizeof(struct ArrowSchema) * Max(x->ninputs, 1));
+	for (j = 0; j < x->ninputs; j++)
+		schemas[j] = x->inputs[j].inschema;
 	memset(&args, 0, sizeof(args));
 	args.ir = x->spec.json;
+	args.input_schemas = schemas;
 	args.partitions = (uint32_t) df_query_partitions(workers, x->slices_together,
 													 x->host_segments);
 	args.memory_limit = (uint64_t) x->memory_limit;
@@ -882,12 +935,13 @@ df_exec_begin(DfExec *x)
 
 	/* From here on the query owns the PAX scans, even if this fails. */
 	DF_ERROR_INIT(err);
-	status = df_engine->query_start(&args, &x->query, &err);
+	status = df_engine->query_start(&args, &out_schema, &x->query, &err);
 	if (status != VEC_OK)
 	{
 		x->query = NULL;
 		df_raise_query(status, &err);
 	}
+	df_check_out_schema(x, &out_schema);
 	df_vmem_sync(x->headroom);
 
 	for (j = 0; j < x->ninputs; j++)
@@ -1024,6 +1078,8 @@ df_exec_fill(DfExec *x, DfInput *in)
 	int			c;
 	bool		strings_full = false;
 
+	for (c = 0; c < in->spec->ncols; c++)
+		in->innull[c] = 0;
 	while (n < x->spec.batch_rows && !strings_full)
 	{
 		if (in->motion || in->reader)
@@ -1082,11 +1138,20 @@ df_exec_fill(DfExec *x, DfInput *in)
 				MemoryContextSwitchTo(oldcxt);
 			}
 
-			in->innulls[c][n] = isnull ? 1 : 0;
+			/* bitmaps: each byte cleared at its first row */
+			if ((n & 7) == 0)
+				in->invalid[c][n >> 3] = 0;
+			if (isnull)
+				in->innull[c]++;
+			else
+				in->invalid[c][n >> 3] |= 1 << (n & 7);
 			switch (in->spec->types[c])
 			{
 				case BOOLOID:
-					((uint8 *) dst)[n] = isnull ? 0 : (DatumGetBool(d) ? 1 : 0);
+					if ((n & 7) == 0)
+						((uint8 *) dst)[n >> 3] = 0;
+					if (!isnull && DatumGetBool(d))
+						((uint8 *) dst)[n >> 3] |= 1 << (n & 7);
 					break;
 				case INT2OID:
 					((int16 *) dst)[n] = isnull ? 0 : DatumGetInt16(d);
@@ -1165,8 +1230,12 @@ df_exec_fill(DfExec *x, DfInput *in)
 		}
 		n++;
 	}
+	/* the strings' bytes may have moved as they grew */
+	in->inbatch.length = n;
 	for (c = 0; c < in->spec->ncols; c++)
-		in->incols[c].values = in->invalues[c];	/* moved if it grew */
+		df_arrow_set_column(in->inbatch.children[c], n, in->innull[c], in->invalid[c],
+							in->invalues[c],
+							df_type_is_string(in->spec->types[c]) ? in->inoffsets[c] : NULL);
 	in->batch_rows = n;
 	in->batch_ready = (n > 0);
 	if (in->ended && !in->batch_ready)
@@ -1196,9 +1265,7 @@ df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
 	if (!in->batch_ready)
 		return;
 	DF_ERROR_INIT(err);
-	status = df_engine->query_push(x->query, (uint32_t) in->index, in->incols,
-								   (uint32_t) in->spec->ncols, (uint32_t) in->batch_rows,
-								   &err);
+	status = df_engine->query_push(x->query, (uint32_t) in->index, &in->inbatch, &err);
 	if (status == VEC_OK)
 	{
 		*pushed = true;
@@ -1292,7 +1359,7 @@ df_exec_emit(DfExec *x)
 	for (c = 0; c < x->spec.nout; c++)
 	{
 		const void *v = x->outcols[c].values;
-		bool		isnull = x->outcols[c].nulls[r] != 0;
+		bool		isnull = df_out_isnull(&x->outcols[c], r);
 		uint8		kind = x->spec.out_kinds ? x->spec.out_kinds[c] : DF_OUT_PLAIN;
 		MemoryContext oldcxt;
 
@@ -1306,7 +1373,7 @@ df_exec_emit(DfExec *x)
 			 * PostgreSQL's sum does; the digits past it are 0
 			 */
 			int			scale = x->spec.out_scales[c];
-			int			shown = x->outcols[c + 1].nulls[r] ? scale :
+			int			shown = df_out_isnull(&x->outcols[c + 1], r) ? scale :
 				((const int32 *) x->outcols[c + 1].values)[r];
 
 			slot->tts_isnull[k] = isnull;
@@ -1334,7 +1401,7 @@ df_exec_emit(DfExec *x)
 			 * function and argument (sum and avg of a column) and combines
 			 * it from one of their columns: the states agree, count and all.
 			 */
-			int64		count = x->outcols[c + 1].nulls[r] ? 0 :
+			int64		count = df_out_isnull(&x->outcols[c + 1], r) ? 0 :
 				((const int64 *) x->outcols[c + 1].values)[r];
 			Datum		sum = (Datum) 0;
 
@@ -1364,7 +1431,7 @@ df_exec_emit(DfExec *x)
 		if (kind == DF_OUT_NUMERIC_AVG)
 		{
 			/* avg(int) = numeric_div(sum, count), as int8_avg and numeric_poly_avg */
-			int64		count = x->outcols[c + 1].nulls[r] ? 0 :
+			int64		count = df_out_isnull(&x->outcols[c + 1], r) ? 0 :
 				((const int64 *) x->outcols[c + 1].values)[r];
 
 			slot->tts_isnull[k] = isnull || count == 0;
@@ -1391,7 +1458,7 @@ df_exec_emit(DfExec *x)
 		switch (x->spec.out_types[c])
 		{
 			case BOOLOID:
-				slot->tts_values[k] = BoolGetDatum(((const uint8 *) v)[r] != 0);
+				slot->tts_values[k] = BoolGetDatum(df_out_bool(&x->outcols[c], r));
 				break;
 			case INT2OID:
 				slot->tts_values[k] = Int16GetDatum(((const int16 *) v)[r]);
@@ -1547,6 +1614,7 @@ df_exec_next(DfExec *x)
 			}
 		}
 
+		df_release_out(x);		/* every row of it is out */
 		DF_ERROR_INIT(err);
 		status = df_engine->query_poll(x->query,
 									   pushed ? 0 : (full ? DF_POLL_FULL_MS : DF_POLL_IDLE_MS),
@@ -1555,9 +1623,15 @@ df_exec_next(DfExec *x)
 		{
 			int			c;
 
+			if (df_engine->query_result(x->query, &x->outbatch) != VEC_OK)
+				elog(ERROR, "datafusion: no result batch after a poll gave one");
+			if (x->outbatch.n_children != x->spec.nout || x->outbatch.length != nrows)
+				elog(ERROR, "datafusion: a result batch of %d columns and " INT64_FORMAT
+					 " rows, not %d and %u", (int) x->outbatch.n_children,
+					 x->outbatch.length, x->spec.nout, nrows);
 			for (c = 0; c < x->spec.nout; c++)
-				if (df_engine->query_column(x->query, (uint32_t) c, &x->outcols[c]) != VEC_OK)
-					elog(ERROR, "datafusion: result column %d is missing", c);
+				df_arrow_out_column(&x->outcols[c], &x->outbatch, c,
+									df_out_width(x->spec.out_types[c]));
 			x->out_nrows = nrows;
 			x->out_row = 0;
 		}
@@ -1783,6 +1857,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	MemoryContext oldcxt;
 	DfExec	   *x;
 	volatile bool ok = false;
+	const char **formats;
 	int			c,
 				j;
 
@@ -1857,12 +1932,14 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			PG_END_TRY();
 		}
 		in->invalues = palloc0(sizeof(char *) * Max(in->spec->ncols, 1));
-		in->innulls = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
+		in->invalid = palloc0(sizeof(uint8 *) * Max(in->spec->ncols, 1));
+		in->innull = palloc0(sizeof(int64) * Max(in->spec->ncols, 1));
 		in->inoffsets = palloc0(sizeof(int32 *) * Max(in->spec->ncols, 1));
 		in->incap = palloc0(sizeof(Size) * Max(in->spec->ncols, 1));
-		in->incols = palloc0(sizeof(VecColumn) * Max(in->spec->ncols, 1));
+		formats = palloc(sizeof(char *) * Max(in->spec->ncols, 1));
 		for (c = 0; c < in->spec->ncols; c++)
 		{
+			formats[c] = df_arrow_format(in->spec->types[c], in->spec->scales[c]);
 			if (df_type_is_string(in->spec->types[c]))
 			{
 				in->incap[c] = DF_BATCH_ROWS * 16;
@@ -1872,13 +1949,12 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			}
 			else
 				in->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(in->spec->types[c]));
-			in->innulls[c] = palloc(DF_BATCH_ROWS);
-			in->incols[c].values = in->invalues[c];
-			in->incols[c].nulls = in->innulls[c];
-			in->incols[c].offsets = in->inoffsets[c];
+			in->invalid[c] = palloc(DF_BATCH_ROWS / 8);
 			in->maxattno = Max(in->maxattno,
 							   in->tupatt ? in->tupatt[c] : in->spec->attnos[c]);
 		}
+		df_arrow_struct_schema(&in->inschema, in->spec->ncols, formats);
+		df_arrow_struct_array(&in->inbatch, in->spec->ncols);
 	}
 	{
 		List	   *producers = df_slice_producers(root->plan);
@@ -1969,7 +2045,7 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 											LocallyExecutingSliceIndex(estate));
 	x->host_segments = df_host_segments();
 
-	x->outcols = palloc0(sizeof(VecColumn) * Max(x->spec.nout, 1));
+	x->outcols = palloc0(sizeof(DfOutCol) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
 	if (x->spec.col_tail != NULL)
 	{

@@ -47,7 +47,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	1
+#define VEC_ENGINE_ABI	2
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -76,17 +76,54 @@ typedef struct VecQuery VecQuery;
 typedef struct VecTask VecTask;
 
 /*
- * A column of pushed or returned rows: native values (one byte per bool),
- * or for a string or numeric column its bytes with 'offsets' giving row r
- * as bytes offsets[r] to offsets[r + 1] ('offsets' is NULL for the
- * others); and one byte per row that is 1 for NULL.
+ * Rows cross the boundary as Arrow arrays, by the Arrow C Data Interface
+ * (https://arrow.apache.org/docs/format/CDataInterface.html): a batch is a
+ * struct array with one child per column.  Each column's layout follows
+ * from its IR type (docs/ir.md, "Types"): bool as Boolean, int2/4/8 as
+ * Int16/32/64, float4/8 as Float32/64, date as Int32 and time, timestamp,
+ * timestamptz and tid as Int64 (PostgreSQL's units and epoch, not Arrow's
+ * date and time types), text and bpchar as Utf8, numeric as Decimal256(76,
+ * scale).
+ *
+ * A batch the host pushes is lent for the call only: the engine copies
+ * what it needs and never calls its release callback.  A batch the engine
+ * returns belongs to the host, which releases it.
  */
-typedef struct VecColumn
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+
+#define ARROW_FLAG_DICTIONARY_ORDERED 1
+#define ARROW_FLAG_NULLABLE 2
+#define ARROW_FLAG_MAP_KEYS_SORTED 4
+
+struct ArrowSchema
 {
-	const void *values;
-	const uint8_t *nulls;
-	const int32_t *offsets;
-} VecColumn;
+	const char *format;
+	const char *name;
+	const char *metadata;
+	int64_t		flags;
+	int64_t		n_children;
+	struct ArrowSchema **children;
+	struct ArrowSchema *dictionary;
+	void		(*release) (struct ArrowSchema *);
+	void	   *private_data;
+};
+
+struct ArrowArray
+{
+	int64_t		length;
+	int64_t		null_count;
+	int64_t		offset;
+	int64_t		n_buffers;
+	int64_t		n_children;
+	const void **buffers;
+	struct ArrowArray **children;
+	struct ArrowArray *dictionary;
+	void		(*release) (struct ArrowArray *);
+	void	   *private_data;
+};
+
+#endif							/* ARROW_C_DATA_INTERFACE */
 
 /* A piece of a byte stream. */
 typedef struct VecSlice
@@ -127,6 +164,8 @@ typedef struct VecPaxInput
 typedef struct VecQueryArgs
 {
 	const char *ir;				/* the plan, NUL-terminated */
+	/* one struct schema per input: the batches query_push takes */
+	const struct ArrowSchema *input_schemas;
 	uint32_t	partitions;		/* parallel partitions to run it in */
 	uint64_t	memory_limit;	/* operator memory budget, bytes */
 	const char *spill_dir;
@@ -184,13 +223,14 @@ typedef struct VecEngineDebug
 	uint64_t	(*active_tasks) (void);
 
 	/*
-	 * Routes of nrows rows by the engine's cdbhash, to check it against
-	 * Cloudberry's: kinds[i] is the hash of key column cols[i] (0 bool,
+	 * Routes of the rows of 'keys' by the engine's cdbhash, to check it
+	 * against Cloudberry's: kinds[i] is the hash of key column i (0 bool,
 	 * 1 int2, 2 int4, 3 int8, 4 float4, 5 float8, 6 text, 7 character,
-	 * 8 + s numeric of scale s, 85 tid).  VEC_ERROR for an unknown kind.
+	 * 8 + s numeric of scale s, 85 tid), laid out as its IR type.  Writes
+	 * keys->length routes to 'out'.  VEC_ERROR for an unknown kind.
 	 */
-	int32_t		(*cdbhash_routes) (const int32_t *kinds, const VecColumn *cols,
-								   uint32_t nkeys, uint32_t nrows,
+	int32_t		(*cdbhash_routes) (const int32_t *kinds, const struct ArrowSchema *schema,
+								   const struct ArrowArray *keys,
 								   int32_t segments, int32_t workers, uint32_t *out);
 } VecEngineDebug;
 
@@ -214,31 +254,39 @@ typedef struct VecEngine
 	void		(*set_case_maps) (const uint32_t *upper, size_t nupper,
 								  const uint32_t *lower, size_t nlower);
 
-	int32_t		(*query_start) (const VecQueryArgs *args, VecQuery **out_query,
-								VecError *err);
+	/*
+	 * Start a query.  *out_schema gets the struct schema of its result
+	 * batches, which the host releases.
+	 */
+	int32_t		(*query_start) (const VecQueryArgs *args, struct ArrowSchema *out_schema,
+								VecQuery **out_query, VecError *err);
 
 	/*
-	 * Offer nrows rows of input 'input' in ncols columns, or Arrow IPC
-	 * bytes from Motion route 'route' as nparts consecutive pieces.  Both
-	 * copy what they take.  VEC_OK: taken.  VEC_PENDING: the queue is full
-	 * and nothing was taken; poll, then offer again.
+	 * Offer a batch of input 'input' (lent: copied, never released), or
+	 * Arrow IPC bytes from Motion route 'route' as nparts consecutive
+	 * pieces (copied).  VEC_OK: taken.  VEC_PENDING: the queue is full and
+	 * nothing was taken; poll, then offer again.
 	 */
-	int32_t		(*query_push) (VecQuery *query, uint32_t input, const VecColumn *cols,
-							   uint32_t ncols, uint32_t nrows, VecError *err);
+	int32_t		(*query_push) (VecQuery *query, uint32_t input,
+							   const struct ArrowArray *batch, VecError *err);
 	int32_t		(*query_push_ipc) (VecQuery *query, uint32_t input, int32_t route,
 								   const VecSlice *parts, uint32_t nparts, VecError *err);
 	/* Input 'input' has no more rows. */
 	void		(*query_finish_input) (VecQuery *query, uint32_t input);
 
 	/*
-	 * Wait up to timeout_ms for results.  VEC_OK: *nrows rows, read with
-	 * query_column until the next poll.  VEC_BYTES: *nrows bytes of the
-	 * result stream, read with query_bytes (VEC_QUERY_IPC_OUTPUT).
-	 * VEC_PENDING, VEC_DONE, or VEC_ERROR / VEC_PANIC.
+	 * Wait up to timeout_ms for results.  VEC_OK: a batch of *nrows rows,
+	 * taken with query_result.  VEC_BYTES: *nrows bytes of the result
+	 * stream, read with query_bytes (VEC_QUERY_IPC_OUTPUT).  VEC_PENDING,
+	 * VEC_DONE, or VEC_ERROR / VEC_PANIC.
 	 */
 	int32_t		(*query_poll) (VecQuery *query, uint32_t timeout_ms, uint32_t *nrows,
 							   VecError *err);
-	int32_t		(*query_column) (VecQuery *query, uint32_t col, VecColumn *out);
+	/*
+	 * Move the batch of the last VEC_OK poll into *out: the host's from
+	 * then on, to release once read.  VEC_ERROR without one.
+	 */
+	int32_t		(*query_result) (VecQuery *query, struct ArrowArray *out);
 	/* The bytes of the last VEC_BYTES poll and their route (-1: the only one). */
 	void		(*query_bytes) (VecQuery *query, int32_t *route,
 								const uint8_t **data, size_t *len);

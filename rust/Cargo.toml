@@ -39,6 +39,9 @@ libc = "0.2"
 serde_json = "1"
 futures = "0.3"
 df_core = { path = "df_core" }
+# the version DataFusion uses, for its C Data Interface (the engine ABI's
+# batches, src/vec_engine.h)
+arrow = { version = "60", default-features = false, features = ["ffi"] }
 
 # panic must stay "unwind": every FFI entry point relies on catch_unwind to
 # turn a panic into an ordinary PostgreSQL ERROR.  "abort" would take the

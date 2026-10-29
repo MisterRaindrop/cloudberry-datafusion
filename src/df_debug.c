@@ -465,7 +465,9 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 	char	   *values[3];
 	int32	   *offsets[3];
 	uint8	   *nulls[3];
-	VecColumn	cols[3];
+	const char *formats[3];
+	struct ArrowSchema schema;
+	struct ArrowArray keys;
 	int32		kinds[3];
 	Oid			funcs[3];
 	uint32	   *routes = palloc(sizeof(uint32) * nrows);
@@ -515,14 +517,46 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 				df_random_key(rng, t->kind, values[k] + r * t->width);
 			}
 		}
-		cols[k].values = (const void *) values[k];
-		cols[k].nulls = nulls[k];
-		cols[k].offsets = offsets[k];
 	}
+
+	/* the keys as the engine takes them: Arrow arrays (vec_engine.h) */
+	df_arrow_struct_array(&keys, nkeys);
+	keys.length = nrows;
+	for (k = 0; k < nkeys; k++)
+	{
+		const DfKeyType *t = &df_key_types[types[k]];
+		uint8	   *valid = palloc0((nrows + 7) / 8);
+		const void *v = values[k];
+		int64		nnull = 0;
+
+		for (r = 0; r < nrows; r++)
+		{
+			if (nulls[k][r])
+				nnull++;
+			else
+				valid[r >> 3] |= 1 << (r & 7);
+		}
+		if (t->kind == 0)
+		{
+			/* bool: a bitmap */
+			uint8	   *bits = palloc0((nrows + 7) / 8);
+
+			for (r = 0; r < nrows; r++)
+				if (values[k][r])
+					bits[r >> 3] |= 1 << (r & 7);
+			v = bits;
+		}
+		formats[k] = t->kind == 0 ? "b" : t->kind == 1 ? "s" : t->kind == 2 ? "i" :
+			t->kind == 3 || t->kind == 85 ? "l" : t->kind == 4 ? "f" :
+			t->kind == 5 ? "g" : t->kind <= 7 ? "u" :
+			df_arrow_format(NUMERICOID, t->kind - 8);
+		df_arrow_set_column(keys.children[k], nrows, nnull, valid, v, offsets[k]);
+	}
+	df_arrow_struct_schema(&schema, nkeys, formats);
 	h = makeCdbHash(segments, nkeys, funcs);
 	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);
 
-	if (df_engine_debug()->cdbhash_routes(kinds, cols, nkeys, nrows, segments, workers,
+	if (df_engine_debug()->cdbhash_routes(kinds, &schema, &keys, segments, workers,
 										  routes) != VEC_OK)
 		elog(ERROR, "datafusion: the engine's cdbhash_routes failed");
 

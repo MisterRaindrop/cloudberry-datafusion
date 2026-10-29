@@ -351,7 +351,7 @@ to the engine).
 
 ## Types
 
-| Tag | Values | Arrow layout (DataFusion) |
+| Tag | Values | Arrow layout across the engine ABI (`src/vec_engine.h`) |
 |---|---|---|
 | `bool` | | Boolean |
 | `int2`, `int4`, `int8` | | Int16, Int32, Int64 |

@@ -24,6 +24,7 @@ publish.workspace = true
 
 [dependencies]
 datafusion.workspace = true
+arrow.workspace = true
 tokio.workspace = true
 libc.workspace = true
 serde_json.workspace = true

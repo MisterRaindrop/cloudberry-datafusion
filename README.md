@@ -1902,7 +1902,10 @@ The extension reaches the engine only through the table of functions
 escape; each reports failure as a status code plus a SQLSTATE and message
 in the caller's `VecError`. The C side raises the `ereport` after the call
 returns, so PostgreSQL's `longjmp` never unwinds through Rust frames.
-Plans reach the engine as the IR of `docs/ir.md`.
+Plans reach the engine as the IR of `docs/ir.md`, and rows as Arrow
+arrays by the Arrow C Data Interface: the extension lends each batch it
+reads (the engine copies it) and releases each result batch once it has
+handed out its rows.
 
 ## License
 

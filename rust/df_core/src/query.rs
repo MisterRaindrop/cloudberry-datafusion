@@ -36,15 +36,16 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, StringArray,
+    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Decimal256Type, Field, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, Schema, SchemaRef,
+    ArrowPrimitiveType, DataType, Decimal256Type, Field, Fields, Float32Type, Float64Type,
+    Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
 };
 use datafusion::arrow::ipc::reader::StreamDecoder;
 use datafusion::arrow::ipc::writer::StreamWriter;
@@ -215,8 +216,10 @@ impl PgType {
     }
 }
 
-/// Column data as the C side lays it out: native values (one byte per bool)
-/// and one byte per row that is 1 for NULL.  A string column's `values` are
+/// Column data as the direct PAX reader lays it out (see `PaxColumn`), and
+/// as the tests write it: native values (one byte per bool) and one byte
+/// per row that is 1 for NULL.  Batches the host pushes are Arrow arrays
+/// instead (`import_column`).  A string column's `values` are
 /// its bytes, row r being `offsets[r]..offsets[r + 1]`; `offsets` is null
 /// for the other types.
 #[repr(C)]
@@ -249,6 +252,7 @@ pub struct PaxColumn {
 }
 
 /// Converted output column whose buffers stay valid until the next poll.
+#[cfg(test)]
 struct OutColumn {
     _array: ArrayRef,
     offsets: *const i32,
@@ -2476,6 +2480,10 @@ pub struct Query {
     out_rx: mpsc::Receiver<Result<Out, PgError>>,
     out_types: Vec<PgType>,
     task: Option<JoinHandle<()>>,
+    /// The result batch of the last Poll::Batch, until taken.
+    result: Option<StructArray>,
+    /// Its columns as the tests read them (`output_column`).
+    #[cfg(test)]
     current: Vec<OutColumn>,
     current_bytes: Vec<u8>,
     current_route: i32,
@@ -3044,6 +3052,8 @@ impl Query {
             out_rx,
             out_types,
             task: Some(task),
+            result: None,
+            #[cfg(test)]
             current: Vec::new(),
             current_bytes: Vec::new(),
             current_route: NO_ROUTE,
@@ -3074,6 +3084,11 @@ impl Query {
 
     pub fn num_inputs(&self) -> usize {
         self.in_types.len()
+    }
+
+    /// The column types of input `j`.
+    pub fn input_types(&self, j: usize) -> Option<&[PgType]> {
+        self.in_types.get(j).map(Vec::as_slice)
     }
 
     pub fn num_output_columns(&self) -> usize {
@@ -3114,6 +3129,64 @@ impl Query {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(cols.len());
         for (c, ty) in cols.iter().zip(types) {
             arrays.push(build_array(*ty, *c, nrows)?);
+        }
+        self.push_arrays(input, arrays, nrows)
+    }
+
+    /// Offer a batch of input `input` as the host lends it through the
+    /// engine ABI (src/vec_engine.h): a struct array of its columns, laid
+    /// out as their types, copied here.  Ok(false): the channel is full;
+    /// nothing was taken.
+    ///
+    /// # Safety
+    /// `batch` is a live struct array of that layout.
+    pub unsafe fn push_ffi(
+        &mut self,
+        input: usize,
+        batch: &FFI_ArrowArray,
+    ) -> Result<bool, PgError> {
+        let types = self
+            .in_types
+            .get(input)
+            .ok_or_else(|| PgError::internal("input not open"))?;
+        if batch.num_children() != types.len() {
+            return Err(PgError::internal(format!(
+                "a batch of {} columns for an input of {}",
+                batch.num_children(),
+                types.len()
+            )));
+        }
+        if self
+            .in_tx
+            .get(input)
+            .and_then(Option::as_ref)
+            .is_some_and(|tx| tx.capacity() == 0)
+        {
+            return Ok(false);
+        }
+        let n = batch.len();
+        let arrays = types
+            .iter()
+            .enumerate()
+            .map(|(c, ty)| import_column(*ty, batch.child(c), batch.offset(), n))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.push_arrays(input, arrays, n)
+    }
+
+    /// Offer the columns of `nrows` rows to input `input`.
+    fn push_arrays(
+        &mut self,
+        input: usize,
+        arrays: Vec<ArrayRef>,
+        nrows: usize,
+    ) -> Result<bool, PgError> {
+        let tx = self
+            .in_tx
+            .get(input)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| PgError::internal("input not open"))?;
+        if tx.capacity() == 0 {
+            return Ok(false);
         }
         let batch = make_batch(&self.in_schemas[input], arrays, nrows)?;
         match tx.try_send(Ok(batch)) {
@@ -3201,6 +3274,8 @@ impl Query {
 
     /// Wait up to `timeout` for the next result batch.
     pub fn poll(&mut self, timeout: Duration) -> Poll {
+        self.result = None;
+        #[cfg(test)]
         self.current.clear();
         self.current_bytes = Vec::new();
         let next = if timeout.is_zero() {
@@ -3220,8 +3295,15 @@ impl Query {
             }
         };
         match next {
-            Some(Ok(Out::Batch(batch))) => match self.convert(&batch) {
-                Ok(()) => Poll::Batch(batch.num_rows()),
+            Some(Ok(Out::Batch(batch))) => match self.result_of(&batch) {
+                Ok(r) => {
+                    #[cfg(test)]
+                    if let Err(e) = self.convert(&r) {
+                        return Poll::Failed(e);
+                    }
+                    self.result = Some(r);
+                    Poll::Batch(batch.num_rows())
+                }
                 Err(e) => Poll::Failed(e),
             },
             Some(Ok(Out::Bytes(route, bytes))) => {
@@ -3249,17 +3331,54 @@ impl Query {
         }
     }
 
-    fn convert(&mut self, batch: &RecordBatch) -> Result<(), PgError> {
+    /// The columns of the result type (`output_type`).
+    fn output_fields(&self) -> Fields {
+        self.out_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| Field::new(format!("o{i}"), ty.arrow(), true))
+            .collect()
+    }
+
+    /// The type of the result batches: a struct of the output columns, laid
+    /// out as their types (src/vec_engine.h).
+    pub fn output_type(&self) -> DataType {
+        DataType::Struct(self.output_fields())
+    }
+
+    /// A result batch as the struct array the engine ABI hands out.
+    fn result_of(&self, batch: &RecordBatch) -> Result<StructArray, PgError> {
         if batch.num_columns() != self.out_types.len() {
             return Err(PgError::internal(
                 "result batch has the wrong number of columns",
             ));
         }
+        let columns = self
+            .out_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let array = batch.column(i);
+                if array.data_type() == &ty.arrow() {
+                    Ok(array.clone())
+                } else {
+                    cast(array, &ty.arrow()).map_err(|e| PgError::internal(e.to_string()))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        StructArray::try_new_with_length(self.output_fields(), columns, None, batch.num_rows())
+            .map_err(|e| PgError::internal(e.to_string()))
+    }
+
+    /// The result batch of the last Poll::Batch, moved out.
+    pub fn take_result(&mut self) -> Option<StructArray> {
+        self.result.take()
+    }
+
+    #[cfg(test)]
+    fn convert(&mut self, batch: &StructArray) -> Result<(), PgError> {
         for (i, ty) in self.out_types.iter().enumerate() {
-            let mut array = batch.column(i).clone();
-            if array.data_type() != &ty.arrow() {
-                array = cast(&array, &ty.arrow()).map_err(|e| PgError::internal(e.to_string()))?;
-            }
+            let array = batch.column(i).clone();
             let n = array.len();
             let nulls: Vec<u8> = (0..n).map(|r| array.is_null(r) as u8).collect();
             let mut offsets: *const i32 = std::ptr::null();
@@ -3317,6 +3436,7 @@ impl Query {
     }
 
     /// Buffers of output column `i` of the current batch.
+    #[cfg(test)]
     pub fn output_column(&self, i: usize) -> Option<RawColumn> {
         self.current.get(i).map(|c| RawColumn {
             values: c.bools.as_ref().map(|b| b.as_ptr()).unwrap_or(c.values),
@@ -3472,6 +3592,127 @@ unsafe fn primitive<T: ArrowPrimitiveType>(
 ) -> ArrayRef {
     let values = std::slice::from_raw_parts(c.values as *const T::Native, n).to_vec();
     Arc::new(PrimitiveArray::<T>::new(ScalarBuffer::from(values), nulls))
+}
+
+/// The Arrow C Data Interface format of a column of type `ty`, as batches
+/// cross the engine ABI (src/vec_engine.h).
+pub fn arrow_format(ty: PgType) -> String {
+    match ty.storage() {
+        PgType::Bool => "b".into(),
+        PgType::Int2 => "s".into(),
+        PgType::Int4 => "i".into(),
+        PgType::Int8 => "l".into(),
+        PgType::Float4 => "f".into(),
+        PgType::Float8 => "g".into(),
+        PgType::Text => "u".into(),
+        PgType::Numeric(s) => format!("d:{},{s},256", crate::pgnum::NUMERIC_PRECISION),
+        _ => unreachable!(),
+    }
+}
+
+/// Is `schema` a struct of columns laid out as `types`?
+pub fn check_schema(types: &[PgType], schema: &FFI_ArrowSchema) -> Result<(), String> {
+    let n = schema.children().count();
+    if schema.format() != "+s" || n != types.len() {
+        return Err(format!(
+            "a schema \"{}\" of {n} columns for {} columns",
+            schema.format(),
+            types.len()
+        ));
+    }
+    for (c, ty) in types.iter().enumerate() {
+        let (got, want) = (schema.child(c).format(), arrow_format(*ty));
+        if got != want {
+            return Err(format!("column {c} is \"{got}\", not \"{want}\""));
+        }
+    }
+    Ok(())
+}
+
+/// Bits `offset..offset + n` of the bitmap at `p`, copied.
+///
+/// # Safety
+/// `p` points to a bitmap of at least `offset + n` bits.
+unsafe fn copy_bits(p: *const u8, offset: usize, n: usize) -> BooleanBuffer {
+    let first = offset / 8;
+    let bytes = std::slice::from_raw_parts(p.add(first), (offset + n).div_ceil(8) - first);
+    BooleanBuffer::new(Buffer::from_slice_ref(bytes), offset % 8, n)
+}
+
+/// Values `offset..offset + n` of the buffer at `p`, of `width` bytes each,
+/// copied (to an aligned buffer: the host's need not be).
+///
+/// # Safety
+/// `p` points to at least `offset + n` such values.
+unsafe fn copy_values(p: *const u8, width: usize, offset: usize, n: usize) -> Buffer {
+    Buffer::from_slice_ref(std::slice::from_raw_parts(p.add(offset * width), n * width))
+}
+
+/// Rows `offset..offset + n` of a column the host lent through the engine
+/// ABI, laid out as `ty` (`arrow_format`), copied; `parent_offset` is the
+/// offset of the struct array it is a child of.
+///
+/// # Safety
+/// `a` is a live array of that layout and of at least that many rows.
+pub unsafe fn import_column(
+    ty: PgType,
+    a: &FFI_ArrowArray,
+    parent_offset: usize,
+    n: usize,
+) -> Result<ArrayRef, PgError> {
+    let off = parent_offset + a.offset();
+    let want = if ty.storage() == PgType::Text { 3 } else { 2 };
+    if a.num_buffers() != want {
+        return Err(PgError::internal(format!(
+            "a column of {} buffers for {:?}",
+            a.num_buffers(),
+            ty
+        )));
+    }
+    let nulls = if a.null_count_opt() == Some(0) || a.buffer(0).is_null() {
+        None
+    } else {
+        Some(NullBuffer::new(copy_bits(a.buffer(0), off, n))).filter(|b| b.null_count() > 0)
+    };
+    let values = a.buffer(1);
+    let primitive = |width: usize, dt: DataType| -> Result<ArrayRef, PgError> {
+        let data = datafusion::arrow::array::ArrayData::builder(dt)
+            .len(n)
+            .add_buffer(copy_values(values, width, off, n))
+            .nulls(nulls.clone())
+            .build()
+            .map_err(|e| PgError::internal(e.to_string()))?;
+        Ok(datafusion::arrow::array::make_array(data))
+    };
+    Ok(match ty.storage() {
+        PgType::Bool => Arc::new(BooleanArray::new(copy_bits(values, off, n), nulls)),
+        PgType::Int2 => primitive(2, DataType::Int16)?,
+        PgType::Int4 => primitive(4, DataType::Int32)?,
+        PgType::Int8 => primitive(8, DataType::Int64)?,
+        PgType::Float4 => primitive(4, DataType::Float32)?,
+        PgType::Float8 => primitive(8, DataType::Float64)?,
+        PgType::Numeric(_) => primitive(32, ty.arrow())?,
+        PgType::Text => {
+            let offsets = std::slice::from_raw_parts(values as *const i32, off + n + 1);
+            let offsets = &offsets[off..];
+            let (start, end) = (offsets[0] as usize, offsets[n] as usize);
+            let bytes = std::slice::from_raw_parts(a.buffer(2).add(start), end - start);
+            let offsets = OffsetBuffer::new(ScalarBuffer::from(
+                offsets.iter().map(|o| o - offsets[0]).collect::<Vec<i32>>(),
+            ));
+            Arc::new(
+                StringArray::try_new(offsets, Buffer::from_slice_ref(bytes), nulls).map_err(
+                    |e| {
+                        PgError::new(
+                            "22021",
+                            format!("invalid byte sequence for encoding \"UTF8\": {e}"),
+                        )
+                    },
+                )?,
+            )
+        }
+        _ => unreachable!(),
+    })
 }
 
 /// An Arrow array of `n` values of `ty` from C buffers.  Strings are

@@ -437,6 +437,44 @@ df_below_sort(Plan *plan)
 	return plan != NULL && IsA(plan, Sort) ? outerPlan(plan) : plan;
 }
 
+/*
+ * df_arrow.c: a column of a result batch, read row by row.  Rows count
+ * from the batch's first; 'bit' is where it starts in the validity bitmap,
+ * and in a bool's bitmap of values.
+ */
+typedef struct DfOutCol
+{
+	const uint8 *valid;			/* 1: not NULL; NULL without NULLs */
+	int64		bit;
+	const void *values;			/* the first row's value, a bool's bitmap,
+								 * or a string's bytes */
+	const int32 *offsets;		/* a string's: the first row's */
+} DfOutCol;
+
+static inline bool
+df_out_isnull(const DfOutCol *c, uint32 r)
+{
+	int64		b = c->bit + r;
+
+	return c->valid != NULL && (c->valid[b >> 3] & (1 << (b & 7))) == 0;
+}
+
+static inline bool
+df_out_bool(const DfOutCol *c, uint32 r)
+{
+	int64		b = c->bit + r;
+
+	return (((const uint8 *) c->values)[b >> 3] & (1 << (b & 7))) != 0;
+}
+
+extern const char *df_arrow_format(Oid type, int scale);
+extern void df_arrow_struct_schema(struct ArrowSchema *s, int n, const char *const *formats);
+extern void df_arrow_struct_array(struct ArrowArray *a, int n);
+extern void df_arrow_set_column(struct ArrowArray *col, int64 length, int64 null_count,
+								const uint8 *valid, const void *values, const int32 *offsets);
+extern void df_arrow_out_column(DfOutCol *out, const struct ArrowArray *batch, int c,
+								int width);
+
 /* df_runtime.c */
 extern int	df_runtime_ensure(void);
 extern void df_case_maps_ensure(void);

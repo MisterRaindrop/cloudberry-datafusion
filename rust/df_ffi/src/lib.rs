@@ -34,12 +34,15 @@ use std::ffi::{c_char, CStr};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
+use arrow::array::Array;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
+
 // catch_unwind only works when panics unwind.
 #[cfg(panic = "abort")]
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `src/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 1;
+pub const VEC_ENGINE_ABI: u32 = 2;
 
 /// Status codes; keep in sync with `src/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
@@ -265,15 +268,6 @@ extern "C" fn debug_active_tasks() -> u64 {
 /// Opaque handle owned by the C caller; release it with `query_free`.
 pub struct VecQuery(df_core::query::Query);
 
-/// Column buffers as exchanged with C: native values and one byte per row
-/// that is 1 for NULL.
-#[repr(C)]
-pub struct VecColumn {
-    pub values: *const u8,
-    pub nulls: *const u8,
-    pub offsets: *const i32,
-}
-
 /// An input DataFusion reads from PAX itself (C3): its scan and blocks, or
 /// a null scan.
 #[repr(C)]
@@ -286,6 +280,7 @@ pub struct VecPaxInput {
 #[repr(C)]
 pub struct VecQueryArgs {
     pub ir: *const c_char,
+    pub input_schemas: *const FFI_ArrowSchema,
     pub partitions: u32,
     pub memory_limit: u64,
     pub spill_dir: *const c_char,
@@ -299,7 +294,9 @@ pub struct VecQueryArgs {
     pub pax_max_readers: u32,
 }
 
-/// Build the plan `args.ir` describes and start it with `partitions`
+/// Build the plan `args.ir` describes, its inputs' batches laid out as
+/// `input_schemas` say (one struct schema per input, checked against the
+/// plan's column types), and start it with `partitions`
 /// parallel partitions, an operator memory budget of `memory_limit` bytes
 /// and spill files under `spill_dir`.  Bit j of `ipc_inputs` says input j
 /// arrives as Arrow IPC streams from a Motion (`query_push_ipc`), otherwise
@@ -307,9 +304,11 @@ pub struct VecQueryArgs {
 /// gives it a PAX scan, which the workers read with `pax_read`, `pax_end`
 /// and `pax_groups`, at most `pax_max_readers` groups at once (0: no
 /// limit), and which the query owns from the call on, even if it fails.
-/// The runtime must be running.
+/// The runtime must be running.  Writes the struct schema of the result
+/// batches to `*out_schema`, the caller's to release.
 extern "C" fn query_start(
     args: *const VecQueryArgs,
+    out_schema: *mut FFI_ArrowSchema,
     out_query: *mut *mut VecQuery,
     err: *mut VecError,
 ) -> i32 {
@@ -341,19 +340,31 @@ extern "C" fn query_start(
         // SAFETY: the caller passes NUL-terminated strings.
         let ir = unsafe { CStr::from_ptr(a.ir) }.to_string_lossy();
         let dir = unsafe { CStr::from_ptr(a.spill_dir) }.to_string_lossy();
-        df_core::query::Query::start_multi(
+        let q = df_core::query::Query::start_multi(
             &ir,
             a.partitions as usize,
             a.memory_limit as usize,
             &dir,
             sources,
             a.flags & VEC_QUERY_IPC_OUTPUT != 0,
-        )
+        )?;
+        for j in 0..a.ninputs as usize {
+            // SAFETY: `input_schemas` holds `ninputs` schemas.
+            let schema = unsafe { &*a.input_schemas.add(j) };
+            df_core::query::check_schema(q.input_types(j).unwrap_or_default(), schema)
+                .map_err(|e| df_core::pgfunc::PgError::internal(format!("input {j}: {e}")))?;
+        }
+        let schema = FFI_ArrowSchema::try_from(&q.output_type())
+            .map_err(|e| df_core::pgfunc::PgError::internal(e.to_string()))?;
+        Ok((q, schema))
     }));
     match r {
-        Ok(Ok(q)) => {
-            // SAFETY: the caller passes a valid out pointer.
-            unsafe { *out_query = Box::into_raw(Box::new(VecQuery(q))) };
+        Ok(Ok((q, schema))) => {
+            // SAFETY: the caller passes valid out pointers.
+            unsafe {
+                std::ptr::write(out_schema, schema);
+                *out_query = Box::into_raw(Box::new(VecQuery(q)));
+            }
             VEC_OK
         }
         Ok(Err(e)) => report(&e, err),
@@ -361,30 +372,20 @@ extern "C" fn query_start(
     }
 }
 
-/// Offer `nrows` rows in `ncols` columns.  VEC_OK: taken.  VEC_PENDING: the
-/// input queue is full and nothing was taken; poll, then offer again.
+/// Offer a batch of input `input`, lent for the call: copied, never
+/// released here.  VEC_OK: taken.  VEC_PENDING: the input queue is full
+/// and nothing was taken; poll, then offer again.
 extern "C" fn query_push(
     query: *mut VecQuery,
     input: u32,
-    cols: *const VecColumn,
-    ncols: u32,
-    nrows: u32,
+    batch: *const FFI_ArrowArray,
     err: *mut VecError,
 ) -> i32 {
-    // SAFETY: `query` is live; `cols` points to `ncols` columns of `nrows` rows.
+    // SAFETY: `query` is live; `batch` is a live struct array of the
+    // input's schema.
     let q = unsafe { &mut (*query).0 };
-    let raw: Vec<df_core::query::RawColumn> = (0..ncols as usize)
-        .map(|i| unsafe {
-            let c = &*cols.add(i);
-            df_core::query::RawColumn {
-                values: c.values,
-                nulls: c.nulls,
-                offsets: c.offsets,
-            }
-        })
-        .collect();
     match catch_unwind(AssertUnwindSafe(|| unsafe {
-        q.push_input(input as usize, &raw, nrows as usize)
+        q.push_ffi(input as usize, &*batch)
     })) {
         Ok(Ok(true)) => VEC_OK,
         Ok(Ok(false)) => VEC_PENDING,
@@ -453,28 +454,30 @@ extern "C" fn query_bytes(
     }
 }
 
-/// Routes of `nrows` rows by Cloudberry's distribution hash, for checking
-/// the Rust transcription against cdbhash(): `kinds[i]` names the hash of
-/// key column `cols[i]` (0 bool, 1 int2, 2 int4, 3 int8, 4 float4,
-/// 5 float8, 6 text, 7 character, 8 + s numeric of scale s, 85 tid).
-/// Writes `nrows` routes to `out`.  VEC_OK, or VEC_ERROR for an unknown
-/// kind.
+/// Routes of the rows of `keys` by Cloudberry's distribution hash, for
+/// checking the Rust transcription against cdbhash(): `kinds[i]` names the
+/// hash of key column i (0 bool, 1 int2, 2 int4, 3 int8, 4 float4,
+/// 5 float8, 6 text, 7 character, 8 + s numeric of scale s, 85 tid), laid
+/// out as `schema` says.  Writes a route per row to `out`.  VEC_OK, or
+/// VEC_ERROR for an unknown kind or a schema of other columns.
 extern "C" fn debug_cdbhash_routes(
     kinds: *const i32,
-    cols: *const VecColumn,
-    nkeys: u32,
-    nrows: u32,
+    schema: *const FFI_ArrowSchema,
+    keys: *const FFI_ArrowArray,
     segments: i32,
     workers: i32,
     out: *mut u32,
 ) -> i32 {
     use df_core::query::PgType;
     let r = catch_unwind(AssertUnwindSafe(|| {
-        let mut keys = Vec::with_capacity(nkeys as usize);
-        for i in 0..nkeys as usize {
-            // SAFETY: the caller passes `nkeys` kinds and columns of `nrows` rows.
-            let (kind, c) = unsafe { (*kinds.add(i), &*cols.add(i)) };
-            let ty = match kind {
+        // SAFETY: the caller passes a live struct array and its schema.
+        let (batch, schema) = unsafe { (&*keys, &*schema) };
+        let (nkeys, nrows) = (batch.num_children(), batch.len());
+        let mut types = Vec::with_capacity(nkeys);
+        for i in 0..nkeys {
+            // SAFETY: the caller passes a kind per key column.
+            let kind = unsafe { *kinds.add(i) };
+            types.push(match kind {
                 0 => PgType::Bool,
                 1 => PgType::Int2,
                 2 => PgType::Int4,
@@ -486,23 +489,20 @@ extern "C" fn debug_cdbhash_routes(
                 8..=84 => PgType::Numeric((kind - 8) as i8),
                 85 => PgType::Tid,
                 _ => return None,
-            };
-            let raw = df_core::query::RawColumn {
-                values: c.values,
-                nulls: c.nulls,
-                offsets: c.offsets,
-            };
-            keys.push((
+            });
+        }
+        df_core::query::check_schema(&types, schema).ok()?;
+        let mut columns = Vec::with_capacity(nkeys);
+        for (i, ty) in types.iter().enumerate() {
+            columns.push((
                 ty.key_hash(),
-                unsafe { df_core::query::build_array(ty, raw, nrows as usize) }.ok()?,
+                unsafe {
+                    df_core::query::import_column(*ty, batch.child(i), batch.offset(), nrows)
+                }
+                .ok()?,
             ));
         }
-        Some(df_core::cdbhash::routes(
-            &keys,
-            nrows as usize,
-            segments,
-            workers,
-        ))
+        Some(df_core::cdbhash::routes(&columns, nrows, segments, workers))
     }));
     match r {
         Ok(Some(routes)) => {
@@ -521,8 +521,8 @@ extern "C" fn query_finish_input(query: *mut VecQuery, input: u32) {
     let _ = catch_unwind(AssertUnwindSafe(|| q.finish_input_at(input as usize)));
 }
 
-/// Wait up to `timeout_ms` for the next result batch.  VEC_OK: `*nrows`
-/// rows are available through `query_column` until the next poll.
+/// Wait up to `timeout_ms` for the next result batch.  VEC_OK: a batch of
+/// `*nrows` rows, taken with `query_result`.
 /// VEC_BYTES: `*nrows` bytes of the result stream are available through
 /// `query_bytes` (VEC_QUERY_IPC_OUTPUT).  VEC_PENDING, VEC_DONE, or
 /// VEC_ERROR / VEC_PANIC with SQLSTATE and message.
@@ -557,20 +557,20 @@ extern "C" fn query_poll(
     }
 }
 
-/// Buffers of output column `col` of the batch returned by the last poll.
-extern "C" fn query_column(query: *mut VecQuery, col: u32, out: *mut VecColumn) -> i32 {
+/// Move the batch of the last VEC_OK poll into `*out`, exported as a struct
+/// array the caller releases (its buffers are shared, not copied).
+/// VEC_ERROR without one.
+extern "C" fn query_result(query: *mut VecQuery, out: *mut FFI_ArrowArray) -> i32 {
     // SAFETY: `query` is live; `out` is valid.
-    let q = unsafe { &(*query).0 };
-    match q.output_column(col as usize) {
-        Some(c) => {
-            unsafe {
-                (*out).values = c.values;
-                (*out).nulls = c.nulls;
-                (*out).offsets = c.offsets;
-            }
+    let q = unsafe { &mut (*query).0 };
+    match catch_unwind(AssertUnwindSafe(|| {
+        q.take_result().map(|r| FFI_ArrowArray::new(&r.to_data()))
+    })) {
+        Ok(Some(array)) => {
+            unsafe { std::ptr::write(out, array) };
             VEC_OK
         }
-        None => VEC_ERROR,
+        _ => VEC_ERROR,
     }
 }
 
@@ -627,8 +627,14 @@ pub struct VecEngineDebug {
     pub task_cancel: extern "C" fn(*mut VecTask),
     pub task_free: extern "C" fn(*mut VecTask),
     pub active_tasks: extern "C" fn() -> u64,
-    pub cdbhash_routes:
-        extern "C" fn(*const i32, *const VecColumn, u32, u32, i32, i32, *mut u32) -> i32,
+    pub cdbhash_routes: extern "C" fn(
+        *const i32,
+        *const FFI_ArrowSchema,
+        *const FFI_ArrowArray,
+        i32,
+        i32,
+        *mut u32,
+    ) -> i32,
 }
 
 /// The engine's table of `src/vec_engine.h`.
@@ -641,14 +647,18 @@ pub struct VecEngine {
     pub runtime_shutdown: extern "C" fn(u32),
     pub heap_bytes: extern "C" fn() -> i64,
     pub set_case_maps: extern "C" fn(*const u32, usize, *const u32, usize),
-    pub query_start: extern "C" fn(*const VecQueryArgs, *mut *mut VecQuery, *mut VecError) -> i32,
-    pub query_push:
-        extern "C" fn(*mut VecQuery, u32, *const VecColumn, u32, u32, *mut VecError) -> i32,
+    pub query_start: extern "C" fn(
+        *const VecQueryArgs,
+        *mut FFI_ArrowSchema,
+        *mut *mut VecQuery,
+        *mut VecError,
+    ) -> i32,
+    pub query_push: extern "C" fn(*mut VecQuery, u32, *const FFI_ArrowArray, *mut VecError) -> i32,
     pub query_push_ipc:
         extern "C" fn(*mut VecQuery, u32, i32, *const VecSlice, u32, *mut VecError) -> i32,
     pub query_finish_input: extern "C" fn(*mut VecQuery, u32),
     pub query_poll: extern "C" fn(*mut VecQuery, u32, *mut u32, *mut VecError) -> i32,
-    pub query_column: extern "C" fn(*mut VecQuery, u32, *mut VecColumn) -> i32,
+    pub query_result: extern "C" fn(*mut VecQuery, *mut FFI_ArrowArray) -> i32,
     pub query_bytes: extern "C" fn(*mut VecQuery, *mut i32, *mut *const u8, *mut usize),
     pub query_stats: extern "C" fn(*mut VecQuery, *mut VecQueryStats),
     pub query_free: extern "C" fn(*mut VecQuery),
@@ -702,7 +712,7 @@ pub extern "C" fn vec_engine_entry(host_abi: u32, _host: *const VecHost) -> *con
             query_push_ipc,
             query_finish_input,
             query_poll,
-            query_column,
+            query_result,
             query_bytes,
             query_stats,
             query_free,
@@ -715,6 +725,8 @@ pub extern "C" fn vec_engine_entry(host_abi: u32, _host: *const VecHost) -> *con
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::StructArray;
+    use std::sync::Arc;
 
     fn engine() -> &'static VecEngine {
         let e = vec_engine_entry(VEC_ENGINE_ABI, std::ptr::null());
@@ -760,6 +772,139 @@ mod tests {
         assert_eq!(status, VEC_PANIC);
         assert_eq!(text(&err.sqlstate), "XX000");
         assert_eq!(text(&err.message), "datafusion_debug_panic requested");
+    }
+
+    /// Start a query of `ir` over one input of `schema`, through the table.
+    fn start(
+        e: &VecEngine,
+        ir: &str,
+        schema: &FFI_ArrowSchema,
+    ) -> Result<(*mut VecQuery, FFI_ArrowSchema), String> {
+        let mut err = new_error();
+        assert_eq!((e.runtime_init)(2, std::ptr::null_mut(), &mut err), VEC_OK);
+        let ir = std::ffi::CString::new(ir).unwrap();
+        let dir = std::ffi::CString::new(std::env::temp_dir().to_str().unwrap()).unwrap();
+        let args = VecQueryArgs {
+            ir: ir.as_ptr(),
+            input_schemas: schema,
+            partitions: 2,
+            memory_limit: 64 << 20,
+            spill_dir: dir.as_ptr(),
+            flags: 0,
+            ninputs: 1,
+            ipc_inputs: 0,
+            pax_inputs: std::ptr::null(),
+            pax_read: None,
+            pax_end: None,
+            pax_groups: None,
+            pax_max_readers: 0,
+        };
+        let mut out_schema = FFI_ArrowSchema::empty();
+        let mut q = std::ptr::null_mut();
+        match (e.query_start)(&args, &mut out_schema, &mut q, &mut err) {
+            VEC_OK => Ok((q, out_schema)),
+            _ => Err(text(&err.message)),
+        }
+    }
+
+    /// Rows go in as a lent Arrow batch (a slice of a larger one, nulls
+    /// and all) and come back as an exported one.
+    #[test]
+    fn batches_cross_as_arrow_arrays() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field};
+        let e = engine();
+        let ir = r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"},{"type":"text"}]}],
+            "plan":{"filter":{"input":{"input":0},"pred":{"op":">","type":"bool",
+                "args":[{"col":0},{"lit":{"type":"int4","value":1}}]}}},
+            "output":[{"expr":{"col":1},"type":"text"},{"expr":{"col":0},"type":"int8"}]}"#;
+        let fields = vec![
+            Field::new("c0", DataType::Int32, true),
+            Field::new("c1", DataType::Utf8, true),
+        ];
+        let schema = FFI_ArrowSchema::try_from(&DataType::Struct(fields.clone().into())).unwrap();
+        let (q, out_schema) = start(e, ir, &schema).unwrap();
+        let input = StructArray::new(
+            fields.into(),
+            vec![
+                Arc::new(Int32Array::from(vec![
+                    Some(9),
+                    Some(1),
+                    Some(2),
+                    None,
+                    Some(3),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("x"),
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("dé"),
+                ])),
+            ],
+            None,
+        )
+        .slice(1, 4);
+        let lent = FFI_ArrowArray::new(&input.to_data());
+        let mut err = new_error();
+        assert_eq!(
+            (e.query_push)(q, 0, &lent, &mut err),
+            VEC_OK,
+            "{}",
+            text(&err.message)
+        );
+        drop(lent);
+        drop(input);
+        (e.query_finish_input)(q, 0);
+        let mut rows = Vec::new();
+        loop {
+            let mut n = 0;
+            match (e.query_poll)(q, 50, &mut n, &mut err) {
+                VEC_OK => {
+                    let mut out = FFI_ArrowArray::empty();
+                    assert_eq!((e.query_result)(q, &mut out), VEC_OK);
+                    let data = unsafe { arrow::ffi::from_ffi(out, &out_schema) }.unwrap();
+                    let batch = StructArray::from(data);
+                    let (s, i) = (
+                        batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<StringArray>()
+                            .unwrap(),
+                        batch
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .unwrap(),
+                    );
+                    for r in 0..batch.len() {
+                        rows.push((s.is_valid(r).then(|| s.value(r).to_string()), i.value(r)));
+                    }
+                    let mut none = FFI_ArrowArray::empty();
+                    assert_eq!((e.query_result)(q, &mut none), VEC_ERROR, "taken twice");
+                }
+                VEC_PENDING => {}
+                VEC_DONE => break,
+                s => panic!("{s}: {}", text(&err.message)),
+            }
+        }
+        (e.query_free)(q);
+        rows.sort();
+        assert_eq!(rows, vec![(None, 2), (Some("dé".to_string()), 3)]);
+    }
+
+    /// A batch schema other than the plan's input columns is refused.
+    #[test]
+    fn input_schema_must_match_the_plan() {
+        use arrow::datatypes::{DataType, Field};
+        let ir = r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"}]}],"plan":{"input":0},
+            "output":[{"expr":{"col":0},"type":"int4"}]}"#;
+        let schema = FFI_ArrowSchema::try_from(&DataType::Struct(
+            vec![Field::new("c0", DataType::Int64, true)].into(),
+        ))
+        .unwrap();
+        let e = start(engine(), ir, &schema).err().expect("refused");
+        assert!(e.contains("input 0: column 0 is \"l\", not \"i\""), "{e}");
     }
 
     #[test]
