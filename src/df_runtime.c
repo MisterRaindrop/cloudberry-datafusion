@@ -150,7 +150,7 @@ df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
 void
 df_vmem_sync(int64 headroom)
 {
-	int64		want = Max(df_engine->heap_bytes(), 0) + headroom;
+	int64		want = Max(df_engine_load()->heap_bytes(), 0) + headroom;
 
 	if (want > df_vmem_leased)
 	{
@@ -163,12 +163,18 @@ df_vmem_sync(int64 headroom)
 	}
 }
 
-/* Give back the part of the lease Rust no longer uses. */
+/*
+ * Give back the part of the lease Rust no longer uses.  Called on cleanup,
+ * so it never loads the engine: without one there is no lease.
+ */
 void
 df_vmem_trim(void)
 {
-	int64		want = Max(df_engine->heap_bytes(), 0);
+	int64		want;
 
+	if (df_engine == NULL)
+		return;
+	want = Max(df_engine->heap_bytes(), 0);
 	if (want < df_vmem_leased)
 	{
 		VmemTracker_ReleaseVmem(df_vmem_leased - want);
@@ -183,18 +189,47 @@ df_vmem_leased_bytes(void)
 }
 
 /*
+ * Threads inherit the signal mask of the thread that creates them.  The
+ * engine calls that may start threads run between these two, with
+ * everything blocked, so no signal meant for the backend can land on an
+ * engine thread.  Signals that arrive in the meantime stay pending and are
+ * delivered once the mask is restored.  Nothing between the two may raise
+ * an error.
+ */
+void
+df_signals_block(sigset_t *saved)
+{
+	sigset_t	all;
+	int			rc;
+
+	sigfillset(&all);
+	rc = pthread_sigmask(SIG_BLOCK, &all, saved);
+	if (rc != 0)
+		elog(ERROR, "pthread_sigmask failed: %s", strerror(rc));
+}
+
+void
+df_signals_restore(const sigset_t *saved)
+{
+	int			rc = pthread_sigmask(SIG_SETMASK, saved, NULL);
+
+	if (rc != 0)
+		elog(FATAL, "pthread_sigmask failed to restore the signal mask: %s",
+			 strerror(rc));
+}
+
+/*
  * Start the runtime in this backend if it is not running yet, and return its
  * number of worker threads.
  */
 int
 df_runtime_ensure(void)
 {
+	const VecEngine *engine;
 	VecError	err;
-	sigset_t	all;
 	sigset_t	saved;
 	uint32_t	workers = 0;
 	int32		status;
-	int			rc;
 
 	if (df_runtime_pid == MyProcPid)
 		return df_runtime_workers;
@@ -208,24 +243,11 @@ df_runtime_ensure(void)
 		elog(ERROR, "DataFusion runtime was started in process %d, not in this backend",
 			 (int) df_runtime_pid);
 
-	/*
-	 * Threads inherit the signal mask of the thread that creates them.
-	 * Block everything while the runtime starts its workers, so no signal
-	 * meant for the backend can land on a worker.  Signals that arrive in
-	 * the meantime stay pending and are delivered once the mask is restored.
-	 */
-	sigfillset(&all);
-	rc = pthread_sigmask(SIG_BLOCK, &all, &saved);
-	if (rc != 0)
-		elog(ERROR, "pthread_sigmask failed: %s", strerror(rc));
-
+	engine = df_engine_load();
 	DF_ERROR_INIT(err);
-	status = df_engine->runtime_init((uint32_t) df_worker_threads, &workers, &err);
-
-	rc = pthread_sigmask(SIG_SETMASK, &saved, NULL);
-	if (rc != 0)
-		elog(FATAL, "pthread_sigmask failed to restore the signal mask: %s",
-			 strerror(rc));
+	df_signals_block(&saved);
+	status = engine->runtime_init((uint32_t) df_worker_threads, &workers, &err);
+	df_signals_restore(&saved);
 
 	if (status != VEC_OK)
 		df_raise(status, err.message);
@@ -347,7 +369,7 @@ df_case_maps_ensure(void)
 	}
 	if (nupper >= 8192 || nlower >= 8192)
 		elog(ERROR, "datafusion: more case mappings than expected");
-	df_engine->set_case_maps(upper, nupper, lower, nlower);
+	df_engine_load()->set_case_maps(upper, nupper, lower, nlower);
 	pfree(upper);
 	pfree(lower);
 	done = true;

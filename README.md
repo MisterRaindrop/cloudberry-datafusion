@@ -17,8 +17,9 @@ Design constraints:
 
 ## Status
 
-Milestones M0 and M1: the Rust static library links into the extension, and
-each backend starts a Tokio runtime on first use.  The runtime's threads block
+Milestones M0 and M1: DataFusion runs behind the extension as a library of
+its own, `vec_engine_datafusion.so` (see Engine ABI below), and each backend
+starts a Tokio runtime on first use.  The runtime's threads block
 every signal, so cancel, statement timeout and terminate requests still reach
 the backend's main thread, which stops the runtime's work before reporting
 the error.  A panic inside Rust, on the main thread or on a worker, surfaces
@@ -640,7 +641,7 @@ side, and a slice no longer stays on PostgreSQL for it; a NOT IN anti join
 (null-aware) and a nested loop are checked as with trusted.  Each hash join
 hash-partitions both sides (no table collected for all partitions on the
 planner's estimate) and is wrapped in `SpillingHashJoinExec`
-(`rust/df_core/src/spilljoin.rs`), a grace hash join around DataFusion's:
+(`engines/datafusion/df_core/src/spilljoin.rs`), a grace hash join around DataFusion's:
 
 - a partition collects its build side under a reservation of the batches'
   size and 40 bytes a row for the hash table, and, read to its end, of what
@@ -1880,7 +1881,11 @@ under a 64 MB statement_mem spilled and returned PostgreSQL's rows.
 
 Requires a Cloudberry installation (for `pg_config` and server headers; the
 headers include OpenSSL's, so install the OpenSSL development package) and a
-Rust toolchain; the version is pinned in `rust/rust-toolchain.toml`.
+Rust toolchain; the version is pinned in `engines/datafusion/rust-toolchain.toml`.
+
+`make install` installs the extension, `datafusion_executor.so`, and the
+engine, `vec_engine_datafusion.so`, built with it; each extension build
+takes only an engine of its own ABI version.
 
 ```sh
 make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
@@ -1890,15 +1895,15 @@ make df-rust-test
 ```
 
 DataFusion is a commit of MisterRaindrop/datafusion's branch of
-apache/datafusion#26264 (`rust/Cargo.toml`), DataFusion's main with that
-fix, which cargo fetches from GitHub; back to a release from crates.io once
-one has it.
+apache/datafusion#26264 (`engines/datafusion/Cargo.toml`), DataFusion's
+main with that fix, which cargo fetches from GitHub; back to a release from
+crates.io once one has it.
 
 ## Engine ABI
 
 The extension reaches the engine only through the table of functions
-`vec_engine_entry` returns (`src/vec_engine.h`); DataFusion's is in
-`rust/df_ffi`.  No function in it calls into PostgreSQL or lets a panic
+`vec_engine_entry` returns (`include/vec_engine.h`); DataFusion's is in
+`engines/datafusion/df_ffi`.  No function in it calls into PostgreSQL or lets a panic
 escape; each reports failure as a status code plus a SQLSTATE and message
 in the caller's `VecError`. The C side raises the `ereport` after the call
 returns, so PostgreSQL's `longjmp` never unwinds through Rust frames.
@@ -1906,6 +1911,19 @@ Plans reach the engine as the IR of `docs/ir.md`, and rows as Arrow
 arrays by the Arrow C Data Interface: the extension lends each batch it
 reads (the engine copies it) and releases each result batch once it has
 handed out its rows.
+
+An engine is a library of its own, `$libdir/vec_engine_<name>.so`, that
+exports only `vec_engine_entry`.  `datafusion.engine` (superuser, default
+`datafusion`, sent to the segments) names it; a backend opens it with
+`RTLD_LOCAL` when it first needs it, so the engine's symbols and the
+libraries it brings stay apart from PostgreSQL's, PAX's and other
+extensions', and keeps it: once a session has used an engine the setting
+can no longer change.  An engine of another ABI version is refused, with
+both versions in the error.  The extension blocks every signal while it
+opens the engine and while the engine starts its runtime or a query, so
+threads it starts then never take the signals PostgreSQL acts on.  The
+stream of a batch Motion starts with a signature of the engine's name and
+the IR version, among the rest, so both ends must run the same engine.
 
 ## License
 

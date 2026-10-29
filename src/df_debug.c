@@ -100,7 +100,7 @@ datafusion_debug_vmem(PG_FUNCTION_ARGS)
 {
 	int64		v[2];
 
-	v[0] = df_engine->heap_bytes();
+	v[0] = df_engine_load()->heap_bytes();
 	v[1] = df_vmem_leased_bytes();
 	PG_RETURN_DATUM(df_int8_record(fcinfo, 2, v));
 }

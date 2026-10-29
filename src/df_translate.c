@@ -25,7 +25,7 @@
  * needs and the filter; the aggregate its grouping keys, aggregate calls
  * and HAVING; the slice's top node the output columns, in targetlist order,
  * each with its PostgreSQL type.  The JSON format is documented in
- * rust/df_core/src/query.rs.
+ * docs/ir.md.
  *
  * Over a Motion, the input columns are the Motion's output columns, by
  * position: what the sending slice computed is already in them.  A

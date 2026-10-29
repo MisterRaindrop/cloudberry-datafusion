@@ -3134,7 +3134,7 @@ impl Query {
     }
 
     /// Offer a batch of input `input` as the host lends it through the
-    /// engine ABI (src/vec_engine.h): a struct array of its columns, laid
+    /// engine ABI (include/vec_engine.h): a struct array of its columns, laid
     /// out as their types, copied here.  Ok(false): the channel is full;
     /// nothing was taken.
     ///
@@ -3341,7 +3341,7 @@ impl Query {
     }
 
     /// The type of the result batches: a struct of the output columns, laid
-    /// out as their types (src/vec_engine.h).
+    /// out as their types (include/vec_engine.h).
     pub fn output_type(&self) -> DataType {
         DataType::Struct(self.output_fields())
     }
@@ -3595,7 +3595,7 @@ unsafe fn primitive<T: ArrowPrimitiveType>(
 }
 
 /// The Arrow C Data Interface format of a column of type `ty`, as batches
-/// cross the engine ABI (src/vec_engine.h).
+/// cross the engine ABI (include/vec_engine.h).
 pub fn arrow_format(ty: PgType) -> String {
     match ty.storage() {
         PgType::Bool => "b".into(),

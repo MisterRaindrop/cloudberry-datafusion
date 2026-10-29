@@ -8256,18 +8256,23 @@ df_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos)
 
 /*
  * What both ends of a batch Motion must agree on, hashed (FNV-1a): the
- * Motion, the types of the columns it carries, the length the
- * character(n) ones are padded back to (CP1) and the digits the numeric
- * ones are narrowed by (NW1).  The sender puts it at the start of each
- * stream and the receiver checks it.
+ * engine and IR version that write and read the stream, the Motion, the
+ * types of the columns it carries, the length the character(n) ones are
+ * padded back to (CP1) and the digits the numeric ones are narrowed by
+ * (NW1).  The sender puts it at the start of each stream and the receiver
+ * checks it.
  */
 uint64
 df_motion_signature(PlannedStmt *stmt, Motion *motion)
 {
 	uint64		h = UINT64CONST(14695981039346656037);
+	const char *p;
 	ListCell   *lc;
 
 #define DF_MIX(v) (h = (h ^ (uint64) (v)) * UINT64CONST(1099511628211))
+	for (p = df_engine_load()->name; *p != '\0'; p++)
+		DF_MIX((unsigned char) *p);
+	DF_MIX(VEC_IR_VERSION);
 	DF_MIX(motion->motionID);
 	DF_MIX(list_length(motion->plan.targetlist));
 	foreach(lc, motion->plan.targetlist)

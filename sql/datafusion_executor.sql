@@ -24,4 +24,22 @@ SELECT datafusion_version() ~ '^datafusion [0-9]+\.[0-9]+\.[0-9]+$' AS version_o
 SELECT datafusion_debug_panic();
 SELECT 1 AS backend_alive;
 
+-- The engine is a library of its own, $libdir/vec_engine_<name>.so, opened
+-- on first use (above) and kept for the session.
+SHOW datafusion.engine;
+SET datafusion.engine = 'other';
+SET datafusion.engine = '../datafusion';
+RESET datafusion.engine;
+
+-- A new session may name another engine before it uses one.  One that is
+-- not installed fails to load (the detail names the file), and the session
+-- can still go back.
+\c
+SET datafusion.engine = 'missing';
+\set VERBOSITY terse
+SELECT datafusion_version();
+\set VERBOSITY default
+SET datafusion.engine = 'datafusion';
+SELECT datafusion_version() ~ '^datafusion ' AS version_ok;
+
 DROP EXTENSION datafusion_executor;

@@ -20,7 +20,7 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION datafusion_executor" to load this file. \quit
 
--- Version of the DataFusion library linked into this extension.
+-- Version of the engine slices run in (datafusion.engine).
 CREATE FUNCTION datafusion_version()
 RETURNS text
 AS 'MODULE_PATHNAME', 'datafusion_version'

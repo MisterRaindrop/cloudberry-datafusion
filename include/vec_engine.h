@@ -32,10 +32,19 @@
  *
  * Plans reach the engine as the IR of docs/ir.md, version VEC_IR_VERSION.
  *
- * The DataFusion engine (rust/df_ffi) implements this; keep the two in
- * sync.
+ * An engine is a library of its own, $libdir/vec_engine_<name>.so, which
+ * exports vec_engine_entry and nothing else.  A backend opens the one
+ * datafusion.engine names (RTLD_LOCAL) when it first needs it, and keeps it.
+ * The host blocks every signal while it opens the library and around
+ * runtime_init and query_start, so that threads started there begin with
+ * all of them blocked; a thread started at any other time must block them
+ * itself.  Only the backend's own thread then gets the signals PostgreSQL
+ * acts on.
  *
- * src/vec_engine.h
+ * The DataFusion engine (engines/datafusion/df_ffi) implements this; keep
+ * the two in sync.
+ *
+ * include/vec_engine.h
  *
  *-------------------------------------------------------------------------
  */
@@ -256,7 +265,7 @@ typedef struct VecEngine
 
 	/*
 	 * Start a query.  *out_schema gets the struct schema of its result
-	 * batches, which the host releases.
+	 * batches, which the host releases.  Called with every signal blocked.
 	 */
 	int32_t		(*query_start) (const VecQueryArgs *args, struct ArrowSchema *out_schema,
 								VecQuery **out_query, VecError *err);
@@ -298,8 +307,10 @@ typedef struct VecEngine
 } VecEngine;
 
 /*
- * The one symbol an engine exports: its table, or NULL if it does not speak
- * host_abi.
+ * The one symbol an engine exports: its table for host_abi, or, if it does
+ * not speak host_abi, a table of the version it does.  abi comes first in
+ * every version, and a host reads nothing else from a table of another one.
+ * NULL if the engine cannot make its table.
  */
 typedef const VecEngine *(*VecEngineEntry) (uint32_t host_abi, const VecHost *host);
 extern const VecEngine *vec_engine_entry(uint32_t host_abi, const VecHost *host);

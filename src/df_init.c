@@ -26,7 +26,10 @@
  */
 #include "postgres.h"
 
+#include <dlfcn.h>
+
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 
@@ -34,10 +37,17 @@
 
 PG_MODULE_MAGIC;
 
-/* The engine slices run in: DataFusion, linked in. */
+char	   *df_engine_name = NULL;
+
+/* The engine slices run in, once loaded: the one datafusion.engine names. */
 const VecEngine *df_engine = NULL;
 
+/* What datafusion.engine said when df_engine was loaded. */
+static char df_engine_loaded[NAMEDATALEN];
+
 static const VecHost df_host = {VEC_ENGINE_ABI};
+
+static bool df_check_engine(char **newval, void **extra, GucSource source);
 
 void		_PG_init(void);
 
@@ -162,24 +172,119 @@ _PG_init(void)
 							 GUC_DISALLOW_IN_FILE,
 							 NULL, NULL, NULL);
 
-	MarkGUCPrefixReserved("datafusion");
+	DefineCustomStringVariable("datafusion.engine",
+							   "The execution engine slices run in.",
+							   "The library $libdir/vec_engine_<name>.so.  A backend "
+							   "opens it when it first needs an engine and keeps it; "
+							   "from then on the setting cannot change.",
+							   &df_engine_name,
+							   "datafusion",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   df_check_engine, NULL, NULL);
 
-	/* The engine's table: no threads, nothing else starts here. */
-	df_engine = vec_engine_entry(VEC_ENGINE_ABI, &df_host);
-	if (df_engine == NULL || df_engine->abi != VEC_ENGINE_ABI)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("datafusion: the execution engine does not speak ABI version %d",
-						VEC_ENGINE_ABI)));
+	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();
 
 	/*
-	 * Never start threads here.  When the library is listed in
-	 * shared_preload_libraries this runs in the postmaster, and every
-	 * backend would inherit the threads' memory without the threads.  The
-	 * Tokio runtime is created lazily inside a backend instead.
+	 * Never open the engine or start threads here.  When the library is
+	 * listed in shared_preload_libraries this runs in the postmaster, and
+	 * every backend would inherit the threads' memory without the threads.
+	 * A backend opens the engine, and starts its runtime, on first use.
 	 */
+}
+
+/*
+ * datafusion.engine names a library in $libdir, and stays as it was once a
+ * backend has loaded one.
+ */
+static bool
+df_check_engine(char **newval, void **extra, GucSource source)
+{
+	const char *p;
+
+	if (**newval == '\0' || strlen(*newval) >= NAMEDATALEN)
+	{
+		GUC_check_errdetail("An engine name has 1 to %d characters.", NAMEDATALEN - 1);
+		return false;
+	}
+	for (p = *newval; *p != '\0'; p++)
+	{
+		if (!((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_'))
+		{
+			GUC_check_errdetail("An engine name consists of lowercase letters, digits and underscores.");
+			return false;
+		}
+	}
+	if (df_engine != NULL && strcmp(*newval, df_engine_loaded) != 0)
+	{
+		GUC_check_errdetail("This session already runs engine \"%s\".", df_engine_loaded);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The engine, opened on first use: $libdir/vec_engine_<datafusion.engine>,
+ * whose vec_engine_entry must give a table of this ABI.  The library stays
+ * loaded, and the engine the same, for the rest of the backend's life.
+ * RTLD_LOCAL keeps its symbols, and the libraries it brings, to itself.
+ */
+const VecEngine *
+df_engine_load(void)
+{
+	char		path[MAXPGPATH];
+	sigset_t	saved;
+	void	   *handle;
+	VecEngineEntry entry = NULL;
+	const VecEngine *engine = NULL;
+	const char *dlerr = NULL;
+
+	if (df_engine != NULL)
+		return df_engine;
+
+	snprintf(path, sizeof(path), "%s/vec_engine_%s.so", pkglib_path, df_engine_name);
+
+	/* Its constructors, or the entry, may start threads (vec_engine.h). */
+	df_signals_block(&saved);
+	handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (handle == NULL)
+		dlerr = dlerror();
+	else
+	{
+		entry = (VecEngineEntry) dlsym(handle, "vec_engine_entry");
+		if (entry != NULL)
+			engine = entry(VEC_ENGINE_ABI, &df_host);
+	}
+	df_signals_restore(&saved);
+
+	if (handle == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FILE),
+				 errmsg("datafusion: could not load engine \"%s\"", df_engine_name),
+				 errdetail("%s", dlerr)));
+	if (entry == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("datafusion: engine \"%s\" does not export vec_engine_entry",
+						df_engine_name),
+				 errdetail("Library: \"%s\".", path)));
+	if (engine == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("datafusion: engine \"%s\" gave no table of functions",
+						df_engine_name)));
+	if (engine->abi != VEC_ENGINE_ABI)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("datafusion: engine \"%s\" speaks ABI version %u, this extension %d",
+						df_engine_name, engine->abi, VEC_ENGINE_ABI),
+				 errhint("Install the engine built with this extension.")));
+
+	strlcpy(df_engine_loaded, df_engine_name, sizeof(df_engine_loaded));
+	df_engine = engine;
+	return df_engine;
 }
 
 /*
@@ -203,17 +308,19 @@ df_raise(int32 status, const char *msg)
 const VecEngineDebug *
 df_engine_debug(void)
 {
-	if (df_engine->debug == NULL)
+	const VecEngine *engine = df_engine_load();
+
+	if (engine->debug == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("datafusion: engine %s has no test functions", df_engine->name)));
-	return df_engine->debug;
+				 errmsg("datafusion: engine %s has no test functions", engine->name)));
+	return engine->debug;
 }
 
 Datum
 datafusion_version(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(cstring_to_text(df_engine->version));
+	PG_RETURN_TEXT_P(cstring_to_text(df_engine_load()->version));
 }
 
 Datum

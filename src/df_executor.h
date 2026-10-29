@@ -27,6 +27,8 @@
 #ifndef DF_EXECUTOR_H
 #define DF_EXECUTOR_H
 
+#include <signal.h>
+
 #include "vec_engine.h"
 #include "executor/execdesc.h"
 #include "lib/stringinfo.h"
@@ -58,8 +60,12 @@ extern int	df_join_estimates;
 /* GUC datafusion.worker_threads */
 extern int	df_worker_threads;
 
+/* GUC datafusion.engine */
+extern char *df_engine_name;
+
 /* df_init.c */
-extern const VecEngine *df_engine;
+extern const VecEngine *df_engine;	/* NULL until df_engine_load */
+extern const VecEngine *df_engine_load(void);
 extern const VecEngineDebug *df_engine_debug(void);
 extern void df_raise(int32 status, const char *msg) pg_attribute_noreturn();
 
@@ -476,6 +482,8 @@ extern void df_arrow_out_column(DfOutCol *out, const struct ArrowArray *batch, i
 								int width);
 
 /* df_runtime.c */
+extern void df_signals_block(sigset_t *saved);
+extern void df_signals_restore(const sigset_t *saved);
 extern int	df_runtime_ensure(void);
 extern void df_case_maps_ensure(void);
 extern bool df_default_case_maps(void);

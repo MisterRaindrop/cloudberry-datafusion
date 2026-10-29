@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The DataFusion engine behind the ABI of `src/vec_engine.h`.
+//! The DataFusion engine behind the ABI of `include/vec_engine.h`.
 //!
 //! The extension gets one table of functions from [`vec_engine_entry`].
 //! Every function in it never calls into PostgreSQL, never lets a panic
@@ -41,10 +41,10 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 #[cfg(panic = "abort")]
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
-/// Version of the ABI; keep in sync with `src/vec_engine.h`.
+/// Version of the ABI; keep in sync with `include/vec_engine.h`.
 pub const VEC_ENGINE_ABI: u32 = 2;
 
-/// Status codes; keep in sync with `src/vec_engine.h`.
+/// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
 pub const VEC_ERROR: i32 = 1;
 pub const VEC_PANIC: i32 = 2;
@@ -276,7 +276,7 @@ pub struct VecPaxInput {
     pub nblocks: u32,
 }
 
-/// What `query_start` needs; see `src/vec_engine.h`.
+/// What `query_start` needs; see `include/vec_engine.h`.
 #[repr(C)]
 pub struct VecQueryArgs {
     pub ir: *const c_char,
@@ -618,7 +618,7 @@ pub struct VecHost {
     pub abi: u32,
 }
 
-/// The test functions of `src/vec_engine.h`.
+/// The test functions of `include/vec_engine.h`.
 #[repr(C)]
 pub struct VecEngineDebug {
     pub panic: extern "C" fn(*mut VecError) -> i32,
@@ -637,7 +637,7 @@ pub struct VecEngineDebug {
     ) -> i32,
 }
 
-/// The engine's table of `src/vec_engine.h`.
+/// The engine's table of `include/vec_engine.h`.
 #[repr(C)]
 pub struct VecEngine {
     pub abi: u32,
@@ -691,13 +691,11 @@ fn version() -> &'static CStr {
     })
 }
 
-/// The table, or null if the host speaks another ABI.  Never panics.
+/// The table, whatever ABI the host speaks: a host of another version reads
+/// only its `abi` and refuses it.  Null only if making it panicked.
 #[no_mangle]
-pub extern "C" fn vec_engine_entry(host_abi: u32, _host: *const VecHost) -> *const VecEngine {
+pub extern "C" fn vec_engine_entry(_host_abi: u32, _host: *const VecHost) -> *const VecEngine {
     static ENGINE: OnceLock<VecEngine> = OnceLock::new();
-    if host_abi != VEC_ENGINE_ABI {
-        return std::ptr::null();
-    }
     catch_unwind(|| {
         ENGINE.get_or_init(|| VecEngine {
             abi: VEC_ENGINE_ABI,
@@ -760,9 +758,12 @@ mod tests {
     }
 
     #[test]
-    fn other_abi_gets_no_table() {
-        assert!(vec_engine_entry(VEC_ENGINE_ABI + 1, std::ptr::null()).is_null());
-        assert!(vec_engine_entry(0, std::ptr::null()).is_null());
+    fn other_abi_learns_ours() {
+        for host_abi in [0, VEC_ENGINE_ABI + 1] {
+            let e = vec_engine_entry(host_abi, std::ptr::null());
+            assert!(!e.is_null());
+            assert_eq!(unsafe { (*e).abi }, VEC_ENGINE_ABI);
+        }
     }
 
     #[test]

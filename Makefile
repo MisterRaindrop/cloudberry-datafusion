@@ -18,13 +18,15 @@
 # datafusion_executor: vectorized execution backend for Apache Cloudberry,
 # built on Apache DataFusion.  Out-of-tree extension, built with PGXS:
 #
-#   make                          release build (Rust crate + C shim)
-#   make DF_CARGO_PROFILE=dev     debug build of the Rust crate
+#   make                          release build (the extension and the
+#                                 DataFusion engine, vec_engine_datafusion.so)
+#   make DF_CARGO_PROFILE=dev     debug build of the engine
 #   make install
 #   make installcheck             pg_regress against a running cluster
 #   make df-rust-test             Rust unit tests
-#   make df-rust-clean            drop rust/target (several GB once DataFusion
-#                                 is built; deliberately not part of `clean`)
+#   make df-rust-clean            drop engines/datafusion/target (several GB
+#                                 once DataFusion is built; deliberately not
+#                                 part of `clean`)
 #
 # Set CARGO_TARGET_DIR to put the Rust build tree elsewhere.
 #
@@ -47,7 +49,7 @@ REGRESS += paxdirect
 endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
-PG_CPPFLAGS = -Isrc
+PG_CPPFLAGS = -Isrc -Iinclude
 
 CARGO ?= cargo
 DF_CARGO_PROFILE ?= release
@@ -59,40 +61,47 @@ DF_CARGO_OUTDIR = $(DF_CARGO_PROFILE)
 endif
 # Honour CARGO_TARGET_DIR, e.g. to keep the multi-GB build tree off a slow
 # bind mount; cargo reads the same variable from the environment.
-DF_CARGO_TARGET_DIR = $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/rust/target)
-DF_RUST_LIB = $(DF_CARGO_TARGET_DIR)/$(DF_CARGO_OUTDIR)/libdf_ffi.a
+DF_CARGO_TARGET_DIR = $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/engines/datafusion/target)
+DF_RUST_LIB = $(DF_CARGO_TARGET_DIR)/$(DF_CARGO_OUTDIR)/libdf_ffi$(DLSUFFIX)
+DF_ENGINE = vec_engine_datafusion$(DLSUFFIX)
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-# Must come after pgxs.mk so PORTNAME is defined.  The library list is what
-# `cargo rustc -- --print native-static-libs` reports for a Rust staticlib on
-# glibc.  The version script keeps every Rust symbol local, so the shared
-# object exports only what PostgreSQL looks up.
-SHLIB_LINK += $(DF_RUST_LIB)
+# Must come after pgxs.mk so PORTNAME is defined.  The version script keeps
+# the module's symbols local but for what PostgreSQL looks up.
 ifeq ($(PORTNAME),linux)
-SHLIB_LINK += -lgcc_s -lutil -lrt -lpthread -lm -ldl
-SHLIB_LINK += -Wl,--version-script=exports.map
-else
-SHLIB_LINK += -lpthread -lm
+SHLIB_LINK += -ldl -Wl,--version-script=exports.map
 endif
+
+# The engine is a library of its own, which the module opens at first use
+# (datafusion.engine).  Cargo builds it; it exports only vec_engine_entry.
+all: $(DF_ENGINE)
 
 .PHONY: df-rust df-rust-test df-rust-clean
 df-rust:
-	cd rust && $(CARGO) build --profile $(DF_CARGO_PROFILE) -p df_ffi $(DF_CARGO_FLAGS)
+	cd engines/datafusion && $(CARGO) build --profile $(DF_CARGO_PROFILE) -p df_ffi $(DF_CARGO_FLAGS)
 
 # The empty recipe makes make look at the library again after cargo has
-# run, so that a change to the Rust side alone relinks the module.
+# run, so that a change to the Rust side alone copies it again.
 $(DF_RUST_LIB): df-rust
 	@:
-$(shlib): $(DF_RUST_LIB)
+$(DF_ENGINE): $(DF_RUST_LIB)
+	cp $< $@
 
 df-rust-test:
-	cd rust && $(CARGO) test --workspace $(DF_CARGO_FLAGS)
+	cd engines/datafusion && $(CARGO) test --workspace $(DF_CARGO_FLAGS)
 
 df-rust-clean:
-	-cd rust && $(CARGO) clean
+	-cd engines/datafusion && $(CARGO) clean
+
+install: install-engine
+.PHONY: install-engine
+install-engine: $(DF_ENGINE)
+	$(INSTALL_SHLIB) $(DF_ENGINE) '$(DESTDIR)$(pkglibdir)/'
+
+EXTRA_CLEAN += $(DF_ENGINE)
 
 # ---------------------------------------------------------------------------
 # Experimental direct PAX reader, datafusion_pax.so.  Its source is a patch to

@@ -4,8 +4,8 @@ The C side (`src/df_translate.c`, plus the Motion members `src/df_exec.c`
 adds) describes each slice it hands to an engine as one JSON object, the
 plan IR.  This document is the contract between the two: an engine that
 reads every construct below, with the semantics given here, runs any slice
-the extension sends it.  `rust/df_core/src/query.rs` is the reference
-reader.
+the extension sends it.  `engines/datafusion/df_core/src/query.rs` is the
+reference reader.
 
 The IR describes a plan PostgreSQL has already planned and the extension
 has already checked.  An engine executes it as given: it may choose how
@@ -15,7 +15,7 @@ arguments in).
 
 ## Versioning
 
-Every plan carries `"ir": 1`.  `VEC_IR_VERSION` (`src/vec_engine.h`) and
+Every plan carries `"ir": 1`.  `VEC_IR_VERSION` (`include/vec_engine.h`) and
 `query::IR_VERSION` must match; an engine refuses a plan of any other
 version, or of none, before it builds anything.
 
@@ -351,7 +351,7 @@ to the engine).
 
 ## Types
 
-| Tag | Values | Arrow layout across the engine ABI (`src/vec_engine.h`) |
+| Tag | Values | Arrow layout across the engine ABI (`include/vec_engine.h`) |
 |---|---|---|
 | `bool` | | Boolean |
 | `int2`, `int4`, `int8` | | Int16, Int32, Int64 |

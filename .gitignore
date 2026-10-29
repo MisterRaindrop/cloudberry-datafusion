@@ -4,7 +4,7 @@
 *.bc
 *.dylib
 # Rust build
-/rust/target/
+/engines/datafusion/target/
 # pg_regress output
 /results/
 /regression.diffs

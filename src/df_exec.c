@@ -875,6 +875,7 @@ static void
 df_exec_begin(DfExec *x)
 {
 	VecError	err;
+	sigset_t	saved;
 	int			workers;
 	int32		status;
 	int			j;
@@ -935,7 +936,9 @@ df_exec_begin(DfExec *x)
 
 	/* From here on the query owns the PAX scans, even if this fails. */
 	DF_ERROR_INIT(err);
+	df_signals_block(&saved);
 	status = df_engine->query_start(&args, &out_schema, &x->query, &err);
+	df_signals_restore(&saved);
 	if (status != VEC_OK)
 	{
 		x->query = NULL;
