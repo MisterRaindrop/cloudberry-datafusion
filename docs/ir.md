@@ -371,7 +371,8 @@ value's display scale, which the C side adds and expressions such as
 ## Motion output
 
 A slice that sends through a Motion between two engine slices produces
-Arrow IPC streams instead of rows (`DF_QUERY_IPC_OUTPUT`).
+Arrow IPC streams instead of rows (`VEC_QUERY_IPC_OUTPUT`), framed and
+routed as `docs/wire.md` says.
 
 - `trim: [k, ...]`: output columns of type `bpchar` sent without their
   trailing blanks; the receiver pads them back (`motion_pad`).

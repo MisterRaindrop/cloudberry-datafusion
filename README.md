@@ -15,6 +15,50 @@ Design constraints:
   per-operator memory the coordinator assigns, and leased from the vmem
   tracker.
 
+## Architecture
+
+The extension (the host) decides what runs where and moves the rows; an
+engine runs the plans it is given.  DataFusion is one engine; others can
+take its place behind the same interface.
+
+```text
+ PostgreSQL backend (QD or QE), main thread         engine library, own threads
+ ------------------------------------------         ---------------------------
+ planner/executor hooks       src/df_hooks.c
+ which slices qualify         src/df_plan_check.c  <- VecCaps
+ slice -> plan IR (JSON)      src/df_translate.c   -> query_start   plan, inputs
+ scan: table AM or PAX        src/df_exec.c        -> query_push    Arrow arrays
+ receive Motion bytes                              -> query_push_ipc  IPC bytes
+ hand out rows / send bytes                        <- query_poll    Arrow arrays,
+                                                                    IPC bytes
+ threads, vmem, spill dir     src/df_runtime.c     <- heap_bytes
+ open the engine              src/df_init.c           vec_engine_<name>.so
+```
+
+- **The host** (`src/`, C) runs inside the backend and alone calls into
+  PostgreSQL.  It checks each slice against what the engine declares,
+  translates the slices that qualify, scans their tables with the query's
+  snapshot, frames batch Motions on the interconnect, leases the engine's
+  heap from the vmem tracker, and turns engine errors into `ereport`s.
+- **An engine** (`engines/<name>/`) is a library of its own,
+  `vec_engine_<name>.so`, chosen by `datafusion.engine` and opened on first
+  use.  It runs a slice's plan on its own threads over the rows it is
+  given, encodes and routes the batches of a sending Motion, and spills
+  within the memory it is allotted.  `engines/datafusion` (Rust, on
+  Apache DataFusion) runs everything; `engines/null` (C) runs nothing, for
+  the tests.
+- **Three contracts** sit between them, each written down so that an
+  engine can be built from them alone:
+  - `include/vec_engine.h`: the table of functions, the threads, signals,
+    errors and memory every engine respects, and the capabilities
+    (`VecCaps`) it declares; see Engine ABI below.
+  - `docs/ir.md`: the plans, with their PostgreSQL semantics: nodes,
+    expressions, types and the PostgreSQL functions an engine computes
+    exactly as PostgreSQL does.
+  - `docs/wire.md`: the Arrow IPC streams of a batch Motion between two
+    engine slices, which run in different processes and must agree byte
+    for byte, cdbhash routing included.
+
 ## Status
 
 Milestones M0 and M1: DataFusion runs behind the extension as a library of
