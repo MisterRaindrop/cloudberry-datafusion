@@ -722,6 +722,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
 | AJ1 | A hash join whose probe side (joined or aggregated, PAX only) ends within 128 K rows hashes it instead |
+| RC1 | A partitioned hash join whose build side ends within 1 M rows (64 MB) builds one table for all partitions; the probe side is not repartitioned |
 | CL1 | Strings ordered by the default collation where it is C on every node |
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
 | IP3 | A numeric init plan value anywhere in an expression, of its init plan's digits and scale |
@@ -805,6 +806,23 @@ the build side streams past it.  A probe side that is a scan is not read
 ahead: a table's estimate is seldom far off, and decoding a large table's
 first groups early, to be held while the build side is read, made Q18 at
 scale factor 10 (where the planner chose well) 15% slower.
+
+RC1: a small build side is collected once.  Every hash join is
+partitioned, both of its sides hash-partitioned so that each partition
+builds and spills a table of its own (DataFusion's choice of a collected
+table goes by the planner's estimate, which can be far off).  That
+repartitions the probe side however small the build side turns out:
+TPC-H Q8 and Q17 at scale factor 100 spent a fifth of their time
+partitioning lineitem for a few thousand parts.  Where nothing above
+relies on the join's rows coming out partitioned by its keys (no
+aggregate grouped by them, no join on them without its own repartition),
+the build side is read first, below its repartition, all its partitions
+at once.  One that ends within 1 M rows and 64 MB, with room in the pool
+for its table, is joined as DataFusion's CollectLeft: one table, which
+each probe partition probes as its rows come, unrepartitioned.  A larger
+one goes on as planned, the rows read so far ahead of the rest.  On
+win-dev (three segments, scale factor 100) the 22 queries took 148.5 s
+against 159.2 s, Q8 7.0 to 4.9 s, Q17 7.2 to 4.4 s.
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
