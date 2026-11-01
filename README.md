@@ -648,6 +648,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | L1 | `LIKE` and `NOT LIKE` |
 | L2 | Common string functions and `\|\|` |
 | RX1 | `regexp_replace(text, text, text)` of constant expressions ending in `$`, split as PostgreSQL splits them |
+| ET1 | `extract(year \| quarter \| month \| day \| hour \| minute from timestamp)` |
 | N1 | numeric results of `sum(int8)` and `avg` of integers |
 | N2 | `numeric(p, s)` columns with p <= 38 |
 | N3 | numeric `+`, `-`, `*`; Decimal256 |
@@ -955,6 +956,14 @@ PostgreSQL, and they come back as `±Infinity`.  Arithmetic, `sum`/`avg`,
 casts and comparisons that rescale such a year (`> 1995.5`) would take an
 infinity for a number and stay on PostgreSQL; the other fields of an
 infinite date are NULL and have no such limits.
+
+ET1 does the same for a `timestamp` (without time zone), which also has
+`hour` and `minute`, as PostgreSQL's `extract_timestamp`: the day of a time
+before 2000 rounds down (`timestamp2tm`), the year of an infinite
+timestamp is `±Infinity` and its other fields NULL.  `second`, `epoch` and
+the other fields, and `timestamptz`, whose fields depend on the time zone,
+stay on PostgreSQL.  ClickBench Q19 groups by `extract(minute from
+EventTime)`, which kept its grouping on PostgreSQL.
 
 Over 20 million heap rows on 3 segments, counting one year by a `date`
 range with `min`/`max` of a timestamp took 0.15 s in DataFusion and 1.00 s

@@ -809,20 +809,23 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
 }
 
 /*
- * The field of extract(field from date) that DataFusion computes (DT2:
- * df_core::pgdate), or NULL: year, quarter, month or day, each a numeric
- * of scale 0.
+ * The field of extract(field from date) or extract(field from timestamp)
+ * that DataFusion computes (DT2, ET1: df_core::pgdate), or NULL: year,
+ * quarter, month or day, and of a timestamp also hour or minute, each a
+ * numeric of scale 0.  A timestamp without time zone needs no time zone
+ * for these fields.
  */
 const char *
 df_extract_field(FuncExpr *fe)
 {
-	static const char *const fields[] = {"year", "quarter", "month", "day", NULL};
+	static const char *const fields[] = {"year", "quarter", "month", "day",
+	"hour", "minute", NULL};
 	Const	   *c;
 	char	   *lower;
 	int			i;
 
-	if (fe->funcid != F_EXTRACT_TEXT_DATE || list_length(fe->args) != 2 ||
-		!IsA(linitial(fe->args), Const))
+	if ((fe->funcid != F_EXTRACT_TEXT_DATE && fe->funcid != F_EXTRACT_TEXT_TIMESTAMP) ||
+		list_length(fe->args) != 2 || !IsA(linitial(fe->args), Const))
 		return NULL;
 	c = linitial_node(Const, fe->args);
 	if (c->constisnull)
@@ -831,8 +834,13 @@ df_extract_field(FuncExpr *fe)
 										 VARSIZE_ANY_EXHDR(DatumGetTextPP(c->constvalue)),
 										 false);
 	for (i = 0; fields[i] != NULL; i++)
+	{
+		/* a date has no hour or minute: PostgreSQL rejects them */
+		if (fe->funcid == F_EXTRACT_TEXT_DATE && i >= 4)
+			break;
 		if (strcmp(lower, fields[i]) == 0)
 			return fields[i];
+	}
 	return NULL;
 }
 

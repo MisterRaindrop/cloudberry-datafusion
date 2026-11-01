@@ -652,7 +652,8 @@ fn expr(v: &Value) -> Result<Expr, String> {
             .as_str()
             .and_then(crate::pgdate::DateField::parse)
             .ok_or("plan spec: bad extract field")?;
-        return Ok(crate::pgdate::PgExtractDate::udf(f).call(vec![expr(e)?]));
+        let timestamp = v.get("timestamp").and_then(Value::as_bool).unwrap_or(false);
+        return Ok(crate::pgdate::PgExtractDate::udf(f, timestamp).call(vec![expr(e)?]));
     }
     if let Some(op) = v.get("numcmp") {
         // an exact comparison of numeric values and quotients (pgnum::PgNumCmp)

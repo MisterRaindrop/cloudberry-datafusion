@@ -2080,10 +2080,11 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				}
 				if (df_extract_field(fe) != NULL)
 				{
-					/* DT2: df_core::pgdate */
+					/* DT2, ET1: df_core::pgdate */
 					appendStringInfoString(out, "{\"extract\":");
 					df_emit(b, out, lsecond(fe->args), level);
-					appendStringInfo(out, ",\"field\":\"%s\"}", df_extract_field(fe));
+					appendStringInfo(out, ",\"field\":\"%s\"%s}", df_extract_field(fe),
+									 fe->funcid == F_EXTRACT_TEXT_TIMESTAMP ? ",\"timestamp\":true" : "");
 					return;
 				}
 				if (df_cast_kind(fe->funcid) != NULL && strcmp(df_cast_kind(fe->funcid), "widen") == 0)

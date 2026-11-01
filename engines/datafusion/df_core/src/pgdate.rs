@@ -19,12 +19,15 @@
 //! (extract_date in date.c), as numeric of scale 0 (DT2).  A date is the
 //! integer PostgreSQL stores: days from 2000-01-01, its extremes the
 //! infinities.  The year of an infinite date is ±Infinity
-//! (`NUMERIC_PINF`, `NUMERIC_NINF`), the other fields NULL.
+//! (`NUMERIC_PINF`, `NUMERIC_NINF`), the other fields NULL.  ET1 does the
+//! same for a timestamp without time zone (extract_timestamp in
+//! timestamp.c), microseconds from 2000-01-01 00:00, which also has an hour
+//! and a minute.
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::{Array, AsArray, Decimal256Builder};
-use datafusion::arrow::datatypes::{i256, DataType, Int32Type};
+use datafusion::arrow::datatypes::{i256, DataType, Int32Type, Int64Type};
 use datafusion::common::Result;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{
@@ -42,6 +45,8 @@ pub enum DateField {
     Quarter,
     Month,
     Day,
+    Hour,
+    Minute,
 }
 
 impl DateField {
@@ -51,6 +56,8 @@ impl DateField {
             "quarter" => DateField::Quarter,
             "month" => DateField::Month,
             "day" => DateField::Day,
+            "hour" => DateField::Hour,
+            "minute" => DateField::Minute,
             _ => return None,
         })
     }
@@ -102,6 +109,33 @@ pub fn extract(field: DateField, d: i32) -> Option<i256> {
         DateField::Quarter => (month - 1) / 3 + 1,
         DateField::Month => month,
         DateField::Day => day,
+        // a date has none (the planner keeps them away)
+        DateField::Hour | DateField::Minute => return None,
+    };
+    Some(i256::from_i128(v as i128))
+}
+
+const USECS_PER_DAY: i64 = 86_400_000_000;
+
+/// extract(field from t) of a stored timestamp; None for NULL.  As
+/// timestamp2tm: the day is the quotient rounded down, the time of day
+/// what remains.  DT_NOBEGIN and DT_NOEND are i64::MIN and i64::MAX.
+pub fn extract_timestamp(field: DateField, t: i64) -> Option<i256> {
+    if t == i64::MIN || t == i64::MAX {
+        return match field {
+            DateField::Year => Some(if t == i64::MIN {
+                NUMERIC_NINF
+            } else {
+                NUMERIC_PINF
+            }),
+            _ => None,
+        };
+    }
+    let (day, time) = (t.div_euclid(USECS_PER_DAY), t.rem_euclid(USECS_PER_DAY));
+    let v = match field {
+        DateField::Hour => time / 3_600_000_000,
+        DateField::Minute => time / 60_000_000 % 60,
+        _ => return extract(field, day as i32),
     };
     Some(i256::from_i128(v as i128))
 }
@@ -109,25 +143,35 @@ pub fn extract(field: DateField, d: i32) -> Option<i256> {
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct PgExtractDate {
     field: DateField,
+    /// of a timestamp (ET1), else of a date
+    timestamp: bool,
     signature: Signature,
 }
 
 impl PgExtractDate {
-    pub fn udf(field: DateField) -> ScalarUDF {
+    pub fn udf(field: DateField, timestamp: bool) -> ScalarUDF {
+        let arg = if timestamp { DataType::Int64 } else { DataType::Int32 };
         ScalarUDF::new_from_impl(PgExtractDate {
             field,
-            signature: Signature::exact(vec![DataType::Int32], Volatility::Immutable),
+            timestamp,
+            signature: Signature::exact(vec![arg], Volatility::Immutable),
         })
     }
 }
 
 impl ScalarUDFImpl for PgExtractDate {
     fn name(&self) -> &str {
-        match self.field {
-            DateField::Year => "pg_extract_year",
-            DateField::Quarter => "pg_extract_quarter",
-            DateField::Month => "pg_extract_month",
-            DateField::Day => "pg_extract_day",
+        match (self.field, self.timestamp) {
+            (DateField::Year, false) => "pg_extract_year",
+            (DateField::Quarter, false) => "pg_extract_quarter",
+            (DateField::Month, false) => "pg_extract_month",
+            (DateField::Day, false) => "pg_extract_day",
+            (DateField::Year, true) => "pg_extract_ts_year",
+            (DateField::Quarter, true) => "pg_extract_ts_quarter",
+            (DateField::Month, true) => "pg_extract_ts_month",
+            (DateField::Day, true) => "pg_extract_ts_day",
+            (DateField::Hour, _) => "pg_extract_ts_hour",
+            (DateField::Minute, _) => "pg_extract_ts_minute",
         }
     }
 
@@ -142,6 +186,21 @@ impl ScalarUDFImpl for PgExtractDate {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
         let x = args.args[0].to_array(n)?;
+        if self.timestamp {
+            let ts = x.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+                DataFusionError::Internal(format!("expected a timestamp column, got {}", x.data_type()))
+            })?;
+            let mut out = Decimal256Builder::with_capacity(ts.len());
+            for i in 0..ts.len() {
+                out.append_option(if ts.is_null(i) {
+                    None
+                } else {
+                    extract_timestamp(self.field, ts.value(i))
+                });
+            }
+            let out = out.finish().with_data_type(numeric_type(0));
+            return Ok(ColumnarValue::Array(Arc::new(out)));
+        }
         let xs = x.as_primitive_opt::<Int32Type>().ok_or_else(|| {
             DataFusionError::Internal(format!("expected a date column, got {}", x.data_type()))
         })?;
@@ -183,6 +242,31 @@ mod tests {
         assert_eq!(extract(DateField::Year, i32::MAX), Some(NUMERIC_PINF));
         assert_eq!(extract(DateField::Year, i32::MIN), Some(NUMERIC_NINF));
         assert_eq!(extract(DateField::Month, i32::MAX), None);
+    }
+
+    #[test]
+    fn fields_of_timestamps() {
+        let f = |f, t| extract_timestamp(f, t).map(|v| v.as_i128());
+        let h = 3_600_000_000i64;
+        let m = 60_000_000i64;
+        // 2000-01-01 13:47:59.999999
+        let t = 13 * h + 47 * m + 59_999_999;
+        assert_eq!(f(DateField::Hour, t), Some(13));
+        assert_eq!(f(DateField::Minute, t), Some(47));
+        assert_eq!(f(DateField::Day, t), Some(1));
+        // 1999-12-31 23:59:00: before the epoch the day rounds down
+        let t = -m;
+        assert_eq!(f(DateField::Hour, t), Some(23));
+        assert_eq!(f(DateField::Minute, t), Some(59));
+        assert_eq!(f(DateField::Day, t), Some(31));
+        assert_eq!(f(DateField::Year, t), Some(1999));
+        // 1999-12-31 00:00:00 exactly
+        assert_eq!(f(DateField::Hour, -USECS_PER_DAY), Some(0));
+        assert_eq!(f(DateField::Day, -USECS_PER_DAY), Some(31));
+        assert_eq!(f(DateField::Quarter, 100 * USECS_PER_DAY), Some(2));
+        assert_eq!(extract_timestamp(DateField::Year, i64::MAX), Some(NUMERIC_PINF));
+        assert_eq!(extract_timestamp(DateField::Year, i64::MIN), Some(NUMERIC_NINF));
+        assert_eq!(extract_timestamp(DateField::Minute, i64::MIN), None);
     }
 }
 

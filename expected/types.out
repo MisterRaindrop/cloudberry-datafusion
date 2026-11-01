@@ -594,6 +594,224 @@ ERROR:  date out of range  (seg0 slice1 172.17.0.3:40000 pid=19683)
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
 ERROR:  date out of range  (seg1 slice1 172.17.0.3:40001 pid=19685)
 DROP TABLE df_ty4;
+-- extract(year | quarter | month | day | hour | minute from timestamp)
+-- (ET1), timestamps without time zone: before 2000 the day rounds down
+-- (timestamp2tm), the year of an infinite timestamp is ±Infinity and its
+-- other fields NULL.  Seconds and time zones stay on PostgreSQL.
+CREATE TABLE df_ty5 (id int4, t timestamp, g int4, s text) DISTRIBUTED BY (id);
+INSERT INTO df_ty5 SELECT i, timestamp '1999-12-30 22:00' + (i * 7919 % 200000) * interval '61.5 seconds',
+  i % 7, (ARRAY['', 'a', 'bb'])[i % 3 + 1] FROM generate_series(1, 3000) i;
+INSERT INTO df_ty5 VALUES (-1, '-infinity', 0, ''), (-2, 'infinity', 0, ''),
+  (-3, '4713-11-24 00:00 BC', 0, ''), (-4, '294276-12-31 23:59:59.999999', 0, ''),
+  (-5, '1999-12-31 23:59:59.999999', 0, ''), (-6, '2000-01-01 00:00', 0, ''),
+  (-7, '0001-12-31 23:30 BC', 0, ''), (-8, NULL, 0, ''), (-9, '1969-07-20 20:17:40', 0, '');
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g, (EXTRACT(minute FROM t)), s
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g, (EXTRACT(minute FROM t)), s
+               ->  Streaming Partial HashAggregate
+                     Group Key: g, EXTRACT(minute FROM t), s
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: (EXTRACT(second FROM t))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (EXTRACT(second FROM t))
+               ->  Streaming Partial HashAggregate
+                     Group Key: EXTRACT(second FROM t)
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ DataFusion: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_ty5 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: (EXTRACT(hour FROM (t)::timestamp with time zone))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (EXTRACT(hour FROM (t)::timestamp with time zone))
+               ->  Streaming Partial HashAggregate
+                     Group Key: EXTRACT(hour FROM (t)::timestamp with time zone)
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ DataFusion: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+(12 rows)
+
+SET datafusion.mode = off;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+ m | count 
+---+-------
+ 0 |    52
+ 1 |    47
+ 2 |    52
+ 3 |    49
+ 4 |    51
+(5 rows)
+
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+ g | m  | s  | count 
+---+----+----+-------
+ 0 | 59 |    |     5
+ 4 |  4 | a  |     5
+ 4 | 36 | bb |     5
+ 5 | 53 |    |     5
+ 0 |  0 |    |     4
+ 0 |  2 |    |     4
+ 0 |  2 | bb |     4
+ 0 |  7 |    |     4
+ 0 |  8 | a  |     4
+ 0 | 15 | a  |     4
+(10 rows)
+
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract | extract | extract | extract 
+----+-----------+---------+---------+---------+---------+---------
+ -9 |      1969 |       3 |       7 |      20 |      20 |      17
+ -8 |           |         |         |         |         |        
+ -7 |        -1 |       4 |      12 |      31 |      23 |      30
+ -6 |      2000 |       1 |       1 |       1 |       0 |       0
+ -5 |      1999 |       4 |      12 |      31 |      23 |      59
+ -4 |    294276 |       4 |      12 |      31 |      23 |      59
+ -3 |     -4713 |       4 |      11 |      24 |       0 |       0
+ -2 |  Infinity |         |         |         |         |        
+ -1 | -Infinity |         |         |         |         |        
+(9 rows)
+
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+ h  | count |  sum   
+----+-------+--------
+  0 |   131 | 199154
+  1 |   126 | 183893
+  2 |   125 | 192034
+  3 |   124 | 183861
+  4 |   128 | 190716
+  5 |   124 | 183859
+  6 |   126 | 194149
+  7 |   124 | 180027
+  8 |   120 | 182541
+  9 |   129 | 196129
+ 10 |   123 | 180814
+ 11 |   126 | 193099
+ 12 |   124 | 187610
+ 13 |   128 | 190512
+ 14 |   121 | 176913
+ 15 |   128 | 200143
+ 16 |   125 | 182301
+ 17 |   122 | 184155
+ 18 |   125 | 188963
+ 19 |   126 | 189332
+ 20 |   126 | 184127
+ 21 |   124 | 190391
+ 22 |   128 | 188941
+ 23 |   123 | 177802
+    |     3 |    -11
+(25 rows)
+
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+SET datafusion.mode = on;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+ m | count 
+---+-------
+ 0 |    52
+ 1 |    47
+ 2 |    52
+ 3 |    49
+ 4 |    51
+(5 rows)
+
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+ g | m  | s  | count 
+---+----+----+-------
+ 0 | 59 |    |     5
+ 4 |  4 | a  |     5
+ 4 | 36 | bb |     5
+ 5 | 53 |    |     5
+ 0 |  0 |    |     4
+ 0 |  2 |    |     4
+ 0 |  2 | bb |     4
+ 0 |  7 |    |     4
+ 0 |  8 | a  |     4
+ 0 | 15 | a  |     4
+(10 rows)
+
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract | extract | extract | extract 
+----+-----------+---------+---------+---------+---------+---------
+ -9 |      1969 |       3 |       7 |      20 |      20 |      17
+ -8 |           |         |         |         |         |        
+ -7 |        -1 |       4 |      12 |      31 |      23 |      30
+ -6 |      2000 |       1 |       1 |       1 |       0 |       0
+ -5 |      1999 |       4 |      12 |      31 |      23 |      59
+ -4 |    294276 |       4 |      12 |      31 |      23 |      59
+ -3 |     -4713 |       4 |      11 |      24 |       0 |       0
+ -2 |  Infinity |         |         |         |         |        
+ -1 | -Infinity |         |         |         |         |        
+(9 rows)
+
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+ h  | count |  sum   
+----+-------+--------
+  0 |   131 | 199154
+  1 |   126 | 183893
+  2 |   125 | 192034
+  3 |   124 | 183861
+  4 |   128 | 190716
+  5 |   124 | 183859
+  6 |   126 | 194149
+  7 |   124 | 180027
+  8 |   120 | 182541
+  9 |   129 | 196129
+ 10 |   123 | 180814
+ 11 |   126 | 193099
+ 12 |   124 | 187610
+ 13 |   128 | 190512
+ 14 |   121 | 176913
+ 15 |   128 | 200143
+ 16 |   125 | 182301
+ 17 |   122 | 184155
+ 18 |   125 | 188963
+ 19 |   126 | 189332
+ 20 |   126 | 184127
+ 21 |   124 | 190391
+ 22 |   128 | 188941
+ 23 |   123 | 177802
+    |     3 |    -11
+(25 rows)
+
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+DROP TABLE df_ty5;
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.
 SET datafusion.motion_batches = on;

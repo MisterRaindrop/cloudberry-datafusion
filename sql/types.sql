@@ -145,6 +145,37 @@ SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
 DROP TABLE df_ty4;
 
+-- extract(year | quarter | month | day | hour | minute from timestamp)
+-- (ET1), timestamps without time zone: before 2000 the day rounds down
+-- (timestamp2tm), the year of an infinite timestamp is ±Infinity and its
+-- other fields NULL.  Seconds and time zones stay on PostgreSQL.
+CREATE TABLE df_ty5 (id int4, t timestamp, g int4, s text) DISTRIBUTED BY (id);
+INSERT INTO df_ty5 SELECT i, timestamp '1999-12-30 22:00' + (i * 7919 % 200000) * interval '61.5 seconds',
+  i % 7, (ARRAY['', 'a', 'bb'])[i % 3 + 1] FROM generate_series(1, 3000) i;
+INSERT INTO df_ty5 VALUES (-1, '-infinity', 0, ''), (-2, 'infinity', 0, ''),
+  (-3, '4713-11-24 00:00 BC', 0, ''), (-4, '294276-12-31 23:59:59.999999', 0, ''),
+  (-5, '1999-12-31 23:59:59.999999', 0, ''), (-6, '2000-01-01 00:00', 0, ''),
+  (-7, '0001-12-31 23:30 BC', 0, ''), (-8, NULL, 0, ''), (-9, '1969-07-20 20:17:40', 0, '');
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s;
+EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;
+EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_ty5 GROUP BY 1;
+SET datafusion.mode = off;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+SET datafusion.mode = on;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+DROP TABLE df_ty5;
+
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.
 SET datafusion.motion_batches = on;

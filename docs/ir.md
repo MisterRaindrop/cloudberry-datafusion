@@ -345,6 +345,7 @@ PostgreSQL reads it (`\1` to `\9`, `\&`, `\\`).
 | Expression | PostgreSQL | Notes |
 |---|---|---|
 | `{"extract": <date>, "field": "year" \| "quarter" \| "month" \| "day"}` | `extract(field from date)` | numeric of scale 0 |
+| `{"extract": <timestamp>, "field": "year" \| "quarter" \| "month" \| "day" \| "hour" \| "minute", "timestamp": true}` | `extract(field from timestamp)`, without time zone | numeric of scale 0 |
 | `{"dateadd": [<date>, <int4>], "sign": 1 \| -1}` | `date_pli`, `date_mii` | 22008 beyond the dates |
 | `{"numabs": <x>}` | `numeric_abs` | NaN stays NaN |
 | `{"numround": <x>, "from": s, "type": "numeric:S"}` | `numeric_round` | from scale s to S |
@@ -434,7 +435,7 @@ member op args and or not isnull isnotnull inlist values negated
 member case when then else
 member cast pgcast from precision floatkey bpkey bpchar call
 member regexp_replace re capture replacement
-member extract field dateadd sign numabs numround rescale by
+member extract field timestamp dateadd sign numabs numround rescale by
 member numdiv numdiv_scale scales greatest numcmp div scale
 member avg_numeric avg_numeric_scale stddev_numeric stddev_numeric_scale sample variance
 member assert detail in_set key scalar_of
@@ -449,6 +450,6 @@ value kind hash int float_int float8_float4 date_timestamp timestamp_date numeri
 value from bool int2 int4 int8 float4 float8 date time timestamp timestamptz text bpchar tid numeric numeric:S
 value hash bool int2 int4 int8 float4 float8 date time timestamp timestamptz text bpchar tid numeric numeric:S
 value key plain float bpchar
-value field year quarter month day
+value field year quarter month day hour minute
 value call char_length octet_length substr textcat concat btrim ltrim rtrim left right reverse repeat lpad rpad strpos replace split_part starts_with lower upper lower_locale upper_locale
 ```
