@@ -353,6 +353,21 @@ of its rows after `l_shipdate`, `l_discount` and `l_quantity`: its
 dev box Q6 took 44% less time, Q7 28%, Q3 38% and Q14 26% (fastest of
 three runs each); TPC-H's queries touched, both planners, a third less.
 
+LT1 (scan interface version 9, engine ABI 5) reads columns that only the
+rows a sort's Limit keeps need after the Limit.  When a slice sorts one
+PAX input, filtered or not, and keeps at most 100 rows (its count plus its
+offset), the input's columns that are outputs and that neither the filter,
+the sort keys nor other outputs read are left out of the scan: the reader
+does not decode them and hands out each row's locator (block, group,
+position in the group) instead.  Above the Limit, LateFetchExec reads
+those columns of the rows left with read_rows, one call per group, the
+groups in parallel.  Each such group is decoded again, so this only
+happens when the rows kept are at most half the scan's micro-partitions.
+ClickBench's Q24, `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY
+EventTime LIMIT 10`, decoded all 105 columns of every group, and copied
+all 28 of its strings for every row, to keep 10 rows; on win-dev it took
+9.7 s, now 1.8 s, about what reading URL and EventTime alone takes.
+
 The query ends its scans on the main thread as it is released, once any
 partition's call into a scan has returned; partitions then find nothing
 left.  The scan used to end when its last partition let it go: where a
@@ -702,6 +717,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | LM2 | Direct PAX reader: then narrow numerics, then strings compared on the reader's bytes; strings built for the rows left |
 | N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |
 | LM3 | Direct PAX reader: fixed-width columns converted when fetched, for the rows the cheap conditions leave (scan interface 8, engine ABI 4) |
+| LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |

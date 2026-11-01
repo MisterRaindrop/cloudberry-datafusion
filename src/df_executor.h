@@ -328,7 +328,7 @@ extern bool df_translate_slice(Plan *root, const DfTails *tails, bool tuples, Df
  * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
  * two identical.
  */
-#define DF_PAX_SCAN_API_VERSION 8
+#define DF_PAX_SCAN_API_VERSION 9
 
 /* What the scan's min/max skipping did (DatafusionPaxScanInfo). */
 typedef struct DfPaxScanInfo
@@ -356,6 +356,8 @@ typedef struct DfPaxReader
 	VecPaxRead	read;
 	VecPaxEnd	end;
 	VecPaxGroups block_groups;
+	VecPaxLate	late;
+	VecPaxReadRows read_rows;
 } DfPaxReader;
 
 extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */

@@ -27,10 +27,10 @@ spread the groups of one block over several threads.
 
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
 new file mode 100644
-index 0000000..a923a15
+index 0000000..c4e1a7d
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,833 @@
+@@ -0,0 +1,987 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -122,6 +122,7 @@ index 0000000..a923a15
 +  std::vector<int> widths;   // their value widths in bytes
 +  std::vector<int> scales;   // a numeric's scale when read fixed-width, or -1
 +  int read_col;              // column decoded when none is handed out
++  std::vector<bool> late;    // per handed-out column: left to read_rows
 +  size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
 +  DatafusionPaxScanInfo info;
 +};
@@ -379,6 +380,7 @@ index 0000000..a923a15
 +    scan->widths.assign(widths, widths + ncols);
 +    scan->scales.assign(scales, scales + ncols);
 +    scan->read_col = ncols > 0 ? cols[0] : 0;
++    scan->late.assign(ncols, false);
 +    scan->read_buffer_size = pax::pax_scan_reuse_buffer_size;
 +    scan->info = DatafusionPaxScanInfo{0, 0, 0, 0};
 +
@@ -473,6 +475,7 @@ index 0000000..a923a15
 +
 +// A projected column of the group being read.
 +struct ColState {
++  bool active;  // decoded by this read: the others are not handed out
 +  pax::PaxColumn *col;
 +  const char *buf;
 +  pax::Bitmap8 *bm;  // bit set: the row has a value
@@ -496,6 +499,11 @@ index 0000000..a923a15
 +  const std::vector<uint32_t> *keep;
 +  bool all_kept;
 +  size_t j0, j1;
++  // what the rows' locators name, and room for them
++  int block;
++  uint32_t group;
++  std::vector<int64_t> *locs;
++  std::vector<uint8_t> *loc_nulls;
 +  // the first failure, for read_block's message
 +  char *err;
 +  size_t errlen;
@@ -547,8 +555,24 @@ index 0000000..a923a15
 +                DatafusionPaxColumn *out) {
 +  auto ch = static_cast<Chunk *>(chunk_arg);
 +  try {
++    if (k == DATAFUSION_PAX_LOCATOR) {
++      const size_t n = rows ? nrows : ch->j1 - ch->j0;
++      ch->locs->resize(std::max<size_t>(n, 1));
++      ch->loc_nulls->assign(std::max<size_t>(n, 1), 0);
++      for (size_t t = 0; t < n; t++) {
++        const size_t j = ch->j0 + (rows ? rows[t] : t);
++        const size_t r = ch->all_kept ? j : (*ch->keep)[j];
++        (*ch->locs)[t] = (static_cast<int64_t>(ch->block) << 40) |
++                         (static_cast<int64_t>(ch->group) << 24) |
++                         static_cast<int64_t>(r);
++      }
++      out->values = ch->locs->data();
++      out->nulls = ch->loc_nulls->data();
++      out->offsets = nullptr;
++      return 0;
++    }
 +    if (k < 0 || static_cast<size_t>(k) >= ch->cols->size() ||
-+        (*ch->cols)[k].width <= 0) {
++        !(*ch->cols)[k].active || (*ch->cols)[k].width <= 0) {
 +      SetError(ch->err, ch->errlen, "PAX read", "fetch of a column not fetched so");
 +      ch->failed = true;
 +      return -1;
@@ -613,6 +637,183 @@ index 0000000..a923a15
 +  return -1;
 +}
 +
++// Hands out rows of one decoded group, of 'nrows' rows: those 'keep' lists
++// (positions in the group) unless 'all_kept', in chunks.  'colv' holds the
++// group's column of each handed-out column, null for one this read does
++// not decode.  'base' is what the reader holds besides the chunks.
++int EmitGroup(const DfScan *scan, int index, uint32_t g,
++              const std::vector<pax::PaxColumn *> &colv, size_t rows,
++              const std::vector<uint32_t> &keep, bool all_kept, Ledger &ledger,
++              int64_t base, DatafusionPaxEmit emit, void *ctx, char *err,
++              size_t errlen) {
++  const size_t ncols = scan->cols.size();
++  std::vector<std::vector<char>> values(ncols);
++  std::vector<std::vector<uint8_t>> nulls(ncols);
++  std::vector<std::vector<int32_t>> offsets(ncols);
++  std::vector<DatafusionPaxColumn> out(ncols);
++  std::vector<int64_t> locs;
++  std::vector<uint8_t> loc_nulls;
++
++  // Rows go out in chunks of kChunkRows, so that the caller can start on
++  // them while the rest of the group is converted, and whose string bytes
++  // stay below kChunkBytes, so that their int32 offsets cannot overflow (a
++  // value has at most 1 GB).
++  constexpr size_t kChunkRows = 8192;
++  constexpr size_t kChunkBytes = 64 << 20;
++
++  const size_t nkept = all_kept ? rows : keep.size();
++  auto row_of = [&](size_t j) -> size_t { return all_kept ? j : keep[j]; };
++
++  std::vector<ColState> cols(ncols);
++  for (size_t k = 0; k < ncols; k++) {
++    ColState &st = cols[k];
++    pax::PaxColumn *col = colv[k];
++    st.active = col != nullptr;
++    st.width = scan->widths[k];
++    st.scale = scan->scales[k];
++    if (!st.active) continue;
++    // In the plain format only non-null values are stored, in row
++    // order; in the vectorized format every row has a slot.  That
++    // format keeps booleans bit-packed in memory, one bit per row,
++    // least significant bit first; the plain format has already
++    // decoded them to one byte per value.
++    st.col = col;
++    st.buf = col->GetBuffer().first;
++    st.bm = col->GetBitmap().get();
++    st.dense = col->GetStorageFormat() !=
++               pax::PaxStorageFormat::kTypeStoragePorcVec;
++    st.bits = col->GetPaxColumnTypeInMem() ==
++              pax::PaxColumnTypeInMem::kTypeVecBitPacked;
++    st.vec_numeric = col->GetPaxColumnTypeInMem() ==
++                     pax::PaxColumnTypeInMem::kTypeVecDecimal;
++    if (st.bm && st.dense) {
++      st.index.resize(rows);
++      uint32_t i = 0;
++      for (size_t r = 0; r < rows; r++) {
++        st.index[r] = i;
++        if (st.bm->Test(static_cast<uint32>(r))) i++;
++      }
++    }
++    if (st.width <= 0) {
++      // A chunk's share of the group's stored bytes, as a first guess
++      // that spares growing the chunk's bytes value by value (copies).
++      const size_t per_chunk = std::min(nkept, kChunkRows);
++      offsets[k].reserve(per_chunk + 1);
++      values[k].reserve(col->GetBuffer().second / std::max<size_t>(rows, 1) *
++                        per_chunk * 5 / 4);
++    }
++    nulls[k].resize(std::min(nkept, kChunkRows));
++  }
++
++  // Chunk by chunk: the strings are copied out here, column by column;
++  // the fixed-width columns are converted when the consumer fetches
++  // them (FetchColumn), for the rows it still wants.
++  for (size_t j0 = 0; j0 < nkept;) {
++    size_t j1 = std::min(nkept, j0 + kChunkRows);
++    for (size_t k = 0; k < ncols; k++) {
++      ColState &st = cols[k];
++      if (!st.active || st.width > 0) continue;
++      uint8_t *nl = nulls[k].data();
++      values[k].clear();
++      offsets[k].assign(1, 0);
++      size_t bytes = 0;
++      for (size_t j = j0; j < j1; j++) {
++        const size_t r = row_of(j);
++        const size_t c = j - j0;
++        const bool present = !st.bm || st.bm->Test(static_cast<uint32>(r));
++        const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
++        if (!present) {
++          nl[c] = 1;
++          offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++          continue;
++        }
++        nl[c] = 0;
++        if (st.vec_numeric) {
++          // the vectorized format's numeric, decoded here: its own
++          // GetDatum goes through PostgreSQL's numeric functions
++          AppendVecNumeric(st.buf + i * 16, values[k]);
++          offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++          continue;
++        }
++        // A string or a numeric: its bytes without the varlena header.
++        // GetDatum decodes PAX's toast (compressed inline or in the toast
++        // file, with PAX's own pglz/lz4) and, in the vectorized format,
++        // restores the header and char(n)'s padding.
++        const struct varlena *v = reinterpret_cast<const struct varlena *>(
++            DatumGetPointer(st.col->GetDatum(i)));
++        if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)) {
++          SetError(err, errlen, "PAX read", "toasted value left");
++          return -1;
++        }
++        const size_t len = VARSIZE_ANY_EXHDR(v);
++        values[k].insert(values[k].end(), VARDATA_ANY(v), VARDATA_ANY(v) + len);
++        offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++        bytes += len;
++        // a chunk of strings past kChunkBytes ends here, for every
++        // column: those done so far are cut back to it
++        if (bytes >= kChunkBytes && j + 1 < j1) {
++          j1 = j + 1;
++          for (size_t q = 0; q < k; q++)
++            if (cols[q].active && cols[q].width <= 0) {
++              offsets[q].resize(j1 - j0 + 1);
++              values[q].resize(static_cast<size_t>(offsets[q].back()));
++            }
++          break;
++        }
++      }
++    }
++
++    auto held = [&]() {
++      int64_t h = static_cast<int64_t>(keep.capacity() * 4 + locs.capacity() * 9);
++      for (size_t k = 0; k < ncols; k++)
++        h += static_cast<int64_t>(values[k].capacity() + nulls[k].capacity() +
++                                  offsets[k].capacity() * 4);
++      return h;
++    };
++    for (size_t k = 0; k < ncols; k++) {
++      // never NULL, even for a chunk of empty strings; NULL values for
++      // a column to fetch or one not decoded
++      static const char kNoBytes = 0;
++      if (!cols[k].active || cols[k].width > 0) {
++        out[k] = DatafusionPaxColumn{nullptr, nullptr, nullptr};
++        continue;
++      }
++      out[k].values = values[k].empty() ? &kNoBytes : values[k].data();
++      out[k].nulls = nulls[k].data();
++      out[k].offsets = offsets[k].data();
++    }
++    ledger.Set(base + held());
++    Chunk chunk{&cols, &values, &nulls, &keep, all_kept, j0, j1,
++                index, g, &locs, &loc_nulls, err, errlen, false};
++    if (emit(ctx, static_cast<uint32_t>(j1 - j0), out.data(), FetchColumn,
++             &chunk) != 0) {
++      if (!chunk.failed) SetError(err, errlen, "PAX read", "the consumer stopped");
++      return -1;
++    }
++    ledger.Set(base + held());
++    j0 = j1;
++  }
++  return 0;
++}
++
++// The bytes a decoded group's columns 'colv' hold.
++int64_t DecodedBytes(const std::vector<pax::PaxColumn *> &colv) {
++  int64_t decoded = 0;
++  for (pax::PaxColumn *col : colv) {
++    if (col == nullptr) continue;
++    decoded += static_cast<int64_t>(col->GetBuffer().second);
++    if (col->GetBitmap())
++      decoded += static_cast<int64_t>(col->GetBitmap()->Raw().size);
++  }
++  return decoded;
++}
++
++// A locator holds the block in bits 40-62, the group in bits 24-39 and the
++// row of the group in bits 0-23 (DATAFUSION_PAX_LOCATOR).
++constexpr int64_t kLocatorBlocks = int64_t{1} << 23;
++constexpr int64_t kLocatorGroups = int64_t{1} << 16;
++constexpr int64_t kLocatorRows = int64_t{1} << 24;
++
 +int ReadBlock(void *scan_arg, int index, int first, int count,
 +              DatafusionPaxEmit emit, DatafusionPaxAccount account, void *ctx,
 +              char *err, size_t errlen) {
@@ -623,9 +824,14 @@ index 0000000..a923a15
 +    Ledger ledger(account, ctx);
 +    const DfBlock &block = scan->blocks.at(index);
 +    auto fs = pax::Singleton<pax::LocalFileSystem>::GetInstance();
++    const size_t ncols = scan->cols.size();
++    const bool locators =
++        std::find(scan->late.begin(), scan->late.end(), true) != scan->late.end();
 +
++    // the late columns are left to read_rows
 +    std::vector<bool> proj(scan->natts, false);
-+    for (int c : scan->cols) proj[c] = true;
++    for (size_t k = 0; k < ncols; k++)
++      if (!scan->late[k]) proj[scan->cols[k]] = true;
 +    proj[scan->read_col] = true;
 +    std::vector<int> projected;
 +    for (int c = 0; c < scan->natts; c++)
@@ -646,19 +852,6 @@ index 0000000..a923a15
 +        std::make_shared<pax::DataBuffer<char>>(scan->read_buffer_size);
 +    auto reader = OpenReader(block, std::move(proj), read_buffer);
 +
-+    const size_t ncols = scan->cols.size();
-+    std::vector<std::vector<char>> values(ncols);
-+    std::vector<std::vector<uint8_t>> nulls(ncols);
-+    std::vector<std::vector<int32_t>> offsets(ncols);
-+    std::vector<DatafusionPaxColumn> out(ncols);
-+
-+    // Rows go out in chunks of kChunkRows, so that the caller can start on
-+    // them while the rest of the group is converted, and whose string bytes
-+    // stay below kChunkBytes, so that their int32 offsets cannot overflow (a
-+    // value has at most 1 GB).
-+    constexpr size_t kChunkRows = 8192;
-+    constexpr size_t kChunkBytes = 64 << 20;
-+
 +    // The block's groups to read are numbered 0 .. ngroups - 1; this call
 +    // reads 'count' of them from 'first' (all from there if count < 0).
 +    const size_t ngroups =
@@ -672,15 +865,24 @@ index 0000000..a923a15
 +      auto &columns = *group->GetAllColumns();
 +      const size_t rows = group->GetRows();
 +      const size_t offset = group->GetRowOffset();
-+
-+      int64_t decoded = 0;
-+      for (int c : projected) {
-+        pax::PaxColumn *col = columns[c].get();
-+        if (col == nullptr) continue;
-+        decoded += static_cast<int64_t>(col->GetBuffer().second);
-+        if (col->GetBitmap())
-+          decoded += static_cast<int64_t>(col->GetBitmap()->Raw().size);
++      if (locators && (index >= kLocatorBlocks || static_cast<int64_t>(g) >= kLocatorGroups ||
++                       static_cast<int64_t>(rows) > kLocatorRows)) {
++        SetError(err, errlen, "PAX read", "block, group or row beyond a row locator");
++        return -1;
 +      }
++
++      std::vector<pax::PaxColumn *> colv(ncols, nullptr);
++      for (size_t k = 0; k < ncols; k++) {
++        if (scan->late[k]) continue;
++        colv[k] = columns[scan->cols[k]].get();
++        if (colv[k] == nullptr) {
++          SetError(err, errlen, "PAX read", "projected column missing");
++          return -1;
++        }
++      }
++      std::vector<pax::PaxColumn *> decoded_cols;
++      for (int c : projected) decoded_cols.push_back(columns[c].get());
++      const int64_t decoded = DecodedBytes(decoded_cols);
 +      const int64_t base = visimap_bytes +
 +                           static_cast<int64_t>(read_buffer->Capacity()) +
 +                           decoded;
@@ -701,140 +903,90 @@ index 0000000..a923a15
 +              keep.push_back(static_cast<uint32_t>(i));
 +        }
 +      }
-+      const size_t nkept = all_kept ? rows : keep.size();
-+      auto row_of = [&](size_t j) -> size_t { return all_kept ? j : keep[j]; };
++      if (EmitGroup(scan, index, static_cast<uint32_t>(g), colv, rows, keep,
++                    all_kept, ledger, base, emit, ctx, err, errlen) != 0)
++        return -1;
++    }
++    reader->Close();
++    return 0;
++  } catch (cbdb::CException &e) {
++    SetError(err, errlen, "cannot read PAX micro-partition", e.What().c_str());
++  } catch (std::exception &e) {
++    SetError(err, errlen, "cannot read PAX micro-partition", e.what());
++  } catch (...) {
++    SetError(err, errlen, "cannot read PAX micro-partition", "unknown error");
++  }
++  return -1;
++}
 +
-+      std::vector<ColState> cols(ncols);
-+      for (size_t k = 0; k < ncols; k++) {
-+        pax::PaxColumn *col = columns[scan->cols[k]].get();
-+        if (col == nullptr) {
-+          SetError(err, errlen, "PAX read", "projected column missing");
-+          return -1;
-+        }
-+        // In the plain format only non-null values are stored, in row
-+        // order; in the vectorized format every row has a slot.  That
-+        // format keeps booleans bit-packed in memory, one bit per row,
-+        // least significant bit first; the plain format has already
-+        // decoded them to one byte per value.
-+        ColState &st = cols[k];
-+        st.col = col;
-+        st.buf = col->GetBuffer().first;
-+        st.bm = col->GetBitmap().get();
-+        st.dense = col->GetStorageFormat() !=
-+                   pax::PaxStorageFormat::kTypeStoragePorcVec;
-+        st.bits = col->GetPaxColumnTypeInMem() ==
-+                  pax::PaxColumnTypeInMem::kTypeVecBitPacked;
-+        st.vec_numeric = col->GetPaxColumnTypeInMem() ==
-+                         pax::PaxColumnTypeInMem::kTypeVecDecimal;
-+        st.width = scan->widths[k];
-+        st.scale = scan->scales[k];
-+        if (st.bm && st.dense) {
-+          st.index.resize(rows);
-+          uint32_t i = 0;
-+          for (size_t r = 0; r < rows; r++) {
-+            st.index[r] = i;
-+            if (st.bm->Test(static_cast<uint32>(r))) i++;
-+          }
-+        }
-+        if (st.width <= 0) {
-+          // A chunk's share of the group's stored bytes, as a first guess
-+          // that spares growing the chunk's bytes value by value (copies).
-+          const size_t per_chunk = std::min(nkept, kChunkRows);
-+          offsets[k].reserve(per_chunk + 1);
-+          values[k].reserve(col->GetBuffer().second / std::max<size_t>(rows, 1) *
-+                            per_chunk * 5 / 4);
-+        }
-+        nulls[k].resize(std::min(nkept, kChunkRows));
++int Late(void *scan_arg, const int *ks, int nks, char *err, size_t errlen) {
++  auto scan = static_cast<DfScan *>(scan_arg);
++  for (int i = 0; i < nks; i++) {
++    if (ks[i] < 0 || static_cast<size_t>(ks[i]) >= scan->cols.size()) {
++      SetError(err, errlen, "PAX late columns", "no such column");
++      return -1;
++    }
++    scan->late[ks[i]] = true;
++  }
++  // a column still decoded when none is handed out
++  for (size_t k = 0; k < scan->cols.size(); k++)
++    if (!scan->late[k]) {
++      scan->read_col = scan->cols[k];
++      break;
++    }
++  return 0;
++}
++
++int ReadRows(void *scan_arg, int index, int group_no, const uint32_t *rows,
++             uint32_t nrows, DatafusionPaxEmit emit, DatafusionPaxAccount account,
++             void *ctx, char *err, size_t errlen) {
++  auto scan = static_cast<DfScan *>(scan_arg);
++  try {
++    Ledger ledger(account, ctx);
++    const DfBlock &block = scan->blocks.at(index);
++    const size_t ncols = scan->cols.size();
++    std::vector<bool> proj(scan->natts, false);
++    bool any = false;
++    for (size_t k = 0; k < ncols; k++)
++      if (scan->late[k]) {
++        proj[scan->cols[k]] = true;
++        any = true;
 +      }
-+
-+      // Chunk by chunk: the strings are copied out here, column by column;
-+      // the fixed-width columns are converted when the consumer fetches
-+      // them (FetchColumn), for the rows it still wants.
-+      for (size_t j0 = 0; j0 < nkept;) {
-+        size_t j1 = std::min(nkept, j0 + kChunkRows);
-+        for (size_t k = 0; k < ncols; k++) {
-+          ColState &st = cols[k];
-+          if (st.width > 0) continue;
-+          uint8_t *nl = nulls[k].data();
-+          values[k].clear();
-+          offsets[k].assign(1, 0);
-+          size_t bytes = 0;
-+          for (size_t j = j0; j < j1; j++) {
-+            const size_t r = row_of(j);
-+            const size_t c = j - j0;
-+            const bool present = !st.bm || st.bm->Test(static_cast<uint32>(r));
-+            const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
-+            if (!present) {
-+              nl[c] = 1;
-+              offsets[k].push_back(static_cast<int32_t>(values[k].size()));
-+              continue;
-+            }
-+            nl[c] = 0;
-+            if (st.vec_numeric) {
-+              // the vectorized format's numeric, decoded here: its own
-+              // GetDatum goes through PostgreSQL's numeric functions
-+              AppendVecNumeric(st.buf + i * 16, values[k]);
-+              offsets[k].push_back(static_cast<int32_t>(values[k].size()));
-+              continue;
-+            }
-+            // A string or a numeric: its bytes without the varlena header.
-+            // GetDatum decodes PAX's toast (compressed inline or in the toast
-+            // file, with PAX's own pglz/lz4) and, in the vectorized format,
-+            // restores the header and char(n)'s padding.
-+            const struct varlena *v = reinterpret_cast<const struct varlena *>(
-+                DatumGetPointer(st.col->GetDatum(i)));
-+            if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)) {
-+              SetError(err, errlen, "PAX read", "toasted value left");
-+              return -1;
-+            }
-+            const size_t len = VARSIZE_ANY_EXHDR(v);
-+            values[k].insert(values[k].end(), VARDATA_ANY(v), VARDATA_ANY(v) + len);
-+            offsets[k].push_back(static_cast<int32_t>(values[k].size()));
-+            bytes += len;
-+            // a chunk of strings past kChunkBytes ends here, for every
-+            // column: those done so far are cut back to it
-+            if (bytes >= kChunkBytes && j + 1 < j1) {
-+              j1 = j + 1;
-+              for (size_t q = 0; q < k; q++)
-+                if (cols[q].width <= 0) {
-+                  offsets[q].resize(j1 - j0 + 1);
-+                  values[q].resize(static_cast<size_t>(offsets[q].back()));
-+                }
-+              break;
-+            }
-+          }
-+        }
-+
-+        auto held = [&]() {
-+          int64_t h = static_cast<int64_t>(keep.capacity() * 4);
-+          for (size_t k = 0; k < ncols; k++)
-+            h += static_cast<int64_t>(values[k].capacity() + nulls[k].capacity() +
-+                                      offsets[k].capacity() * 4);
-+          return h;
-+        };
-+        for (size_t k = 0; k < ncols; k++) {
-+          // never NULL, even for a chunk of empty strings; NULL values for
-+          // a column to fetch
-+          static const char kNoBytes = 0;
-+          if (cols[k].width > 0) {
-+            out[k] = DatafusionPaxColumn{nullptr, nullptr, nullptr};
-+            continue;
-+          }
-+          out[k].values = values[k].empty() ? &kNoBytes : values[k].data();
-+          out[k].nulls = nulls[k].data();
-+          out[k].offsets = offsets[k].data();
-+        }
-+        ledger.Set(base + held());
-+        Chunk chunk{&cols, &values, &nulls, &keep, all_kept, j0, j1, err, errlen, false};
-+        if (emit(ctx, static_cast<uint32_t>(j1 - j0), out.data(), FetchColumn,
-+                 &chunk) != 0) {
-+          if (!chunk.failed) SetError(err, errlen, "PAX read", "the consumer stopped");
-+          return -1;
-+        }
-+        ledger.Set(base + held());
-+        j0 = j1;
++    if (!any) {
++      SetError(err, errlen, "PAX read", "no late column to read");
++      return -1;
++    }
++    auto read_buffer =
++        std::make_shared<pax::DataBuffer<char>>(scan->read_buffer_size);
++    auto reader = OpenReader(block, std::move(proj), read_buffer);
++    if (group_no < 0 || static_cast<size_t>(group_no) >= reader->GetGroupNums()) {
++      SetError(err, errlen, "PAX read", "no such group");
++      return -1;
++    }
++    auto group = reader->ReadGroup(static_cast<size_t>(group_no));
++    auto &columns = *group->GetAllColumns();
++    const size_t nrows_group = group->GetRows();
++    std::vector<uint32_t> keep(rows, rows + nrows);
++    for (uint32_t i = 0; i < nrows; i++)
++      if (keep[i] >= nrows_group || (i > 0 && keep[i] <= keep[i - 1])) {
++        SetError(err, errlen, "PAX read", "rows not ascending within the group");
++        return -1;
++      }
++    std::vector<pax::PaxColumn *> colv(ncols, nullptr);
++    for (size_t k = 0; k < ncols; k++) {
++      if (!scan->late[k]) continue;
++      colv[k] = columns[scan->cols[k]].get();
++      if (colv[k] == nullptr) {
++        SetError(err, errlen, "PAX read", "projected column missing");
++        return -1;
 +      }
 +    }
++    const int64_t base =
++        static_cast<int64_t>(read_buffer->Capacity()) + DecodedBytes(colv);
++    ledger.Set(base);
++    if (EmitGroup(scan, index, static_cast<uint32_t>(group_no), colv, nrows_group,
++                  keep, false, ledger, base, emit, ctx, err, errlen) != 0)
++      return -1;
 +    reader->Close();
 +    return 0;
 +  } catch (cbdb::CException &e) {
@@ -856,6 +1008,8 @@ index 0000000..a923a15
 +    ReadBlock,
 +    ScanEnd,
 +    BlockGroups,
++    Late,
++    ReadRows,
 +};
 +
 +}  // namespace
@@ -866,10 +1020,10 @@ index 0000000..a923a15
 +}
 diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
 new file mode 100644
-index 0000000..284ab34
+index 0000000..03b0fd2
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
-@@ -0,0 +1,145 @@
+@@ -0,0 +1,165 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -926,7 +1080,7 @@ index 0000000..284ab34
 +extern "C" {
 +#endif
 +
-+#define DATAFUSION_PAX_SCAN_API_VERSION 8
++#define DATAFUSION_PAX_SCAN_API_VERSION 9
 +
 +struct List;
 +struct RelationData;
@@ -951,7 +1105,12 @@ index 0000000..284ab34
 + * at the positions 'rows' (ascending, 'nrows' of them; all rows if NULL):
 + * conversions happen here, for the rows asked for only.  'out' stays valid
 + * until the next fetch of the same column or until 'emit' returns.
-+ * Returns 0, or -1 (read_block then fails with the reason). */
++ * Returns 0, or -1 (read_block then fails with the reason).
++ * 'col' DATAFUSION_PAX_LOCATOR gives the rows' locators, int64 values none
++ * NULL, which read_rows takes: the block in bits 40-62, the group of the
++ * block in bits 24-39 and the row's position in the group in bits 0-23. */
++#define DATAFUSION_PAX_LOCATOR (-1)
++
 +typedef int (*DatafusionPaxFetch)(void *chunk, int col, const uint32_t *rows,
 +                                  uint32_t nrows, DatafusionPaxColumn *out);
 +
@@ -1008,6 +1167,21 @@ index 0000000..284ab34
 +   * may read them in separate read_block calls, on several threads.
 +   * Returns -1 with a message on failure.  Any thread, like read_block. */
 +  int (*block_groups)(void *scan, int index, char *err, size_t errlen);
++  /* Leave the handed-out columns at positions 'ks' of begin's 'cols' ('nks'
++   * of them) to read_rows: read_block does not decode them, their entries
++   * are NULL and fetch refuses them.  Once any is, read_block fails on a
++   * block, group or group size a locator cannot name (2^23 blocks, 2^16
++   * groups, 2^24 rows).  Call it before any read_block.  Returns 0, or -1
++   * with a message. */
++  int (*late)(void *scan, const int *ks, int nks, char *err, size_t errlen);
++  /* Decode the late columns of group 'group' of block 'index', those a
++   * locator names, and call 'emit' with the rows at positions 'rows' of the
++   * group (ascending, 'nrows' of them, from locators), as read_block does
++   * but with the late columns only.  Any thread, like read_block. */
++  int (*read_rows)(void *scan, int index, int group, const uint32_t *rows,
++                   uint32_t nrows, DatafusionPaxEmit emit,
++                   DatafusionPaxAccount account, void *ctx, char *err,
++                   size_t errlen);
 +} DatafusionPaxScanApi;
 +
 +const DatafusionPaxScanApi *datafusion_pax_scan_api(void);

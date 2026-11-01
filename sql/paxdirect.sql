@@ -265,6 +265,52 @@ SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_vlm3 W
 SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_vlm3 WHERE a > 200 AND k <> 4;
 SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
 
+-- Columns that only the rows a sort's Limit keeps need are read after the
+-- Limit, by the rows' locators (LT1): here outputs that nothing else reads,
+-- of a table of several micro-partitions per segment (one per INSERT), with
+-- NULLs, deleted rows, an unconstrained numeric and character(n), and in
+-- the vectorized format.
+SET pax.max_tuples_per_group = 100;
+CREATE TABLE df_pd_lt (id int, k int, s text, t text, c char(4), b bool, a numeric(12,2), w numeric) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vlt (id int, k int, s text, t text, c char(4), b bool, a numeric(12,2), w numeric(30,6)) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_lt SELECT i, i * 37 % 8000, 'v' || i, CASE WHEN i % 4 = 0 THEN NULL ELSE repeat(chr(97 + i % 26), i % 30) END,
+  CASE WHEN i % 6 = 0 THEN NULL ELSE (i % 100)::text END, CASE WHEN i % 7 = 0 THEN NULL ELSE i % 2 = 0 END,
+  CASE WHEN i % 9 = 0 THEN NULL ELSE i * 0.25 END, CASE WHEN i % 5 = 0 THEN NULL ELSE i / 7.0 END
+FROM generate_series(1, 1000) i;
+INSERT INTO df_pd_lt SELECT id + 1000, (id + 1000) * 37 % 8000, 'v' || (id + 1000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 2000, (id + 2000) * 37 % 8000, 'v' || (id + 2000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 3000, (id + 3000) * 37 % 8000, 'v' || (id + 3000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 4000, (id + 4000) * 37 % 8000, 'v' || (id + 4000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 5000, (id + 5000) * 37 % 8000, 'v' || (id + 5000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 6000, (id + 6000) * 37 % 8000, 'v' || (id + 6000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_lt SELECT id + 7000, (id + 7000) * 37 % 8000, 'v' || (id + 7000), t, c, b, a, w FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id <= 1000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 1000 AND id <= 2000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 2000 AND id <= 3000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 3000 AND id <= 4000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 4000 AND id <= 5000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 5000 AND id <= 6000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 6000 AND id <= 7000;
+INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 7000;
+DELETE FROM df_pd_lt WHERE id % 50 = 3;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT * FROM df_pd_lt WHERE s LIKE '%7%' ORDER BY k DESC LIMIT 3;
+SELECT id, t, c, b, a, w FROM df_pd_lt WHERE k % 5 = 1 ORDER BY k LIMIT 2 OFFSET 1;
+SELECT t, t AS t2, id, length(s) FROM df_pd_lt ORDER BY id DESC LIMIT 3;
+SELECT * FROM df_pd_lt WHERE id < 0 ORDER BY k LIMIT 3;
+SELECT * FROM df_pd_vlt WHERE k > 7000 ORDER BY a DESC NULLS LAST, id LIMIT 3;
+SELECT id, b, w, c FROM df_pd_vlt WHERE s LIKE '%33%' ORDER BY k LIMIT 3;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT * FROM df_pd_lt WHERE s LIKE '%7%' ORDER BY k DESC LIMIT 3;
+SELECT id, t, c, b, a, w FROM df_pd_lt WHERE k % 5 = 1 ORDER BY k LIMIT 2 OFFSET 1;
+SELECT t, t AS t2, id, length(s) FROM df_pd_lt ORDER BY id DESC LIMIT 3;
+SELECT * FROM df_pd_lt WHERE id < 0 ORDER BY k LIMIT 3;
+SELECT * FROM df_pd_vlt WHERE k > 7000 ORDER BY a DESC NULLS LAST, id LIMIT 3;
+SELECT id, b, w, c FROM df_pd_vlt WHERE s LIKE '%33%' ORDER BY k LIMIT 3;
+
 -- Several inputs in one slice (C3): each PAX scan is read directly, the
 -- others through the table AM or their Motion; here two PAX tables joined
 -- on their distribution key, and one joined with a heap table.
@@ -282,6 +328,6 @@ SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = 
 SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3, df_pd_lt, df_pd_vlt;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -44,7 +44,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `include/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 4;
+pub const VEC_ENGINE_ABI: u32 = 5;
 
 /// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
@@ -294,6 +294,8 @@ pub struct VecQueryArgs {
     pub pax_end: Option<df_core::query::PaxEndFn>,
     pub pax_groups: Option<df_core::query::PaxGroupsFn>,
     pub pax_max_readers: u32,
+    pub pax_late: Option<df_core::query::PaxLateFn>,
+    pub pax_read_rows: Option<df_core::query::PaxRowsFn>,
 }
 
 /// Build the plan `args.ir` describes, its inputs' batches laid out as
@@ -330,7 +332,8 @@ extern "C" fn query_start(
                 (Some(p), Some(read), Some(end), Some(groups)) if !p.scan.is_null() => {
                     df_core::query::Source::Pax(
                         df_core::query::PaxScan::new(p.scan, p.nblocks as usize, read, end, groups)
-                            .with_max_readers(a.pax_max_readers as usize),
+                            .with_max_readers(a.pax_max_readers as usize)
+                            .with_late_reads(a.pax_late, a.pax_read_rows),
                     )
                 }
                 _ if j < 64 && a.ipc_inputs & (1u64 << j) != 0 => df_core::query::Source::Ipc,
@@ -917,6 +920,8 @@ mod tests {
             pax_end: None,
             pax_groups: None,
             pax_max_readers: 0,
+            pax_late: None,
+            pax_read_rows: None,
         };
         let mut out_schema = FFI_ArrowSchema::empty();
         let mut q = std::ptr::null_mut();

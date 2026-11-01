@@ -964,6 +964,8 @@ df_exec_begin(DfExec *x)
 	args.pax_end = reader ? reader->end : NULL;
 	args.pax_groups = reader ? reader->block_groups : NULL;
 	args.pax_max_readers = (uint32_t) df_pax_max_decoders;
+	args.pax_late = reader ? reader->late : NULL;
+	args.pax_read_rows = reader ? reader->read_rows : NULL;
 
 	/* From here on the query owns the PAX scans, even if this fails. */
 	DF_ERROR_INIT(err);

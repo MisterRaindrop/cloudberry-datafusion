@@ -39,7 +39,7 @@ use std::time::Duration;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use datafusion::arrow::array::UInt32Array;
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray, StringArray, StructArray,
+    Array, ArrayRef, AsArray, BooleanArray, Int64Array, PrimitiveArray, StringArray, StructArray,
 };
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::{cast, take};
@@ -1188,6 +1188,32 @@ pub type PaxEndFn = unsafe extern "C" fn(scan: *mut c_void);
 /// left to read, or -1 with a message.
 pub type PaxGroupsFn =
     unsafe extern "C" fn(scan: *mut c_void, index: i32, err: *mut c_char, errlen: usize) -> i32;
+/// LT1: late of the PAX scan interface: leave the columns at positions
+/// `ks` out of read_block, for read_rows.
+pub type PaxLateFn = unsafe extern "C" fn(
+    scan: *mut c_void,
+    ks: *const i32,
+    nks: i32,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32;
+/// LT1: read_rows of the PAX scan interface: the late columns of rows
+/// `rows` (ascending) of group `group` of block `index`, emitted as
+/// read_block emits.
+pub type PaxRowsFn = unsafe extern "C" fn(
+    scan: *mut c_void,
+    index: i32,
+    group: i32,
+    rows: *const u32,
+    nrows: u32,
+    emit: PaxEmitFn,
+    account: PaxAccountFn,
+    ctx: *mut c_void,
+    err: *mut c_char,
+    errlen: usize,
+) -> i32;
+/// LT1: the fetch column of the rows' locators (DATAFUSION_PAX_LOCATOR).
+pub const PAX_LOCATOR: i32 = -1;
 
 /// A PAX scan listed on the main thread.  Partitions take blocks from it
 /// one at a time; it is freed when the last partition is done with it.
@@ -1222,7 +1248,7 @@ pub struct PaxScan {
     /// partitions holding work that may still queue groups or batches
     pending: AtomicUsize,
     /// what the query's PAX scans share
-    shared: Arc<PaxShared>,
+    pub(crate) shared: Arc<PaxShared>,
     /// most groups decoded at once for the query (0: no limit)
     max_readers: usize,
     /// true once the scan has ended (`close`); held shared by a partition
@@ -1230,6 +1256,12 @@ pub struct PaxScan {
     ended: std::sync::RwLock<bool>,
     /// LM1: conditions the reader checks before building the other columns
     prefilter: Option<PaxPrefilter>,
+    /// LT1: the interface's late and read_rows, when the reader has them
+    late_fn: Option<PaxLateFn>,
+    pub(crate) rows_fn: Option<PaxRowsFn>,
+    /// LT1: the columns left to read_rows, ascending; the batches then end
+    /// with the rows' locators instead
+    pub(crate) late: Vec<usize>,
 }
 
 /// LM1: conditions of the filter right above a PAX input on columns cheap
@@ -1530,7 +1562,7 @@ pub struct PaxMemory {
 }
 
 impl PaxMemory {
-    fn add(&self, delta: i64) {
+    pub(crate) fn add(&self, delta: i64) {
         crate::memory::external_add(delta);
         let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
         self.peak.fetch_max(now, Ordering::Relaxed);
@@ -1569,7 +1601,40 @@ impl PaxScan {
             max_readers: 0,
             ended: std::sync::RwLock::new(false),
             prefilter: None,
+            late_fn: None,
+            rows_fn: None,
+            late: Vec::new(),
         }
+    }
+
+    /// LT1: the reader's late and read_rows (both, or neither is used).
+    pub fn with_late_reads(mut self, late: Option<PaxLateFn>, rows: Option<PaxRowsFn>) -> Self {
+        if let (Some(l), Some(r)) = (late, rows) {
+            self.late_fn = Some(l);
+            self.rows_fn = Some(r);
+        }
+        self
+    }
+
+    /// LT1: leave columns `late` (positions, ascending) to read_rows.  On
+    /// the main thread, before any read.
+    fn set_late(&mut self, late: Vec<usize>) -> Result<(), String> {
+        let f = self.late_fn.ok_or("the PAX reader has no late columns")?;
+        let ks: Vec<i32> = late.iter().map(|&k| k as i32).collect();
+        let mut err = vec![0 as c_char; 1024];
+        // SAFETY: see PaxScan; no read has started.
+        if unsafe { f(self.scan, ks.as_ptr(), ks.len() as i32, err.as_mut_ptr(), err.len()) } != 0 {
+            return Err(unsafe { std::ffi::CStr::from_ptr(err.as_ptr()) }
+                .to_string_lossy()
+                .into_owned());
+        }
+        self.late = late;
+        Ok(())
+    }
+
+    /// The raw scan, for read_rows (LT1).
+    pub(crate) fn raw(&self) -> *mut c_void {
+        self.scan
     }
 
     /// End the scan, once, after the calls into it under way; partitions
@@ -1589,7 +1654,7 @@ impl PaxScan {
 
     /// Has the scan ended?  A partition about to call into it holds the
     /// guard meanwhile.
-    fn ended(&self) -> std::sync::RwLockReadGuard<'_, bool> {
+    pub(crate) fn ended(&self) -> std::sync::RwLockReadGuard<'_, bool> {
         self.ended.read().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -1847,12 +1912,29 @@ unsafe extern "C" fn pax_emit(
                 }
             }
         }
-        let arrays = (0..ctx.types.len())
+        // LT1: the late columns are read after the Limit, by the rows'
+        // locators, which end the batch instead
+        let late = &ctx.scan.late;
+        let mut arrays = (0..ctx.types.len())
+            .filter(|i| late.binary_search(i).is_err())
             .map(|i| match built[i].take() {
                 Some(a) => Ok(a),
                 None => column(i, rows.as_deref()),
             })
             .collect::<Result<Vec<ArrayRef>, PgError>>()?;
+        if !late.is_empty() {
+            let mut out = PaxColumn {
+                values: std::ptr::null(),
+                nulls: std::ptr::null(),
+                offsets: std::ptr::null(),
+            };
+            let (ptr, m) = rows.as_deref().map_or((std::ptr::null(), n), |r| (r.as_ptr(), r.len()));
+            if fetch(chunk, PAX_LOCATOR, ptr, m as u32, &mut out) != 0 {
+                return Err(PgError::internal(String::new()));
+            }
+            let locs = std::slice::from_raw_parts(out.values as *const i64, m);
+            arrays.push(Arc::new(Int64Array::from(locs.to_vec())));
+        }
         make_batch(&ctx.schema, arrays, rows.as_ref().map_or(n, Vec::len)).map(Some)
     }));
     match result {
@@ -3031,6 +3113,14 @@ impl Query {
                 (a, b) => a.min(b),
             })
             .map(|n| Arc::new(PaxShared::new(n)));
+        // LT1: a PAX input's columns that only the Limit's rows need
+        // (worth it when the rows kept are few beside the scan's blocks:
+        // each may cost a group decoded again, the scan decodes every one)
+        let late_plan = crate::late::late_columns(&spec).filter(|(j, _)| {
+            matches!(sources.get(*j), Some(Source::Pax(s))
+                if s.late_fn.is_some() && crate::late::late_rows(&spec) * 2 <= s.nblocks as u64)
+        });
+        let mut late_scan: Option<Arc<PaxScan>> = None;
         let mut in_tx = Vec::with_capacity(sources.len());
         let mut ipc_tx = Vec::with_capacity(sources.len());
         let mut decoders = Vec::new();
@@ -3151,12 +3241,26 @@ impl Query {
                         scan.prefilter =
                             pax_prefilter(pred, j, &in_types[j], &schema).map_err(internal)?;
                     }
+                    // LT1: the late columns left out, the rows' locators last
+                    let mut table_schema = schema.clone();
+                    if let Some((_, late)) = late_plan.as_ref().filter(|(lj, _)| *lj == j) {
+                        scan.set_late(late.clone()).map_err(internal)?;
+                        let mut fields: Vec<Field> = (0..schema.fields().len())
+                            .filter(|i| late.binary_search(i).is_err())
+                            .map(|i| schema.field(i).clone())
+                            .collect();
+                        fields.push(Field::new(format!("t{j}_loc"), DataType::Int64, false));
+                        table_schema = Arc::new(Schema::new(fields));
+                    }
                     let scan = Arc::new(scan);
                     pax_scans.push(scan.clone());
+                    if !scan.late.is_empty() {
+                        late_scan = Some(scan.clone());
+                    }
                     let parts: Vec<Arc<dyn PartitionStream>> = (0..partitions)
                         .map(|_| {
                             Arc::new(PaxPartition {
-                                schema: schema.clone(),
+                                schema: table_schema.clone(),
                                 types: in_types[j].clone(),
                                 scan: scan.clone(),
                             }) as Arc<dyn PartitionStream>
@@ -3165,7 +3269,7 @@ impl Query {
                     (
                         None,
                         None,
-                        StreamingTable::try_new(schema.clone(), parts).map_err(df)?,
+                        StreamingTable::try_new(table_schema.clone(), parts).map_err(df)?,
                     )
                 }
             };
@@ -3194,9 +3298,25 @@ impl Query {
         };
         let mut out_types = Vec::with_capacity(outputs.len());
         let mut out_exprs = Vec::with_capacity(outputs.len());
+        // LT1: (output, its late column's position) of the outputs read
+        // after the Limit; their columns are not in the plan below it
+        let mut late_outputs: Vec<(usize, usize)> = Vec::new();
         for (i, o) in outputs.iter().enumerate() {
             let ty = PgType::parse(o.get("type").and_then(Value::as_str).unwrap_or(""))
                 .map_err(internal)?;
+            if let (Some(scan), Some((lj, _))) = (&late_scan, &late_plan) {
+                let k = o
+                    .get("expr")
+                    .filter(|e| e.get("input").map_or(Some(0), Value::as_u64) == Some(*lj as u64))
+                    .and_then(|e| e.get("col"))
+                    .and_then(Value::as_u64);
+                if let Some(p) = k.and_then(|k| scan.late.binary_search(&(k as usize)).ok()) {
+                    late_outputs.push((i, p));
+                    out_exprs.push(col(format!("lt{p}")));
+                    out_types.push(ty);
+                    continue;
+                }
+            }
             let e = expr(field(o, "expr").map_err(internal)?).map_err(internal)?;
             let e = if trim.contains(&i) {
                 if ty != PgType::Bpchar {
@@ -3237,11 +3357,7 @@ impl Query {
         // N6: a numeric output narrowed for its Motion goes as it is, narrow
         // or not; the others as Decimal256 (NaN kept: an Arrow cast would
         // not), which the host reads
-        let out_exprs: Vec<Expr> = out_exprs
-            .into_iter()
-            .zip(&out_types)
-            .enumerate()
-            .map(|(i, (e, ty))| {
+        let finish = |i: usize, e: Expr, ty: &PgType| -> Expr {
                 let e = match ty {
                     PgType::Numeric(_) if narrow.iter().any(|(c, _)| *c == i) => e,
                     PgType::Numeric(scale) => PgNumeric::udf(NumericFn::As {
@@ -3252,9 +3368,37 @@ impl Query {
                     _ => Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), ty.arrow())),
                 };
                 e.alias(format!("o{i}"))
-            })
+        };
+        let is_late = |i: usize| late_outputs.iter().any(|(o, _)| *o == i);
+        // LT1: the outputs over the late columns, above LateFetchExec
+        let late_final: Option<(Arc<PaxScan>, Vec<PgType>, Vec<Expr>)> = late_scan.as_ref().map(|scan| {
+            let lj = late_plan.as_ref().map_or(0, |(j, _)| *j);
+            let types = scan.late.iter().map(|&k| in_types[lj][k]).collect();
+            let exprs = out_exprs
+                .iter()
+                .zip(&out_types)
+                .enumerate()
+                .map(|(i, (e, ty))| {
+                    if !is_late(i) {
+                        return col(format!("o{i}"));
+                    }
+                    let e = if trim.contains(&i) { bpchar_key(e.clone()) } else { e.clone() };
+                    finish(i, e, ty)
+                })
+                .collect();
+            (scan.clone(), types, exprs)
+        });
+        let mut proj: Vec<Expr> = out_exprs
+            .into_iter()
+            .zip(&out_types)
+            .enumerate()
+            .filter(|(i, _)| !is_late(*i))
+            .map(|(i, (e, ty))| finish(i, e, ty))
             .collect();
-        let mut b = b.project(out_exprs).map_err(df)?;
+        if let Some((lj, _)) = late_plan.as_ref().filter(|_| late_scan.is_some()) {
+            proj.push(col(format!("t{lj}_loc")).alias(crate::late::LATE_LOC));
+        }
+        let mut b = b.project(proj).map_err(df)?;
         // S1: the slice's Sort, by output columns, then its Limit.
         if let Some(keys) = spec.get("sort").filter(|v| !v.is_null()) {
             let mut sorts = Vec::new();
@@ -3369,6 +3513,9 @@ impl Query {
                 let mut physical = state.create_physical_plan(&plan).await?;
                 if partial {
                     physical = partial_only(physical)?;
+                }
+                if let Some((scan, types, exprs)) = late_final {
+                    physical = late_outputs_plan(physical, scan, types, exprs)?;
                 }
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(physical.clone());
@@ -3956,6 +4103,37 @@ fn strings_dominate(batch: &RecordBatch) -> bool {
 /// row).  Only with groups, and when each aggregate's partial state is one
 /// column of its result's type, which the result is (count, sum, min, max);
 /// otherwise `plan` as it is.
+/// LT1: LateFetchExec over `plan`, reading `scan`'s late columns (of types
+/// `types`) as lt0, lt1, ..., then the outputs `exprs` over its columns.
+fn late_outputs_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    scan: Arc<PaxScan>,
+    types: Vec<PgType>,
+    exprs: Vec<Expr>,
+) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+    let names = (0..types.len()).map(|p| format!("lt{p}")).collect();
+    let exec: Arc<dyn ExecutionPlan> =
+        Arc::new(crate::late::LateFetchExec::try_new(plan, scan, types, names)?);
+    let dfschema = DFSchema::try_from(exec.schema().as_ref().clone())?;
+    let props = ExecutionProps::new();
+    let exprs = exprs
+        .into_iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let e = match e {
+                Expr::Alias(a) => *a.expr,
+                e => e,
+            };
+            Ok(ProjectionExpr {
+                expr: create_physical_expr(&e, &dfschema, &props, &PhysicalPlanningContext::default())?,
+                alias: format!("o{i}"),
+            })
+        })
+        .collect::<Result<Vec<_>, DataFusionError>>()?;
+    Ok(Arc::new(ProjectionExec::try_new(exprs, exec)?))
+}
+
 fn partial_only(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
     use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
     use datafusion::physical_expr::expressions::Column;
@@ -4429,7 +4607,7 @@ unsafe fn numeric_rows(
 ///
 /// # Safety
 /// As `build_array`'s.
-unsafe fn build_array_rows(
+pub(crate) unsafe fn build_array_rows(
     ty: PgType,
     c: RawColumn,
     n: usize,
@@ -5601,6 +5779,259 @@ mod tests {
         // Every block's groups counted, and each group read alone.
         assert_eq!(fake.group_calls.load(Ordering::SeqCst), 50);
         assert_eq!(fake.single_group_reads.load(Ordering::SeqCst), 100);
+    }
+
+    /// LT1: a fake reader of two int4 columns, k (rows i*10 .. i*10+9 of
+    /// block i, two groups of five, k ending in 3 NULL) and v = k * 100
+    /// (NULL where k ends in 7).  read_block refuses v once it is late;
+    /// read_rows hands out v only, of the rows asked for.
+    #[derive(Default)]
+    struct FakeLate {
+        late: Mutex<Vec<i32>>,
+        rows_calls: AtomicUsize,
+        rows_read: AtomicUsize,
+        ended: AtomicUsize,
+    }
+
+    struct FakeLateChunk {
+        late: bool,
+        block: i32,
+        group: i32,
+        // the group's rows the chunk holds
+        rows: Vec<u32>,
+        vals: Vec<i32>,
+        nulls: Vec<u8>,
+        locs: Vec<i64>,
+    }
+
+    fn fake_k(block: i32, group: i32, r: u32) -> i32 {
+        block * 10 + group * 5 + r as i32
+    }
+
+    unsafe extern "C" fn fake_late_fetch(
+        chunk: *mut c_void,
+        col: i32,
+        rows: *const u32,
+        nrows: u32,
+        out: *mut PaxColumn,
+    ) -> i32 {
+        let ch = &mut *(chunk as *mut FakeLateChunk);
+        let picked: Vec<u32> = if rows.is_null() {
+            (0..ch.rows.len() as u32).collect()
+        } else {
+            std::slice::from_raw_parts(rows, nrows as usize).to_vec()
+        };
+        let rows: Vec<u32> = picked.iter().map(|&p| ch.rows[p as usize]).collect();
+        match col {
+            PAX_LOCATOR if ch.late => {
+                ch.locs = rows
+                    .iter()
+                    .map(|&r| (ch.block as i64) << 40 | (ch.group as i64) << 24 | r as i64)
+                    .collect();
+                ch.nulls = vec![0; rows.len()];
+                *out = PaxColumn {
+                    values: ch.locs.as_ptr() as *const u8,
+                    nulls: ch.nulls.as_ptr(),
+                    offsets: std::ptr::null(),
+                };
+                return 0;
+            }
+            // k from read_block, v from read_rows only once v is late
+            0 if !ch.late || ch.locs.is_empty() => {
+                ch.vals = rows.iter().map(|&r| fake_k(ch.block, ch.group, r)).collect();
+                ch.nulls = ch.vals.iter().map(|k| (k % 10 == 3) as u8).collect();
+            }
+            1 => {
+                ch.vals = rows.iter().map(|&r| fake_k(ch.block, ch.group, r) * 100).collect();
+                ch.nulls = ch.vals.iter().map(|v| (v / 100 % 10 == 7) as u8).collect();
+            }
+            _ => return -1,
+        }
+        *out = PaxColumn {
+            values: ch.vals.as_ptr() as *const u8,
+            nulls: ch.nulls.as_ptr(),
+            offsets: std::ptr::null(),
+        };
+        0
+    }
+
+    unsafe extern "C" fn fake_late_read(
+        scan: *mut c_void,
+        index: i32,
+        first: i32,
+        count: i32,
+        emit: PaxEmitFn,
+        _account: PaxAccountFn,
+        ctx: *mut c_void,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        let fake = &*(scan as *const FakeLate);
+        let late = fake.late.lock().unwrap().clone();
+        let to = if count < 0 { 2 } else { (first + count).min(2) };
+        for g in first..to {
+            let mut chunk = FakeLateChunk {
+                late: !late.is_empty(),
+                block: index,
+                group: g,
+                rows: (0..5).collect(),
+                vals: Vec::new(),
+                nulls: Vec::new(),
+                locs: Vec::new(),
+            };
+            let cols = [PaxColumn {
+                values: std::ptr::null(),
+                nulls: std::ptr::null(),
+                offsets: std::ptr::null(),
+            }; 2];
+            let fetch: PaxFetchFn = if late.is_empty() { fake_late_fetch } else { fake_late_fetch_k };
+            if emit(ctx, 5, cols.as_ptr(), fetch, &mut chunk as *mut FakeLateChunk as *mut c_void) != 0 {
+                return -1;
+            }
+        }
+        0
+    }
+
+    /// read_block's fetch once v is late: k and the locators only.
+    unsafe extern "C" fn fake_late_fetch_k(
+        chunk: *mut c_void,
+        col: i32,
+        rows: *const u32,
+        nrows: u32,
+        out: *mut PaxColumn,
+    ) -> i32 {
+        if col == 1 {
+            return -1;
+        }
+        fake_late_fetch(chunk, col, rows, nrows, out)
+    }
+
+    unsafe extern "C" fn fake_late_set(
+        scan: *mut c_void,
+        ks: *const i32,
+        nks: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        let fake = &*(scan as *const FakeLate);
+        *fake.late.lock().unwrap() = std::slice::from_raw_parts(ks, nks as usize).to_vec();
+        0
+    }
+
+    unsafe extern "C" fn fake_late_rows(
+        scan: *mut c_void,
+        index: i32,
+        group: i32,
+        rows: *const u32,
+        nrows: u32,
+        emit: PaxEmitFn,
+        _account: PaxAccountFn,
+        ctx: *mut c_void,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        let fake = &*(scan as *const FakeLate);
+        fake.rows_calls.fetch_add(1, Ordering::SeqCst);
+        fake.rows_read.fetch_add(nrows as usize, Ordering::SeqCst);
+        let rows = std::slice::from_raw_parts(rows, nrows as usize).to_vec();
+        assert!(rows.windows(2).all(|w| w[0] < w[1]), "rows not ascending");
+        let mut chunk = FakeLateChunk {
+            late: true,
+            block: index,
+            group,
+            rows,
+            vals: Vec::new(),
+            nulls: Vec::new(),
+            // non-empty: k is not to be had here
+            locs: vec![0],
+        };
+        let cols = [PaxColumn {
+            values: std::ptr::null(),
+            nulls: std::ptr::null(),
+            offsets: std::ptr::null(),
+        }; 2];
+        emit(ctx, nrows, cols.as_ptr(), fake_late_fetch, &mut chunk as *mut FakeLateChunk as *mut c_void)
+    }
+
+    unsafe extern "C" fn fake_late_groups(
+        _scan: *mut c_void,
+        _index: i32,
+        _err: *mut c_char,
+        _errlen: usize,
+    ) -> i32 {
+        2
+    }
+
+    unsafe extern "C" fn fake_late_end(scan: *mut c_void) {
+        let fake = &*(scan as *const FakeLate);
+        fake.ended.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The rows (k, v) of `spec` over a FakeLate of `nblocks` blocks.
+    fn run_fake_late(fake: &FakeLate, nblocks: usize, spec: &str) -> Vec<(Option<i32>, Option<i32>)> {
+        runtime::init(2).unwrap();
+        let ptr = fake as *const FakeLate as *mut c_void;
+        let scan = PaxScan::new(ptr, nblocks, fake_late_read, fake_late_end, fake_late_groups)
+            .with_late_reads(Some(fake_late_set), Some(fake_late_rows));
+        let dir = std::env::temp_dir();
+        let mut q =
+            Query::start_with(spec, 4, 64 << 20, dir.to_str().unwrap(), Source::Pax(scan), false)
+                .unwrap();
+        let mut out = Vec::new();
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(n) => {
+                    let c: Vec<RawColumn> = (0..2).map(|c| q.output_column(c).unwrap()).collect();
+                    for r in 0..n {
+                        let get = |c: &RawColumn| unsafe {
+                            (*c.nulls.add(r) == 0).then(|| *(c.values as *const i32).add(r))
+                        };
+                        out.push((get(&c[0]), get(&c[1])));
+                    }
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
+            }
+        }
+        drop(q);
+        assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
+        out
+    }
+
+    const LATE_SPEC: &str = r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"},{"type":"int4"}]}],
+        "plan":{"input":0},
+        "output":[{"expr":{"col":0},"type":"int4"},{"expr":{"col":1},"type":"int4"}],
+        "sort":[{"col":0,"desc":true,"nulls_first":false}],
+        "limit":{"skip":1,"fetch":LIMIT}}"#;
+
+    /// LT1: v, which only the outputs read, is left out of the scan and
+    /// read for the rows the Limit keeps, NULLs included, by group.
+    #[test]
+    fn late_columns_read_after_the_limit() {
+        let fake = FakeLate::default();
+        let rows = run_fake_late(&fake, 50, &LATE_SPEC.replace("LIMIT", "4"));
+        // k 499 .. 0 descending (k ending in 3 NULL, last), skip 1
+        assert_eq!(
+            rows,
+            vec![(Some(498), Some(49800)), (Some(497), None), (Some(496), Some(49600)), (Some(495), Some(49500))]
+        );
+        assert_eq!(*fake.late.lock().unwrap(), vec![1]);
+        // each partition's Limit keeps at most 5 rows, whose v is read
+        assert!(fake.rows_read.load(Ordering::SeqCst) <= 4 * 5, "{:?}", fake.rows_read);
+        assert!(fake.rows_calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// LT1: not for a Limit of many rows beside the scan's blocks.
+    #[test]
+    fn late_columns_need_few_rows() {
+        let fake = FakeLate::default();
+        let rows = run_fake_late(&fake, 4, &LATE_SPEC.replace("LIMIT", "3"));
+        assert_eq!(rows, vec![(Some(38), Some(3800)), (Some(37), None), (Some(36), Some(3600))]);
+        assert!(fake.late.lock().unwrap().is_empty());
+        assert_eq!(fake.rows_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

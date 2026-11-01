@@ -20,6 +20,7 @@
 
 pub mod cdbhash;
 pub mod debug;
+pub mod late;
 pub mod memory;
 pub mod numwidth;
 pub mod pgcast;

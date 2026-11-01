@@ -57,7 +57,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	4
+#define VEC_ENGINE_ABI	5
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -170,6 +170,19 @@ typedef int (*VecPaxRead) (void *scan, int index, int first, int count,
 typedef void (*VecPaxEnd) (void *scan);
 typedef int (*VecPaxGroups) (void *scan, int index, char *err, size_t errlen);
 
+/*
+ * LT1: columns left out of pax_read, read by pax_read_rows for the rows
+ * whose locators fetch gives (col VEC_PAX_LOCATOR); see the patch's late and
+ * read_rows.
+ */
+#define VEC_PAX_LOCATOR (-1)
+typedef int (*VecPaxLate) (void *scan, const int *ks, int nks, char *err,
+						   size_t errlen);
+typedef int (*VecPaxReadRows) (void *scan, int index, int group,
+							   const uint32_t *rows, uint32_t nrows,
+							   VecPaxEmit emit, VecPaxAccount account,
+							   void *ctx, char *err, size_t errlen);
+
 /* An input read directly from PAX: its scan and blocks, or a NULL scan. */
 typedef struct VecPaxInput
 {
@@ -201,6 +214,9 @@ typedef struct VecQueryArgs
 	VecPaxEnd	pax_end;
 	VecPaxGroups pax_groups;
 	uint32_t	pax_max_readers;
+	/* NULL, or what reads a PAX input's columns after a Limit (LT1) */
+	VecPaxLate	pax_late;
+	VecPaxReadRows pax_read_rows;
 } VecQueryArgs;
 
 /* Memory and spill figures of a query, for EXPLAIN ANALYZE. */
