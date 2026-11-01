@@ -1694,6 +1694,150 @@ SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
 (6 rows)
 
 DROP TABLE df_lc;
+-- regexp_replace (RX1) of constant patterns ending in $ without
+-- alternation, non-greedy quantifiers or escapes of letters, capturing
+-- groups only at the top level: matched as PostgreSQL matches, each part
+-- before, inside and after a group ending as late as the rest allows
+-- ('^a?(?:ab)?(.*)$' leaves nothing for the group in 'ab').
+CREATE TABLE df_rx (id int4, s text) DISTRIBUTED BY (id);
+INSERT INTO df_rx VALUES (1, 'ab'), (2, 'xab'), (3, 'abab'), (4, 'aaa'),
+  (5, 'http://www.example.com/path?q=1'), (6, 'https://www./'), (7, 'ftp://a.b/c'),
+  (8, 'http://a.b'), (9, E'http://wwwa.ру/п\n/x'), (10, ''), (11, NULL), (12, '😀a😀/');
+ANALYZE df_rx;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '^a?(?:ab)?(.*)$', '\1') = '';
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, '^a?(?:ab)?(.*)$'::text, '\1'::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible, sends Arrow batches
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a|b$', '') = '';
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, 'a|b$'::text, ''::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace() alternation
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a+?$', '') = '';
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, 'a+?$'::text, ''::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace() a non-greedy quantifier
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '(a)+$', '') = '';
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, '(a)+$'::text, ''::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace() a quantified capturing group
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '\w$', '') = '';
+                                           QUERY PLAN                                            
+-------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, '\w$'::text, ''::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace() an escape other than of punctuation
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a', '') = '';
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, 'a'::text, ''::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace() a regular expression not ending in $
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a$', '', 'g') = '';
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Seq Scan on df_rx
+               Filter: (regexp_replace(s, 'a$'::text, ''::text, 'g'::text) = ''::text)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 not eligible: function regexp_replace()
+(7 rows)
+
+SET datafusion.mode = off;
+SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
+  regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
+  regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
+  regexp_replace(s, '(.)(/?)$', '<\&|\2|\1|\3|\\|\x|\') AS c,
+  regexp_replace(s, '[^a-c/]{1,2}([a😀]*)/?$', '{\1}') AS d
+FROM df_rx GROUP BY id, s ORDER BY id;
+ id |                 a                 |                 b                  |    host     |                      c                      |                d                
+----+-----------------------------------+------------------------------------+-------------+---------------------------------------------+---------------------------------
+  1 | []                                | [|]                                | ab          | a<b||b||\|\x|\                              | ab
+  2 | [xab]                             | [|xab]                             | xab         | xa<b||b||\|\x|\                             | xab
+  3 | [ab]                              | [a|b]                              | abab        | aba<b||b||\|\x|\                            | abab
+  4 | [aa]                              | [a|aa]                             | aaa         | aa<a||a||\|\x|\                             | aaa
+  5 | [http://www.example.com/path?q=1] | [|http://www.example.com/path?q=1] | example.com | http://www.example.com/path?q=<1||1||\|\x|\ | http://www.example.com/path?q{}
+  6 | [https://www./]                   | [|https://www./]                   | www.        | https://www<./|/|.||\|\x|\                  | https://ww{}
+  7 | [ftp://a.b/c]                     | [|ftp://a.b/c]                     | ftp://a.b/c | ftp://a.b/<c||c||\|\x|\                     | ftp://a.b/c
+  8 | [http://a.b]                      | [|http://a.b]                      | http://a.b  | http://a.<b||b||\|\x|\                      | http://a.b
+  9 | [http://wwwa.ру/п                +| [|http://wwwa.ру/п                +| wwwa.ру     | http://wwwa.ру/п                           +| http://wwwa.ру/п               +
+    | /x]                               | /x]                                |             | /<x||x||\|\x|\                              | /{}
+ 10 | []                                | [|]                                |             |                                             | 
+ 11 |                                   |                                    |             |                                             | 
+ 12 | [😀a😀/]                          | [|😀a😀/]                          | 😀a😀/      | 😀a<😀/|/|😀||\|\x|\                        | {a😀}
+(12 rows)
+
+SET datafusion.mode = on;
+SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
+  regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
+  regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
+  regexp_replace(s, '(.)(/?)$', '<\&|\2|\1|\3|\\|\x|\') AS c,
+  regexp_replace(s, '[^a-c/]{1,2}([a😀]*)/?$', '{\1}') AS d
+FROM df_rx GROUP BY id, s ORDER BY id;
+ id |                 a                 |                 b                  |    host     |                      c                      |                d                
+----+-----------------------------------+------------------------------------+-------------+---------------------------------------------+---------------------------------
+  1 | []                                | [|]                                | ab          | a<b||b||\|\x|\                              | ab
+  2 | [xab]                             | [|xab]                             | xab         | xa<b||b||\|\x|\                             | xab
+  3 | [ab]                              | [a|b]                              | abab        | aba<b||b||\|\x|\                            | abab
+  4 | [aa]                              | [a|aa]                             | aaa         | aa<a||a||\|\x|\                             | aaa
+  5 | [http://www.example.com/path?q=1] | [|http://www.example.com/path?q=1] | example.com | http://www.example.com/path?q=<1||1||\|\x|\ | http://www.example.com/path?q{}
+  6 | [https://www./]                   | [|https://www./]                   | www.        | https://www<./|/|.||\|\x|\                  | https://ww{}
+  7 | [ftp://a.b/c]                     | [|ftp://a.b/c]                     | ftp://a.b/c | ftp://a.b/<c||c||\|\x|\                     | ftp://a.b/c
+  8 | [http://a.b]                      | [|http://a.b]                      | http://a.b  | http://a.<b||b||\|\x|\                      | http://a.b
+  9 | [http://wwwa.ру/п                +| [|http://wwwa.ру/п                +| wwwa.ру     | http://wwwa.ру/п                           +| http://wwwa.ру/п               +
+    | /x]                               | /x]                                |             | /<x||x||\|\x|\                              | /{}
+ 10 | []                                | [|]                                |             |                                             | 
+ 11 |                                   |                                    |             |                                             | 
+ 12 | [😀a😀/]                          | [|😀a😀/]                          | 😀a😀/      | 😀a<😀/|/|😀||\|\x|\                        | {a😀}
+(12 rows)
+
+DROP TABLE df_rx;
 DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

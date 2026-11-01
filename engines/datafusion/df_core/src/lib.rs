@@ -28,6 +28,7 @@ pub mod pgdate;
 pub mod pgfloat;
 pub mod pgfunc;
 pub mod pgnum;
+pub mod pgregex;
 pub mod pgset;
 pub mod pgstr;
 pub mod query;

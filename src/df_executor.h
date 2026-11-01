@@ -409,6 +409,17 @@ extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **
 /* df_hooks.c */
 extern void df_install_hooks(void);
 
+/* df_regex.c: RX1, the regular expressions of regexp_replace DataFusion runs */
+typedef struct DfRegexSeg
+{
+	StringInfoData re;			/* in PostgreSQL's syntax, of the subset taken */
+	bool		capture;		/* the contents of a capturing group */
+} DfRegexSeg;
+
+extern List *df_regex_segments(const char *pattern, const char **problem);
+extern const char *df_regexp_replace_problem(FuncExpr *fe, List **segments,
+											  char **replacement);
+
 /* df_rewrite.c: SQ1, filters of correlated aggregate subqueries */
 extern bool df_subquery_key_filter;	/* GUC datafusion.subquery_key_filter */
 extern void df_install_planner_hook(void);

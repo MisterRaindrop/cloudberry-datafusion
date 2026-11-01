@@ -329,6 +329,17 @@ String functions with PostgreSQL's results and errors: `char_length`,
 `upper_locale` (by the backend's LC_CTYPE case maps, which the host passes
 to the engine).
 
+```text
+{"regexp_replace": <expr>, "segments": [{"re": r, "capture": bool}, ...], "replacement": t}
+```
+
+`regexp_replace(<expr>, pattern, t)` of a pattern the host cut into
+segments at its top-level capturing groups (`capture`: the contents of
+one), in PostgreSQL's syntax, of the subset `src/df_regex.c` takes: the
+match is the leftmost, it ends at the end of the value, and each segment
+in turn ends as late as the rest allows.  `t` is the replacement as
+PostgreSQL reads it (`\1` to `\9`, `\&`, `\\`).
+
 ### PostgreSQL numeric and date functions
 
 | Expression | PostgreSQL | Notes |
@@ -422,6 +433,7 @@ member agg lit value null per_set
 member op args and or not isnull isnotnull inlist values negated
 member case when then else
 member cast pgcast from precision floatkey bpkey bpchar call
+member regexp_replace re capture replacement
 member extract field dateadd sign numabs numround rescale by
 member numdiv numdiv_scale scales greatest numcmp div scale
 member avg_numeric avg_numeric_scale stddev_numeric stddev_numeric_scale sample variance

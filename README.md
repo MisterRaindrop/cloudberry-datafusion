@@ -647,6 +647,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | X2 | Redistribute batches by `text` and `varchar` keys (`hashtext`) |
 | L1 | `LIKE` and `NOT LIKE` |
 | L2 | Common string functions and `\|\|` |
+| RX1 | `regexp_replace(text, text, text)` of constant expressions ending in `$`, split as PostgreSQL splits them |
 | N1 | numeric results of `sum(int8)` and `avg` of integers |
 | N2 | `numeric(p, s)` columns with p <= 38 |
 | N3 | numeric `+`, `-`, `*`; Decimal256 |
@@ -1102,6 +1103,28 @@ DataFusion off and on: identical.  Over 20 million rows,
 `upper(city COLLATE "C") || '/' || btrim(cust, 'c') = ...` took 0.27 s
 against 1.00 s in PostgreSQL, grouping by `split_part(city, '-', 2)` 0.25 s
 against 1.02 s.
+
+RX1: `regexp_replace(s, pattern, replacement)` with a constant pattern and
+replacement, under a deterministic collation, runs in DataFusion when the
+pattern is one whose match the engine reads as PostgreSQL does
+(`src/df_regex.c` says which): it ends in `$`, has no alternation, no
+non-greedy quantifiers and no escapes of letters (`\d`, `\w`, ...), and its
+capturing groups are at the top level, neither quantified nor nested.
+PostgreSQL's ARE engine takes the leftmost match, and splits it among the
+parts of the expression cut at its capturing groups so that each part in
+turn ends as late as the rest allows; Rust's regex crate prefers the first
+alternative of each choice instead (`regexp_replace('ab',
+'^a?(?:ab)?(.*)$', '\1')` is `''` in PostgreSQL and would be `'b'`), so
+`df_core::pgregex` finds PostgreSQL's split with lazy DFAs of the parts: a
+reverse search anchored at the end lists where the rest can start, a
+forward one where the part can end, and the part ends at the last position
+in both.  The replacement reads `\1` to `\9`, `\&` and `\\` as
+`appendStringInfoRegexpSubstr` does.  A fuzz test of 1,300 random patterns
+of that subset over 3,000 strings of `a b w / . : é` and newlines gave
+PostgreSQL's results for all; taking the first split point instead of the
+last gave 21 differences in 300.  ClickBench's Q29 (`REGEXP_REPLACE(Referer,
+'^https?://(?:www\.)?([^/]+)/.*$', '\1')` grouped) stayed on PostgreSQL
+before: over 6 million URLs it took 0.34 s against 4.3 s.
 
 CM1: under the default collation of a libc provider in a UTF-8 database
 other than C (C.UTF-8, en_US.UTF-8), PostgreSQL maps each character with

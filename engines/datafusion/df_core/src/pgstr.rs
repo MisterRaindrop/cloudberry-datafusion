@@ -43,7 +43,7 @@ fn pg_error(sqlstate: &'static str, message: &str) -> DataFusionError {
 }
 
 /// `a` as a Utf8 array (DataFusion may hand over another string layout).
-fn utf8(a: &ArrayRef) -> Result<ArrayRef> {
+pub(crate) fn utf8(a: &ArrayRef) -> Result<ArrayRef> {
     if a.data_type() == &DataType::Utf8 {
         Ok(a.clone())
     } else {

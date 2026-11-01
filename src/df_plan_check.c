@@ -3376,6 +3376,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				}
 				if (df_bpchar_func(fe->funcid) != NULL)
 					break;		/* B1: character to text, lengths */
+				if (fe->funcid == F_REGEXP_REPLACE_TEXT_TEXT_TEXT)
+				{
+					/* RX1: of a constant expression of the subset df_regex.c takes */
+					List	   *segments;
+					char	   *replacement;
+
+					if ((problem = df_regexp_replace_problem(fe, &segments, &replacement)) != NULL)
+					{
+						df_reject(cxt, "function regexp_replace() %s", problem);
+						return true;
+					}
+					df_check_expr(linitial(fe->args), cxt);
+					return cxt->failed;
+				}
 				if (f == NULL || fe->funcretset || fe->funcvariadic)
 				{
 					df_reject(cxt, "function %s()", name ? name : "?");

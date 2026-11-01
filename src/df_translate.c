@@ -2123,6 +2123,34 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					return;
 				}
 
+				if (fe->funcid == F_REGEXP_REPLACE_TEXT_TEXT_TEXT)
+				{
+					/* RX1: df_core::pgregex, by the segments of the expression */
+					List	   *segments;
+					char	   *replacement;
+					ListCell   *lc;
+
+					if (df_regexp_replace_problem(fe, &segments, &replacement) != NULL)
+					{
+						df_fail(b, "a regular expression");
+						return;
+					}
+					appendStringInfoString(out, "{\"regexp_replace\":");
+					df_emit(b, out, linitial(fe->args), level);
+					appendStringInfoString(out, ",\"segments\":[");
+					foreach(lc, segments)
+					{
+						DfRegexSeg *seg = lfirst(lc);
+
+						appendStringInfo(out, "%s{\"re\":", foreach_current_index(lc) > 0 ? "," : "");
+						df_emit_json_string(out, seg->re.data, seg->re.len);
+						appendStringInfo(out, ",\"capture\":%s}", seg->capture ? "true" : "false");
+					}
+					appendStringInfoString(out, "],\"replacement\":");
+					df_emit_json_string(out, replacement, strlen(replacement));
+					appendStringInfoChar(out, '}');
+					return;
+				}
 				if (f == NULL || tag == NULL)
 				{
 					df_fail(b, "a function call");

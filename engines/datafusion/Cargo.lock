@@ -1015,6 +1015,7 @@ dependencies = [
  "libc",
  "memchr",
  "num-bigint",
+ "regex-automata",
  "serde_json",
  "tokio",
 ]

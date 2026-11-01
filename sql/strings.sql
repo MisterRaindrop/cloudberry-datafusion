@@ -355,6 +355,40 @@ SET datafusion.mode = on;
 SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
 DROP TABLE df_lc;
 
+-- regexp_replace (RX1) of constant patterns ending in $ without
+-- alternation, non-greedy quantifiers or escapes of letters, capturing
+-- groups only at the top level: matched as PostgreSQL matches, each part
+-- before, inside and after a group ending as late as the rest allows
+-- ('^a?(?:ab)?(.*)$' leaves nothing for the group in 'ab').
+CREATE TABLE df_rx (id int4, s text) DISTRIBUTED BY (id);
+INSERT INTO df_rx VALUES (1, 'ab'), (2, 'xab'), (3, 'abab'), (4, 'aaa'),
+  (5, 'http://www.example.com/path?q=1'), (6, 'https://www./'), (7, 'ftp://a.b/c'),
+  (8, 'http://a.b'), (9, E'http://wwwa.ру/п\n/x'), (10, ''), (11, NULL), (12, '😀a😀/');
+ANALYZE df_rx;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '^a?(?:ab)?(.*)$', '\1') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a|b$', '') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a+?$', '') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '(a)+$', '') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '\w$', '') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a', '') = '';
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a$', '', 'g') = '';
+SET datafusion.mode = off;
+SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
+  regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
+  regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
+  regexp_replace(s, '(.)(/?)$', '<\&|\2|\1|\3|\\|\x|\') AS c,
+  regexp_replace(s, '[^a-c/]{1,2}([a😀]*)/?$', '{\1}') AS d
+FROM df_rx GROUP BY id, s ORDER BY id;
+SET datafusion.mode = on;
+SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
+  regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
+  regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
+  regexp_replace(s, '(.)(/?)$', '<\&|\2|\1|\3|\\|\x|\') AS c,
+  regexp_replace(s, '[^a-c/]{1,2}([a😀]*)/?$', '{\1}') AS d
+FROM df_rx GROUP BY id, s ORDER BY id;
+DROP TABLE df_rx;
+
 DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;

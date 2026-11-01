@@ -626,6 +626,27 @@ fn expr(v: &Value) -> Result<Expr, String> {
         let args = args.iter().map(expr).collect::<Result<Vec<_>, _>>()?;
         return Ok(PgStrFn::udf(f).call(args));
     }
+    if let Some(e) = v.get("regexp_replace") {
+        // RX1: of a constant expression's segments (pgregex)
+        let segments = field(v, "segments")?
+            .as_array()
+            .ok_or("plan spec: bad segments")?
+            .iter()
+            .map(|s| {
+                Ok(crate::pgregex::Segment {
+                    re: field(s, "re")?.as_str().ok_or("plan spec: bad re")?.to_string(),
+                    capture: field(s, "capture")?.as_bool().ok_or("plan spec: bad capture")?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let replacement = field(v, "replacement")?
+            .as_str()
+            .ok_or("plan spec: bad replacement")?
+            .to_string();
+        let udf = crate::pgregex::PgRegexpReplace::udf(segments, replacement)
+            .map_err(|e| e.to_string())?;
+        return Ok(udf.call(vec![expr(e)?]));
+    }
     if let Some(e) = v.get("extract") {
         let f = field(v, "field")?
             .as_str()

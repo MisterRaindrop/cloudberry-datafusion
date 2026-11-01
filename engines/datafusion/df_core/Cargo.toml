@@ -33,6 +33,8 @@ futures.workspace = true
 num-bigint = "0.5"
 # LM2's LIKE on the PAX reader's bytes, not yet checked to be UTF-8
 memchr = "2"
+# RX1: PostgreSQL's split of a regular expression's match (pgregex)
+regex-automata = "0.4"
 
 [dev-dependencies]
 # SpillFile::read_stream's chunks (tests/repartition_spill.rs)
