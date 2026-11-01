@@ -1198,6 +1198,53 @@ df_share_producer(ShareInputScan *consumer)
 	return find.producer;
 }
 
+typedef struct DfConsumerFind
+{
+	plan_tree_base_prefix base; /* for plan_tree_walker */
+	Plan	   *top;
+	Plan	   *consumer;
+} DfConsumerFind;
+
+static bool
+df_consumer_walker(Node *node, void *context)
+{
+	DfConsumerFind *find = (DfConsumerFind *) context;
+
+	if (node == NULL || find->consumer != NULL)
+		return find->consumer != NULL;
+	if (IsA(node, Agg))
+	{
+		Plan	   *below = outerPlan(node);
+
+		if (below != NULL && IsA(below, Sort))
+			below = outerPlan(below);
+		if (below != NULL && IsA(below, Motion) && outerPlan(below) == find->top)
+		{
+			find->consumer = (Plan *) node;
+			return true;
+		}
+	}
+	return plan_tree_walker(node, df_consumer_walker, context, true);
+}
+
+/*
+ * AP2: the Agg that reads the rows the slice under 'top' sends, through its
+ * Motion (and a Sort), or NULL.
+ */
+Agg *
+df_motion_consumer_agg(Plan *top)
+{
+	DfConsumerFind find;
+
+	if (df_numeric_stmt == NULL)
+		return NULL;
+	exec_init_plan_tree_base(&find.base, df_numeric_stmt);
+	find.top = top;
+	find.consumer = NULL;
+	(void) df_consumer_walker((Node *) df_numeric_stmt->planTree, &find);
+	return (Agg *) find.consumer;
+}
+
 /*
  * Precision and scale of output column 'attno' of the inputs 'plans' of an
  * Append: all of one scale, the widest precision.  Inputs of different

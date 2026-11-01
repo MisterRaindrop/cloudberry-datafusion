@@ -261,11 +261,23 @@ planners, 44 runs) DataFusion took 11.6 s reading PAX directly against
 
 It reads fixed-width columns, strings (text, varchar, char(n)) and
 numeric(p, s) columns (C2); a scan of ctid goes through the table AM.
-Numerics come out in PostgreSQL's representation and are read by
+A numeric(p, s) column of p <= 38 comes out as 16-byte integers at s
+(SC2, N6, scan interface version 7): the reader converts PostgreSQL's
+representation and the vectorized format's 16-byte numerics itself, and
+the values go into Decimal128 arrays with one copy.  The conversion
+accumulates a value's first four base-10000 digits in 64 bits, and scales
+it in 64 bits within 18 digits: a 128-bit multiply per digit was most of
+it (TPC-H at scale factor 10, the numeric-heavy queries, 5-7% less time).  Other numerics come
+out in PostgreSQL's representation and are read by
 df_core::pgnum::from_pg_numeric, as df_numeric.c reads them on the main
 thread (within 38 digits in i128, without allocating); the vectorized
 format's 16-byte numerics are rebuilt in that representation by the
 reader, since PAX's own conversion calls PostgreSQL's numeric functions.
+The reader copies a chunk's strings out column by column; its
+fixed-width columns, numerics read at a scale among them, it converts
+when DataFusion fetches them (LM3, below): a fixed-width column without
+nulls, of a group without deleted rows, is then handed out where PAX
+decoded it, without a copy.
 On one segment of TPC-H at scale factor 1, summing four numeric(15,2)
 columns of lineitem takes 43 ms against 154 ms through the table AM.  DataFusion's
 partitions take micro-partitions one at a time; a partition taking one
@@ -309,6 +321,37 @@ with literals of their own type (and AND, OR, NOT and IS NULL of those),
 which cannot fail, are evaluated on each decoded piece first; the other
 columns are built for the rows that pass only, a numeric converted for
 those rows alone.  The filter still checks all its conditions on them.
+
+LM2 adds two kinds.  A narrow numeric column (N6: 16 bytes a value, no
+conversion) compared with a constant is cheap too, evaluated after the
+integers and dates, on the rows they leave.  And then conditions on a
+string column are checked on the reader's bytes, before the column is
+built at all: `=` and `<>` of a constant, `IN` and `NOT IN` constants, of
+text (byte equality, as PostgreSQL's for a deterministic collation) or of
+character without trailing blanks, and `LIKE` and `NOT LIKE` of text by a
+pattern of literal pieces and `%` only (`pgstr::like_pieces`; byte search
+finds what PostgreSQL's character matching does, the pieces being whole
+UTF-8 characters); a NULL fails the row.  Building a string column copies
+every value and checks it is UTF-8; a string column is now built for the
+rows left only.  A string condition that keeps more than 90% of the first
+100,000 rows it sees is dropped for the rest of the scan, since the filter
+above checks it anyway: Q13's `o_comment NOT LIKE '%special%requests%'`
+keeps 99%, and checking it twice made Q13 9% slower.  TPC-H Q19's lineitem scan keeps 7%
+of its rows by `l_shipmode IN (...)`, `l_shipinstruct = ...` and
+`l_quantity` ranges; Q12's dates go first, keeping fewer rows than its
+`l_shipmode` at less cost.  At scale factor 10 on the dev box Q19 took
+24% less time, Q12 21% less.
+
+Since SC2 the reader converted every row's numerics itself, before any
+condition was checked, so LM1 and LM2 saved building Arrow arrays but not
+the conversions.  LM3 (scan interface version 8, engine ABI 4) hands a
+chunk out with its strings only; DataFusion fetches each fixed-width
+column, for the rows its conditions have left by then, and the reader
+converts and copies those rows alone.  Q6's lineitem scan keeps about 2%
+of its rows after `l_shipdate`, `l_discount` and `l_quantity`: its
+`l_extendedprice` was converted for every row.  At scale factor 10 on the
+dev box Q6 took 44% less time, Q7 28%, Q3 38% and Q14 26% (fastest of
+three runs each); TPC-H's queries touched, both planners, a third less.
 
 The query ends its scans on the main thread as it is released, once any
 partition's call into a scan has returned; partitions then find nothing
@@ -654,9 +697,13 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
 | LM1 | Direct PAX reader: conditions on integer and date columns first, other columns built for the rows that pass |
+| LM2 | Direct PAX reader: then narrow numerics, then strings compared on the reader's bytes; strings built for the rows left |
+| N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |
+| LM3 | Direct PAX reader: fixed-width columns converted when fetched, for the rows the cheap conditions leave (scan interface 8, engine ABI 4) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
+| AJ1 | A hash join whose probe side (joined or aggregated, PAX only) ends within 128 K rows hashes it instead |
 | CL1 | Strings ordered by the default collation where it is C on every node |
 | IP2 | The slices below an init plan's top slice, with batch Motions between them |
 | IP3 | A numeric init plan value anywhere in an expression, of its init plan's digits and scale |
@@ -720,6 +767,26 @@ included: 11.5 s at scale factor 1 (bounded 12.9, trusted 10.8), 83.8 s at
 scale factor 10 (bounded 109, trusted 77 with Q9 failing), against 223 s
 on PostgreSQL in the same run.  Under `work_mem` of 512 kB to 2 MB, eleven
 joins spilling on one segment matched PostgreSQL.
+
+AJ1: a small probe side becomes the hash table.  The planner's estimate
+of a join or aggregation can be far off, and a hash join then hashes its
+larger side: TPC-H Q18's `o_orderkey IN (... GROUP BY l_orderkey HAVING
+sum(l_quantity) > 300)` is estimated at a third of the orders (the default
+selectivity of an inequality) against a few thousand, and on three
+segments at scale factor 100 PostgreSQL hashed orders joined with customer,
+50 million rows a segment, to probe them with the lineitem rows of those
+few thousand orders; on six segments it chose the other way round, and Q18
+took 18 s there against 31 s.  Where the probe side joins or aggregates
+and reads only PAX scans of its own (no input the main thread feeds,
+which it feeds in order, build side first; no set or scalar subquery
+waiting for another input), a partition reads up to 128 K probe rows (32
+MB) first.  A probe side that ends within them, unless the build side
+ends within as many rows, is hashed instead, by DataFusion's own swap of
+the join's inputs (join type, filter and column order swapped back), and
+the build side streams past it.  A probe side that is a scan is not read
+ahead: a table's estimate is seldom far off, and decoding a large table's
+first groups early, to be held while the build side is read, made Q18 at
+scale factor 10 (where the planner chose well) 15% slower.
 
 NJ1: `x NOT IN (SELECT k ...)` is Cloudberry's Hash Left Anti Semi
 (Not-In) Join.  PostgreSQL's executor returns no row once the inner side
@@ -1219,6 +1286,31 @@ columns too (C2).  Over 20 million rows of `numeric(15,2)` columns,
 a query shaped like TPC-H Q1 (`sum(price * (1 - disc) * (1 + disc))` and
 six more aggregates grouped by a flag) took 0.55 s with batch Motions
 against 2.31 s in PostgreSQL.
+
+N6: Decimal256 makes every value 32 bytes, and in TPC-H Q1 at scale factor
+100 on 20 threads the reads and writes of them, not the arithmetic, were
+what numeric cost: gathering a column's values for the rows a filter
+kept, adding them into the groups' sums and `+ - *` (i64 arithmetic did
+not help, N4).  So the engine keeps each value's digits in its type:
+a `numeric(p, s)` column of p <= 38 is `Decimal128(p, s)`, 16 bytes a
+value, read so by the direct PAX reader and pushed so by the host
+(`digits` of an input, docs/ir.md), as is a numeric a batch Motion
+narrows (NW1, now not widened back); a constant has its own digits;
+`+ - *`, `sum`, `abs` and rescaling give Decimal128 while their digits
+stay within 38 (`numeric(15,2)`'s `price * (1 - disc)` has 31, its sum
+50: Decimal256), and arithmetic on such values checks for overflow
+wherever the values do not all fit an i64.  NaN and the infinities are
+`i128::MAX`, `MAX - 1` and `MIN`, as on a batch Motion.  Where DataFusion
+pairs values up itself (a comparison, BETWEEN, IN, the branches of CASE,
+COALESCE, a join's keys, a UNION's columns), its type coercion would cast
+one type to the other with Arrow's casts, which do not keep those
+sentinels: an analyzer rule ahead of it (`numwidth.rs`) gives them one
+type with `pg_numeric_as`, Decimal256 if any is, else Decimal128 of the
+most digits, converting constants in place.  Outputs go to the host as
+Decimal256, except those a batch Motion narrows.  On TPC-H at scale factor
+100 (win-dev, 20 threads, 3 primaries), N6 with LM2 (below) took 24% less
+time under the Postgres planner (319 s to 243 s, builds alternating) and
+22% less under GPORCA: Q1 40% less, Q19 44%, Q10 33%, Q5 31%, Q9 29%.
 
 RL1: a coercion to `numeric(p, s)` of a value of scale s and at most p
 digits does not change it, so numeric_support makes it a relabeling
@@ -1857,6 +1949,29 @@ before: an aggregate without outputs, a semi join reading its inner side,
 and DataFusion's own join reordering (eliminate_cross_join), which hung
 Q7.  A grouping below ORCA's Result over 30 million rows took 0.27 s
 against 1.39 s.
+
+### Correlated aggregate subqueries
+
+A scalar subquery with aggregates matched on a key of an outer relation,
+as in TPC-H's Q17 (`l_quantity < (SELECT 0.2 * avg(l_quantity) FROM
+lineitem WHERE l_partkey = p_partkey)`), is planned as a join with the
+aggregate of the whole inner table grouped by that key; the outer query
+then keeps the few keys that pass its conditions on part.  With
+datafusion.mode = on, the extension's planner hook (SQ1, src/df_rewrite.c)
+first adds `l_partkey IN (SELECT p_partkey FROM part WHERE <the outer
+query's conditions on part>)` to the subquery, which the planner turns
+into a semi join below the aggregate.  The results are the same: a row of
+the outer query passes only if part's conditions hold for it, and then
+its key is among those listed.  It applies to a subquery without GROUP BY,
+HAVING, window functions, LIMIT or set operations in a top-level conjunct
+of a WHERE clause whose FROM list holds the outer relation itself (no
+outer join), matched by a hash- or merge-joinable equality of one type,
+and takes the other top-level conjuncts that only read that relation
+(uncorrelated subqueries included) and have no volatile functions.
+`datafusion.subquery_key_filter` turns it off.  At scale factor 10 with
+the PostgreSQL planner, Q17 took 0.61 s instead of 5.0 s and Q20 0.36 s
+instead of 0.84 s; GPORCA aggregates before the semi join and gains
+little.
 
 ### Sort and LIMIT
 

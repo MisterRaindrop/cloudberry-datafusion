@@ -923,6 +923,58 @@ RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_nw, df_nw2;
 
+-- N6: numeric(p, s) columns of p <= 38 are Decimal128 of p digits, others
+-- Decimal256; where the two meet (a comparison, CASE, COALESCE, IN, UNION, a
+-- join's keys) they are made one type with NaN kept, and + - * and sums
+-- leave 38 digits for Decimal256
+CREATE TABLE df_n6 (id int, g int, n numeric(12,2), w numeric(50,2), d numeric(38,0))
+DISTRIBUTED BY (id);
+INSERT INTO df_n6 SELECT i, i % 5, ((i * 7919) % 20000 - 10000) / 100.0,
+  CASE WHEN i % 4 = 0 THEN ((i * 7919) % 20000 - 10000) / 100.0
+       ELSE ((i * 104729) % 20000 - 10000) / 100.0 END,
+  i::numeric * 9999999999999999999999999999999
+FROM generate_series(1, 20000) i;
+INSERT INTO df_n6 VALUES (-1, 9, 'NaN', 'NaN', 'NaN'), (-2, 9, 1.50, 1.50, 1),
+  (-3, 9, NULL, NULL, NULL), (-4, 9, 9999999999.99, 1e45, 99999999999999999999999999999999999999),
+  (-5, 9, -9999999999.99, -1e45, -99999999999999999999999999999999999999),
+  (-6, 9, 'NaN', 2.50, 0), (-7, 9, 3.50, 'NaN', 0);
+ANALYZE df_n6;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+SET optimizer = off;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+RESET optimizer;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_n6;
+
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

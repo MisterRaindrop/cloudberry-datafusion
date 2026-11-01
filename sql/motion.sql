@@ -87,6 +87,41 @@ SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
 SELECT partitions FROM datafusion_debug_last_run();
 RESET datafusion.slice_partitions;
 
+-- AP2: a partial aggregate may produce a group more than once (the
+-- aggregate above combines them, as after a Streaming Partial
+-- HashAggregate whose memory is full), so DataFusion runs it as a partial
+-- aggregation alone, which emits its groups when its budget (here 1 MB)
+-- is full instead of spilling them.  60,000 groups on each segment overflow
+-- it; the sums must match PostgreSQL's.
+CREATE TABLE df_ap2 (a int4, k int4, v int8, f float8) DISTRIBUTED BY (a);
+INSERT INTO df_ap2 SELECT i, i % 60000, i, i / 8.0 FROM generate_series(1, 600000) i;
+ANALYZE df_ap2;
+SET optimizer = on;
+SET work_mem = '1MB';
+EXPLAIN (COSTS OFF) SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+SET datafusion.mode = off;
+SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+SET datafusion.mode = on;
+SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+-- Not when the aggregate above counts the partial aggregate's groups: a
+-- multi-stage DISTINCT groups by its argument below and counts it above
+-- (count(a % 200000) without DISTINCT), so a group produced twice would
+-- count twice.
+EXPLAIN (COSTS OFF) SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+SET datafusion.mode = off;
+SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+SET datafusion.mode = on;
+SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+RESET work_mem;
+SET optimizer = off;
+DROP TABLE df_ap2;
+
 -- An error on a segment carries PostgreSQL's SQLSTATE and message.
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
 \set VERBOSITY sqlstate

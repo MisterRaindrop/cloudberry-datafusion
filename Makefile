@@ -36,13 +36,13 @@
 MODULE_big = datafusion_executor
 OBJS = src/df_init.o src/df_runtime.o src/df_debug.o \
 	src/df_hooks.o src/df_plan_check.o src/df_translate.o src/df_exec.o \
-	src/df_paxload.o src/df_numeric.o src/df_arrow.o
+	src/df_paxload.o src/df_numeric.o src/df_arrow.o src/df_rewrite.o
 
 EXTENSION = datafusion_executor
 DATA = datafusion_executor--1.0.sql
 PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial storage parallel
+REGRESS = datafusion_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage parallel
 # The direct PAX reader is only tested when it is built.
 ifdef DF_PAX_SRC
 REGRESS += paxdirect
@@ -146,7 +146,10 @@ pax_build/.patched: $(DF_PAX_PATCHES)
 	done
 	touch $@
 
+# The empty recipe makes make look at the source again once the patches
+# have rewritten it, so that one run rebuilds the library.
 $(DF_PAX_API_SRC): pax_build/.patched
+	@:
 
 # -Bsymbolic keeps the library's own references inside it, even if a loaded
 # pax.so ever exports the same names.

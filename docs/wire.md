@@ -72,7 +72,10 @@ head   := "DFARROW1" (8 bytes) signature (8 bytes)
 
 `arrow-ipc-stream` is the Arrow IPC streaming format: a schema message,
 then record batch messages, then the end-of-stream marker, without
-compression or dictionaries.  Batches with no rows are not sent.
+dictionaries.  Batches with no rows are not sent.  A record batch message
+whose string values make up most of its bytes is compressed with
+LZ4_FRAME (MZ1), the others are not; each message says which, so a
+receiver decodes the stream as Arrow's reader does.
 
 The stream's columns are the Motion's output columns in order, except that
 a partial aggregate's state may take several (an `avg`: sum, then count);
@@ -83,7 +86,7 @@ bytes on the wire:
 | Rule | Column | On the wire | Receiver |
 |---|---|---|---|
 | CP1 | `bpchar` of a table's `character(n)`, n > 1 (`trim`) | without trailing blanks | pads back to n characters (`motion_pad`) |
-| NW1 | numeric of one scale and at most 18 digits (`narrow`) | Int64, the unscaled integer | widens back to Decimal256(76, S) (`motion_narrow`) |
+| NW1 | numeric of one scale and at most 18 digits (`narrow`) | Int64, the unscaled integer | reads it as Decimal128(D, S) of those D digits (`motion_narrow`) |
 | NW1 | numeric of one scale and 19 to 38 digits | Decimal128(38, S) | the same |
 
 A narrowed column keeps the special values: NaN, +Infinity and -Infinity

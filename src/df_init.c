@@ -150,6 +150,18 @@ _PG_init(void)
 							GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("datafusion.subquery_key_filter",
+							 "Lets a correlated aggregate subquery read only the keys the outer query keeps.",
+							 "With datafusion.mode = on, a scalar subquery with aggregates whose "
+							 "WHERE clause matches a relation of the outer query on a key gets "
+							 "\"key IN (SELECT key FROM relation WHERE <its conditions in the outer "
+							 "query>)\" before planning, so that only those keys are aggregated.",
+							 &df_subquery_key_filter,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("datafusion.motion_batches",
 							 "Experimental: send Arrow batches through Gather Motions between DataFusion slices.",
 							 "When both the sending and the receiving slice of a Gather Motion run "
@@ -206,6 +218,7 @@ _PG_init(void)
 	MarkGUCPrefixReserved("datafusion");
 
 	df_install_hooks();
+	df_install_planner_hook();
 
 	/*
 	 * Never open the engine or start threads here.  When the library is

@@ -57,7 +57,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	3
+#define VEC_ENGINE_ABI	4
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -155,7 +155,14 @@ typedef struct VecPaxColumn
 	const int32_t *offsets;
 } VecPaxColumn;
 
-typedef int (*VecPaxEmit) (void *ctx, uint32_t nrows, const VecPaxColumn *cols);
+/*
+ * A fixed-width column of the chunk being emitted, of its rows at 'rows'
+ * (all if NULL); see DatafusionPaxFetch.
+ */
+typedef int (*VecPaxFetch) (void *chunk, int col, const uint32_t *rows,
+							uint32_t nrows, VecPaxColumn *out);
+typedef int (*VecPaxEmit) (void *ctx, uint32_t nrows, const VecPaxColumn *cols,
+						   VecPaxFetch fetch, void *chunk);
 typedef void (*VecPaxAccount) (void *ctx, int64_t delta);
 typedef int (*VecPaxRead) (void *scan, int index, int first, int count,
 						   VecPaxEmit emit, VecPaxAccount account, void *ctx,

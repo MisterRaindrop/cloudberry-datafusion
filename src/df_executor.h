@@ -89,6 +89,9 @@ typedef struct DfSliceInput
 								 * positions + 1 */
 	Oid		   *types;
 	int16	   *scales;			/* of numeric columns (Decimal128) */
+	int16	   *digits;			/* N6: of a numeric column read narrow, as
+								 * Decimal128(digits, scale) of 16 bytes; 0
+								 * for Decimal256 of 32 */
 	bool		set;			/* SP1: a subquery's rows, read whole first */
 } DfSliceInput;
 
@@ -202,6 +205,7 @@ extern int	df_agg_state_ncols(DfAggState state);
 #define DF_NUMERIC_PINF	(DF_NUMERIC_NAN - 1)
 #define DF_NUMERIC_NINF	(-DF_NUMERIC_NAN - 1)
 #define DF_NUMERIC_BYTES 32		/* a Decimal256 value, little-endian */
+#define DF_NARROW_BYTES 16		/* N6: a Decimal128 value, little-endian */
 
 typedef enum DfNumericFit
 {
@@ -258,6 +262,7 @@ extern const DfStringFunc *df_string_func(Oid funcid);
 extern const char *df_bpchar_func(Oid funcid);
 extern const char *df_collation_locale(Oid collation);
 extern PlannedStmt *df_numeric_stmt;
+extern Agg *df_motion_consumer_agg(Plan *top);
 extern bool df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale);
 extern int	df_bpchar_length(Plan *ctx, Node *expr);
 extern bool df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn);
@@ -323,7 +328,7 @@ extern bool df_translate_slice(Plan *root, const DfTails *tails, bool tuples, Df
  * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
  * two identical.
  */
-#define DF_PAX_SCAN_API_VERSION 5
+#define DF_PAX_SCAN_API_VERSION 8
 
 /* What the scan's min/max skipping did (DatafusionPaxScanInfo). */
 typedef struct DfPaxScanInfo
@@ -335,7 +340,8 @@ typedef struct DfPaxScanInfo
 } DfPaxScanInfo;
 
 typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, List *qual,
-							 const int *cols, const int *widths, int ncols,
+							 const int *cols, const int *widths,
+							 const int *scales, int ncols,
 							 char *err, size_t errlen);
 typedef int (*DfPaxNBlocks) (void *scan);
 typedef void (*DfPaxInfo) (void *scan, DfPaxScanInfo *out);
@@ -402,6 +408,10 @@ extern bool df_motion_hash_key(Motion *motion, int i, int *column, const char **
 
 /* df_hooks.c */
 extern void df_install_hooks(void);
+
+/* df_rewrite.c: SQ1, filters of correlated aggregate subqueries */
+extern bool df_subquery_key_filter;	/* GUC datafusion.subquery_key_filter */
+extern void df_install_planner_hook(void);
 
 /* df_plan_check.c */
 extern bool df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,

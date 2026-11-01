@@ -1669,8 +1669,8 @@ SET optimizer = on;
 EXPLAIN (COSTS OFF) WITH ctr AS (SELECT cust, store, sum(v) AS total FROM df_nr GROUP BY cust, store)
 SELECT count(*), sum(c1.total) FROM ctr c1
 WHERE c1.total > (SELECT avg(total) * 1.2 FROM ctr c2 WHERE c2.store = c1.store);
-                                                               QUERY PLAN                                                                
------------------------------------------------------------------------------------------------------------------------------------------
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Sequence
          ->  Shared Scan (share slice:id 1:0)
@@ -4662,9 +4662,9 @@ DROP TABLE df_dk;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=24351)
+ERROR:  division by zero  (seg2 slice1 172.17.0.2:40002 pid=98275)
 SELECT sum(a / b) FROM df_dn;
-ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=24351)
+ERROR:  division by zero  (seg0 slice1 172.17.0.2:40000 pid=98273)
 -- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
 -- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
 -- picked from the sum and the count, goes beside it, so it sorts in
@@ -7178,6 +7178,216 @@ RESET optimizer;
 RESET datafusion.motion_batches;
 SET datafusion.mode = off;
 DROP TABLE df_nw, df_nw2;
+-- N6: numeric(p, s) columns of p <= 38 are Decimal128 of p digits, others
+-- Decimal256; where the two meet (a comparison, CASE, COALESCE, IN, UNION, a
+-- join's keys) they are made one type with NaN kept, and + - * and sums
+-- leave 38 digits for Decimal256
+CREATE TABLE df_n6 (id int, g int, n numeric(12,2), w numeric(50,2), d numeric(38,0))
+DISTRIBUTED BY (id);
+INSERT INTO df_n6 SELECT i, i % 5, ((i * 7919) % 20000 - 10000) / 100.0,
+  CASE WHEN i % 4 = 0 THEN ((i * 7919) % 20000 - 10000) / 100.0
+       ELSE ((i * 104729) % 20000 - 10000) / 100.0 END,
+  i::numeric * 9999999999999999999999999999999
+FROM generate_series(1, 20000) i;
+INSERT INTO df_n6 VALUES (-1, 9, 'NaN', 'NaN', 'NaN'), (-2, 9, 1.50, 1.50, 1),
+  (-3, 9, NULL, NULL, NULL), (-4, 9, 9999999999.99, 1e45, 99999999999999999999999999999999999999),
+  (-5, 9, -9999999999.99, -1e45, -99999999999999999999999999999999999999),
+  (-6, 9, 'NaN', 2.50, 0), (-7, 9, 3.50, 'NaN', 0);
+ANALYZE df_n6;
+SET datafusion.motion_batches = on;
+SET datafusion.mode = off;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+ count |   sum    
+-------+----------
+  5002 | 50009997
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+ count |   sum    
+-------+----------
+  7503 | 75047368
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+ count |   sum    
+-------+----------
+  2056 | 20520705
+(1 row)
+
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+ g |   sum   |  max  |                        min                         
+---+---------+-------+----------------------------------------------------
+ 0 | -100.00 | 99.95 |                                            -100.00
+ 1 |   60.00 | 99.99 |                                             -99.96
+ 2 |   20.00 | 99.98 |                                             -99.97
+ 3 |  -20.00 | 99.97 |                                             -99.98
+ 4 |  -60.00 | 99.96 |                                             -99.99
+ 9 |     NaN |   NaN | -1000000000000000000000000000000000000000000000.00
+(6 rows)
+
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+ count | sum | max 
+-------+-----+-----
+ 26675 | NaN | NaN
+(1 row)
+
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+ count |   sum   |                        max                        |                        min                         
+-------+---------+---------------------------------------------------+----------------------------------------------------
+ 26674 | -182.63 | 1000000000000000000000000000000000000000000000.00 | -1000000000000000000000000000000000000000000000.00
+(1 row)
+
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+ count |    sum    |    sum    |   min   
+-------+-----------+-----------+---------
+ 20009 | 200021575 | 200034474 | -100.00
+(1 row)
+
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+                                      sum                                      |                        sum                         |                   sum                    |                         max                         |                        min                        
+-------------------------------------------------------------------------------+----------------------------------------------------+------------------------------------------+-----------------------------------------------------+---------------------------------------------------
+ 20266686666999999999999999999999946662266600000000000000000000002666866670003 | 19999999999920000000000120000399999926671.72916002 | 2000099999999999999999999999999799990001 | 999999999998999999999999999999999999990000000000.01 | -999999999999999999999999999999999990000000000.01
+(1 row)
+
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+       n       | count |                  sum                   
+---------------+-------+----------------------------------------
+          1.50 |     2 |    18499999999999999999999999999998151
+          3.50 |     2 |   176499999999999999999999999999982350
+ 9999999999.99 |     1 | 99999999999999999999999999999999999999
+           NaN |     2 |                                    NaN
+(4 rows)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+ count |   sum    
+-------+----------
+  5002 | 50009997
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+ count |   sum    
+-------+----------
+  7503 | 75047368
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+ count |   sum    
+-------+----------
+  2056 | 20520705
+(1 row)
+
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+ g |   sum   |  max  |                        min                         
+---+---------+-------+----------------------------------------------------
+ 0 | -100.00 | 99.95 |                                            -100.00
+ 1 |   60.00 | 99.99 |                                             -99.96
+ 2 |   20.00 | 99.98 |                                             -99.97
+ 3 |  -20.00 | 99.97 |                                             -99.98
+ 4 |  -60.00 | 99.96 |                                             -99.99
+ 9 |     NaN |   NaN | -1000000000000000000000000000000000000000000000.00
+(6 rows)
+
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+ count | sum | max 
+-------+-----+-----
+ 26675 | NaN | NaN
+(1 row)
+
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+ count |   sum   |                        max                        |                        min                         
+-------+---------+---------------------------------------------------+----------------------------------------------------
+ 26674 | -182.63 | 1000000000000000000000000000000000000000000000.00 | -1000000000000000000000000000000000000000000000.00
+(1 row)
+
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+ count |    sum    |    sum    |   min   
+-------+-----------+-----------+---------
+ 20009 | 200021575 | 200034474 | -100.00
+(1 row)
+
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+                                      sum                                      |                        sum                         |                   sum                    |                         max                         |                        min                        
+-------------------------------------------------------------------------------+----------------------------------------------------+------------------------------------------+-----------------------------------------------------+---------------------------------------------------
+ 20266686666999999999999999999999946662266600000000000000000000002666866670003 | 19999999999920000000000120000399999926671.72916002 | 2000099999999999999999999999999799990001 | 999999999998999999999999999999999999990000000000.01 | -999999999999999999999999999999999990000000000.01
+(1 row)
+
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+       n       | count |                  sum                   
+---------------+-------+----------------------------------------
+          1.50 |     2 |    18499999999999999999999999999998151
+          3.50 |     2 |   176499999999999999999999999999982350
+ 9999999999.99 |     1 | 99999999999999999999999999999999999999
+           NaN |     2 |                                    NaN
+(4 rows)
+
+SET optimizer = off;
+SELECT count(*), sum(id) FROM df_n6 WHERE n = w;
+ count |   sum    
+-------+----------
+  5002 | 50009997
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n < w OR w = 'NaN';
+ count |   sum    
+-------+----------
+  7503 | 75047368
+(1 row)
+
+SELECT count(*), sum(id) FROM df_n6 WHERE n IN (1.50, 'NaN', 9999999999.99) OR n BETWEEN -10 AND 10.5;
+ count |   sum    
+-------+----------
+  2056 | 20520705
+(1 row)
+
+SELECT g, sum(CASE WHEN id % 2 = 0 THEN n ELSE w END), max(COALESCE(n, w)), min(COALESCE(w, n)) FROM df_n6 GROUP BY g ORDER BY g;
+ g |   sum   |  max  |                        min                         
+---+---------+-------+----------------------------------------------------
+ 0 | -100.00 | 99.95 |                                            -100.00
+ 1 |   60.00 | 99.99 |                                             -99.96
+ 2 |   20.00 | 99.98 |                                             -99.97
+ 3 |  -20.00 | 99.97 |                                             -99.98
+ 4 |  -60.00 | 99.96 |                                             -99.99
+ 9 |     NaN |   NaN | -1000000000000000000000000000000000000000000000.00
+(6 rows)
+
+SELECT count(*), sum(v), max(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0) t;
+ count | sum | max 
+-------+-----+-----
+ 26675 | NaN | NaN
+(1 row)
+
+SELECT count(*), sum(v), max(v), min(v) FROM (SELECT n AS v FROM df_n6 UNION ALL SELECT w FROM df_n6 WHERE id % 3 = 0 OR id < 0) t WHERE v <> 'NaN';
+ count |   sum   |                        max                        |                        min                         
+-------+---------+---------------------------------------------------+----------------------------------------------------
+ 26674 | -182.63 | 1000000000000000000000000000000000000000000000.00 | -1000000000000000000000000000000000000000000000.00
+(1 row)
+
+SELECT count(*), sum(x.id), sum(y.id), min(y.w) FROM df_n6 x JOIN df_n6 y ON x.n = y.w;
+ count |    sum    |    sum    |   min   
+-------+-----------+-----------+---------
+ 20009 | 200021575 | 200034474 | -100.00
+(1 row)
+
+SELECT sum(d * d), sum(n * n * n * n), sum(d), max(n * d), min(n - w) FROM df_n6 WHERE id NOT IN (-1, -6, -7);
+                                      sum                                      |                        sum                         |                   sum                    |                         max                         |                        min                        
+-------------------------------------------------------------------------------+----------------------------------------------------+------------------------------------------+-----------------------------------------------------+---------------------------------------------------
+ 20266686666999999999999999999999946662266600000000000000000000002666866670003 | 19999999999920000000000120000399999926671.72916002 | 2000099999999999999999999999999799990001 | 999999999998999999999999999999999999990000000000.01 | -999999999999999999999999999999999990000000000.01
+(1 row)
+
+SELECT n, count(*), sum(d) FROM df_n6 GROUP BY n HAVING count(*) > 1 OR n = 'NaN' OR n > 9999999999 ORDER BY n;
+       n       | count |                  sum                   
+---------------+-------+----------------------------------------
+          1.50 |     2 |    18499999999999999999999999999998151
+          3.50 |     2 |   176499999999999999999999999999982350
+ 9999999999.99 |     1 | 99999999999999999999999999999999999999
+           NaN |     2 |                                    NaN
+(4 rows)
+
+RESET optimizer;
+RESET datafusion.motion_batches;
+SET datafusion.mode = off;
+DROP TABLE df_n6;
 DROP TABLE df_nm, df_nm_empty, df_nc, df_nc2, df_nc3, df_nc4;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

@@ -254,6 +254,11 @@ impl ScalarUDFImpl for PgCast {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let n = args.number_rows;
         let a = args.args[0].to_array(n)?;
+        // N6: a narrow numeric as a wide one
+        let a = match a.data_type() {
+            DataType::Decimal128(..) => crate::pgnum::widen(&a)?,
+            _ => a,
+        };
         let to = &self.to;
         let out: ArrayRef = match self.kind {
             CastKind::Int => {

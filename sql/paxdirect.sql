@@ -117,6 +117,38 @@ SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d
 SELECT count(*) FILTER (WHERE a = 'NaN'), sum(b) FILTER (WHERE a > 1000.50 AND b < 0) FROM df_pd_vnum;
 SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
 
+-- SC2: numeric(p, s) of p <= 38 converted by the reader to fixed-width
+-- values at s, up to 38 digits (35 in the vectorized format, its most),
+-- beside a numeric(40, 2) still handed out as bytes; with deleted rows, so
+-- that a chunk's rows are not the group's.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_wnum (id int, w numeric(38,4), z numeric(38,0), v numeric(40,2)) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vwnum (id int, w numeric(35,4), z numeric(35,0), v numeric(35,2)) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_wnum SELECT k,
+  CASE WHEN k % 41 = 0 THEN NULL WHEN k % 43 = 0 THEN 'NaN' ELSE (k - 10000) * 1234567890123456789012345.6789 END,
+  CASE WHEN k % 47 = 0 THEN NULL ELSE (k - 10000) * 12345678901234567890123456789012 END,
+  CASE WHEN k % 37 = 0 THEN NULL ELSE (k - 10000) * 123456789012345678901234567890123.45 END
+FROM generate_series(1, 20000) k;
+INSERT INTO df_pd_wnum VALUES (-1, 9999999999999999999999999999999999.9999, 99999999999999999999999999999999999999, 99999999999999999999999999999999999999.99),
+  (-2, -9999999999999999999999999999999999.9999, -99999999999999999999999999999999999999, -99999999999999999999999999999999999999.99),
+  (-3, 0.0001, 1, 0.01), (-4, -0.0001, -1, -0.01);
+INSERT INTO df_pd_vwnum SELECT id, trunc(w / 10000, 4), trunc(z / 10000), trunc(v / 1000000, 2) FROM df_pd_wnum;
+DELETE FROM df_pd_wnum WHERE id % 7 = 3;
+DELETE FROM df_pd_vwnum WHERE id % 7 = 3;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
+SELECT id, w, z, v FROM df_pd_wnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_vwnum;
+SELECT id, w, z, v FROM df_pd_vwnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
+SELECT id, w, z, v FROM df_pd_wnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_vwnum;
+SELECT id, w, z, v FROM df_pd_vwnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+
 -- Conditions on cheap columns checked first (LM1): the filter right above
 -- a PAX scan has its conditions on integer and date columns evaluated on
 -- each decoded chunk before the other columns are built, which are then
@@ -152,6 +184,87 @@ SELECT count(*), sum(a) FROM df_pd_lm WHERE id >= k AND (k = 4 OR a > 200);
 SELECT count(*), sum(a), max(t) FROM df_pd_lm WHERE k > 100 AND a > 0;
 SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND (a < -100 OR a IS NULL OR t IS NULL) ORDER BY id;
 
+-- Then conditions on strings (LM2), checked on the reader's bytes of the
+-- rows left before any other column is built: = and <> of a constant, IN
+-- and NOT IN, of text (trailing blanks count) and of character (they do
+-- not), and LIKE of text with pieces and %'s only; NULLs fail; narrow
+-- numeric columns compared with constants are cheap (N6).
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_s2 (id int, m char(10), s text, v varchar(8), a numeric(15,2)) USING pax DISTRIBUTED BY (id);
+INSERT INTO df_pd_s2 SELECT i,
+  CASE i % 7 WHEN 0 THEN NULL WHEN 1 THEN 'AIR' WHEN 2 THEN 'AIR REG' WHEN 3 THEN 'MAIL'
+    WHEN 4 THEN 'RAIL' WHEN 5 THEN 'SHIP' ELSE 'TRUCK' END,
+  CASE i % 5 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'NONE' WHEN 2 THEN NULL
+    WHEN 3 THEN 'abc ' ELSE 'é中文' END,
+  CASE WHEN i % 11 = 0 THEN NULL WHEN i % 3 = 0 THEN 'x' ELSE 'y' || (i % 7) END,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 4001 - 2000) * 0.25 END
+FROM generate_series(1, 30000) i;
+DELETE FROM df_pd_s2 WHERE id % 1000 = 7;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
+SELECT count(*), sum(a), max(v) FROM df_pd_s2 WHERE m = 'MAIL' AND a BETWEEN 10 AND 120.5;
+SELECT count(*), sum(a), min(s) FROM df_pd_s2 WHERE m NOT IN ('AIR', 'MAIL') AND s <> 'NONE' AND v <> 'x';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'é中文' AND v = 'x';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m = 'AIR   ' AND 'abc' = s;
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'abc ' AND m <> 'TRUCK';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m IN ('none such') AND id > 0;
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE ((a >= 1 AND a <= 11) OR (a >= 10 AND a <= 20) OR (a >= 20 AND a <= 30.25)) AND m IN ('AIR', 'RAIL');
+SELECT id, m, s, v, a FROM df_pd_s2 WHERE m = 'SHIP' AND s IN ('NONE', 'abc ') AND a < -480 ORDER BY id;
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE '%中%' AND v LIKE '%5';
+SELECT count(*), sum(id), min(m) FROM df_pd_s2 WHERE s NOT LIKE 'abc%' AND s LIKE 'DELIVER%PERSON';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE 'abc ' AND v LIKE 'y_' AND s LIKE '%';
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE s NOT LIKE '%IN%PER%' AND a > 400;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
+SELECT count(*), sum(a), max(v) FROM df_pd_s2 WHERE m = 'MAIL' AND a BETWEEN 10 AND 120.5;
+SELECT count(*), sum(a), min(s) FROM df_pd_s2 WHERE m NOT IN ('AIR', 'MAIL') AND s <> 'NONE' AND v <> 'x';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'é中文' AND v = 'x';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m = 'AIR   ' AND 'abc' = s;
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'abc ' AND m <> 'TRUCK';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m IN ('none such') AND id > 0;
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE ((a >= 1 AND a <= 11) OR (a >= 10 AND a <= 20) OR (a >= 20 AND a <= 30.25)) AND m IN ('AIR', 'RAIL');
+SELECT id, m, s, v, a FROM df_pd_s2 WHERE m = 'SHIP' AND s IN ('NONE', 'abc ') AND a < -480 ORDER BY id;
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE '%中%' AND v LIKE '%5';
+SELECT count(*), sum(id), min(m) FROM df_pd_s2 WHERE s NOT LIKE 'abc%' AND s LIKE 'DELIVER%PERSON';
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE 'abc ' AND v LIKE 'y_' AND s LIKE '%';
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE s NOT LIKE '%IN%PER%' AND a > 400;
+
+-- The reader converts a fixed-width column when the consumer asks for it,
+-- for the rows the conditions checked first leave (LM3): booleans, 8-byte
+-- values without NULLs (picked from the stored values), a numeric, in the
+-- plain format with deleted rows and in the vectorized one without.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_lm3 (id int, k int2, f bool, g int8, h float8, a numeric(15,2)) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vlm3 (LIKE df_pd_lm3) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_lm3 SELECT i,
+  CASE WHEN i % 23 = 0 THEN NULL ELSE (i % 10)::int2 END,
+  CASE WHEN i % 19 = 0 THEN NULL ELSE i % 3 = 0 END,
+  i::int8 * 1000003, i * 0.5,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 2001 - 1000) * 0.25 END
+FROM generate_series(1, 30000) i;
+INSERT INTO df_pd_vlm3 SELECT * FROM df_pd_lm3;
+DELETE FROM df_pd_lm3 WHERE id % 1000 = 11;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_lm3 WHERE a > 200 AND k <> 4;
+SELECT id, k, f, g, h, a FROM df_pd_lm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_vlm3 WHERE k IN (2, 7) AND id > 5;
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_vlm3 WHERE a > 200 AND k <> 4;
+SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_lm3 WHERE a > 200 AND k <> 4;
+SELECT id, k, f, g, h, a FROM df_pd_lm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_vlm3 WHERE k IN (2, 7) AND id > 5;
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_vlm3 WHERE a > 200 AND k <> 4;
+SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+
 -- Several inputs in one slice (C3): each PAX scan is read directly, the
 -- others through the table AM or their Motion; here two PAX tables joined
 -- on their distribution key, and one joined with a heap table.
@@ -169,6 +282,6 @@ SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = 
 SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET datafusion.motion_batches;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap, df_pd_lm;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

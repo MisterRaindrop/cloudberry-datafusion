@@ -180,6 +180,17 @@ enum Pattern {
     General(Vec<u8>),
 }
 
+/// LM2: the literal pieces between the %'s of LIKE pattern `p` (escapes
+/// resolved), if it has no `_` and no dangling escape: a text matches when
+/// it equals the only piece, or with %'s starts with the first piece, ends
+/// with the last and holds the middle ones in order, byte for byte.
+pub fn like_pieces(p: &[u8]) -> Option<Vec<Vec<u8>>> {
+    match Pattern::new(p) {
+        Pattern::Pieces(pieces) => Some(pieces),
+        Pattern::General(_) => None,
+    }
+}
+
 impl Pattern {
     fn new(p: &[u8]) -> Pattern {
         let mut pieces = vec![Vec::new()];

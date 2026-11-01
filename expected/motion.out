@@ -246,6 +246,99 @@ SELECT partitions FROM datafusion_debug_last_run();
 (1 row)
 
 RESET datafusion.slice_partitions;
+-- AP2: a partial aggregate may produce a group more than once (the
+-- aggregate above combines them, as after a Streaming Partial
+-- HashAggregate whose memory is full), so DataFusion runs it as a partial
+-- aggregation alone, which emits its groups when its budget (here 1 MB)
+-- is full instead of spilling them.  60,000 groups on each segment overflow
+-- it; the sums must match PostgreSQL's.
+CREATE TABLE df_ap2 (a int4, k int4, v int8, f float8) DISTRIBUTED BY (a);
+INSERT INTO df_ap2 SELECT i, i % 60000, i, i / 8.0 FROM generate_series(1, 600000) i;
+ANALYZE df_ap2;
+SET optimizer = on;
+SET work_mem = '1MB';
+EXPLAIN (COSTS OFF) SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Finalize HashAggregate
+                     Group Key: k
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: k
+                           ->  Streaming Partial HashAggregate
+                                 Group Key: k
+                                 ->  Seq Scan on df_ap2
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+(14 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+ count |  sum   |     sum      |    sum    |     sum     
+-------+--------+--------------+-----------+-------------
+ 60000 | 600000 | 180000300000 | 225003750 | 34200030000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
+FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
+ count |  sum   |     sum      |    sum    |     sum     
+-------+--------+--------------+-----------+-------------
+ 60000 | 600000 | 180000300000 | 225003750 | 34200030000
+(1 row)
+
+-- Not when the aggregate above counts the partial aggregate's groups: a
+-- multi-stage DISTINCT groups by its argument below and counts it above
+-- (count(a % 200000) without DISTINCT), so a group produced twice would
+-- count twice.
+EXPLAIN (COSTS OFF) SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+                                     QUERY PLAN                                     
+------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Finalize HashAggregate
+                     Group Key: ((k % 100))
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: ((k % 100))
+                           ->  Partial HashAggregate
+                                 Group Key: ((k % 100)), ((a % 200000))
+                                 ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                       Hash Key: ((k % 100)), ((a % 200000))
+                                       ->  Seq Scan on df_ap2
+ Optimizer: GPORCA
+ DataFusion: slice 0 eligible
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible
+ DataFusion: slice 3 eligible
+(17 rows)
+
+SET datafusion.mode = off;
+SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+ count |     sum      |  sum   |  sum   
+-------+--------------+--------+--------
+   100 | 180000300000 | 600000 | 200000
+(1 row)
+
+SET datafusion.mode = on;
+SELECT count(*), sum(s), sum(n), sum(d)
+FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
+ count |     sum      |  sum   |  sum   
+-------+--------------+--------+--------
+   100 | 180000300000 | 600000 | 200000
+(1 row)
+
+RESET work_mem;
+SET optimizer = off;
+DROP TABLE df_ap2;
 -- An error on a segment carries PostgreSQL's SQLSTATE and message.
 SELECT a / (a - a) FROM df_m5 WHERE a = 5;
 ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=89058)

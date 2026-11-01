@@ -31,7 +31,7 @@
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::datatypes::{
-    i256, Decimal256Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    i256, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
 };
 
 use crate::pgnum::{NUMERIC_NAN, NUMERIC_NINF, NUMERIC_PINF};
@@ -281,7 +281,7 @@ fn key_hash(h: KeyHash, a: &ArrayRef, r: usize) -> Option<u32> {
         KeyHash::Bpchar => {
             hash_bytes(crate::pgstr::bpchar_trim(a.as_string::<i32>().value(r)).as_bytes())
         }
-        KeyHash::Numeric(s) => hash_numeric(a.as_primitive::<Decimal256Type>().value(r), s),
+        KeyHash::Numeric(s) => hash_numeric(crate::pgnum::numeric_value(a, r), s),
         KeyHash::Tid => hash_tid(a.as_primitive::<Int64Type>().value(r)),
     })
 }

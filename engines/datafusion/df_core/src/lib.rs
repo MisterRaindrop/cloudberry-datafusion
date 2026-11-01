@@ -21,6 +21,7 @@
 pub mod cdbhash;
 pub mod debug;
 pub mod memory;
+pub mod numwidth;
 pub mod pgcast;
 pub mod pgcoll;
 pub mod pgdate;

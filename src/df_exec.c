@@ -746,6 +746,7 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 	DfPaxScanInfo info;
 	int		   *cols;
 	int		   *widths;
+	int		   *scales;
 	void	   *scan;
 	int			c;
 
@@ -762,22 +763,50 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 
 	cols = palloc(sizeof(int) * Max(in->spec->ncols, 1));
 	widths = palloc(sizeof(int) * Max(in->spec->ncols, 1));
+	scales = palloc(sizeof(int) * Max(in->spec->ncols, 1));
 	for (c = 0; c < in->spec->ncols; c++)
 	{
+		int			precision;
+		int			scale;
+
 		cols[c] = in->spec->attnos[c] - 1;
 		/* strings and numerics as their bytes (C1, C2) */
 		widths[c] = df_type_is_string(in->spec->types[c]) ||
 			in->spec->types[c] == NUMERICOID ? -1 :
 			df_type_width(in->spec->types[c]);
+		scales[c] = -1;
+		/*
+		 * SC2: a numeric(p, s) column of p <= 38 read at s, its own scale,
+		 * as fixed-width values the reader converts: every value fits
+		 * 38 digits there.  N6: 16 bytes each where DataFusion reads it
+		 * narrow, as it does every such column.
+		 */
+		if (in->spec->types[c] == NUMERICOID &&
+			df_numeric_typmod(TupleDescAttr(RelationGetDescr(rel), cols[c])->atttypmod,
+							  &precision, &scale) &&
+			precision <= 38 && scale == in->spec->scales[c])
+		{
+			widths[c] = in->spec->digits[c] > 0 ? DF_NARROW_BYTES : DF_NUMERIC_BYTES;
+			scales[c] = scale;
+		}
+		else if (in->spec->digits[c] > 0)
+		{
+			/* the planner's column is no longer this one */
+			pfree(cols);
+			pfree(widths);
+			pfree(scales);
+			return false;
+		}
 	}
 	/*
 	 * The scan's qual only lets PAX skip micro-partitions and groups by
 	 * their min/max statistics; DataFusion still filters every row.
 	 */
 	scan = reader->begin(rel, x->estate->es_snapshot, in->scan->ss.ps.plan->qual,
-						 cols, widths, in->spec->ncols, buf, sizeof(buf));
+						 cols, widths, scales, in->spec->ncols, buf, sizeof(buf));
 	pfree(cols);
 	pfree(widths);
+	pfree(scales);
 	if (scan == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
@@ -1188,6 +1217,21 @@ df_exec_fill(DfExec *x, DfInput *in)
 					((float8 *) dst)[n] = isnull ? 0 : DatumGetFloat8(d);
 					break;
 				case NUMERICOID:
+					if (in->spec->digits[c] > 0)
+					{
+						/*
+						 * N6: 16 bytes, the narrow sentinels being
+						 * DF_NUMERIC_NAN and the infinities as they are
+						 */
+						int128		v = 0;
+
+						if (!isnull &&
+							df_numeric_value(d, in->spec->scales[c], &v) == DF_NUMERIC_TOO_LONG)
+							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
+								 in->spec->digits[c], in->spec->scales[c]);
+						memcpy((uint8 *) dst + (size_t) n * DF_NARROW_BYTES, &v, sizeof(v));
+					}
+					else
 					{
 						uint8	   *out = (uint8 *) dst + (size_t) n * DF_NUMERIC_BYTES;
 
@@ -1944,7 +1988,9 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		formats = palloc(sizeof(char *) * Max(in->spec->ncols, 1));
 		for (c = 0; c < in->spec->ncols; c++)
 		{
-			formats[c] = df_arrow_format(in->spec->types[c], in->spec->scales[c]);
+			formats[c] = in->spec->digits[c] > 0 ?
+				psprintf("d:%d,%d", in->spec->digits[c], in->spec->scales[c]) :
+				df_arrow_format(in->spec->types[c], in->spec->scales[c]);
 			if (df_type_is_string(in->spec->types[c]))
 			{
 				in->incap[c] = DF_BATCH_ROWS * 16;
@@ -1953,7 +1999,8 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 				in->inoffsets[c][0] = 0;
 			}
 			else
-				in->invalues[c] = palloc(DF_BATCH_ROWS * df_type_width(in->spec->types[c]));
+				in->invalues[c] = palloc(DF_BATCH_ROWS * (in->spec->digits[c] > 0 ? DF_NARROW_BYTES :
+														  df_type_width(in->spec->types[c])));
 			in->invalid[c] = palloc(DF_BATCH_ROWS / 8);
 			in->maxattno = Max(in->maxattno,
 							   in->tupatt ? in->tupatt[c] : in->spec->attnos[c]);

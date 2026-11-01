@@ -44,7 +44,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `include/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 3;
+pub const VEC_ENGINE_ABI: u32 = 4;
 
 /// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;

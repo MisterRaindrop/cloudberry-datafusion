@@ -771,6 +771,44 @@ df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 	return i;
 }
 
+/*
+ * N6: the digits of input column 'k' of 'in' when DataFusion reads it narrow
+ * (Decimal128 of them, 16 bytes a value), 0 for Decimal256: a table's
+ * numeric(p, s) column of p <= 38 read at s, every value of which has at
+ * most p digits there, or a numeric column a batch Motion narrows (NW1).
+ * At least the scale, as Arrow wants.
+ */
+static int
+df_input_digits(DfInputDesc *in, int k)
+{
+	int			scale = list_nth_int(in->scales, k);
+	int			attno = list_nth_int(in->attnos, k);
+	int			p = -1;
+	int			s;
+
+	if (list_nth_oid(in->types, k) != NUMERICOID || scale == DF_SCALE_DSCALE)
+		return 0;
+	if (IsA(in->leaf, Motion))
+		p = df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf, attno - 1);
+	else if ((IsA(in->leaf, SeqScan) || IsA(in->leaf, DynamicSeqScan)) &&
+			 df_numeric_stmt != NULL && attno > 0)
+	{
+		Oid			relid = rt_fetch(((Scan *) in->leaf)->scanrelid,
+									 df_numeric_stmt->rtable)->relid;
+		Oid			typid;
+		int32		typmod;
+		Oid			collid;
+
+		get_atttypetypmodcoll(relid, attno, &typid, &typmod, &collid);
+		if (typid != NUMERICOID || !df_numeric_typmod(typmod, &p, &s) || s != scale)
+			p = -1;
+	}
+	if (p < 1)
+		return 0;
+	p = Max(p, scale);
+	return p <= DF_NUMERIC_MAX_PRECISION ? p : 0;
+}
+
 /* Append a reference to that column of input 'j'. */
 static void
 df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, int scale)
@@ -3906,6 +3944,45 @@ df_sequence_body(Plan *plan)
 }
 
 /*
+ * AP2: is 'agg', the top of the slice under 'top', a partial aggregate
+ * whose groups the aggregate reading them combines, so that it may produce
+ * a group more than once (as a Streaming Partial HashAggregate does when
+ * its memory is full)?  Not with DISTINCT arguments or grouping sets, nor
+ * with a HAVING; and only when that aggregate, by the same number of keys,
+ * only combines partial states.  A multi-stage DISTINCT groups by the
+ * DISTINCT argument too and counts the partial aggregate's rows above
+ * (ClickBench Q10 under GPORCA: Partial HashAggregate by RegionID, UserID
+ * under a Finalize HashAggregate by RegionID with count(UserID)), which a
+ * group produced twice would count twice.
+ */
+static bool
+df_agg_partial(Agg *agg, Plan *top)
+{
+	List	   *calls = NIL;
+	ListCell   *lc;
+	Agg		   *above;
+
+	if (agg->aggsplit != AGGSPLIT_INITIAL_SERIAL || agg->groupingSets != NIL ||
+		agg->plan.qual != NIL)
+		return false;
+	df_collect_aggrefs((Node *) agg->plan.targetlist, &calls);
+	foreach(lc, calls)
+		if (((Aggref *) lfirst(lc))->aggdistinct != NIL)
+			return false;
+	above = df_motion_consumer_agg(top);
+	if (above == NULL || above->aggsplit != AGGSPLIT_FINAL_DESERIAL ||
+		above->numCols != agg->numCols || above->groupingSets != NIL)
+		return false;
+	calls = NIL;
+	df_collect_aggrefs((Node *) above->plan.targetlist, &calls);
+	df_collect_aggrefs((Node *) above->plan.qual, &calls);
+	foreach(lc, calls)
+		if (((Aggref *) lfirst(lc))->aggsplit != AGGSPLIT_FINAL_DESERIAL)
+			return false;
+	return true;
+}
+
+/*
  * Build the JSON plan for the slice whose top node is 'root'.  Returns
  * false, with a reason, if something cannot be expressed.
  */
@@ -3925,6 +4002,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	Limit	   *limit = NULL;
 	Sort	   *sort = NULL;
 	List	   *values;
+	Plan	   *top = root;		/* the slice's top, below its Motion */
 
 	/*
 	 * S1: a Limit and a Sort at the top, over the rows of the rest; a
@@ -4050,6 +4128,21 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			appendStringInfoChar(&json, ']');
 			if (in->set)
 				appendStringInfoString(&json, ",\"set\":true");
+			/* N6: the table's numeric columns read narrow */
+			if (!IsA(in->leaf, Motion))
+			{
+				for (k = 0; k < list_length(in->attnos); k++)
+					if (df_input_digits(in, k) > 0)
+						break;
+				if (k < list_length(in->attnos))
+				{
+					appendStringInfoString(&json, ",\"digits\":[");
+					for (k = 0; k < list_length(in->attnos); k++)
+						appendStringInfo(&json, "%s%d", k > 0 ? "," : "",
+										 df_input_digits(in, k));
+					appendStringInfoChar(&json, ']');
+				}
+			}
 			if (IsA(in->leaf, Motion))
 			{
 				/* The stream column behind each input column (M7b batches). */
@@ -4108,8 +4201,10 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 
 			initStringInfo(&a);
 			appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,%s,"
-							 "\"aggs\":[%s],\"having\":%s}}",
-							 node.data, group.data, aggs.data, having.data);
+							 "\"aggs\":[%s],\"having\":%s%s}}",
+							 node.data, group.data, aggs.data, having.data,
+							 limit == NULL && sort == NULL && df_agg_partial(b.agg, top) ?
+							 ",\"partial\":true" : "");
 			node = a;
 		}
 		spec->batch_rows = Min(DF_BATCH_MAX_ROWS,
@@ -4136,11 +4231,13 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		si->attnos = palloc(sizeof(AttrNumber) * Max(si->ncols, 1));
 		si->types = palloc(sizeof(Oid) * Max(si->ncols, 1));
 		si->scales = palloc(sizeof(int16) * Max(si->ncols, 1));
+		si->digits = palloc(sizeof(int16) * Max(si->ncols, 1));
 		forboth(la, in->attnos, lt, in->types)
 		{
 			si->attnos[k] = (AttrNumber) lfirst_int(la);
 			si->types[k] = lfirst_oid(lt);
 			si->scales[k] = (int16) list_nth_int(in->scales, k);
+			si->digits[k] = (int16) df_input_digits(in, k);
 			k++;
 		}
 	}

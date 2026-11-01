@@ -72,6 +72,7 @@ not know; it must not skip it.
              "motion_columns": [k, ...],      optional
              "motion_pad":     [n, ...],      optional
              "motion_narrow":  [digits, ...], optional
+             "digits":         [digits, ...], optional
              "set":            true }         optional
 ```
 
@@ -82,9 +83,15 @@ Column `k` of input `j` is `{"col": k, "input": j}` in expressions
 - With `motion_columns` the input arrives as Arrow IPC streams from a
   Motion; entry `i` is the stream column behind input column `i`.
   `motion_pad[i] > 0` pads a `bpchar` stream column back to that many
-  characters (the sender trimmed it); `motion_narrow[i] > 0` widens a
-  numeric stream column sent narrowed to that many digits (`-1`: sent
-  as is).  See [Motion output](#motion-output).
+  characters (the sender trimmed it); `motion_narrow[i] > 0` reads a
+  numeric stream column sent narrowed to that many digits as Decimal128
+  of them (`-1`: sent as is).  See [Motion output](#motion-output).
+- `digits[i] > 0` (N6): numeric input column `i` is a table's
+  `numeric(p, s)` read at its scale, `digits[i]` = p <= 38 (at least s):
+  the host pushes it as Decimal128(p, s), 16 bytes a value, instead of
+  Decimal256(76, s).  NaN and the infinities are i128::MAX, i128::MAX - 1
+  and i128::MIN.  The engine carries such values narrow through `+ - *`,
+  `sum`, `min`, `max` while their digits stay within 38.
 - `"set": true` marks a subquery's rows that `in_set` and `scalar_of`
   read: the engine reads the whole input before the plan starts.
 
@@ -117,7 +124,8 @@ The rows of `input` for which `pred` is true (not false, not NULL).
                 "aggs":   [<agg>, ...],
                 "having": <expr> | null,
                 "name":   s,                optional
-                "sets":   [[g, ...], ...] }} optional
+                "sets":   [[g, ...], ...],  optional
+                "partial": b }}             optional
 ```
 
 One row per group of equal `group` values (one row in all without
@@ -135,6 +143,10 @@ expression and `a<i>` for each aggregate, read as `{"group": i}` and
 - `sets`: grouping sets, each a list of indexes into `group`.  The rows of
   every set are produced, the keys outside a row's set NULL, and a column
   `gset` (`<s>_gset`) holds the row's set, its position in `sets`.
+- `partial`: the plan's top aggregate is a partial one, whose groups an
+  aggregate in another slice combines: a group may come out more than
+  once, as from a Streaming Partial HashAggregate, so an engine may emit
+  groups early instead of spilling them.
 
 `<agg>`:
 
@@ -400,7 +412,7 @@ Every member name and every value of a member that selects a kind.
 ```catalog
 member ir inputs plan output sort limit batch_rows trim narrow route
 member columns type motion_columns motion_pad motion_narrow set
-member input filter pred aggregate group aggs having name sets
+member input filter pred aggregate group aggs having name sets partial
 member fn arg arg2 distinct collate
 member join left right on null_equal null_aware
 member window partition order frame funcs sum count desc nulls_first

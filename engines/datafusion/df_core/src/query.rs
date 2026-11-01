@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -44,10 +44,11 @@ use datafusion::arrow::array::{
 use datafusion::arrow::buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::{cast, take};
 use datafusion::arrow::datatypes::{
-    ArrowPrimitiveType, DataType, Decimal256Type, Field, Fields, Float32Type, Float64Type,
+    ArrowPrimitiveType, DataType, Decimal128Type, Decimal256Type, Field, Fields, Float32Type, Float64Type,
     Int16Type, Int32Type, Int64Type, Schema, SchemaRef,
 };
 use datafusion::arrow::ipc::reader::StreamDecoder;
+use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::catalog::streaming::StreamingTable;
@@ -58,7 +59,7 @@ use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::functions_aggregate::expr_fn::{avg, bool_or, count, max, min, sum};
+use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
 use datafusion::functions_window::expr_fn::{dense_rank, rank, row_number};
 use datafusion::logical_expr::execution_props::ExecutionProps;
 use datafusion::logical_expr::expr::Case;
@@ -139,6 +140,10 @@ pub enum PgType {
     // numeric of a fixed scale, as Decimal256(76, scale): the C side builds
     // PostgreSQL's numeric values from the integers (pgnum).
     Numeric(i8),
+    // N6: an input column of numeric of a fixed scale and at most that
+    // many digits (up to 38), as Decimal128(digits, scale): one of a
+    // numeric(p, s) table column, or a Motion's narrowed one (NW1).
+    NumericN(i8, u8),
     // tid (TID1): block << 16 | offset as int8, ordered as tids are.
     Tid,
 }
@@ -196,7 +201,7 @@ impl PgType {
             PgType::Int8 => KeyHash::Int8,
             PgType::Float4 => KeyHash::Float4,
             PgType::Float8 => KeyHash::Float8,
-            PgType::Numeric(s) => KeyHash::Numeric(s),
+            PgType::Numeric(s) | PgType::NumericN(s, _) => KeyHash::Numeric(s),
             _ => unreachable!(),
         }
     }
@@ -211,7 +216,19 @@ impl PgType {
             PgType::Float8 => DataType::Float64,
             PgType::Text => DataType::Utf8,
             PgType::Numeric(s) => crate::pgnum::numeric_type(s),
+            PgType::NumericN(s, p) => DataType::Decimal128(p, s),
             _ => unreachable!(),
+        }
+    }
+
+    /// N6: this input column type, narrow if `digits` (1 to 38) are given
+    /// for a numeric one.
+    fn with_digits(self, digits: Option<i64>) -> PgType {
+        match (self, digits) {
+            (PgType::Numeric(s), Some(d)) if d >= 1 && d.max(s as i64) <= 38 => {
+                PgType::NumericN(s, d.max(s as i64) as u8)
+            }
+            (t, _) => t,
         }
     }
 }
@@ -354,7 +371,22 @@ fn literal(v: &Value) -> Result<Expr, String> {
             crate::pgnum::NUMERIC_PRECISION,
             s,
         ),
+        PgType::NumericN(..) => return Err("plan spec: a narrow numeric literal".into()),
         _ => unreachable!(),
+    };
+    // N6: a number within 38 digits is narrow, of its own digits
+    let sv = match sv {
+        ScalarValue::Decimal256(Some(v), _, s) => match crate::pgnum::narrow_value(v) {
+            Some(n) if n.unsigned_abs() < 10u128.pow(38) => {
+                let digits = n.unsigned_abs().checked_ilog10().map_or(1, |d| d as i64 + 1);
+                match crate::pgnum::numeric_type_of(digits, s) {
+                    DataType::Decimal128(p, s) => ScalarValue::Decimal128(Some(n), p, s),
+                    _ => ScalarValue::Decimal256(Some(v), crate::pgnum::NUMERIC_PRECISION, s),
+                }
+            }
+            _ => ScalarValue::Decimal256(Some(v), crate::pgnum::NUMERIC_PRECISION, s),
+        },
+        sv => sv,
     };
     Ok(lit(sv))
 }
@@ -839,9 +871,8 @@ fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, S
         // The sum of the sums; the counts are a second aggregate (`aggregate_extra`).
         "avg_merge" => sum(need(arg)?),
         // sum_numeric: PostgreSQL's sum(int8) and avg(int)'s sum, exact, as
-        // numeric.  sum_decimal: sum of numeric(p, s), NaN aside; the second
-        // aggregate notes NaNs (`aggregate_extra`) and the projection after
-        // the aggregate makes the sum NaN then.
+        // numeric.  sum_decimal: sum of numeric(p, s), NaN if any is
+        // (pgnum::PgSumDecimal).
         "min" | "max" if v.get("collate").is_some() => collated_min_max(v, need(arg)?)?,
         _ => aggregate_of(name, need(arg)?)?,
     })
@@ -862,7 +893,7 @@ fn aggregate_of(name: &str, a: Expr) -> Result<Expr, String> {
             Box::new(a),
             crate::pgnum::numeric_type(0),
         ))),
-        "sum_decimal" => sum(PgNumeric::udf(NumericFn::NanToZero).call(vec![a])),
+        "sum_decimal" => crate::pgnum::PgSumDecimal::udaf().call(vec![a]),
         "min" => min(a),
         "max" => max(a),
         "avg" => avg(a),
@@ -887,15 +918,10 @@ fn is_float_expr(e: &Expr, input: &DFSchema) -> bool {
 }
 
 /// The second aggregate an aggregate spec needs, if any: avg_merge's sum of
-/// counts, sum_decimal's "some value is NaN".  The latter is bool_or, not
-/// max: DataFusion's max of booleans has no groups accumulator and keeps one
-/// row accumulator per group, about 50 times slower over many groups.
-fn aggregate_extra(v: &Value, over: Option<&Expr>) -> Result<Option<Expr>, String> {
+/// counts.
+fn aggregate_extra(v: &Value, _over: Option<&Expr>) -> Result<Option<Expr>, String> {
     match field(v, "fn")?.as_str() {
         Some("avg_merge") => Ok(Some(sum(expr(field(v, "arg2")?)?))),
-        Some("sum_decimal") => Ok(Some(bool_or(PgNumeric::udf(NumericFn::IsNan).call(vec![
-            agg_arg(v, over)?.ok_or("sum_decimal needs an argument")?,
-        ])))),
         _ => Ok(None),
     }
 }
@@ -991,8 +1017,6 @@ enum Post {
     None,
     /// a count combined from partial counts: 0, not NULL, without any
     CountZero,
-    /// sum_decimal: NaN where the second aggregate saw one
-    NanIf,
     /// an avg from a sum and a count (the second aggregate): NULL for none
     AvgDivide,
     /// min or max of floats, run on order keys (pgfloat)
@@ -1003,7 +1027,6 @@ impl Post {
     fn of(a: &Value) -> Result<Post, String> {
         Ok(match field(a, "fn")?.as_str() {
             Some("count_merge") => Post::CountZero,
-            Some("sum_decimal") => Post::NanIf,
             Some("avg_merge") => Post::AvgDivide,
             _ => Post::None,
         })
@@ -1056,9 +1079,16 @@ fn session_state(
         .cloned()
         .collect();
     // last, once DataFusion has chosen each hash join's mode
+    // N6: numeric values paired up made one type before type coercion
+    let analyzer: Vec<Arc<dyn datafusion::optimizer::AnalyzerRule + Send + Sync>> = vec![
+        Arc::new(datafusion::optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction::new()),
+        Arc::new(crate::numwidth::NumericWidth),
+        Arc::new(datafusion::optimizer::analyzer::type_coercion::TypeCoercion::new()),
+    ];
     Ok(SessionStateBuilder::new_from_existing(state)
+        .with_analyzer_rules(analyzer)
         .with_optimizer_rules(rules)
-        .with_physical_optimizer_rule(Arc::new(crate::spilljoin::SpillHashJoins))
+        .with_physical_optimizer_rule(Arc::new(crate::spilljoin::SpillHashJoins::default()))
         .build())
 }
 
@@ -1094,9 +1124,26 @@ impl PartitionStream for ChannelPartition {
 // PAX micro-partitions read on the workers (experimental)
 // ---------------------------------------------------------------------------
 
-/// Called by the PAX reader once per group of visible rows.
-pub type PaxEmitFn =
-    unsafe extern "C" fn(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32;
+/// The PAX reader's conversion of a fixed-width column of the chunk being
+/// emitted, of the chunk rows at `rows` (all if null): 0, or -1 with the
+/// reason left for read_block's message.
+pub type PaxFetchFn = unsafe extern "C" fn(
+    chunk: *mut c_void,
+    col: i32,
+    rows: *const u32,
+    nrows: u32,
+    out: *mut PaxColumn,
+) -> i32;
+/// Called by the PAX reader once per chunk of a group's visible rows: the
+/// string columns in `cols`, the fixed-width ones (null pointers there) had
+/// from `fetch` with `chunk`, during the call.
+pub type PaxEmitFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    nrows: u32,
+    cols: *const PaxColumn,
+    fetch: PaxFetchFn,
+    chunk: *mut c_void,
+) -> i32;
 /// Called by the PAX reader with the change in bytes it holds.
 pub type PaxAccountFn = unsafe extern "C" fn(ctx: *mut c_void, delta: i64);
 /// read_block of the PAX scan interface (patches/pax): decode `count`
@@ -1169,12 +1216,240 @@ pub struct PaxScan {
 /// pass only.  A numeric costs a conversion per value: in TPC-DS Q28's
 /// scans of store_sales ss_quantity alone keeps 5% of the rows.  The filter
 /// above still checks every condition of the rows that pass.
+/// LM2: then, on the rows left, conditions on strings checked on the
+/// reader's bytes (`StrCond`): a string column costs a copy and a UTF-8
+/// check of every value to build (TPC-H Q19's l_shipmode and
+/// l_shipinstruct keep 7% of lineitem's rows).  The cheap conditions go
+/// first: Q12's dates keep fewer rows than its l_shipmode, at less cost.
 struct PaxPrefilter {
+    /// the cheap conditions on integers and dates, then those on narrow
+    /// numerics (16 bytes a value to build, of the rows left)
+    stages: Vec<PaxStage>,
+    strs: Vec<StrCond>,
+}
+
+/// LM1: cheap conditions evaluated together.
+struct PaxStage {
     /// the input columns the conditions read, ascending
     cols: Vec<usize>,
     /// their fields, which the expression's columns index
     schema: SchemaRef,
     expr: Arc<dyn PhysicalExpr>,
+}
+
+/// LM2: `col = c`, `col <> c`, `col IN (c, ...)` or `col NOT IN (c, ...)`
+/// of a text column, or of a character one without trailing blanks (both
+/// sides `bpkey`), and constants that are not NULL.  Byte equality is
+/// PostgreSQL's for a deterministic collation (no "collate"); a NULL
+/// value fails the row, as the filter's NULL result does.
+/// And `col LIKE c` or `col NOT LIKE c` of a text column, of a pattern of
+/// literal pieces and %'s (`pgstr::like_pieces`): byte search finds what
+/// PostgreSQL's character matching does in UTF-8, pieces being whole
+/// characters.
+/// A condition that keeps more than 90% of the first 100,000 rows it sees
+/// is dropped (`useful`): the filter above checks it anyway, and TPC-H Q13's
+/// `o_comment NOT LIKE '%special%requests%'` keeps 99%.
+#[derive(Debug)]
+struct StrCond {
+    col: usize,
+    bpchar: bool,
+    /// the values `col` equals one of; or with `like`, the pattern's pieces
+    values: Vec<Vec<u8>>,
+    /// the searchers of the middle pieces of a LIKE pattern
+    finders: Vec<memchr::memmem::Finder<'static>>,
+    like: bool,
+    negated: bool,
+    /// rows seen and kept while deciding
+    seen: AtomicU64,
+    kept: AtomicU64,
+}
+
+/// Rows a string condition is tried on before it is judged.
+const STR_COND_TRIAL: u64 = 100_000;
+
+impl StrCond {
+    /// `v` as such a condition on input `j` of column types `types`.
+    fn parse(v: &Value, j: usize, types: &[PgType]) -> Option<StrCond> {
+        // (column or constant, under bpkey)
+        enum Side {
+            Col(usize),
+            Lit(String),
+        }
+        let side = |v: &Value| -> Option<(Side, bool)> {
+            let (x, bp) = match v.get("bpkey") {
+                Some(x) => (x, true),
+                None => (v, false),
+            };
+            let want = if bp { PgType::Bpchar } else { PgType::Text };
+            if let Some(k) = x.get("col") {
+                if x.get("input").map_or(Some(0), Value::as_u64)? as usize != j {
+                    return None;
+                }
+                let k = k.as_u64()? as usize;
+                return (*types.get(k)? == want).then_some((Side::Col(k), bp));
+            }
+            let l = x.get("lit")?;
+            let tag = if bp { "bpchar" } else { "text" };
+            if l.get("type")?.as_str()? != tag {
+                return None;
+            }
+            let s = l.get("value")?.as_str()?;
+            let s = if bp { crate::pgstr::bpchar_trim(s) } else { s };
+            Some((Side::Lit(s.to_string()), bp))
+        };
+        let like = false;
+        let (col, bpchar, values, negated) = if let Some(op) = v.get("op").and_then(Value::as_str) {
+            let args = v.get("args")?.as_array()?;
+            if !matches!(op, "=" | "<>" | "~~" | "!~~")
+                || v.get("collate").is_some()
+                || args.len() != 2
+            {
+                return None;
+            }
+            if matches!(op, "~~" | "!~~") {
+                // text LIKE constant, the column first
+                return match (side(&args[0])?, side(&args[1])?) {
+                    ((Side::Col(k), false), (Side::Lit(s), false)) => {
+                        let values = crate::pgstr::like_pieces(s.as_bytes())?;
+                        let finders = match values.len() {
+                            0..=2 => Vec::new(),
+                            n => values[1..n - 1]
+                                .iter()
+                                .filter(|p| !p.is_empty())
+                                .map(|p| memchr::memmem::Finder::new(p).into_owned())
+                                .collect(),
+                        };
+                        Some(StrCond {
+                            col: k,
+                            bpchar: false,
+                            values,
+                            finders,
+                            like: true,
+                            negated: op == "!~~",
+                            seen: AtomicU64::new(0),
+                            kept: AtomicU64::new(0),
+                        })
+                    }
+                    _ => None,
+                };
+            }
+            match (side(&args[0])?, side(&args[1])?) {
+                ((Side::Col(k), a), (Side::Lit(s), b)) | ((Side::Lit(s), b), (Side::Col(k), a))
+                    if a == b =>
+                {
+                    (k, a, vec![s.into_bytes()], op == "<>")
+                }
+                _ => return None,
+            }
+        } else if let Some(e) = v.get("inlist") {
+            let (Side::Col(k), bp) = side(e)? else {
+                return None;
+            };
+            let mut values = Vec::new();
+            for x in v.get("values")?.as_array()? {
+                match side(x)? {
+                    (Side::Lit(s), b) if b == bp => values.push(s.into_bytes()),
+                    _ => return None,
+                }
+            }
+            let negated = v.get("negated").and_then(Value::as_bool).unwrap_or(false);
+            (k, bp, values, negated)
+        } else {
+            return None;
+        };
+        Some(StrCond {
+            col,
+            bpchar,
+            values,
+            finders: Vec::new(),
+            like,
+            negated,
+            seen: AtomicU64::new(0),
+            kept: AtomicU64::new(0),
+        })
+    }
+
+    /// Is the condition still worth checking here (see `StrCond`)?
+    fn useful(&self) -> bool {
+        let seen = self.seen.load(Ordering::Relaxed);
+        seen < STR_COND_TRIAL || self.kept.load(Ordering::Relaxed) * 10 <= seen * 9
+    }
+
+    /// Count `kept` of `seen` rows while the condition is on trial.
+    fn record(&self, seen: usize, kept: usize) {
+        if self.seen.load(Ordering::Relaxed) < STR_COND_TRIAL {
+            self.seen.fetch_add(seen as u64, Ordering::Relaxed);
+            self.kept.fetch_add(kept as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Does `t` match the LIKE pattern of pieces `values`?
+    #[inline]
+    fn like_match(&self, t: &[u8]) -> bool {
+        let pieces = &self.values;
+        if pieces.len() == 1 {
+            return t == pieces[0].as_slice();
+        }
+        let (first, last) = (&pieces[0], &pieces[pieces.len() - 1]);
+        if t.len() < first.len() + last.len() || !t.starts_with(first) || !t.ends_with(last) {
+            return false;
+        }
+        let mut rest = &t[first.len()..t.len() - last.len()];
+        for f in &self.finders {
+            match f.find(rest) {
+                Some(at) => rest = &rest[at + f.needle().len()..],
+                None => return false,
+            }
+        }
+        true
+    }
+
+    /// Does the value of row `r` of `c`, a string column the reader lent,
+    /// pass?
+    ///
+    /// # Safety
+    /// `c` has offsets for more than `r` rows and a null byte per row.
+    #[inline]
+    unsafe fn holds(&self, offsets: &[i32], bytes: &[u8], nulls: &[u8], r: usize) -> bool {
+        if nulls[r] != 0 {
+            return false;
+        }
+        let mut v = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
+        if self.like {
+            return self.like_match(v) != self.negated;
+        }
+        if self.bpchar {
+            while let [rest @ .., b' '] = v {
+                v = rest;
+            }
+        }
+        self.values.iter().any(|x| x.as_slice() == v) != self.negated
+    }
+}
+
+/// LM2: the positions in `rows` (all `n` rows if None) of the rows that
+/// pass every condition of `conds`, the columns being `raw`'s.
+///
+/// # Safety
+/// Each condition's column is a string column of `n` rows the reader lent.
+unsafe fn str_rows(
+    conds: &[StrCond],
+    raw: impl Fn(usize) -> RawColumn,
+    n: usize,
+    rows: Option<&[u32]>,
+) -> Vec<u32> {
+    let row = |k: u32| rows.map_or(k, |r| r[k as usize]) as usize;
+    let mut keep: Vec<u32> = (0..rows.map_or(n, <[u32]>::len) as u32).collect();
+    for c in conds.iter().filter(|c| c.useful()) {
+        let col = raw(c.col);
+        let offsets = std::slice::from_raw_parts(col.offsets, n + 1);
+        let bytes = std::slice::from_raw_parts(col.values, offsets[n] as usize);
+        let nulls = std::slice::from_raw_parts(col.nulls, n);
+        let before = keep.len();
+        keep.retain(|&k| c.holds(offsets, bytes, nulls, row(k)));
+        c.record(before, keep.len());
+    }
+    keep
 }
 
 /// What the PAX scans of one query share: the account their decoding
@@ -1442,7 +1717,13 @@ struct EmitContext {
     error: Option<String>,
 }
 
-unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColumn) -> i32 {
+unsafe extern "C" fn pax_emit(
+    ctx: *mut c_void,
+    nrows: u32,
+    cols: *const PaxColumn,
+    fetch: PaxFetchFn,
+    chunk: *mut c_void,
+) -> i32 {
     let ctx = &mut *(ctx as *mut EmitContext);
     let result = catch_unwind(AssertUnwindSafe(|| {
         let n = nrows as usize;
@@ -1454,43 +1735,100 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
                 offsets: c.offsets,
             }
         };
+        // Column i of the rows `rows` (all if None): a string column from
+        // the reader's bytes, a fixed-width one converted by the reader for
+        // those rows only.  A failed conversion is an error without a
+        // message: read_block's tells why.
+        let column = |i: usize, rows: Option<&[u32]>| -> Result<ArrayRef, PgError> {
+            let c = raw(i);
+            if !c.values.is_null() {
+                return build_array_rows(ctx.types[i], c, n, rows);
+            }
+            let mut out = PaxColumn {
+                values: std::ptr::null(),
+                nulls: std::ptr::null(),
+                offsets: std::ptr::null(),
+            };
+            let (ptr, m) = rows.map_or((std::ptr::null(), n), |r| (r.as_ptr(), r.len()));
+            if fetch(chunk, i as i32, ptr, m as u32, &mut out) != 0 {
+                return Err(PgError::internal(String::new()));
+            }
+            build_array_rows(
+                ctx.types[i],
+                RawColumn {
+                    values: out.values,
+                    nulls: out.nulls,
+                    offsets: out.offsets,
+                },
+                m,
+                None,
+            )
+        };
         let internal = |e: DataFusionError| PgError::internal(e.to_string());
+        // the columns built so far, of the rows `rows`
         let mut built: Vec<Option<ArrayRef>> = vec![None; ctx.types.len()];
         // LM1: the rows that pass the cheap conditions, when not all do
         let mut rows: Option<Vec<u32>> = None;
+        // `keep` (positions in `rows`) the rows from now on
+        let narrow = |built: &mut Vec<Option<ArrayRef>>,
+                      rows: &mut Option<Vec<u32>>,
+                      keep: Vec<u32>|
+         -> Result<(), PgError> {
+            let positions = UInt32Array::from(keep.clone());
+            for a in built.iter_mut().filter(|a| a.is_some()) {
+                *a = Some(
+                    take(a.as_ref().unwrap().as_ref(), &positions, None)
+                        .map_err(|e| PgError::internal(e.to_string()))?,
+                );
+            }
+            *rows = Some(match rows.take() {
+                Some(r) => keep.iter().map(|&k| r[k as usize]).collect(),
+                None => keep,
+            });
+            Ok(())
+        };
         if let Some(p) = &ctx.scan.prefilter {
-            for &i in &p.cols {
-                built[i] = Some(build_array(ctx.types[i], raw(i), n)?);
+            for stage in &p.stages {
+                for &i in &stage.cols {
+                    if built[i].is_none() {
+                        built[i] = Some(column(i, rows.as_deref())?);
+                    }
+                }
+                let m = rows.as_ref().map_or(n, Vec::len);
+                let arrays = stage.cols.iter().map(|&i| built[i].clone().unwrap()).collect();
+                let mask = stage
+                    .expr
+                    .evaluate(&make_batch(&stage.schema, arrays, m)?)
+                    .and_then(|v| v.into_array(m))
+                    .map_err(internal)?;
+                let mask = mask.as_boolean();
+                let keep: Vec<u32> = (0..m)
+                    .filter(|&r| mask.is_valid(r) && mask.value(r))
+                    .map(|r| r as u32)
+                    .collect();
+                if keep.is_empty() {
+                    return Ok(None);
+                }
+                if keep.len() < m {
+                    narrow(&mut built, &mut rows, keep)?;
+                }
             }
-            let arrays = p.cols.iter().map(|&i| built[i].clone().unwrap()).collect();
-            let mask = p
-                .expr
-                .evaluate(&make_batch(&p.schema, arrays, n)?)
-                .and_then(|v| v.into_array(n))
-                .map_err(internal)?;
-            let mask = mask.as_boolean();
-            let keep: Vec<u32> = (0..n)
-                .filter(|&r| mask.is_valid(r) && mask.value(r))
-                .map(|r| r as u32)
-                .collect();
-            if keep.is_empty() {
-                return Ok(None);
-            }
-            if keep.len() < n {
-                rows = Some(keep);
+            // LM2: then strings, on the reader's bytes of the rows left
+            if !p.strs.is_empty() {
+                let m = rows.as_ref().map_or(n, Vec::len);
+                let keep = str_rows(&p.strs, raw, n, rows.as_deref());
+                if keep.is_empty() {
+                    return Ok(None);
+                }
+                if keep.len() < m {
+                    narrow(&mut built, &mut rows, keep)?;
+                }
             }
         }
-        let rows_array = rows.as_ref().map(|r| UInt32Array::from(r.clone()));
-        let arrays = ctx
-            .types
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| match (built[i].take(), &rows_array) {
-                (Some(a), None) => Ok(a),
-                (Some(a), Some(r)) => {
-                    take(a.as_ref(), r, None).map_err(|e| PgError::internal(e.to_string()))
-                }
-                (None, _) => build_array_rows(*ty, raw(i), n, rows.as_deref()),
+        let arrays = (0..ctx.types.len())
+            .map(|i| match built[i].take() {
+                Some(a) => Ok(a),
+                None => column(i, rows.as_deref()),
             })
             .collect::<Result<Vec<ArrayRef>, PgError>>()?;
         make_batch(&ctx.schema, arrays, rows.as_ref().map_or(n, Vec::len)).map(Some)
@@ -1502,7 +1840,8 @@ unsafe extern "C" fn pax_emit(ctx: *mut c_void, nrows: u32, cols: *const PaxColu
         }
         Ok(Ok(None)) => 0,
         Ok(Err(e)) => {
-            ctx.error = Some(e.message);
+            // no message: the reader's
+            ctx.error = (!e.message.is_empty()).then_some(e.message);
             1
         }
         Err(_) => {
@@ -1828,8 +2167,6 @@ fn window(
                 cols.push(col(&n).alias(format!("{name}_w{i}_n")));
                 match Post::of(sum_call)? {
                     Post::None => col(&v),
-                    Post::NanIf => PgNumeric::udf(NumericFn::NanIf)
-                        .call(vec![col(&v), col(format!("{v}_n"))]),
                     _ => return Err("plan spec: avg_parts sum".into()),
                 }
             }
@@ -1843,8 +2180,6 @@ fn window(
                 } else {
                     match Post::of(f)? {
                         Post::None => col(&v),
-                        Post::NanIf => PgNumeric::udf(NumericFn::NanIf)
-                            .call(vec![col(&v), col(format!("{v}_n"))]),
                         _ => return Err(format!("plan spec: window function {fname}")),
                     }
                 }
@@ -1874,15 +2209,23 @@ fn input_filters<'a>(v: &'a Value, out: &mut HashMap<usize, &'a Value>) {
 }
 
 /// LM1: the type of a column of input `j` or a literal, if it is one
-/// cheap to build and compare: an integer or a date.
+/// cheap to build and compare: an integer or a date; LM2: a narrow numeric
+/// column (16 bytes a value, N6) or a numeric constant, compared at one
+/// scale.
 fn cheap_operand(v: &Value, j: usize, types: &[PgType]) -> Option<PgType> {
     let ty = if let Some(k) = v.get("col") {
         if v.get("input").map_or(Some(0), Value::as_u64)? as usize != j {
             return None;
         }
-        *types.get(k.as_u64()? as usize)?
+        match *types.get(k.as_u64()? as usize)? {
+            PgType::NumericN(s, _) => return Some(PgType::Numeric(s)),
+            t => t,
+        }
     } else {
-        PgType::parse(v.get("lit")?.get("type")?.as_str()?).ok()?
+        match PgType::parse(v.get("lit")?.get("type")?.as_str()?).ok()? {
+            t @ PgType::Numeric(_) => return Some(t),
+            t => t,
+        }
     };
     matches!(
         ty,
@@ -1925,12 +2268,19 @@ fn cheap_condition(v: &Value, j: usize, types: &[PgType]) -> bool {
 }
 
 /// LM1: the conditions of `pred`, ANDed at its top, that are cheap
-/// (`cheap_condition`).  A row failing one fails `pred`.
-fn cheap_conjuncts<'a>(pred: &'a Value, j: usize, types: &[PgType], out: &mut Vec<&'a Value>) {
+/// (`cheap_condition`), and LM2's on strings.  A row failing one fails
+/// `pred`.
+fn cheap_conjuncts<'a>(
+    pred: &'a Value,
+    j: usize,
+    types: &[PgType],
+    out: &mut Vec<&'a Value>,
+    strs: &mut Vec<StrCond>,
+) {
     match pred.get("and").and_then(Value::as_array) {
-        Some(xs) => xs.iter().for_each(|x| cheap_conjuncts(x, j, types, out)),
+        Some(xs) => xs.iter().for_each(|x| cheap_conjuncts(x, j, types, out, strs)),
         None if cheap_condition(pred, j, types) => out.push(pred),
-        None => {}
+        None => strs.extend(StrCond::parse(pred, j, types)),
     }
 }
 
@@ -1958,35 +2308,46 @@ fn pax_prefilter(
 ) -> Result<Option<PaxPrefilter>, String> {
     let df = |e: DataFusionError| e.to_string();
     let mut conjuncts = Vec::new();
-    cheap_conjuncts(pred, j, types, &mut conjuncts);
-    let mut cols = Vec::new();
-    conjuncts.iter().for_each(|c| spec_columns(c, &mut cols));
-    cols.sort_unstable();
-    cols.dedup();
-    if conjuncts.is_empty() || cols.len() == types.len() {
+    let mut strs = Vec::new();
+    cheap_conjuncts(pred, j, types, &mut conjuncts, &mut strs);
+    let columns = |cs: &[&Value]| {
+        let mut cols = Vec::new();
+        cs.iter().for_each(|c| spec_columns(c, &mut cols));
+        cols.sort_unstable();
+        cols.dedup();
+        cols
+    };
+    if strs.is_empty() && (conjuncts.is_empty() || columns(&conjuncts).len() == types.len()) {
         return Ok(None);
     }
-    let e = conjuncts
-        .iter()
-        .map(|c| expr(c))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .reduce(Expr::and)
-        .unwrap();
-    let sub: SchemaRef = Arc::new(schema.project(&cols).map_err(|e| e.to_string())?);
-    let dfschema = DFSchema::try_from(sub.as_ref().clone()).map_err(df)?;
-    let expr = create_physical_expr(
-        &e,
-        &dfschema,
-        &ExecutionProps::new(),
-        &PhysicalPlanningContext::default(),
-    )
-    .map_err(df)?;
-    Ok(Some(PaxPrefilter {
-        cols,
-        schema: sub,
-        expr,
-    }))
+    // integers and dates first, then narrow numerics
+    let (numeric, plain): (Vec<&Value>, Vec<&Value>) = conjuncts.into_iter().partition(|c| {
+        columns(&[c]).iter().any(|&k| matches!(types.get(k), Some(PgType::NumericN(..))))
+    });
+    let mut stages = Vec::new();
+    for group in [plain, numeric].into_iter().filter(|g| !g.is_empty()) {
+        let cols = columns(&group);
+        let e = group
+            .iter()
+            .map(|c| expr(c))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .reduce(Expr::and)
+            .unwrap();
+        let sub: SchemaRef = Arc::new(schema.project(&cols).map_err(|e| e.to_string())?);
+        let dfschema = DFSchema::try_from(sub.as_ref().clone()).map_err(df)?;
+        // N6: a narrow column and a constant compared made one type
+        let e = crate::numwidth::unify_numerics(e, &dfschema).map_err(df)?;
+        let expr = create_physical_expr(
+            &e,
+            &dfschema,
+            &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
+        )
+        .map_err(df)?;
+        stages.push(PaxStage { cols, schema: sub, expr });
+    }
+    Ok(Some(PaxPrefilter { stages, strs }))
 }
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
@@ -2221,8 +2582,7 @@ fn build_node(
                         agg_exprs.push(sum(pn).alias(format!("{a}_n")));
                     }
                     "sum_decimal" => {
-                        agg_exprs.push(sum(p).alias(&a));
-                        agg_exprs.push(bool_or(pn).alias(format!("{a}_n")));
+                        agg_exprs.push(crate::pgnum::PgSumDecimal::udaf().call(vec![p]).alias(&a))
                     }
                     _ => agg_exprs.push(sum(p).alias(&a)),
                 }
@@ -2295,7 +2655,6 @@ fn build_node(
                         Post::CountZero => when(c.clone().is_null(), lit(0i64))
                             .otherwise(c)
                             .map_err(df)?,
-                        Post::NanIf => PgNumeric::udf(NumericFn::NanIf).call(vec![c, n]),
                         Post::AvgDivide => {
                             let nf = Expr::Cast(datafusion::logical_expr::Cast::new(
                                 Box::new(n.clone()),
@@ -2605,6 +2964,18 @@ impl Query {
                 .map(|c| PgType::parse(c.get("type").and_then(Value::as_str).unwrap_or("")))
                 .collect::<Result<_, _>>()
                 .map_err(internal)?;
+            // N6: numeric columns of known digits up to 38 are narrow: a
+            // table's numeric(p, s) ("digits"), a Motion's narrowed ones
+            let digits = inp.get("digits").or_else(|| inp.get("motion_narrow"));
+            let types: Vec<PgType> = match digits.and_then(Value::as_array) {
+                Some(d) if d.len() == types.len() => types
+                    .into_iter()
+                    .zip(d)
+                    .map(|(t, d)| t.with_digits(d.as_i64()))
+                    .collect(),
+                Some(_) => return Err(internal("bad input digits".into())),
+                None => types,
+            };
             in_schemas.push(Arc::new(Schema::new(
                 types
                     .iter()
@@ -2704,7 +3075,7 @@ impl Query {
                                 Some(d)
                                     if matches!(
                                         schema.field(i).data_type(),
-                                        DataType::Decimal256(..)
+                                        DataType::Decimal128(..)
                                     ) =>
                                 {
                                     MotionNumeric::of_digits(d)
@@ -2813,10 +3184,7 @@ impl Query {
             } else {
                 e
             };
-            out_exprs.push(
-                Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), ty.arrow()))
-                    .alias(format!("o{i}")),
-            );
+            out_exprs.push(e);
             out_types.push(ty);
         }
         // NW1: numeric outputs sent narrowed, by their digits
@@ -2844,6 +3212,26 @@ impl Query {
             Some(_) => return Err(internal("narrowing needs IPC output".into())),
             None => {}
         }
+        // N6: a numeric output narrowed for its Motion goes as it is, narrow
+        // or not; the others as Decimal256 (NaN kept: an Arrow cast would
+        // not), which the host reads
+        let out_exprs: Vec<Expr> = out_exprs
+            .into_iter()
+            .zip(&out_types)
+            .enumerate()
+            .map(|(i, (e, ty))| {
+                let e = match ty {
+                    PgType::Numeric(_) if narrow.iter().any(|(c, _)| *c == i) => e,
+                    PgType::Numeric(scale) => PgNumeric::udf(NumericFn::As {
+                        digits: crate::pgnum::NUMERIC_PRECISION,
+                        scale: *scale,
+                    })
+                    .call(vec![e]),
+                    _ => Expr::Cast(datafusion::logical_expr::Cast::new(Box::new(e), ty.arrow())),
+                };
+                e.alias(format!("o{i}"))
+            })
+            .collect();
         let mut b = b.project(out_exprs).map_err(df)?;
         // S1: the slice's Sort, by output columns, then its Limit.
         if let Some(keys) = spec.get("sort").filter(|v| !v.is_null()) {
@@ -2880,6 +3268,12 @@ impl Query {
         }
         let plan = b.build().map_err(df)?;
         drop(building);
+        let partial = spec
+            .get("plan")
+            .and_then(|p| p.get("aggregate"))
+            .and_then(|a| a.get("partial"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let route = match spec.get("route").filter(|v| !v.is_null()) {
             Some(r) if ipc_output => Some(HashRoute::parse(r).map_err(internal)?),
             Some(_) => return Err(internal("a route needs IPC output".into())),
@@ -2950,7 +3344,10 @@ impl Query {
                     h.finish();
                 }
                 let state = ctx.state();
-                let physical = state.create_physical_plan(&plan).await?;
+                let mut physical = state.create_physical_plan(&plan).await?;
+                if partial {
+                    physical = partial_only(physical)?;
+                }
                 if let Ok(mut s) = slot.lock() {
                     *s = Some(physical.clone());
                 }
@@ -2960,7 +3357,7 @@ impl Query {
                 if let Some(route) = route {
                     // One stream per receiving route, opened on its first
                     // rows; a route without rows gets end-of-stream only.
-                    let mut writers: HashMap<u32, StreamWriter<Vec<u8>>> = HashMap::new();
+                    let mut writers: HashMap<u32, MotionWriter> = HashMap::new();
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         let n = batch.num_rows();
@@ -2989,12 +3386,10 @@ impl Query {
                             let part = RecordBatch::try_new(wire.clone(), cols)?;
                             let w = match writers.entry(r) {
                                 Entry::Occupied(e) => e.into_mut(),
-                                Entry::Vacant(e) => {
-                                    e.insert(StreamWriter::try_new(Vec::new(), &wire)?)
-                                }
+                                Entry::Vacant(e) => e.insert(MotionWriter::try_new(&wire)?),
                             };
                             w.write(&part)?;
-                            let bytes = std::mem::take(w.get_mut());
+                            let bytes = w.take();
                             if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
                                 return Ok(());
                             }
@@ -3002,7 +3397,7 @@ impl Query {
                     }
                     for (r, mut w) in writers {
                         w.finish()?;
-                        let bytes = std::mem::take(w.get_mut());
+                        let bytes = w.take();
                         if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
                             return Ok(());
                         }
@@ -3012,20 +3407,20 @@ impl Query {
                 if ipc_output {
                     // Encode here, on a worker; the main thread only copies
                     // the bytes into the interconnect.
-                    let mut w = StreamWriter::try_new(Vec::new(), &wire)?;
+                    let mut w = MotionWriter::try_new(&wire)?;
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         if batch.num_rows() == 0 {
                             continue;
                         }
                         w.write(&narrow_batch(&wire, batch, &narrow)?)?;
-                        let bytes = std::mem::take(w.get_mut());
+                        let bytes = w.take();
                         if out_tx.send(Ok(Out::Bytes(NO_ROUTE, bytes))).await.is_err() {
                             return Ok(());
                         }
                     }
                     w.finish()?;
-                    let bytes = std::mem::take(w.get_mut());
+                    let bytes = w.take();
                     let _ = out_tx.send(Ok(Out::Bytes(NO_ROUTE, bytes))).await;
                     return Ok(());
                 }
@@ -3461,6 +3856,165 @@ impl Drop for Query {
     }
 }
 
+/// MZ1: the Arrow IPC stream a slice sends through a Motion, each batch
+/// compressed with LZ4 when string values make up most of its bytes.  A
+/// sender of ClickBench Q34 (GROUP BY URL) held up the interconnect with a
+/// gigabyte of URLs, and LZ4 took a quarter off that query; batches mostly
+/// of numbers only lost time to it.  Each record batch message of a stream
+/// says whether it is compressed, so the receiver's decoder reads both.
+/// A Motion carries no dictionary-encoded columns, so the messages encoded
+/// here and the writer's own share no dictionary state.
+struct MotionWriter {
+    w: StreamWriter<Vec<u8>>,
+    gen: datafusion::arrow::ipc::writer::IpcDataGenerator,
+    tracker: datafusion::arrow::ipc::writer::DictionaryTracker,
+    ctx: datafusion::arrow::ipc::writer::IpcWriteContext,
+    lz4: datafusion::arrow::ipc::writer::IpcWriteOptions,
+}
+
+impl MotionWriter {
+    fn try_new(schema: &Schema) -> Result<Self, ArrowError> {
+        use datafusion::arrow::ipc::writer::IpcWriteOptions;
+        Ok(MotionWriter {
+            w: StreamWriter::try_new(Vec::new(), schema)?,
+            gen: Default::default(),
+            tracker: datafusion::arrow::ipc::writer::DictionaryTracker::new(false),
+            ctx: Default::default(),
+            lz4: IpcWriteOptions::default()
+                .try_with_compression(Some(datafusion::arrow::ipc::CompressionType::LZ4_FRAME))?,
+        })
+    }
+
+    fn write(&mut self, batch: &RecordBatch) -> Result<(), ArrowError> {
+        if !strings_dominate(batch) {
+            return self.w.write(batch);
+        }
+        let (dicts, encoded) =
+            self.gen
+                .encode(batch, &mut self.tracker, &self.lz4, &mut self.ctx)?;
+        for d in dicts {
+            datafusion::arrow::ipc::writer::write_message(self.w.get_mut(), d, &self.lz4)?;
+        }
+        datafusion::arrow::ipc::writer::write_message(self.w.get_mut(), encoded, &self.lz4)?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<(), ArrowError> {
+        self.w.finish()
+    }
+
+    /// The bytes written since the last call.
+    fn take(&mut self) -> Vec<u8> {
+        std::mem::take(self.w.get_mut())
+    }
+}
+
+/// MZ1: do string values make up most of the batch's bytes?
+fn strings_dominate(batch: &RecordBatch) -> bool {
+    let (mut strings, mut total) = (0usize, 0usize);
+    for c in batch.columns() {
+        match c.data_type() {
+            DataType::Utf8 => {
+                let n = c.as_string::<i32>().value_data().len();
+                strings += n;
+                total += n + 4 * c.len();
+            }
+            t => total += t.primitive_width().unwrap_or(16) * c.len(),
+        }
+    }
+    strings * 2 > total
+}
+
+/// AP2: `plan` with its top aggregate, a partial one whose groups another
+/// slice combines (the spec's "partial"), run as DataFusion's partial
+/// aggregation alone: that one emits its groups when its memory is full
+/// and passes rows on as they come when they hardly group, where the
+/// combining of its partitions' partial results (FinalPartitioned) spills
+/// them and merges them back (ClickBench Q34's GROUP BY URL spilled every
+/// row).  Only with groups, and when each aggregate's partial state is one
+/// column of its result's type, which the result is (count, sum, min, max);
+/// otherwise `plan` as it is.
+fn partial_only(plan: Arc<dyn ExecutionPlan>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+    use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
+    use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
+
+    let replace =
+        |node: &Arc<dyn ExecutionPlan>| -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+            let Some(fin) = node.downcast_ref::<AggregateExec>() else {
+                return Ok(None);
+            };
+            // one group, nothing to emit early: as it is, one row and not one
+            // per partition
+            if fin.group_expr().is_empty() {
+                return Ok(None);
+            }
+            let below: Arc<dyn ExecutionPlan> = match fin.mode() {
+                // the partitions' partial aggregations, combined
+                AggregateMode::FinalPartitioned | AggregateMode::Final => {
+                    let mut below = fin.input().clone();
+                    while matches!(
+                        below.name(),
+                        "RepartitionExec" | "CoalescePartitionsExec" | "CoalesceBatchesExec"
+                    ) {
+                        below = below.children()[0].clone();
+                    }
+                    match below.downcast_ref::<AggregateExec>() {
+                        Some(part) if *part.mode() == AggregateMode::Partial => below,
+                        _ => return Ok(None),
+                    }
+                }
+                // one aggregation (one partition, or input partitioned by the groups)
+                AggregateMode::Single | AggregateMode::SinglePartitioned => {
+                    Arc::new(AggregateExec::try_new(
+                        AggregateMode::Partial,
+                        fin.group_expr().clone(),
+                        fin.aggr_expr().to_vec(),
+                        fin.filter_expr().to_vec(),
+                        fin.input().clone(),
+                        fin.input_schema(),
+                    )?)
+                }
+                _ => return Ok(None),
+            };
+            let (from, to) = (below.schema(), fin.schema());
+            if from.fields().len() != to.fields().len()
+                || from
+                    .fields()
+                    .iter()
+                    .zip(to.fields())
+                    .any(|(a, b)| a.data_type() != b.data_type())
+            {
+                return Ok(None);
+            }
+            let exprs: Vec<ProjectionExpr> = to
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, f)| ProjectionExpr {
+                    expr: Arc::new(Column::new(from.field(i).name(), i)),
+                    alias: f.name().clone(),
+                })
+                .collect();
+            Ok(Some(Arc::new(ProjectionExec::try_new(exprs, below)?)))
+        };
+    // the topmost aggregate only
+    plan.transform_down(|node| {
+        if node
+            .downcast_ref::<datafusion::physical_plan::aggregates::AggregateExec>()
+            .is_some()
+        {
+            return Ok(match replace(&node)? {
+                Some(p) => Transformed::new(p, true, TreeNodeRecursion::Stop),
+                None => Transformed::new(node, false, TreeNodeRecursion::Stop),
+            });
+        }
+        Ok(Transformed::no(node))
+    })
+    .map(|t| t.data)
+}
+
 /// Decode the Arrow IPC streams arriving from a Motion, one per route, and
 /// feed their rows to the plan: input column i is the stream's column
 /// `positions[i]`, its character values padded back to `pads[i]`
@@ -3477,7 +4031,7 @@ fn wire_schema(
     for (c, nw) in narrow {
         let f = &fields[*c];
         let scale = match f.data_type() {
-            DataType::Decimal256(_, s) => *s,
+            DataType::Decimal256(_, s) | DataType::Decimal128(_, s) => *s,
             t => {
                 return Err(DataFusionError::Internal(format!(
                     "narrowed output {c} is {t}"
@@ -3536,10 +4090,10 @@ async fn decode_ipc(
             for (i, &k) in positions.iter().enumerate() {
                 let field = schema.field(i).data_type();
                 match (batch.columns().get(k), narrows[i], field) {
-                    (Some(a), Some(nw), DataType::Decimal256(_, scale))
+                    (Some(a), Some(nw), DataType::Decimal128(digits, scale))
                         if a.data_type() == &nw.wire_type(*scale) =>
                     {
-                        match nw.widen(a, *scale) {
+                        match nw.widen(a, *digits, *scale) {
                             Ok(w) => arrays.push(w),
                             Err(e) => {
                                 let _ = tx.send(fail(e.to_string())).await;
@@ -3606,6 +4160,7 @@ pub fn arrow_format(ty: PgType) -> String {
         PgType::Float8 => "g".into(),
         PgType::Text => "u".into(),
         PgType::Numeric(s) => format!("d:{},{s},256", crate::pgnum::NUMERIC_PRECISION),
+        PgType::NumericN(s, p) => format!("d:{p},{s}"),
         _ => unreachable!(),
     }
 }
@@ -3692,6 +4247,7 @@ pub unsafe fn import_column(
         PgType::Float4 => primitive(4, DataType::Float32)?,
         PgType::Float8 => primitive(8, DataType::Float64)?,
         PgType::Numeric(_) => primitive(32, ty.arrow())?,
+        PgType::NumericN(..) => primitive(16, ty.arrow())?,
         PgType::Text => {
             let offsets = std::slice::from_raw_parts(values as *const i32, off + n + 1);
             let offsets = &offsets[off..];
@@ -3759,20 +4315,30 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
         PgType::Int8 => primitive::<Int64Type>(c, n, nulls),
         PgType::Float4 => primitive::<Float32Type>(c, n, nulls),
         PgType::Float8 => primitive::<Float64Type>(c, n, nulls),
-        PgType::Numeric(s) if !c.offsets.is_null() => numeric_rows(c, n, s, 0..n, nulls)?,
-        PgType::Numeric(s) => {
-            // 32 little-endian bytes each; palloc aligns to 8 only.
-            let p = c.values as *const [u8; 32];
-            let values: Vec<datafusion::arrow::datatypes::i256> = (0..n)
-                .map(|r| {
-                    datafusion::arrow::datatypes::i256::from_le_bytes(std::ptr::read_unaligned(
-                        p.add(r),
-                    ))
-                })
-                .collect();
+        PgType::Numeric(_) | PgType::NumericN(..) if !c.offsets.is_null() => {
+            numeric_rows(c, n, ty, 0..n, nulls)?
+        }
+        PgType::NumericN(..) => {
+            // N6: 16 little-endian bytes each
+            let bytes = std::slice::from_raw_parts(c.values, n * 16);
             Arc::new(
-                PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
-                    .with_data_type(crate::pgnum::numeric_type(s)),
+                PrimitiveArray::<Decimal128Type>::new(
+                    ScalarBuffer::new(Buffer::from_slice_ref(bytes), 0, n),
+                    nulls,
+                )
+                .with_data_type(ty.arrow()),
+            )
+        }
+        PgType::Numeric(s) => {
+            // 32 little-endian bytes each, i256's layout here; palloc aligns
+            // to 8 only, the copy to Arrow's 64
+            let bytes = std::slice::from_raw_parts(c.values, n * 32);
+            Arc::new(
+                PrimitiveArray::<Decimal256Type>::new(
+                    ScalarBuffer::new(Buffer::from_slice_ref(bytes), 0, n),
+                    nulls,
+                )
+                .with_data_type(crate::pgnum::numeric_type(s)),
             )
         }
         _ => unreachable!(),
@@ -3788,22 +4354,47 @@ pub unsafe fn build_array(ty: PgType, c: RawColumn, n: usize) -> Result<ArrayRef
 unsafe fn numeric_rows(
     c: RawColumn,
     n: usize,
-    s: i8,
+    ty: PgType,
     rows: impl Iterator<Item = usize>,
     nulls: Option<NullBuffer>,
 ) -> Result<ArrayRef, PgError> {
     let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
     let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
     let null_bytes = std::slice::from_raw_parts(c.nulls, n);
-    let values = rows
-        .map(|r| {
-            if null_bytes[r] != 0 {
-                return Ok(datafusion::arrow::datatypes::i256::ZERO);
+    let s = match ty {
+        PgType::Numeric(s) => s,
+        PgType::NumericN(s, _) => {
+            // N6: a value of the column's numeric(p, s) has at most p digits
+            let mut values = Vec::with_capacity(rows.size_hint().0);
+            for r in rows {
+                values.push(if null_bytes[r] != 0 {
+                    0
+                } else {
+                    let row = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
+                    let v = crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)?;
+                    crate::pgnum::narrow_value(v).ok_or_else(|| {
+                        PgError::internal(format!("numeric value beyond {ty:?}"))
+                    })?
+                });
             }
+            return Ok(Arc::new(
+                PrimitiveArray::<Decimal128Type>::new(ScalarBuffer::from(values), nulls)
+                    .with_data_type(ty.arrow()),
+            ));
+        }
+        _ => unreachable!(),
+    };
+    // collected into a Result, the values would lose the rows' count and
+    // grow by reallocation
+    let mut values = Vec::with_capacity(rows.size_hint().0);
+    for r in rows {
+        values.push(if null_bytes[r] != 0 {
+            datafusion::arrow::datatypes::i256::ZERO
+        } else {
             let row = &bytes[offsets[r] as usize..offsets[r + 1] as usize];
-            crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)
-        })
-        .collect::<Result<Vec<_>, PgError>>()?;
+            crate::pgnum::from_pg_numeric(row, s).map_err(PgError::internal)?
+        });
+    }
     Ok(Arc::new(
         PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
             .with_data_type(crate::pgnum::numeric_type(s)),
@@ -3811,8 +4402,8 @@ unsafe fn numeric_rows(
 }
 
 /// `build_array` of rows `rows` (ascending) of the `n` only, or of all.
-/// LM1: a numeric is converted for those rows only; the others are built
-/// whole and the rows taken.
+/// LM1: a numeric is converted (or, fixed-width, copied) for those rows
+/// only; the others are built whole and the rows taken.
 ///
 /// # Safety
 /// As `build_array`'s.
@@ -3826,7 +4417,7 @@ unsafe fn build_array_rows(
         return build_array(ty, c, n);
     };
     match ty.storage() {
-        PgType::Numeric(s) if !c.offsets.is_null() => {
+        PgType::Numeric(_) | PgType::NumericN(..) if !c.offsets.is_null() => {
             let null_bytes = std::slice::from_raw_parts(c.nulls, n);
             let nulls = if rows.iter().any(|&r| null_bytes[r as usize] != 0) {
                 Some(NullBuffer::from(
@@ -3837,7 +4428,89 @@ unsafe fn build_array_rows(
             } else {
                 None
             };
-            numeric_rows(c, n, s, rows.iter().map(|&r| r as usize), nulls)
+            numeric_rows(c, n, ty, rows.iter().map(|&r| r as usize), nulls)
+        }
+        PgType::NumericN(..) => {
+            // N6: 16-byte values, gathered for those rows only
+            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+            let nulls = if rows.iter().any(|&r| null_bytes[r as usize] != 0) {
+                Some(NullBuffer::from(
+                    rows.iter()
+                        .map(|&r| null_bytes[r as usize] == 0)
+                        .collect::<Vec<bool>>(),
+                ))
+            } else {
+                None
+            };
+            let p = c.values as *const [u8; 16];
+            let values: Vec<i128> = rows
+                .iter()
+                .map(|&r| i128::from_le_bytes(std::ptr::read_unaligned(p.add(r as usize))))
+                .collect();
+            Ok(Arc::new(
+                PrimitiveArray::<Decimal128Type>::new(ScalarBuffer::from(values), nulls)
+                    .with_data_type(ty.arrow()),
+            ))
+        }
+        PgType::Numeric(s) => {
+            // SC2: fixed-width values, gathered for those rows only
+            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+            let nulls = if rows.iter().any(|&r| null_bytes[r as usize] != 0) {
+                Some(NullBuffer::from(
+                    rows.iter()
+                        .map(|&r| null_bytes[r as usize] == 0)
+                        .collect::<Vec<bool>>(),
+                ))
+            } else {
+                None
+            };
+            let p = c.values as *const [u8; 32];
+            let values: Vec<datafusion::arrow::datatypes::i256> = rows
+                .iter()
+                .map(|&r| {
+                    datafusion::arrow::datatypes::i256::from_le_bytes(std::ptr::read_unaligned(
+                        p.add(r as usize),
+                    ))
+                })
+                .collect();
+            Ok(Arc::new(
+                PrimitiveArray::<Decimal256Type>::new(ScalarBuffer::from(values), nulls)
+                    .with_data_type(crate::pgnum::numeric_type(s)),
+            ))
+        }
+        PgType::Text => {
+            // LM2: the bytes of those rows only, checked as UTF-8
+            let offsets = std::slice::from_raw_parts(c.offsets, n + 1);
+            let null_bytes = std::slice::from_raw_parts(c.nulls, n);
+            let span = |r: u32| offsets[r as usize] as usize..offsets[r as usize + 1] as usize;
+            let total: usize = rows.iter().map(|&r| span(r).len()).sum();
+            let bytes = std::slice::from_raw_parts(c.values, offsets[n] as usize);
+            let mut buf: Vec<u8> = Vec::with_capacity(total);
+            let mut out: Vec<i32> = Vec::with_capacity(rows.len() + 1);
+            out.push(0);
+            for &r in rows {
+                buf.extend_from_slice(&bytes[span(r)]);
+                out.push(buf.len() as i32);
+            }
+            let nulls = if rows.iter().any(|&r| null_bytes[r as usize] != 0) {
+                Some(NullBuffer::from(
+                    rows.iter()
+                        .map(|&r| null_bytes[r as usize] == 0)
+                        .collect::<Vec<bool>>(),
+                ))
+            } else {
+                None
+            };
+            Ok(Arc::new(
+                StringArray::try_new(
+                    OffsetBuffer::new(ScalarBuffer::from(out)),
+                    Buffer::from_vec(buf),
+                    nulls,
+                )
+                .map_err(|e| {
+                    PgError::new("22021", format!("invalid byte sequence for encoding \"UTF8\": {e}"))
+                })?,
+            ))
         }
         _ => take(
             build_array(ty, c, n)?.as_ref(),
@@ -3851,6 +4524,39 @@ unsafe fn build_array_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn string_conditions_on_the_readers_bytes() {
+        let types = [PgType::Bpchar, PgType::Text];
+        let parse = |j: &str| StrCond::parse(&serde_json::from_str(j).unwrap(), 0, &types);
+        // rows: "AIR  " (char), "DELIVER IN PERSON" (text); NULL; "MAIL", "a中b"
+        let offsets = [0i32, 5, 5, 9];
+        let bytes = b"AIR  MAIL";
+        let nulls = [0u8, 1, 0];
+        let t_off = [0i32, 17, 17, 22];
+        let t_bytes = "DELIVER IN PERSONa中b".as_bytes();
+        let eq = parse(r#"{"op":"=","args":[{"bpkey":{"col":0}},{"bpkey":{"lit":{"type":"bpchar","value":"AIR "}}}]}"#).unwrap();
+        let hold = |c: &StrCond, o: &[i32], b: &[u8], r| unsafe { c.holds(o, b, &nulls, r) };
+        assert_eq!((0..3).map(|r| hold(&eq, &offsets, bytes, r)).collect::<Vec<_>>(), [true, false, false]);
+        let notin = parse(r#"{"inlist":{"bpkey":{"col":0}},"values":[{"bpkey":{"lit":{"type":"bpchar","value":"AIR"}}}],"negated":true}"#).unwrap();
+        // NULL fails NOT IN too
+        assert_eq!((0..3).map(|r| hold(&notin, &offsets, bytes, r)).collect::<Vec<_>>(), [false, false, true]);
+        let like = parse(r#"{"op":"~~","args":[{"col":1},{"lit":{"type":"text","value":"DEL%IN%SON"}}]}"#).unwrap();
+        let nlike = parse(r#"{"op":"!~~","args":[{"col":1},{"lit":{"type":"text","value":"%中%"}}]}"#).unwrap();
+        assert_eq!((0..3).map(|r| hold(&like, &t_off, t_bytes, r)).collect::<Vec<_>>(), [true, false, false]);
+        assert_eq!((0..3).map(|r| hold(&nlike, &t_off, t_bytes, r)).collect::<Vec<_>>(), [true, false, false]);
+        // not taken: '_', bpchar LIKE, a NULL constant, another collation
+        assert!(parse(r#"{"op":"~~","args":[{"col":1},{"lit":{"type":"text","value":"a_b"}}]}"#).is_none());
+        assert!(parse(r#"{"op":"~~","args":[{"bpkey":{"col":0}},{"bpkey":{"lit":{"type":"bpchar","value":"A%"}}}]}"#).is_none());
+        assert!(parse(r#"{"op":"=","args":[{"col":1},{"lit":{"type":"text","null":true}}]}"#).is_none());
+        assert!(parse(r#"{"op":"=","collate":"en_US","args":[{"col":1},{"lit":{"type":"text","value":"x"}}]}"#).is_none());
+        // judged after its trial: dropped when it keeps more than 90%
+        assert!(eq.useful());
+        eq.record(STR_COND_TRIAL as usize, (STR_COND_TRIAL * 95 / 100) as usize);
+        assert!(!eq.useful());
+        notin.record(STR_COND_TRIAL as usize, (STR_COND_TRIAL / 2) as usize);
+        assert!(notin.useful());
+    }
 
     fn run(
         spec: &str,
@@ -4343,12 +5049,21 @@ mod tests {
         };
         let padded = send("");
         let trimmed = send(r#","trim":[0]"#);
-        assert!(
-            trimmed.len() < padded.len(),
-            "{} vs {}",
-            trimmed.len(),
-            padded.len()
-        );
+        // the values on the wire (compressed or not, MZ1)
+        let wire = |bytes: &[u8]| {
+            let mut d = StreamDecoder::new();
+            let mut buf = Buffer::from(bytes);
+            let mut vals: Vec<Option<String>> = Vec::new();
+            while !buf.is_empty() {
+                if let Some(b) = d.decode(&mut buf).unwrap() {
+                    vals.extend(b.column(0).as_string::<i32>().iter().map(|v| v.map(String::from)));
+                }
+            }
+            vals
+        };
+        let blanks = |vals: Vec<Option<String>>| vals.iter().flatten().filter(|v| v.ends_with(' ')).count();
+        assert_eq!(blanks(wire(&padded)), 800);
+        assert_eq!(blanks(wire(&trimmed)), 0);
         let recv = r#"{"ir":1,"scan":{"columns":[{"type":"bpchar"}],"motion_columns":[0],"motion_pad":[6]},
             "filter":null,"aggregate":null,"having":null,
             "output":[{"expr":{"col":0},"type":"bpchar"}]}"#;
@@ -4437,6 +5152,77 @@ mod tests {
             d.finish().unwrap();
         }
         assert_eq!(total, 1000);
+    }
+
+    /// MZ1: a batch mostly of strings goes compressed, one of numbers as it
+    /// is, in one stream that decodes back to both.
+    #[test]
+    fn motion_stream_compresses_string_batches() {
+        use datafusion::arrow::array::{Int64Array, StringArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("u", DataType::Utf8, true),
+            Field::new("n", DataType::Int64, true),
+        ]));
+        let urls: Vec<Option<String>> = (0..4000)
+            .map(|i| {
+                Some(format!(
+                    "http://site{}.example.com/abcdef/abcdef/{}",
+                    i % 50,
+                    i
+                ))
+            })
+            .collect();
+        let strings = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(urls)),
+                Arc::new(Int64Array::from_iter_values(0..4000)),
+            ],
+        )
+        .unwrap();
+        let numbers = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![Some("x"); 4000])),
+                Arc::new(Int64Array::from_iter_values((0..4000).map(|i| i * 7919))),
+            ],
+        )
+        .unwrap();
+        assert!(strings_dominate(&strings) && !strings_dominate(&numbers));
+        let size = |b: &RecordBatch, compress: bool| {
+            let mut w = MotionWriter::try_new(&schema).unwrap();
+            let header = w.take().len();
+            if compress {
+                w.write(b).unwrap();
+            } else {
+                w.w.write(b).unwrap();
+            }
+            w.take().len() + header
+        };
+        assert!(
+            size(&strings, true) * 2 < size(&strings, false),
+            "strings compressed"
+        );
+        assert_eq!(
+            size(&numbers, true),
+            size(&numbers, false),
+            "numbers as they are"
+        );
+        let mut w = MotionWriter::try_new(&schema).unwrap();
+        for b in [&strings, &numbers, &strings] {
+            w.write(b).unwrap();
+        }
+        w.finish().unwrap();
+        let mut d = StreamDecoder::new();
+        let mut buf = Buffer::from_vec(w.take());
+        let mut got = Vec::new();
+        while !buf.is_empty() {
+            if let Some(b) = d.decode(&mut buf).unwrap() {
+                got.push(b);
+            }
+        }
+        d.finish().unwrap();
+        assert_eq!(got, vec![strings.clone(), numbers, strings]);
     }
 
     #[test]
@@ -4619,17 +5405,61 @@ mod tests {
         for g in first..to {
             let vals: Vec<i32> = (0..5).map(|r| index * 10 + g * 5 + r).collect();
             let nulls: Vec<u8> = vals.iter().map(|v| (v % 10 == 3) as u8).collect();
+            let mut chunk = FakeChunk {
+                vals,
+                nulls,
+                picked: Vec::new(),
+                picked_nulls: Vec::new(),
+            };
             let col = PaxColumn {
-                values: vals.as_ptr() as *const u8,
-                nulls: nulls.as_ptr(),
+                values: std::ptr::null(),
+                nulls: std::ptr::null(),
                 offsets: std::ptr::null(),
             };
-            if emit(ctx, 5, &col) != 0 {
+            if emit(ctx, 5, &col, fake_fetch, &mut chunk as *mut FakeChunk as *mut c_void) != 0 {
                 account(ctx, -1000);
                 return -1;
             }
         }
         account(ctx, -1000);
+        0
+    }
+
+    /// The fake reader's chunk: its one int4 column, and the rows fetched.
+    struct FakeChunk {
+        vals: Vec<i32>,
+        nulls: Vec<u8>,
+        picked: Vec<i32>,
+        picked_nulls: Vec<u8>,
+    }
+
+    unsafe extern "C" fn fake_fetch(
+        chunk: *mut c_void,
+        col: i32,
+        rows: *const u32,
+        nrows: u32,
+        out: *mut PaxColumn,
+    ) -> i32 {
+        let ch = &mut *(chunk as *mut FakeChunk);
+        if col != 0 {
+            return -1;
+        }
+        if rows.is_null() {
+            *out = PaxColumn {
+                values: ch.vals.as_ptr() as *const u8,
+                nulls: ch.nulls.as_ptr(),
+                offsets: std::ptr::null(),
+            };
+            return 0;
+        }
+        let rows = std::slice::from_raw_parts(rows, nrows as usize);
+        ch.picked = rows.iter().map(|&r| ch.vals[r as usize]).collect();
+        ch.picked_nulls = rows.iter().map(|&r| ch.nulls[r as usize]).collect();
+        *out = PaxColumn {
+            values: ch.picked.as_ptr() as *const u8,
+            nulls: ch.picked_nulls.as_ptr(),
+            offsets: std::ptr::null(),
+        };
         0
     }
 

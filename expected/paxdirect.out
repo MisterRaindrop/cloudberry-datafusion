@@ -738,6 +738,101 @@ SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
  19996 |         -10249.48 |              61234567.4052345232 | -0.80003
 (9 rows)
 
+-- SC2: numeric(p, s) of p <= 38 converted by the reader to fixed-width
+-- values at s, up to 38 digits (35 in the vectorized format, its most),
+-- beside a numeric(40, 2) still handed out as bytes; with deleted rows, so
+-- that a chunk's rows are not the group's.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_wnum (id int, w numeric(38,4), z numeric(38,0), v numeric(40,2)) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vwnum (id int, w numeric(35,4), z numeric(35,0), v numeric(35,2)) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_wnum SELECT k,
+  CASE WHEN k % 41 = 0 THEN NULL WHEN k % 43 = 0 THEN 'NaN' ELSE (k - 10000) * 1234567890123456789012345.6789 END,
+  CASE WHEN k % 47 = 0 THEN NULL ELSE (k - 10000) * 12345678901234567890123456789012 END,
+  CASE WHEN k % 37 = 0 THEN NULL ELSE (k - 10000) * 123456789012345678901234567890123.45 END
+FROM generate_series(1, 20000) k;
+INSERT INTO df_pd_wnum VALUES (-1, 9999999999999999999999999999999999.9999, 99999999999999999999999999999999999999, 99999999999999999999999999999999999999.99),
+  (-2, -9999999999999999999999999999999999.9999, -99999999999999999999999999999999999999, -99999999999999999999999999999999999999.99),
+  (-3, 0.0001, 1, 0.01), (-4, -0.0001, -1, -0.01);
+INSERT INTO df_pd_vwnum SELECT id, trunc(w / 10000, 4), trunc(z / 10000), trunc(v / 1000000, 2) FROM df_pd_wnum;
+DELETE FROM df_pd_wnum WHERE id % 7 = 3;
+DELETE FROM df_pd_vwnum WHERE id % 7 = 3;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
+ count | count | sum |                   min                    | max |                 sum                 |                   min                   |                  max                   |                   sum                    |                    min                     |                    max                    
+-------+-------+-----+------------------------------------------+-----+-------------------------------------+-----------------------------------------+----------------------------------------+------------------------------------------+--------------------------------------------+-------------------------------------------
+ 17147 | 16730 | NaN | -9999999999999999999999999999999999.9999 | NaN | 73901233902790123390279012339025832 | -99999999999999999999999999999999999999 | 99999999999999999999999999999999999999 | 1277283939121728393912172839391217213.70 | -99999999999999999999999999999999999999.99 | 99999999999999999999999999999999999999.99
+(1 row)
+
+SELECT id, w, z, v FROM df_pd_wnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+  id   |                    w                     |                    z                    |                     v                      
+-------+------------------------------------------+-----------------------------------------+--------------------------------------------
+    -4 |                                  -0.0001 |                                      -1 |                                      -0.01
+    -3 |                                   0.0001 |                                       1 |                                       0.01
+    -2 | -9999999999999999999999999999999999.9999 | -99999999999999999999999999999999999999 | -99999999999999999999999999999999999999.99
+    -1 |  9999999999999999999999999999999999.9999 |  99999999999999999999999999999999999999 |  99999999999999999999999999999999999999.99
+  4999 |       -6174074018507407401850740740.1789 |    -61740740185074074018507407401849012 |   -617407401850740740185074074018507373.45
+  9998 |          -2469135780246913578024691.3578 |       -24691357802469135780246913578024 |      -246913578024691357802469135780246.90
+ 19996 |       12340740629674074062967407406.2844 |    123407406296740740629674074062963952 |   1234074062967407406296740740629674006.20
+(7 rows)
+
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_vwnum;
+ count | count | sum |                  min                  | max |               sum               |                 min                  |                 max                 |                sum                 |                  min                  |                 max                  
+-------+-------+-----+---------------------------------------+-----+---------------------------------+--------------------------------------+-------------------------------------+------------------------------------+---------------------------------------+--------------------------------------
+ 17147 | 16730 | NaN | -1000000000000000000000000000000.0000 | NaN | 7390123390279012339027901233906 | -10000000000000000000000000000000000 | 10000000000000000000000000000000000 | 1277283939121728393912172839391.23 | -100000000000000000000000000000000.00 | 100000000000000000000000000000000.00
+(1 row)
+
+SELECT id, w, z, v FROM df_pd_vwnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+  id   |                   w                   |                  z                   |                   v                   
+-------+---------------------------------------+--------------------------------------+---------------------------------------
+    -4 |                                0.0000 |                                    0 |                                  0.00
+    -3 |                                0.0000 |                                    0 |                                  0.00
+    -2 | -1000000000000000000000000000000.0000 | -10000000000000000000000000000000000 | -100000000000000000000000000000000.00
+    -1 |  1000000000000000000000000000000.0000 |  10000000000000000000000000000000000 |  100000000000000000000000000000000.00
+  4999 |        -617407401850740740185074.0740 |     -6174074018507407401850740740185 |    -617407401850740740185074074018.51
+  9998 |           -246913578024691357802.4691 |        -2469135780246913578024691358 |       -246913578024691357802469135.78
+ 19996 |        1234074062967407406296740.7406 |     12340740629674074062967407406296 |    1234074062967407406296740740629.67
+(7 rows)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
+ count | count | sum |                   min                    | max |                 sum                 |                   min                   |                  max                   |                   sum                    |                    min                     |                    max                    
+-------+-------+-----+------------------------------------------+-----+-------------------------------------+-----------------------------------------+----------------------------------------+------------------------------------------+--------------------------------------------+-------------------------------------------
+ 17147 | 16730 | NaN | -9999999999999999999999999999999999.9999 | NaN | 73901233902790123390279012339025832 | -99999999999999999999999999999999999999 | 99999999999999999999999999999999999999 | 1277283939121728393912172839391217213.70 | -99999999999999999999999999999999999999.99 | 99999999999999999999999999999999999999.99
+(1 row)
+
+SELECT id, w, z, v FROM df_pd_wnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+  id   |                    w                     |                    z                    |                     v                      
+-------+------------------------------------------+-----------------------------------------+--------------------------------------------
+    -4 |                                  -0.0001 |                                      -1 |                                      -0.01
+    -3 |                                   0.0001 |                                       1 |                                       0.01
+    -2 | -9999999999999999999999999999999999.9999 | -99999999999999999999999999999999999999 | -99999999999999999999999999999999999999.99
+    -1 |  9999999999999999999999999999999999.9999 |  99999999999999999999999999999999999999 |  99999999999999999999999999999999999999.99
+  4999 |       -6174074018507407401850740740.1789 |    -61740740185074074018507407401849012 |   -617407401850740740185074074018507373.45
+  9998 |          -2469135780246913578024691.3578 |       -24691357802469135780246913578024 |      -246913578024691357802469135780246.90
+ 19996 |       12340740629674074062967407406.2844 |    123407406296740740629674074062963952 |   1234074062967407406296740740629674006.20
+(7 rows)
+
+SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_vwnum;
+ count | count | sum |                  min                  | max |               sum               |                 min                  |                 max                 |                sum                 |                  min                  |                 max                  
+-------+-------+-----+---------------------------------------+-----+---------------------------------+--------------------------------------+-------------------------------------+------------------------------------+---------------------------------------+--------------------------------------
+ 17147 | 16730 | NaN | -1000000000000000000000000000000.0000 | NaN | 7390123390279012339027901233906 | -10000000000000000000000000000000000 | 10000000000000000000000000000000000 | 1277283939121728393912172839391.23 | -100000000000000000000000000000000.00 | 100000000000000000000000000000000.00
+(1 row)
+
+SELECT id, w, z, v FROM df_pd_vwnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
+  id   |                   w                   |                  z                   |                   v                   
+-------+---------------------------------------+--------------------------------------+---------------------------------------
+    -4 |                                0.0000 |                                    0 |                                  0.00
+    -3 |                                0.0000 |                                    0 |                                  0.00
+    -2 | -1000000000000000000000000000000.0000 | -10000000000000000000000000000000000 | -100000000000000000000000000000000.00
+    -1 |  1000000000000000000000000000000.0000 |  10000000000000000000000000000000000 |  100000000000000000000000000000000.00
+  4999 |        -617407401850740740185074.0740 |     -6174074018507407401850740740185 |    -617407401850740740185074074018.51
+  9998 |           -246913578024691357802.4691 |        -2469135780246913578024691358 |       -246913578024691357802469135.78
+ 19996 |        1234074062967407406296740.7406 |     12340740629674074062967407406296 |    1234074062967407406296740740629.67
+(7 rows)
+
 -- Conditions on cheap columns checked first (LM1): the filter right above
 -- a PAX scan has its conditions on integer and date columns evaluated on
 -- each decoded chunk before the other columns are built, which are then
@@ -902,6 +997,361 @@ SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND 
  7967 | 7 | 01-08-2020 |         | v7967
 (31 rows)
 
+-- Then conditions on strings (LM2), checked on the reader's bytes of the
+-- rows left before any other column is built: = and <> of a constant, IN
+-- and NOT IN, of text (trailing blanks count) and of character (they do
+-- not), and LIKE of text with pieces and %'s only; NULLs fail; narrow
+-- numeric columns compared with constants are cheap (N6).
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_s2 (id int, m char(10), s text, v varchar(8), a numeric(15,2)) USING pax DISTRIBUTED BY (id);
+INSERT INTO df_pd_s2 SELECT i,
+  CASE i % 7 WHEN 0 THEN NULL WHEN 1 THEN 'AIR' WHEN 2 THEN 'AIR REG' WHEN 3 THEN 'MAIL'
+    WHEN 4 THEN 'RAIL' WHEN 5 THEN 'SHIP' ELSE 'TRUCK' END,
+  CASE i % 5 WHEN 0 THEN 'DELIVER IN PERSON' WHEN 1 THEN 'NONE' WHEN 2 THEN NULL
+    WHEN 3 THEN 'abc ' ELSE 'é中文' END,
+  CASE WHEN i % 11 = 0 THEN NULL WHEN i % 3 = 0 THEN 'x' ELSE 'y' || (i % 7) END,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 4001 - 2000) * 0.25 END
+FROM generate_series(1, 30000) i;
+DELETE FROM df_pd_s2 WHERE id % 1000 = 7;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
+ count |   sum   | min |  max  
+-------+---------+-----+-------
+  1714 | 1083.50 | x   | 29990
+(1 row)
+
+SELECT count(*), sum(a), max(v) FROM df_pd_s2 WHERE m = 'MAIL' AND a BETWEEN 10 AND 120.5;
+ count |   sum    | max 
+-------+----------+-----
+   454 | 29572.50 | y3
+(1 row)
+
+SELECT count(*), sum(a), min(s) FROM df_pd_s2 WHERE m NOT IN ('AIR', 'MAIL') AND s <> 'NONE' AND v <> 'x';
+ count |   sum    |        min        
+-------+----------+-------------------
+  6233 | -9093.50 | DELIVER IN PERSON
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'é中文' AND v = 'x';
+ count |   sum    
+-------+----------
+  1818 | 27267267
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m = 'AIR   ' AND 'abc' = s;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'abc ' AND m <> 'TRUCK';
+ count |   sum    
+-------+----------
+  4286 | 64292143
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m IN ('none such') AND id > 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE ((a >= 1 AND a <= 11) OR (a >= 10 AND a <= 20) OR (a >= 20 AND a <= 30.25)) AND m IN ('AIR', 'RAIL');
+ count |   sum   
+-------+---------
+   241 | 3803.00
+(1 row)
+
+SELECT id, m, s, v, a FROM df_pd_s2 WHERE m = 'SHIP' AND s IN ('NONE', 'abc ') AND a < -480 ORDER BY id;
+  id   |     m      |  s   | v  |    a    
+-------+------------+------+----+---------
+  1146 | SHIP       | NONE | x  | -495.00
+  1153 | SHIP       | abc  | y5 | -482.75
+  2861 | SHIP       | NONE | y5 | -494.50
+  2868 | SHIP       | abc  | x  | -482.25
+  4576 | SHIP       | NONE |    | -494.00
+  4583 | SHIP       | abc  | y5 | -481.75
+  6291 | SHIP       | NONE | x  | -493.50
+  6298 | SHIP       | abc  | y5 | -481.25
+  8006 | SHIP       | NONE | y5 | -493.00
+  8013 | SHIP       | abc  | x  | -480.75
+  9721 | SHIP       | NONE | y5 | -492.50
+  9728 | SHIP       | abc  | y5 | -480.25
+ 11436 | SHIP       | NONE | x  | -492.00
+ 12003 | SHIP       | abc  | x  | -500.00
+ 13151 | SHIP       | NONE | y5 | -491.50
+ 13718 | SHIP       | abc  | y5 | -499.50
+ 14866 | SHIP       | NONE | y5 | -491.00
+ 15433 | SHIP       | abc  |    | -499.00
+ 16581 | SHIP       | NONE | x  | -490.50
+ 17148 | SHIP       | abc  | x  | -498.50
+ 18296 | SHIP       | NONE | y5 | -490.00
+ 18863 | SHIP       | abc  | y5 | -498.00
+ 20011 | SHIP       | NONE | y5 | -489.50
+ 20578 | SHIP       | abc  | y5 | -497.50
+ 21726 | SHIP       | NONE | x  | -489.00
+ 22293 | SHIP       | abc  | x  | -497.00
+ 23441 | SHIP       | NONE |    | -488.50
+ 24008 | SHIP       | abc  | y5 | -496.50
+ 25156 | SHIP       | NONE | y5 | -488.00
+ 25723 | SHIP       | abc  | y5 | -496.00
+ 26871 | SHIP       | NONE | x  | -487.50
+ 27438 | SHIP       | abc  | x  | -495.50
+ 28586 | SHIP       | NONE | y5 | -487.00
+ 29153 | SHIP       | abc  | y5 | -495.00
+(34 rows)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE '%中%' AND v LIKE '%5';
+ count |   sum   
+-------+---------
+   519 | 7764916
+(1 row)
+
+SELECT count(*), sum(id), min(m) FROM df_pd_s2 WHERE s NOT LIKE 'abc%' AND s LIKE 'DELIVER%PERSON';
+ count |   sum    |    min     
+-------+----------+------------
+  6000 | 90015000 | AIR       
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE 'abc ' AND v LIKE 'y_' AND s LIKE '%';
+ count |   sum    
+-------+----------
+  3637 | 54564536
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE s NOT LIKE '%IN%PER%' AND a > 400;
+ count |    sum    
+-------+-----------
+  1725 | 776491.25
+(1 row)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
+ count |   sum   | min |  max  
+-------+---------+-----+-------
+  1714 | 1083.50 | x   | 29990
+(1 row)
+
+SELECT count(*), sum(a), max(v) FROM df_pd_s2 WHERE m = 'MAIL' AND a BETWEEN 10 AND 120.5;
+ count |   sum    | max 
+-------+----------+-----
+   454 | 29572.50 | y3
+(1 row)
+
+SELECT count(*), sum(a), min(s) FROM df_pd_s2 WHERE m NOT IN ('AIR', 'MAIL') AND s <> 'NONE' AND v <> 'x';
+ count |   sum    |        min        
+-------+----------+-------------------
+  6233 | -9093.50 | DELIVER IN PERSON
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'é中文' AND v = 'x';
+ count |   sum    
+-------+----------
+  1818 | 27267267
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m = 'AIR   ' AND 'abc' = s;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s = 'abc ' AND m <> 'TRUCK';
+ count |   sum    
+-------+----------
+  4286 | 64292143
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE m IN ('none such') AND id > 0;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE ((a >= 1 AND a <= 11) OR (a >= 10 AND a <= 20) OR (a >= 20 AND a <= 30.25)) AND m IN ('AIR', 'RAIL');
+ count |   sum   
+-------+---------
+   241 | 3803.00
+(1 row)
+
+SELECT id, m, s, v, a FROM df_pd_s2 WHERE m = 'SHIP' AND s IN ('NONE', 'abc ') AND a < -480 ORDER BY id;
+  id   |     m      |  s   | v  |    a    
+-------+------------+------+----+---------
+  1146 | SHIP       | NONE | x  | -495.00
+  1153 | SHIP       | abc  | y5 | -482.75
+  2861 | SHIP       | NONE | y5 | -494.50
+  2868 | SHIP       | abc  | x  | -482.25
+  4576 | SHIP       | NONE |    | -494.00
+  4583 | SHIP       | abc  | y5 | -481.75
+  6291 | SHIP       | NONE | x  | -493.50
+  6298 | SHIP       | abc  | y5 | -481.25
+  8006 | SHIP       | NONE | y5 | -493.00
+  8013 | SHIP       | abc  | x  | -480.75
+  9721 | SHIP       | NONE | y5 | -492.50
+  9728 | SHIP       | abc  | y5 | -480.25
+ 11436 | SHIP       | NONE | x  | -492.00
+ 12003 | SHIP       | abc  | x  | -500.00
+ 13151 | SHIP       | NONE | y5 | -491.50
+ 13718 | SHIP       | abc  | y5 | -499.50
+ 14866 | SHIP       | NONE | y5 | -491.00
+ 15433 | SHIP       | abc  |    | -499.00
+ 16581 | SHIP       | NONE | x  | -490.50
+ 17148 | SHIP       | abc  | x  | -498.50
+ 18296 | SHIP       | NONE | y5 | -490.00
+ 18863 | SHIP       | abc  | y5 | -498.00
+ 20011 | SHIP       | NONE | y5 | -489.50
+ 20578 | SHIP       | abc  | y5 | -497.50
+ 21726 | SHIP       | NONE | x  | -489.00
+ 22293 | SHIP       | abc  | x  | -497.00
+ 23441 | SHIP       | NONE |    | -488.50
+ 24008 | SHIP       | abc  | y5 | -496.50
+ 25156 | SHIP       | NONE | y5 | -488.00
+ 25723 | SHIP       | abc  | y5 | -496.00
+ 26871 | SHIP       | NONE | x  | -487.50
+ 27438 | SHIP       | abc  | x  | -495.50
+ 28586 | SHIP       | NONE | y5 | -487.00
+ 29153 | SHIP       | abc  | y5 | -495.00
+(34 rows)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE '%中%' AND v LIKE '%5';
+ count |   sum   
+-------+---------
+   519 | 7764916
+(1 row)
+
+SELECT count(*), sum(id), min(m) FROM df_pd_s2 WHERE s NOT LIKE 'abc%' AND s LIKE 'DELIVER%PERSON';
+ count |   sum    |    min     
+-------+----------+------------
+  6000 | 90015000 | AIR       
+(1 row)
+
+SELECT count(*), sum(id) FROM df_pd_s2 WHERE s LIKE 'abc ' AND v LIKE 'y_' AND s LIKE '%';
+ count |   sum    
+-------+----------
+  3637 | 54564536
+(1 row)
+
+SELECT count(*), sum(a) FROM df_pd_s2 WHERE s NOT LIKE '%IN%PER%' AND a > 400;
+ count |    sum    
+-------+-----------
+  1725 | 776491.25
+(1 row)
+
+-- The reader converts a fixed-width column when the consumer asks for it,
+-- for the rows the conditions checked first leave (LM3): booleans, 8-byte
+-- values without NULLs (picked from the stored values), a numeric, in the
+-- plain format with deleted rows and in the vectorized one without.
+SET pax.max_tuples_per_group = 1000;
+CREATE TABLE df_pd_lm3 (id int, k int2, f bool, g int8, h float8, a numeric(15,2)) USING pax DISTRIBUTED BY (id);
+CREATE TABLE df_pd_vlm3 (LIKE df_pd_lm3) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_lm3 SELECT i,
+  CASE WHEN i % 23 = 0 THEN NULL ELSE (i % 10)::int2 END,
+  CASE WHEN i % 19 = 0 THEN NULL ELSE i % 3 = 0 END,
+  i::int8 * 1000003, i * 0.5,
+  CASE WHEN i % 31 = 0 THEN NULL ELSE (i * 7 % 2001 - 1000) * 0.25 END
+FROM generate_series(1, 30000) i;
+INSERT INTO df_pd_vlm3 SELECT * FROM df_pd_lm3;
+DELETE FROM df_pd_lm3 WHERE id % 1000 = 11;
+RESET pax.max_tuples_per_group;
+SET datafusion.mode = off;
+SET datafusion.pax_direct_read = off;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
+ count | count | sum  |      sum       |   sum    |  sum   
+-------+-------+------+----------------+----------+--------
+  5738 |  5436 | 1812 | 86071294213108 | 43035518 | 666.25
+(1 row)
+
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_lm3 WHERE a > 200 AND k <> 4;
+ count |      sum       |    sum     |  max   
+-------+----------------+------------+--------
+  2498 | 37533211599297 | 18766549.5 | 250.00
+(1 row)
+
+SELECT id, k, f, g, h, a FROM df_pd_lm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+  id   | k | f |      g      |    h    |    a    
+-------+---+---+-------------+---------+---------
+  5983 | 3 | f |  5983017949 |  2991.5 |        
+  8973 | 3 | t |  8973026919 |  4486.5 |  -55.00
+ 15953 | 3 | f | 15953047859 |  7976.5 |  154.00
+ 18943 | 3 |   | 18943056829 |  9471.5 | -116.25
+ 25923 | 3 | t | 25923077769 | 12961.5 |   92.75
+ 28913 | 3 | f | 28913086739 | 14456.5 | -177.50
+(6 rows)
+
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_vlm3 WHERE k IN (2, 7) AND id > 5;
+ count | count | sum  |      sum       |   sum    |  sum   
+-------+-------+------+----------------+----------+--------
+  5738 |  5436 | 1812 | 86071294213108 | 43035518 | 666.25
+(1 row)
+
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_vlm3 WHERE a > 200 AND k <> 4;
+ count |      sum       |   sum    |  max   
+-------+----------------+----------+--------
+  2501 | 37611244833396 | 18805566 | 250.00
+(1 row)
+
+SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+  id   | k | f |      g      |    h    |    a    
+-------+---+---+-------------+---------+---------
+  5983 | 3 | f |  5983017949 |  2991.5 |        
+  8973 | 3 | t |  8973026919 |  4486.5 |  -55.00
+ 15953 | 3 | f | 15953047859 |  7976.5 |  154.00
+ 18943 | 3 |   | 18943056829 |  9471.5 | -116.25
+ 25923 | 3 | t | 25923077769 | 12961.5 |   92.75
+ 28913 | 3 | f | 28913086739 | 14456.5 | -177.50
+(6 rows)
+
+SET datafusion.mode = on;
+SET datafusion.pax_direct_read = on;
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
+ count | count | sum  |      sum       |   sum    |  sum   
+-------+-------+------+----------------+----------+--------
+  5738 |  5436 | 1812 | 86071294213108 | 43035518 | 666.25
+(1 row)
+
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_lm3 WHERE a > 200 AND k <> 4;
+ count |      sum       |    sum     |  max   
+-------+----------------+------------+--------
+  2498 | 37533211599297 | 18766549.5 | 250.00
+(1 row)
+
+SELECT id, k, f, g, h, a FROM df_pd_lm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+  id   | k | f |      g      |    h    |    a    
+-------+---+---+-------------+---------+---------
+  5983 | 3 | f |  5983017949 |  2991.5 |        
+  8973 | 3 | t |  8973026919 |  4486.5 |  -55.00
+ 15953 | 3 | f | 15953047859 |  7976.5 |  154.00
+ 18943 | 3 |   | 18943056829 |  9471.5 | -116.25
+ 25923 | 3 | t | 25923077769 | 12961.5 |   92.75
+ 28913 | 3 | f | 28913086739 | 14456.5 | -177.50
+(6 rows)
+
+SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_vlm3 WHERE k IN (2, 7) AND id > 5;
+ count | count | sum  |      sum       |   sum    |  sum   
+-------+-------+------+----------------+----------+--------
+  5738 |  5436 | 1812 | 86071294213108 | 43035518 | 666.25
+(1 row)
+
+SELECT count(*), sum(g), sum(h), max(a) FROM df_pd_vlm3 WHERE a > 200 AND k <> 4;
+ count |      sum       |   sum    |  max   
+-------+----------------+----------+--------
+  2501 | 37611244833396 | 18805566 | 250.00
+(1 row)
+
+SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY id;
+  id   | k | f |      g      |    h    |    a    
+-------+---+---+-------------+---------+---------
+  5983 | 3 | f |  5983017949 |  2991.5 |        
+  8973 | 3 | t |  8973026919 |  4486.5 |  -55.00
+ 15953 | 3 | f | 15953047859 |  7976.5 |  154.00
+ 18943 | 3 |   | 18943056829 |  9471.5 | -116.25
+ 25923 | 3 | t | 25923077769 | 12961.5 |   92.75
+ 28913 | 3 | f | 28913086739 | 14456.5 | -177.50
+(6 rows)
+
 -- Several inputs in one slice (C3): each PAX scan is read directly, the
 -- others through the table AM or their Motion; here two PAX tables joined
 -- on their distribution key, and one joined with a heap table.
@@ -1028,6 +1478,6 @@ SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id =
 (1 row)
 
 RESET datafusion.motion_batches;
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_heap, df_pd_lm;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION datafusion_executor;

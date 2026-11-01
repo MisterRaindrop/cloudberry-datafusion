@@ -75,7 +75,7 @@ ERROR:  datafusion: engine null has no test functions
 \c
 SET datafusion.engine = 'null_abi1';
 SELECT datafusion_version();
-ERROR:  datafusion: engine "null_abi1" speaks ABI version 1, this extension 3
+ERROR:  datafusion: engine "null_abi1" speaks ABI version 1, this extension 4
 HINT:  Install the engine built with this extension.
 -- DataFusion without one feature: what needs it stays on PostgreSQL, the
 -- rest still runs in DataFusion.

@@ -36,6 +36,7 @@
 //!   for EXPLAIN ANALYZE.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fmt;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
@@ -47,7 +48,38 @@ use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
 
-static HEAP_BYTES: AtomicI64 = AtomicI64::new(0);
+/// The heap counter, in shards of a cache line each: one counter that
+/// every allocation and free on every thread adds to bounces its line
+/// between the cores (MC1).  A thread adds to its own shard; a shard can go
+/// below zero (freed on another thread than allocated), their sum cannot.
+const HEAP_SHARDS: usize = 64;
+
+#[repr(align(128))]
+struct HeapShard(AtomicI64);
+
+static HEAP_BYTES: [HeapShard; HEAP_SHARDS] = [const { HeapShard(AtomicI64::new(0)) }; HEAP_SHARDS];
+static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    // const, without a destructor: the allocator may run while the thread
+    // starts or ends
+    static SHARD: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+#[inline]
+fn heap_add(delta: i64) {
+    let i = SHARD
+        .try_with(|s| {
+            let mut i = s.get();
+            if i == usize::MAX {
+                i = NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % HEAP_SHARDS;
+                s.set(i);
+            }
+            i
+        })
+        .unwrap_or(0);
+    HEAP_BYTES[i].0.fetch_add(delta, Ordering::Relaxed);
+}
 /// Bytes held by C/C++ code on DataFusion's threads (PAX's reader), as it
 /// reports them; leased from the vmem tracker together with the Rust heap.
 static EXTERNAL_BYTES: AtomicI64 = AtomicI64::new(0);
@@ -59,7 +91,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc(layout);
         if !p.is_null() {
-            HEAP_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            heap_add(layout.size() as i64);
         }
         p
     }
@@ -67,20 +99,20 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         let p = System.alloc_zeroed(layout);
         if !p.is_null() {
-            HEAP_BYTES.fetch_add(layout.size() as i64, Ordering::Relaxed);
+            heap_add(layout.size() as i64);
         }
         p
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         System.dealloc(ptr, layout);
-        HEAP_BYTES.fetch_sub(layout.size() as i64, Ordering::Relaxed);
+        heap_add(-(layout.size() as i64));
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let p = System.realloc(ptr, layout, new_size);
         if !p.is_null() {
-            HEAP_BYTES.fetch_add(new_size as i64 - layout.size() as i64, Ordering::Relaxed);
+            heap_add(new_size as i64 - layout.size() as i64);
         }
         p
     }
@@ -92,7 +124,11 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 /// Live bytes allocated by Rust code in this process, plus those reported
 /// through `external_add`.
 pub fn heap_bytes() -> i64 {
-    HEAP_BYTES.load(Ordering::Relaxed) + EXTERNAL_BYTES.load(Ordering::Relaxed)
+    HEAP_BYTES
+        .iter()
+        .map(|s| s.0.load(Ordering::Relaxed))
+        .sum::<i64>()
+        + EXTERNAL_BYTES.load(Ordering::Relaxed)
 }
 
 /// Record memory allocated (positive) or freed (negative) outside the Rust
@@ -267,13 +303,35 @@ mod tests {
 
     use super::*;
 
+    // The counter is the process's: other tests allocate meanwhile, so these
+    // allocate far more than those (capacity only, never touched), allow
+    // for them, and run one at a time.
+    static HEAP_TESTS: Mutex<()> = Mutex::new(());
+    const GB: i64 = 1 << 30;
+    const SLACK: i64 = 256 << 20;
+
     #[test]
     fn heap_counter_follows_allocations() {
+        let _one = HEAP_TESTS.lock().unwrap();
         let before = heap_bytes();
-        let v: Vec<u8> = Vec::with_capacity(1 << 20);
-        assert!(heap_bytes() - before >= 1 << 20);
+        let v: Vec<u8> = Vec::with_capacity(GB as usize);
+        assert!(heap_bytes() - before >= GB - SLACK);
         drop(v);
-        assert!(heap_bytes() - before < 1 << 20);
+        assert!(heap_bytes() - before < SLACK);
+    }
+
+    /// Allocated on one thread and freed on another: the shards differ,
+    /// their sum is back where it was.
+    #[test]
+    fn heap_counter_sums_its_shards() {
+        let _one = HEAP_TESTS.lock().unwrap();
+        let before = heap_bytes();
+        let v: Vec<u8> = std::thread::spawn(|| Vec::with_capacity(GB as usize))
+            .join()
+            .unwrap();
+        assert!(heap_bytes() - before >= GB - SLACK);
+        std::thread::spawn(move || drop(v)).join().unwrap();
+        assert!(heap_bytes() - before < SLACK);
     }
 
     fn consumer(pool: &Arc<dyn MemoryPool>, name: &str, spill: bool) -> MemoryReservation {

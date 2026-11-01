@@ -1013,6 +1013,7 @@ dependencies = [
  "datafusion",
  "futures",
  "libc",
+ "memchr",
  "num-bigint",
  "serde_json",
  "tokio",

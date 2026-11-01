@@ -24,21 +24,35 @@
 //! What does not: rescaling and arithmetic (NaN in, NaN out, here) and
 //! sums, which a NaN makes NaN (`sum_decimal` in query.rs adds the others
 //! and marks the group with these functions).
+//!
+//! N6: values known to have at most 38 digits (columns of numeric(p, s) of
+//! p <= 38, constants, and what + - * and sums of such make within 38) are
+//! Decimal128(digits, scale) instead, half the bytes: the type's precision
+//! is the most digits a value may have, which the functions here carry
+//! through.  NaN and the infinities are i128::MAX, MAX - 1 and MIN there,
+//! as a batch Motion carries them (NW1).  Where the two kinds meet, as
+//! operands of one comparison, branches of one CASE or inputs of one
+//! UNION, `NumericWidth` (query.rs) makes them one type with `NumericFn::As`.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, AsArray, BooleanArray, Decimal256Array, PrimitiveArray,
+    Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Decimal256Array, PrimitiveArray,
 };
+use datafusion::arrow::buffer::{NullBuffer, ScalarBuffer};
 use datafusion::arrow::datatypes::{
     i256, DataType, Decimal128Type, Decimal256Type, Int32Type, Int64Type,
 };
 use datafusion::arrow::error::ArrowError;
-use datafusion::common::Result;
+use datafusion::common::{Result, ScalarValue};
 use datafusion::error::DataFusionError;
+use datafusion::logical_expr::function::AccumulatorArgs;
 use datafusion::logical_expr::{
-    ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, ColumnarValue, EmitTo, GroupsAccumulator,
+    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use num_bigint::BigUint;
 
@@ -59,10 +73,94 @@ pub fn numeric_type(scale: i8) -> DataType {
     DataType::Decimal256(NUMERIC_PRECISION, scale)
 }
 
-fn decimal(a: &ArrayRef) -> Result<&Decimal256Array> {
-    a.as_primitive_opt::<Decimal256Type>().ok_or_else(|| {
-        DataFusionError::Internal(format!("expected a numeric column, got {}", a.data_type()))
+/// N6: NaN and the infinities of a narrow numeric value (Decimal128).
+pub const NARROW_NAN: i128 = i128::MAX;
+pub const NARROW_PINF: i128 = i128::MAX - 1;
+pub const NARROW_NINF: i128 = i128::MIN;
+
+/// The most digits a narrow numeric value has.
+pub const NARROW_PRECISION: u8 = 38;
+
+/// The type of numeric values of at most `digits` digits at `scale`:
+/// narrow up to 38 digits, Decimal256 beyond.  Arrow wants the digits at
+/// least the scale (0.05 has one digit at scale 2).
+pub fn numeric_type_of(digits: i64, scale: i8) -> DataType {
+    let digits = digits.max(scale as i64).max(1);
+    if digits <= NARROW_PRECISION as i64 {
+        DataType::Decimal128(digits as u8, scale)
+    } else {
+        numeric_type(scale)
+    }
+}
+
+/// The digits and scale of numeric type `t` (76 for Decimal256), if it is
+/// one.
+pub fn numeric_digits(t: &DataType) -> Option<(u8, i8)> {
+    match t {
+        DataType::Decimal128(p, s) => Some((*p, *s)),
+        DataType::Decimal256(_, s) => Some((NUMERIC_PRECISION, *s)),
+        _ => None,
+    }
+}
+
+/// A narrow numeric value as a wide one.
+#[inline]
+pub fn widen_value(v: i128) -> i256 {
+    match v {
+        NARROW_NAN => NUMERIC_NAN,
+        NARROW_PINF => NUMERIC_PINF,
+        NARROW_NINF => NUMERIC_NINF,
+        v => i256::from_i128(v),
+    }
+}
+
+/// A wide numeric value as a narrow one, if it has at most 38 digits.
+#[inline]
+pub fn narrow_value(v: i256) -> Option<i128> {
+    match v {
+        NUMERIC_NAN => Some(NARROW_NAN),
+        NUMERIC_PINF => Some(NARROW_PINF),
+        NUMERIC_NINF => Some(NARROW_NINF),
+        v => v.to_i128().filter(|v| *v < NARROW_PINF && *v > NARROW_NINF),
+    }
+}
+
+/// Numeric value `r` of array `a` of either kind, as a wide one.
+#[inline]
+pub fn numeric_value(a: &dyn Array, r: usize) -> i256 {
+    match a.data_type() {
+        DataType::Decimal128(..) => widen_value(a.as_primitive::<Decimal128Type>().value(r)),
+        _ => a.as_primitive::<Decimal256Type>().value(r),
+    }
+}
+
+/// Numeric array `a` of either kind as Decimal256(76, its scale).
+pub fn widen(a: &ArrayRef) -> Result<ArrayRef> {
+    Ok(match decimal(a)? {
+        Cow::Borrowed(_) => a.clone(),
+        Cow::Owned(w) => Arc::new(w),
     })
+}
+
+/// Numeric array `a` of either kind, a narrow one widened.
+fn decimal(a: &ArrayRef) -> Result<Cow<'_, Decimal256Array>> {
+    if let Some(d) = a.as_primitive_opt::<Decimal256Type>() {
+        return Ok(Cow::Borrowed(d));
+    }
+    match a.data_type() {
+        DataType::Decimal128(_, s) => Ok(Cow::Owned(
+            a.as_primitive::<Decimal128Type>()
+                .unary::<_, Decimal256Type>(widen_value)
+                .with_data_type(numeric_type(*s)),
+        )),
+        t => Err(DataFusionError::Internal(format!(
+            "expected a numeric column, got {t}"
+        ))),
+    }
+}
+
+fn narrow_array(a: &ArrayRef) -> Option<&Decimal128Array> {
+    a.as_primitive_opt::<Decimal128Type>()
 }
 
 /// NW1: how a numeric column of at most 38 digits goes through a batch
@@ -95,12 +193,32 @@ impl MotionNumeric {
         }
     }
 
-    /// Numeric column `a` in this form.  Err for a value it cannot hold,
-    /// which the planner hook's digits rule out.
+    /// Numeric column `a` (of either kind) in this form.  Err for a value
+    /// it cannot hold, which the planner hook's digits rule out.
     pub fn narrow(self, a: &ArrayRef) -> Result<ArrayRef> {
+        let lost = || ArrowError::ComputeError("numeric value beyond its digits".into());
+        if let Some(d) = narrow_array(a) {
+            // N6: as it is, or 8 bytes of it
+            let scale = d.scale();
+            return Ok(match self {
+                MotionNumeric::Int64 => Arc::new(d.try_unary::<_, Int64Type, _>(|v| {
+                    Ok::<_, ArrowError>(match v {
+                        NARROW_NAN => i64::MAX,
+                        NARROW_PINF => i64::MAX - 1,
+                        NARROW_NINF => i64::MIN,
+                        v => i64::try_from(v)
+                            .ok()
+                            .filter(|v| *v < i64::MAX - 1 && *v > i64::MIN)
+                            .ok_or_else(lost)?,
+                    })
+                })?),
+                MotionNumeric::Decimal128 => {
+                    Arc::new(d.clone().with_data_type(DataType::Decimal128(38, scale)))
+                }
+            });
+        }
         let d = decimal(a)?;
         let scale = d.scale();
-        let lost = || ArrowError::ComputeError("numeric value beyond its digits".into());
         Ok(match self {
             MotionNumeric::Int64 => Arc::new(d.try_unary::<_, Int64Type, _>(|v| {
                 Ok::<_, ArrowError>(if v == NUMERIC_NAN {
@@ -135,29 +253,31 @@ impl MotionNumeric {
         })
     }
 
-    /// Column `a` in this form back as numeric of scale `scale`.
-    pub fn widen(self, a: &ArrayRef, scale: i8) -> Result<ArrayRef> {
-        let wide = |v: i128, max: i128, min: i128| match v {
-            v if v == max => NUMERIC_NAN,
-            v if v == max - 1 => NUMERIC_PINF,
-            v if v == min => NUMERIC_NINF,
-            v => i256::from_i128(v),
-        };
+    /// Column `a` in this form back as numeric of `digits` digits at scale
+    /// `scale`: narrow (N6), as its form is.
+    pub fn widen(self, a: &ArrayRef, digits: u8, scale: i8) -> Result<ArrayRef> {
         let bad =
             || DataFusionError::Internal(format!("unexpected Motion column {}", a.data_type()));
-        let d: Decimal256Array = match self {
-            MotionNumeric::Int64 => a
-                .as_primitive_opt::<Int64Type>()
-                .ok_or_else(bad)?
-                .unary(|v| wide(v as i128, i64::MAX as i128, i64::MIN as i128)),
-            MotionNumeric::Decimal128 => a
-                .as_primitive_opt::<Decimal128Type>()
-                .ok_or_else(bad)?
-                .unary(|v| wide(v, i128::MAX, i128::MIN)),
-        };
-        Ok(Arc::new(
-            d.with_precision_and_scale(NUMERIC_PRECISION, scale)?,
-        ))
+        let ty = DataType::Decimal128(digits, scale);
+        Ok(match self {
+            MotionNumeric::Int64 => Arc::new(
+                a.as_primitive_opt::<Int64Type>()
+                    .ok_or_else(bad)?
+                    .unary::<_, Decimal128Type>(|v| match v {
+                        i64::MAX => NARROW_NAN,
+                        v if v == i64::MAX - 1 => NARROW_PINF,
+                        i64::MIN => NARROW_NINF,
+                        v => v as i128,
+                    })
+                    .with_data_type(ty),
+            ),
+            MotionNumeric::Decimal128 => Arc::new(
+                a.as_primitive_opt::<Decimal128Type>()
+                    .ok_or_else(bad)?
+                    .clone()
+                    .with_data_type(ty),
+            ),
+        })
     }
 }
 
@@ -431,6 +551,634 @@ fn beyond() -> ArrowError {
     ArrowError::ComputeError("numeric result beyond 76 digits".into())
 }
 
+// N1: numeric + - * of two values, NaN in, NaN out.  Operands within 38
+// digits (most columns and what they make) take i128 arithmetic, which
+// cannot be NaN or infinite (both beyond i128); the rest i256's.
+
+#[inline]
+fn num_add(a: i256, b: i256) -> Result<i256, ArrowError> {
+    if let (Some(x), Some(y)) = (a.to_i128(), b.to_i128()) {
+        if let Some(v) = x.checked_add(y) {
+            return Ok(i256::from_i128(v));
+        }
+    }
+    if a == NUMERIC_NAN || b == NUMERIC_NAN {
+        return Ok(NUMERIC_NAN);
+    }
+    a.checked_add(b).ok_or_else(beyond)
+}
+
+#[inline]
+fn num_sub(a: i256, b: i256) -> Result<i256, ArrowError> {
+    if let (Some(x), Some(y)) = (a.to_i128(), b.to_i128()) {
+        if let Some(v) = x.checked_sub(y) {
+            return Ok(i256::from_i128(v));
+        }
+    }
+    if a == NUMERIC_NAN || b == NUMERIC_NAN {
+        return Ok(NUMERIC_NAN);
+    }
+    a.checked_sub(b).ok_or_else(beyond)
+}
+
+// N4: arrays whose every value fits an i64 (nearly all of a numeric(p, s)
+// column of p <= 18 and what + - * of such make), whose + - * fit an i128
+// without checks, go through plain loops: NaN and the infinities never fit.
+// Null slots are looked at too; a value there that does not fit only sends
+// the array the general way.
+
+#[inline]
+fn fits_i64(x: i256) -> bool {
+    let (lo, hi) = x.to_parts();
+    let l = lo as i128;
+    hi == l >> 127 && l == l as i64 as i128
+}
+
+fn all_i64(v: &[i256]) -> bool {
+    v.iter().fold(true, |all, &x| all & fits_i64(x))
+}
+
+#[inline]
+fn narrow_op(op: NumOp) -> fn(i128, i128) -> i128 {
+    match op {
+        NumOp::Add => |a, b| a + b,
+        NumOp::Sub => |a, b| a - b,
+        NumOp::Mul => |a, b| a * b,
+    }
+}
+
+/// The second operand of `narrow_arith`.
+enum Operand<'a> {
+    One(i256),
+    Each(&'a Decimal256Array),
+}
+
+/// `op` of `xs` and `b` when all fit an i64.
+fn narrow_arith(op: NumOp, xs: &Decimal256Array, b: Operand) -> Option<Decimal256Array> {
+    if !all_i64(xs.values()) {
+        return None;
+    }
+    let f = narrow_op(op);
+    let lo = |v: i256| v.as_i128();
+    let values: Vec<i256> = match b {
+        Operand::One(b) => {
+            if !fits_i64(b) {
+                return None;
+            }
+            let b = lo(b);
+            xs.values().iter().map(|&a| i256::from_i128(f(lo(a), b))).collect()
+        }
+        Operand::Each(ys) => {
+            if !all_i64(ys.values()) {
+                return None;
+            }
+            xs.values()
+                .iter()
+                .zip(ys.values().iter())
+                .map(|(&a, &b)| i256::from_i128(f(lo(a), lo(b))))
+                .collect()
+        }
+    };
+    let nulls = match b {
+        Operand::One(_) => xs.nulls().cloned(),
+        Operand::Each(ys) => NullBuffer::union(xs.nulls(), ys.nulls()),
+    };
+    Some(Decimal256Array::new(ScalarBuffer::from(values), nulls))
+}
+
+/// N6: an operand of + - * of narrow values: one value, or one per row.
+#[derive(Clone, Copy)]
+enum Narrow<'a> {
+    One(i128),
+    Each(&'a Decimal128Array),
+}
+
+impl Narrow<'_> {
+    /// Does every value (null slots too) fit an i64?
+    fn all_i64(self) -> bool {
+        let fits = |v: i128| v == v as i64 as i128;
+        match self {
+            Narrow::One(v) => fits(v),
+            Narrow::Each(a) => a.values().iter().fold(true, |all, &v| all & fits(v)),
+        }
+    }
+
+    #[inline]
+    fn get(self, r: usize) -> i128 {
+        match self {
+            Narrow::One(v) => v,
+            Narrow::Each(a) => a.values()[r],
+        }
+    }
+
+    fn nulls(&self) -> Option<&NullBuffer> {
+        match self {
+            Narrow::One(_) => None,
+            Narrow::Each(a) => a.nulls(),
+        }
+    }
+}
+
+/// `f` of the values of `a` and `b`, row by row, `n` rows.
+#[inline]
+fn map_narrow<T: Clone>(n: usize, a: Narrow, b: Narrow, f: impl Fn(i128, i128) -> T) -> Vec<T> {
+    match (a, b) {
+        (Narrow::Each(x), Narrow::Each(y)) => x
+            .values()
+            .iter()
+            .zip(y.values().iter())
+            .map(|(&x, &y)| f(x, y))
+            .collect(),
+        (Narrow::Each(x), Narrow::One(y)) => x.values().iter().map(|&x| f(x, y)).collect(),
+        (Narrow::One(x), Narrow::Each(y)) => y.values().iter().map(|&y| f(x, y)).collect(),
+        (Narrow::One(x), Narrow::One(y)) => vec![f(x, y); n],
+    }
+}
+
+fn beyond_digits() -> ArrowError {
+    // The planner hook's digits rule it out.
+    ArrowError::ComputeError("numeric value beyond its digits".into())
+}
+
+/// N6: `op` of narrow `a` and `b`, of type `out`.  A narrow result has at
+/// most 38 digits by the operands' (`PgNumeric::return_type`), within an
+/// i128 and short of its NaN.  Values that all fit an i64 cannot be NaN
+/// and their + - * fit an i128: plain loops (N4's); the others are checked.
+fn arith_narrow(op: NumOp, a: Narrow, b: Narrow, n: usize, out: &DataType) -> Result<ArrayRef> {
+    let nulls = NullBuffer::union(a.nulls(), b.nulls());
+    let fast = a.all_i64() && b.all_i64();
+    let f = narrow_op(op);
+    let checked = |x: i128, y: i128| match op {
+        NumOp::Add => x.checked_add(y),
+        NumOp::Sub => x.checked_sub(y),
+        NumOp::Mul => x.checked_mul(y),
+    };
+    let null = |r: usize| nulls.as_ref().is_some_and(|nb| nb.is_null(r));
+    let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
+    if let DataType::Decimal128(..) = out {
+        let values: Vec<i128> = if fast {
+            map_narrow(n, a, b, f)
+        } else {
+            let mut v = Vec::with_capacity(n);
+            for r in 0..n {
+                let (x, y) = (a.get(r), b.get(r));
+                v.push(if null(r) {
+                    0
+                } else if x == NARROW_NAN || y == NARROW_NAN {
+                    NARROW_NAN
+                } else {
+                    checked(x, y)
+                        .filter(|v| *v < NARROW_PINF && *v > NARROW_NINF)
+                        .ok_or_else(beyond_digits)
+                        .map_err(arrow)?
+                });
+            }
+            v
+        };
+        return Ok(Arc::new(
+            Decimal128Array::new(ScalarBuffer::from(values), nulls).with_data_type(out.clone()),
+        ));
+    }
+    let values: Vec<i256> = if fast {
+        map_narrow(n, a, b, |x, y| i256::from_i128(f(x, y)))
+    } else {
+        let mut v = Vec::with_capacity(n);
+        for r in 0..n {
+            let (x, y) = (a.get(r), b.get(r));
+            v.push(if null(r) {
+                i256::ZERO
+            } else if x == NARROW_NAN || y == NARROW_NAN {
+                NUMERIC_NAN
+            } else {
+                match checked(x, y) {
+                    Some(v) => i256::from_i128(v),
+                    None => {
+                        let (x, y) = (i256::from_i128(x), i256::from_i128(y));
+                        match op {
+                            NumOp::Add => x.checked_add(y),
+                            NumOp::Sub => x.checked_sub(y),
+                            NumOp::Mul => x.checked_mul(y),
+                        }
+                        .ok_or_else(beyond)
+                        .map_err(arrow)?
+                    }
+                }
+            });
+        }
+        v
+    };
+    Ok(Arc::new(
+        Decimal256Array::new(ScalarBuffer::from(values), nulls).with_data_type(out.clone()),
+    ))
+}
+
+/// `op` of arguments `args` if both are narrow (N6), else None.
+fn arith_narrow_args(
+    op: NumOp,
+    args: &[ColumnarValue],
+    n: usize,
+    out: &DataType,
+) -> Result<Option<ArrayRef>> {
+    enum Side {
+        One(Option<i128>),
+        Each(ArrayRef),
+    }
+    let side = |c: &ColumnarValue| match c {
+        ColumnarValue::Scalar(ScalarValue::Decimal128(v, ..)) => Some(Side::One(*v)),
+        ColumnarValue::Array(a) if narrow_array(a).is_some() => Some(Side::Each(a.clone())),
+        _ => None,
+    };
+    let (Some(a), Some(b)) = (side(&args[0]), side(&args[1])) else {
+        return Ok(None);
+    };
+    fn view(s: &Side) -> Option<Narrow<'_>> {
+        match s {
+            Side::One(v) => v.map(Narrow::One),
+            Side::Each(a) => narrow_array(a).map(Narrow::Each),
+        }
+    }
+    match (view(&a), view(&b)) {
+        (Some(x), Some(y)) => arith_narrow(op, x, y, n, out).map(Some),
+        _ => Ok(Some(datafusion::arrow::array::new_null_array(out, n))),
+    }
+}
+
+/// The type of `op` of numeric operands of types `l` and `r` at scale
+/// `to`: + and - add a digit to the larger part before the point, * adds
+/// up the digits (numeric_mul is exact).
+fn arith_type(op: NumOp, to: i8, l: &DataType, r: &DataType) -> DataType {
+    match (numeric_digits(l), numeric_digits(r)) {
+        (Some((pl, sl)), Some((pr, sr))) => {
+            let (pl, sl, pr, sr) = (pl as i64, sl as i64, pr as i64, sr as i64);
+            let digits = match op {
+                NumOp::Add | NumOp::Sub => (pl - sl).max(pr - sr) + to as i64 + 1,
+                NumOp::Mul => pl + pr,
+            };
+            numeric_type_of(digits, to)
+        }
+        _ => numeric_type(to),
+    }
+}
+
+#[inline]
+fn num_mul(a: i256, b: i256) -> Result<i256, ArrowError> {
+    if let (Some(x), Some(y)) = (a.to_i128(), b.to_i128()) {
+        if let Some(v) = x.checked_mul(y) {
+            return Ok(i256::from_i128(v));
+        }
+    }
+    if a == NUMERIC_NAN || b == NUMERIC_NAN {
+        return Ok(NUMERIC_NAN);
+    }
+    a.checked_mul(b).ok_or_else(beyond)
+}
+
+/// N1: sum_decimal, the sum of numeric values as PostgreSQL's numeric sum
+/// gives it: NaN if any value is NaN, NULL without values.  One pass,
+/// where `sum` of the values with NaN as 0, `bool_or` of "is NaN" and a
+/// projection marking NaN sums took four.  Its state is that value, which
+/// merges as the values do.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PgSumDecimal {
+    signature: Signature,
+}
+
+impl PgSumDecimal {
+    pub fn udaf() -> AggregateUDF {
+        AggregateUDF::new_from_impl(PgSumDecimal {
+            signature: Signature::any(1, Volatility::Immutable),
+        })
+    }
+}
+
+impl AggregateUDFImpl for PgSumDecimal {
+    fn name(&self) -> &str {
+        "pg_sum_decimal"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        match arg_types.first() {
+            Some(t @ DataType::Decimal256(..)) => Ok(t.clone()),
+            // N6: fewer than 2^63 values, under 10^19, add up to 19 digits
+            Some(DataType::Decimal128(p, s)) => Ok(numeric_type_of(*p as i64 + 19, *s)),
+            t => Err(DataFusionError::Internal(format!(
+                "pg_sum_decimal of {t:?}"
+            ))),
+        }
+    }
+
+    fn accumulator(&self, args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        Ok(Box::new(SumDecimal {
+            data_type: args.return_field.data_type().clone(),
+            sum: i256::ZERO,
+            values: 0,
+            nans: 0,
+        }))
+    }
+
+    fn groups_accumulator_supported(&self, _args: AccumulatorArgs) -> bool {
+        true
+    }
+
+    fn create_groups_accumulator(
+        &self,
+        args: AccumulatorArgs,
+    ) -> Result<Box<dyn GroupsAccumulator>> {
+        Ok(Box::new(SumDecimalGroups {
+            data_type: args.return_field.data_type().clone(),
+            sums: Vec::new(),
+            narrow: Vec::new(),
+            narrow_rows: 0,
+            nan: Vec::new(),
+            seen: Vec::new(),
+        }))
+    }
+}
+
+/// pg_sum_decimal of one group, or of a window frame: the values it saw
+/// and the NaNs among them are counted so that a frame can drop them.
+#[derive(Debug)]
+struct SumDecimal {
+    data_type: DataType,
+    sum: i256,
+    values: i64,
+    nans: i64,
+}
+
+impl SumDecimal {
+    fn add(&mut self, a: &ArrayRef, sign: i64) -> Result<()> {
+        for v in decimal(a)?.iter().flatten() {
+            if v == NUMERIC_NAN {
+                self.nans += sign;
+            } else if sign > 0 {
+                self.sum = self.sum.wrapping_add(v);
+            } else {
+                self.sum = self.sum.wrapping_sub(v);
+            }
+            self.values += sign;
+        }
+        Ok(())
+    }
+}
+
+impl Accumulator for SumDecimal {
+    fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.add(&values[0], 1)
+    }
+
+    fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
+        self.add(&values[0], -1)
+    }
+
+    fn supports_retract_batch(&self) -> bool {
+        true
+    }
+
+    fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
+        self.add(&states[0], 1)
+    }
+
+    fn state(&mut self) -> Result<Vec<ScalarValue>> {
+        Ok(vec![self.evaluate()?])
+    }
+
+    fn evaluate(&mut self) -> Result<ScalarValue> {
+        let v = (self.values > 0).then_some(if self.nans > 0 { NUMERIC_NAN } else { self.sum });
+        if let DataType::Decimal128(..) = self.data_type {
+            let v = v
+                .map(|v| narrow_value(v).ok_or_else(beyond_digits))
+                .transpose()
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            return ScalarValue::new_primitive::<Decimal128Type>(v, &self.data_type);
+        }
+        ScalarValue::new_primitive::<Decimal256Type>(v, &self.data_type)
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+    }
+}
+
+/// pg_sum_decimal of many groups.
+struct SumDecimalGroups {
+    data_type: DataType,
+    sums: Vec<i256>,
+    /// N4: the part of each sum from batches of values that all fit an
+    /// i64, added in i128: within 2^63 each, 2^63 of them cannot overflow
+    narrow: Vec<i128>,
+    /// values added to `narrow` since it was last folded into `sums`
+    narrow_rows: u64,
+    nan: Vec<bool>,
+    seen: Vec<bool>,
+}
+
+impl SumDecimalGroups {
+    fn add(
+        &mut self,
+        a: &ArrayRef,
+        groups: &[usize],
+        filter: Option<&BooleanArray>,
+        total: usize,
+    ) -> Result<()> {
+        self.sums.resize(total, i256::ZERO);
+        self.narrow.resize(total, 0);
+        self.nan.resize(total, false);
+        self.seen.resize(total, false);
+        if let Some(xs) = narrow_array(a) {
+            return self.add_narrow(xs, groups, filter);
+        }
+        let xs = decimal(a)?;
+        let values = xs.values();
+        if all_i64(values) {
+            if self.narrow_rows + groups.len() as u64 > 1 << 62 {
+                self.fold_narrow();
+            }
+            self.narrow_rows += groups.len() as u64;
+            if xs.null_count() == 0 && filter.is_none() {
+                for (&g, &v) in groups.iter().zip(values.iter()) {
+                    self.narrow[g] += v.as_i128();
+                    self.seen[g] = true;
+                }
+            } else {
+                for (r, &g) in groups.iter().enumerate() {
+                    if xs.is_valid(r) && filter.is_none_or(|f| f.is_valid(r) && f.value(r)) {
+                        self.narrow[g] += values[r].as_i128();
+                        self.seen[g] = true;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let mut one = |g: usize, v: i256| {
+            if v == NUMERIC_NAN {
+                self.nan[g] = true;
+            } else {
+                self.sums[g] = self.sums[g].wrapping_add(v);
+            }
+            self.seen[g] = true;
+        };
+        if xs.null_count() == 0 && filter.is_none() {
+            for (&g, &v) in groups.iter().zip(values.iter()) {
+                one(g, v);
+            }
+        } else {
+            for (r, &g) in groups.iter().enumerate() {
+                if xs.is_valid(r) && filter.is_none_or(|f| f.is_valid(r) && f.value(r)) {
+                    one(g, values[r]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// N6: `add` of narrow values: those of a batch that all fit an i64
+    /// into `narrow`, as wide ones fitting it do; the others one by one.
+    fn add_narrow(
+        &mut self,
+        xs: &Decimal128Array,
+        groups: &[usize],
+        filter: Option<&BooleanArray>,
+    ) -> Result<()> {
+        let values = xs.values();
+        let take = |r: usize| xs.is_valid(r) && filter.is_none_or(|f| f.is_valid(r) && f.value(r));
+        let dense = xs.null_count() == 0 && filter.is_none();
+        if values.iter().fold(true, |all, &v| all & (v == v as i64 as i128)) {
+            if self.narrow_rows + groups.len() as u64 > 1 << 62 {
+                self.fold_narrow();
+            }
+            self.narrow_rows += groups.len() as u64;
+            if dense {
+                for (&g, &v) in groups.iter().zip(values.iter()) {
+                    self.narrow[g] += v;
+                    self.seen[g] = true;
+                }
+            } else {
+                for (r, &g) in groups.iter().enumerate() {
+                    if take(r) {
+                        self.narrow[g] += values[r];
+                        self.seen[g] = true;
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for (r, &g) in groups.iter().enumerate() {
+            if dense || take(r) {
+                match values[r] {
+                    NARROW_NAN => self.nan[g] = true,
+                    v => self.sums[g] = self.sums[g].wrapping_add(i256::from_i128(v)),
+                }
+                self.seen[g] = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn fold_narrow(&mut self) {
+        for (s, n) in self.sums.iter_mut().zip(self.narrow.iter_mut()) {
+            *s = s.wrapping_add(i256::from_i128(std::mem::take(n)));
+        }
+        self.narrow_rows = 0;
+    }
+}
+
+impl GroupsAccumulator for SumDecimalGroups {
+    fn update_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        opt_filter: Option<&BooleanArray>,
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.add(&values[0], group_indices, opt_filter, total_num_groups)
+    }
+
+    fn merge_batch(
+        &mut self,
+        values: &[ArrayRef],
+        group_indices: &[usize],
+        total_num_groups: usize,
+    ) -> Result<()> {
+        self.add(&values[0], group_indices, None, total_num_groups)
+    }
+
+    fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        self.fold_narrow();
+        let sums = emit_to.take_needed(&mut self.sums);
+        emit_to.take_needed(&mut self.narrow);
+        let nan = emit_to.take_needed(&mut self.nan);
+        let seen = emit_to.take_needed(&mut self.seen);
+        let values: Vec<i256> = sums
+            .into_iter()
+            .zip(nan)
+            .map(|(s, n)| if n { NUMERIC_NAN } else { s })
+            .collect();
+        if let DataType::Decimal128(..) = self.data_type {
+            // N6: within its digits (`return_type`)
+            let values = values
+                .into_iter()
+                .map(|v| narrow_value(v).ok_or_else(beyond_digits))
+                .collect::<Result<Vec<i128>, ArrowError>>()
+                .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
+            return Ok(Arc::new(
+                Decimal128Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(seen)))
+                    .with_data_type(self.data_type.clone()),
+            ));
+        }
+        Ok(Arc::new(
+            Decimal256Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(seen)))
+                .with_data_type(self.data_type.clone()),
+        ))
+    }
+
+    fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        Ok(vec![self.evaluate(emit_to)?])
+    }
+
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> Result<Vec<ArrayRef>> {
+        // the values as the state's type: a narrow one relabeled or widened
+        let a = &values[0];
+        let a = match (&self.data_type, a.data_type()) {
+            (DataType::Decimal256(..), DataType::Decimal128(..)) => widen(a)?,
+            (DataType::Decimal128(..), DataType::Decimal128(..)) => Arc::new(
+                a.as_primitive::<Decimal128Type>()
+                    .clone()
+                    .with_data_type(self.data_type.clone()),
+            ),
+            _ => a.clone(),
+        };
+        let Some(f) = opt_filter else {
+            return Ok(vec![a]);
+        };
+        let keep: Vec<bool> = (0..a.len())
+            .map(|r| a.is_valid(r) && f.is_valid(r) && f.value(r))
+            .collect();
+        let nulls = Some(NullBuffer::from(keep));
+        Ok(vec![match narrow_array(&a) {
+            Some(d) => Arc::new(Decimal128Array::new(d.values().clone(), nulls).with_data_type(self.data_type.clone())),
+            None => Arc::new(
+                Decimal256Array::new(decimal(&a)?.values().clone(), nulls)
+                    .with_data_type(self.data_type.clone()),
+            ),
+        }])
+    }
+
+    fn size(&self) -> usize {
+        self.sums.capacity() * std::mem::size_of::<i256>()
+            + self.narrow.capacity() * std::mem::size_of::<i128>()
+            + self.nan.capacity()
+            + self.seen.capacity()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NumOp {
     Add,
@@ -440,19 +1188,17 @@ pub enum NumOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NumericFn {
+    /// N6: x, numeric of scale `scale`, as numeric of `digits` digits:
+    /// Decimal256 for 76, else narrow (x within those digits); NaN stays
+    /// NaN.  An x of another type (an integer) is cast.
+    As { digits: u8, scale: i8 },
     /// x * 10^by, to scale `to`; NaN stays NaN.
     Rescale { by: i8, to: i8 },
-    /// x, with NaN as 0.
-    NanToZero,
     /// abs(x), as numeric_abs; NaN stays NaN.
     Abs,
     /// RD1: round(x, to), as numeric_round: x of scale `from`, rounded half
     /// away from zero at scale `to` (not below 0); NaN stays NaN.
     Round { from: i8, to: i8 },
-    /// x is NaN.
-    IsNan,
-    /// NaN where the second argument is true, else x.
-    NanIf,
     /// x op y, of scale `to`: + and - take operands already of that scale,
     /// * operands whose scales add up to it (numeric_mul's rscale).
     Arith { op: NumOp, to: i8 },
@@ -484,10 +1230,7 @@ pub struct PgNumeric {
 impl PgNumeric {
     pub fn udf(f: NumericFn) -> ScalarUDF {
         let n = match f {
-            NumericFn::NanIf
-            | NumericFn::Arith { .. }
-            | NumericFn::Avg { .. }
-            | NumericFn::AvgScale { .. } => 2,
+            NumericFn::Arith { .. } | NumericFn::Avg { .. } | NumericFn::AvgScale { .. } => 2,
             NumericFn::Div { .. } | NumericFn::DivScale { .. } => 4,
             NumericFn::Stddev { .. } | NumericFn::StddevScale { .. } => 3,
             _ => 1,
@@ -502,12 +1245,10 @@ impl PgNumeric {
 impl ScalarUDFImpl for PgNumeric {
     fn name(&self) -> &str {
         match self.f {
+            NumericFn::As { .. } => "pg_numeric_as",
             NumericFn::Rescale { .. } => "pg_numeric_rescale",
-            NumericFn::NanToZero => "pg_numeric_nan_to_zero",
             NumericFn::Abs => "pg_numeric_abs",
             NumericFn::Round { .. } => "pg_numeric_round",
-            NumericFn::IsNan => "pg_numeric_is_nan",
-            NumericFn::NanIf => "pg_numeric_nan_if",
             NumericFn::Arith { op: NumOp::Add, .. } => "pg_numeric_add",
             NumericFn::Arith { op: NumOp::Sub, .. } => "pg_numeric_sub",
             NumericFn::Arith { op: NumOp::Mul, .. } => "pg_numeric_mul",
@@ -526,13 +1267,23 @@ impl ScalarUDFImpl for PgNumeric {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(match self.f {
-            NumericFn::Rescale { to, .. }
-            | NumericFn::Round { to, .. }
-            | NumericFn::Arith { to, .. }
+            NumericFn::As { digits, scale } => {
+                if digits >= NUMERIC_PRECISION {
+                    numeric_type(scale)
+                } else {
+                    numeric_type_of(digits as i64, scale)
+                }
+            }
+            // N6: narrow values stay narrow within 38 digits
+            NumericFn::Rescale { by, to } => match &arg_types[0] {
+                DataType::Decimal128(p, _) => numeric_type_of(*p as i64 + by as i64, to),
+                _ => numeric_type(to),
+            },
+            NumericFn::Arith { op, to } => arith_type(op, to, &arg_types[0], &arg_types[1]),
+            NumericFn::Round { to, .. }
             | NumericFn::Avg { to, .. }
             | NumericFn::Div { to, .. }
             | NumericFn::Stddev { to, .. } => numeric_type(to),
-            NumericFn::IsNan => DataType::Boolean,
             NumericFn::DivScale { .. }
             | NumericFn::AvgScale { .. }
             | NumericFn::StddevScale { .. } => DataType::Int32,
@@ -541,6 +1292,25 @@ impl ScalarUDFImpl for PgNumeric {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if args
+            .args
+            .iter()
+            .all(|a| matches!(a, ColumnarValue::Scalar(_)))
+            && args.number_rows != 1
+        {
+            // N1: constant arguments (a literal rescaled, 1 - x's 1) make one
+            // value, not one per row
+            let one = ScalarFunctionArgs {
+                number_rows: 1,
+                ..args
+            };
+            return match self.invoke_with_args(one)? {
+                ColumnarValue::Array(a) => {
+                    Ok(ColumnarValue::Scalar(ScalarValue::try_from_array(&a, 0)?))
+                }
+                s => Ok(s),
+            };
+        }
         let n = args.number_rows;
         let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
         let stddev = match self.f {
@@ -577,12 +1347,78 @@ impl ScalarUDFImpl for PgNumeric {
             };
             return Ok(ColumnarValue::Array(out));
         }
+        let out_type = args.return_field.data_type().clone();
+        if let NumericFn::Arith { op, .. } = self.f {
+            if let Some(a) = arith_narrow_args(op, &args.args, n, &out_type)? {
+                return Ok(ColumnarValue::Array(a));
+            }
+        }
         let x = args.args[0].to_array(n)?;
+        if let NumericFn::As { scale, digits } = self.f {
+            if numeric_digits(x.data_type()).is_some_and(|(_, s)| s != scale) {
+                if digits < NUMERIC_PRECISION {
+                    return Err(DataFusionError::Internal(format!(
+                        "pg_numeric_as: {} at scale {scale}",
+                        x.data_type()
+                    )));
+                }
+                // an output at another scale: rescaled as a cast does
+                return Ok(ColumnarValue::Array(
+                    datafusion::arrow::compute::cast(&widen(&x)?, &out_type).map_err(arrow)?,
+                ));
+            }
+        }
+        if matches!(self.f, NumericFn::As { .. }) && numeric_digits(x.data_type()).is_none() {
+            // an output of numeric type computed in another (an integer)
+            return Ok(ColumnarValue::Array(
+                datafusion::arrow::compute::cast(&x, &out_type).map_err(arrow)?,
+            ));
+        }
+        if let Some(d) = narrow_array(&x) {
+            // N6: narrow in, narrow out
+            match (self.f, &out_type) {
+                (NumericFn::As { .. }, DataType::Decimal128(..)) | (NumericFn::Abs, _) => {
+                    let a = if matches!(self.f, NumericFn::Abs) {
+                        d.unary::<_, Decimal128Type>(|v| match v {
+                            NARROW_NAN | NARROW_PINF | NARROW_NINF => v,
+                            v => v.abs(),
+                        })
+                    } else {
+                        d.clone()
+                    };
+                    return Ok(ColumnarValue::Array(Arc::new(a.with_data_type(out_type))));
+                }
+                (NumericFn::Rescale { by, .. }, DataType::Decimal128(..)) => {
+                    let k = 10i128.pow(by as u32);
+                    let a: Decimal128Array = d
+                        .try_unary(|v| match v {
+                            NARROW_NAN | NARROW_PINF | NARROW_NINF => Ok(v),
+                            v => v
+                                .checked_mul(k)
+                                .filter(|v| *v < NARROW_PINF && *v > NARROW_NINF)
+                                .ok_or_else(beyond_digits),
+                        })
+                        .map_err(arrow)?;
+                    return Ok(ColumnarValue::Array(Arc::new(a.with_data_type(out_type))));
+                }
+                _ => {}
+            }
+        }
         let xs = decimal(&x)?;
         let out: ArrayRef = match self.f {
             NumericFn::Stddev { .. } | NumericFn::StddevScale { .. } => {
                 return Err(DataFusionError::Internal("stddev computed above".into()))
             }
+            NumericFn::As { .. } => match &out_type {
+                DataType::Decimal128(..) => {
+                    // a wide x within the digits
+                    let a: Decimal128Array = xs
+                        .try_unary(|v| narrow_value(v).ok_or_else(beyond_digits))
+                        .map_err(arrow)?;
+                    Arc::new(a.with_data_type(out_type.clone()))
+                }
+                _ => Arc::new(xs.into_owned()),
+            },
             NumericFn::Rescale { by, to } => {
                 let k = pow10(by as u32);
                 let a: Decimal256Array = xs
@@ -596,11 +1432,6 @@ impl ScalarUDFImpl for PgNumeric {
                     .map_err(arrow)?;
                 Arc::new(a.with_data_type(numeric_type(to)))
             }
-            NumericFn::NanToZero => {
-                let a: Decimal256Array =
-                    xs.unary(|v| if v == NUMERIC_NAN { i256::ZERO } else { v });
-                Arc::new(a.with_data_type(x.data_type().clone()))
-            }
             NumericFn::Abs => {
                 // within 76 digits, far from i256::MIN
                 let a: Decimal256Array =
@@ -613,46 +1444,35 @@ impl ScalarUDFImpl for PgNumeric {
                     .map_err(arrow)?;
                 Arc::new(a.with_data_type(numeric_type(to)))
             }
-            NumericFn::IsNan => Arc::new(BooleanArray::from_unary(xs, |v| v == NUMERIC_NAN)),
-            NumericFn::NanIf => {
-                let flag = args.args[1].to_array(n)?;
-                let flag = flag.as_boolean();
-                let a: Decimal256Array = (0..n)
-                    .map(|r| {
-                        if xs.is_null(r) {
-                            None
-                        } else if !flag.is_null(r) && flag.value(r) {
-                            Some(NUMERIC_NAN)
-                        } else {
-                            Some(xs.value(r))
-                        }
-                    })
-                    .collect();
-                Arc::new(a.with_data_type(x.data_type().clone()))
-            }
             NumericFn::Arith { op, to } => {
-                let y = args.args[1].to_array(n)?;
-                let ys = decimal(&y)?;
-                let mut values = Vec::with_capacity(n);
-                for r in 0..n {
-                    if xs.is_null(r) || ys.is_null(r) {
-                        values.push(None);
-                        continue;
-                    }
-                    let (a, b) = (xs.value(r), ys.value(r));
-                    values.push(Some(if a == NUMERIC_NAN || b == NUMERIC_NAN {
-                        NUMERIC_NAN
-                    } else {
-                        match op {
-                            NumOp::Add => a.checked_add(b),
-                            NumOp::Sub => a.checked_sub(b),
-                            NumOp::Mul => a.checked_mul(b),
+                let f = match op {
+                    NumOp::Add => num_add,
+                    NumOp::Sub => num_sub,
+                    NumOp::Mul => num_mul,
+                };
+                let a: Decimal256Array = match &args.args[1] {
+                    // a constant operand (1 - x): one pass over x
+                    ColumnarValue::Scalar(ScalarValue::Decimal256(Some(b), ..)) => {
+                        let b = *b;
+                        match narrow_arith(op, &xs, Operand::One(b)) {
+                            Some(a) => a,
+                            None => xs.try_unary(|a| f(a, b)).map_err(arrow)?,
                         }
-                        .ok_or_else(beyond)
-                        .map_err(arrow)?
-                    }));
-                }
-                Arc::new(Decimal256Array::from(values).with_data_type(numeric_type(to)))
+                    }
+                    ColumnarValue::Scalar(ScalarValue::Decimal256(None, ..)) => {
+                        Decimal256Array::new_null(n)
+                    }
+                    y => {
+                        let y = y.to_array(n)?;
+                        let ys = decimal(&y)?;
+                        match narrow_arith(op, &xs, Operand::Each(&ys)) {
+                            Some(a) => a,
+                            None => datafusion::arrow::compute::try_binary(&*xs, &*ys, f)
+                                .map_err(arrow)?,
+                        }
+                    }
+                };
+                Arc::new(a.with_data_type(numeric_type(to)))
             }
             NumericFn::AvgScale { from } => {
                 let y = args.args[1].to_array(n)?;
@@ -963,7 +1783,39 @@ impl ScalarUDFImpl for PgNumCmp {
 /// reads it on the C side, for the direct PAX reader (C2).  NaN and the
 /// infinities become their sentinels; a value with more fractional digits
 /// than `scale`, or more than 76 digits at it, is an error.
+#[inline]
 pub fn from_pg_numeric(bytes: &[u8], scale: i8) -> std::result::Result<i256, String> {
+    // N1: the short form (values of display scale up to 63) of at most 38
+    // digits at `scale`, nearly every value of a numeric(p, s) column,
+    // without the general path's checks: every NBASE digit goes into an
+    // i128, then the trailing fractional digits come off.
+    if let [h0, h1, digits @ ..] = bytes {
+        let h = u16::from_ne_bytes([*h0, *h1]);
+        if h & 0xC000 == 0x8000 {
+            let weight = (h & 0x003F) as i32 - if h & 0x0040 != 0 { 0x40 } else { 0 };
+            let dscale = ((h & 0x1F80) >> 7) as i32;
+            let s = scale as i32;
+            // the integer of all the digits has at most 4 (weight + 1)
+            // digits before the point and dscale rounded up to 4 after
+            if dscale <= s && 4 * (weight + 1) + s + 3 <= 38 {
+                let mut acc: i128 = 0;
+                let mut n = 0i32;
+                for d in digits.chunks_exact(2) {
+                    acc = acc * 10000 + u16::from_ne_bytes([d[0], d[1]]) as i128;
+                    n += 1;
+                }
+                // acc is the value times 10^(4 (n - 1 - weight)); digits past
+                // dscale are zeros, so the division is exact
+                let shift = s - 4 * (n - 1 - weight);
+                acc = if shift >= 0 {
+                    acc * POW10_I128[shift as usize]
+                } else {
+                    acc / POW10_I128[(-shift) as usize]
+                };
+                return Ok(i256::from_i128(if h & 0x2000 != 0 { -acc } else { acc }));
+            }
+        }
+    }
     const NUMERIC_SIGN_MASK: u16 = 0xC000;
     const NUMERIC_NEG: u16 = 0x4000;
     const NUMERIC_SHORT: u16 = 0x8000;
@@ -1105,8 +1957,8 @@ mod tests {
         for nw in [MotionNumeric::Int64, MotionNumeric::Decimal128] {
             let n = nw.narrow(&a).unwrap();
             assert_eq!(n.data_type(), &nw.wire_type(2));
-            let w = nw.widen(&n, 2).unwrap();
-            assert_eq!(w.data_type(), &numeric_type(2));
+            let w = nw.widen(&n, 38, 2).unwrap();
+            assert_eq!(w.data_type(), &DataType::Decimal128(38, 2));
             assert_eq!(decimal(&w).unwrap().iter().collect::<Vec<_>>(), values);
         }
         // beyond int8, within 16 bytes
@@ -1118,7 +1970,7 @@ mod tests {
         assert!(MotionNumeric::Int64.narrow(&big).is_err());
         let n = MotionNumeric::Decimal128.narrow(&big).unwrap();
         assert_eq!(
-            MotionNumeric::Decimal128.widen(&n, 4).unwrap().as_ref(),
+            widen(&MotionNumeric::Decimal128.widen(&n, 38, 4).unwrap()).unwrap().as_ref(),
             big.as_ref()
         );
         assert_eq!(MotionNumeric::of_digits(18), Some(MotionNumeric::Int64));
@@ -1161,6 +2013,60 @@ mod tests {
         assert_eq!(v(&pg_bytes(0xC000, None, &[]), 2), NUMERIC_NAN);
         assert_eq!(v(&pg_bytes(0xD000, None, &[]), 2), NUMERIC_PINF);
         assert_eq!(v(&pg_bytes(0xF000, None, &[]), 2), NUMERIC_NINF);
+    }
+
+    #[test]
+    fn short_form_fast_path_reads_as_the_long_form() {
+        // values of up to 38 digits at several display scales, each in the
+        // short form (N1's fast path when it fits) and the long form (the
+        // general path), read at scales from dscale up
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20000 {
+            let ndig = (next() % 39) as u32;
+            let dscale = (next() % 13) as i8;
+            let mag = ((next() as u128) << 64 | next() as u128) % 10u128.pow(ndig.min(38)).max(1);
+            let v = if next() % 2 == 0 {
+                mag as i128
+            } else {
+                -(mag as i128)
+            };
+            let (le, nfrac) = nbase_digits(i256::from_i128(v), dscale);
+            let (be, weight): (Vec<u16>, i32) = match le.iter().rposition(|&d| d != 0) {
+                Some(top) => (
+                    le[..=top].iter().rev().copied().collect(),
+                    top as i32 - nfrac,
+                ),
+                None => (vec![], 0),
+            };
+            let neg = v < 0;
+            let short = 0x8000
+                | if neg { 0x2000 } else { 0 }
+                | ((dscale as u16) << 7)
+                | (weight as u16 & 0x7F);
+            let long = if neg { 0x4000 } else { 0 } | dscale as u16;
+            let sb = pg_bytes(short, None, &be);
+            let lb = pg_bytes(long, Some(weight as i16), &be);
+            for s in dscale..=dscale + 3 {
+                let want = i256::from_i128(v)
+                    .checked_mul(pow10((s - dscale) as u32))
+                    .unwrap();
+                assert_eq!(
+                    from_pg_numeric(&sb, s).unwrap(),
+                    want,
+                    "{v} dscale {dscale} at {s}"
+                );
+                assert_eq!(from_pg_numeric(&lb, s).unwrap(), want, "{v} long at {s}");
+            }
+            if dscale > 0 && v % 10 != 0 {
+                assert!(from_pg_numeric(&sb, dscale - 1).is_err());
+            }
+        }
     }
 
     /// numeric_div(s::numeric(38, 2), c), as numeric_avg computes avg:
@@ -1429,6 +2335,271 @@ mod tests {
         }
     }
 
+    fn dec256(v: Vec<Option<i256>>, scale: i8) -> ArrayRef {
+        Arc::new(Decimal256Array::from(v).with_data_type(numeric_type(scale)))
+    }
+
+    #[test]
+    fn arithmetic_past_i128_and_with_constants() {
+        let i = |v: i128| i256::from_i128(v);
+        let big = i(i128::MAX / 2);
+        let x = dec256(vec![Some(big), Some(i(-3)), None, Some(NUMERIC_NAN)], 0);
+        let y = dec256(vec![Some(i(4)), Some(big), Some(i(1)), Some(i(2))], 0);
+        // beyond i128, then i256's arithmetic
+        let p = call(
+            NumericFn::Arith {
+                op: NumOp::Mul,
+                to: 0,
+            },
+            vec![x.clone(), y.clone()],
+        );
+        let p = decimal(&p).unwrap();
+        assert_eq!(p.value(0), big.checked_mul(i(4)).unwrap());
+        assert_eq!(p.value(1), big.checked_mul(i(-3)).unwrap());
+        assert!(p.is_null(2));
+        assert_eq!(p.value(3), NUMERIC_NAN);
+        let a = call(
+            NumericFn::Arith {
+                op: NumOp::Add,
+                to: 0,
+            },
+            vec![x.clone(), x.clone()],
+        );
+        let a = decimal(&a).unwrap();
+        assert_eq!(
+            (a.value(0), a.value(1), a.value(3)),
+            (big + big, i(-6), NUMERIC_NAN)
+        );
+        let d = call(
+            NumericFn::Arith {
+                op: NumOp::Sub,
+                to: 0,
+            },
+            vec![y, x.clone()],
+        );
+        let d = decimal(&d).unwrap();
+        assert_eq!((d.value(0), d.value(1)), (i(4) - big, big + i(3)));
+        // a constant operand: 10 - x; a NULL one: NULL
+        let udf = PgNumeric::udf(NumericFn::Arith {
+            op: NumOp::Sub,
+            to: 0,
+        });
+        let run = |l: ColumnarValue, r: ColumnarValue, n: usize| {
+            udf.invoke_with_args(ScalarFunctionArgs {
+                args: vec![l, r],
+                arg_fields: vec![Arc::new(Field::new("a", numeric_type(0), true)); 2],
+                number_rows: n,
+                return_field: Arc::new(Field::new("r", numeric_type(0), true)),
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+            .unwrap()
+        };
+        let ten = || ColumnarValue::Scalar(ScalarValue::Decimal256(Some(i(10)), 76, 0));
+        let r = run(ColumnarValue::Array(x.clone()), ten(), 4)
+            .to_array(4)
+            .unwrap();
+        let r = decimal(&r).unwrap();
+        assert_eq!(
+            (r.value(1), r.is_null(2), r.value(3)),
+            (i(-13), true, NUMERIC_NAN)
+        );
+        let none = ColumnarValue::Scalar(ScalarValue::Decimal256(None, 76, 0));
+        let r = run(ColumnarValue::Array(x), none, 4).to_array(4).unwrap();
+        assert_eq!(r.null_count(), 4);
+        // constants only: one value
+        match run(ten(), ten(), 4) {
+            ColumnarValue::Scalar(ScalarValue::Decimal256(Some(v), 76, 0)) => assert_eq!(v, i(0)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn narrow_paths_match_the_general_ones() {
+        // N4: arrays all within i64 (boundaries included) take the plain
+        // loops; one value beyond, or NaN, sends them the general way; the
+        // results, nulls and sums are the same either way
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let edges = [i64::MAX, i64::MIN, i64::MAX - 1, i64::MIN + 1, 0, -1, 1];
+        for round in 0..200 {
+            let n = 1 + (next() % 300) as usize;
+            let mut gen = |k: usize| -> Option<i256> {
+                match next() % 10 {
+                    0 => None,
+                    1 => Some(i256::from_i128(edges[k % edges.len()] as i128)),
+                    _ => Some(i256::from_i128((next() as i64 >> (next() % 60)) as i128)),
+                }
+            };
+            let mut a: Vec<Option<i256>> = (0..n).map(&mut gen).collect();
+            let b: Vec<Option<i256>> = (0..n).map(&mut gen).collect();
+            match round % 4 {
+                1 => a[n / 2] = Some(NUMERIC_NAN),
+                2 => a[n / 2] = Some(i256::from_i128(i64::MAX as i128 + 1)),
+                _ => {}
+            }
+            let xa = dec256(a.clone(), 2);
+            let xb = dec256(b.clone(), 2);
+            let (xs, ys) = (decimal(&xa).unwrap(), decimal(&xb).unwrap());
+            for op in [NumOp::Add, NumOp::Sub, NumOp::Mul] {
+                let f = match op {
+                    NumOp::Add => num_add,
+                    NumOp::Sub => num_sub,
+                    NumOp::Mul => num_mul,
+                };
+                let general: Decimal256Array =
+                    datafusion::arrow::compute::try_binary(&*xs, &*ys, f).unwrap();
+                match narrow_arith(op, &xs, Operand::Each(&ys)) {
+                    Some(fast) => {
+                        assert!(round % 4 == 0 || round % 4 == 3);
+                        assert_eq!(fast.nulls(), general.nulls());
+                        for r in 0..n {
+                            if general.is_valid(r) {
+                                assert_eq!(fast.value(r), general.value(r), "{op:?} row {r}");
+                            }
+                        }
+                    }
+                    None => assert!(round % 4 == 1 || round % 4 == 2),
+                }
+                let c = i256::from_i128(edges[round % edges.len()] as i128);
+                let general = xs.try_unary::<_, Decimal256Type, _>(|v| f(v, c)).unwrap();
+                if let Some(fast) = narrow_arith(op, &xs, Operand::One(c)) {
+                    for r in 0..n {
+                        if general.is_valid(r) {
+                            assert_eq!(fast.value(r), general.value(r), "{op:?} const row {r}");
+                        }
+                    }
+                }
+            }
+            // sums: narrow and general batches into the same groups
+            let groups: Vec<usize> = (0..n).map(|_| (next() % 5) as usize).collect();
+            let mut g = SumDecimalGroups {
+                data_type: numeric_type(2),
+                sums: vec![],
+                narrow: Vec::new(),
+                narrow_rows: 0,
+                nan: vec![],
+                seen: vec![],
+            };
+            g.update_batch(&[xa.clone()], &groups, None, 5).unwrap();
+            g.update_batch(&[xb.clone()], &groups, None, 5).unwrap();
+            let out = g.evaluate(EmitTo::All).unwrap();
+            let out = decimal(&out).unwrap();
+            for k in 0..5 {
+                let mut sum = i256::ZERO;
+                let (mut seen, mut nan) = (false, false);
+                for (r, &gr) in groups.iter().enumerate() {
+                    for v in [a[r], b[r]] {
+                        if gr == k {
+                            if let Some(v) = v {
+                                seen = true;
+                                if v == NUMERIC_NAN {
+                                    nan = true;
+                                } else {
+                                    sum = sum.wrapping_add(v);
+                                }
+                            }
+                        }
+                    }
+                }
+                assert_eq!(out.is_valid(k), seen);
+                if seen {
+                    assert_eq!(out.value(k), if nan { NUMERIC_NAN } else { sum });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sum_decimal_is_numeric_sum() {
+        let i = |v: i128| i256::from_i128(v);
+        let t = numeric_type(2);
+        // groups: 0 sums 1.50 + 2.25, 1 sees a NaN, 2 only NULLs, 3 a filtered-out value
+        let x = dec256(
+            vec![
+                Some(i(150)),
+                Some(i(-7)),
+                Some(NUMERIC_NAN),
+                None,
+                Some(i(225)),
+                Some(i(9)),
+            ],
+            2,
+        );
+        let groups = [0, 1, 1, 2, 0, 3];
+        let filter = BooleanArray::from(vec![
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(true),
+            None,
+        ]);
+        let mut g = SumDecimalGroups {
+            data_type: t.clone(),
+            sums: vec![],
+            narrow: Vec::new(),
+            narrow_rows: 0,
+            nan: vec![],
+            seen: vec![],
+        };
+        g.update_batch(&[x.clone()], &groups, Some(&filter), 4)
+            .unwrap();
+        let out = g.evaluate(EmitTo::All).unwrap();
+        let out = decimal(&out).unwrap();
+        assert_eq!(out.data_type(), &t);
+        assert_eq!((out.value(0), out.value(1)), (i(375), NUMERIC_NAN));
+        assert!(out.is_null(2) && out.is_null(3));
+        // states merge as values; a NaN state keeps the group NaN; First(n) emits the first n
+        g.update_batch(&[x.clone()], &groups, None, 4).unwrap();
+        let st = g.state(EmitTo::All).unwrap();
+        let mut m = SumDecimalGroups {
+            data_type: t.clone(),
+            sums: vec![],
+            narrow: Vec::new(),
+            narrow_rows: 0,
+            nan: vec![],
+            seen: vec![],
+        };
+        m.merge_batch(&st, &[1, 1, 0, 0], 2).unwrap();
+        m.merge_batch(&[dec256(vec![Some(i(5))], 2)], &[0], 2)
+            .unwrap();
+        let out = m.evaluate(EmitTo::First(1)).unwrap();
+        assert_eq!((out.len(), decimal(&out).unwrap().value(0)), (1, i(9 + 5)));
+        let out = m.evaluate(EmitTo::All).unwrap();
+        assert_eq!(
+            (out.len(), decimal(&out).unwrap().value(0)),
+            (1, NUMERIC_NAN)
+        );
+        // a frame: values in and out, NaN only while one is in it
+        let mut a = SumDecimal {
+            data_type: t,
+            sum: i256::ZERO,
+            values: 0,
+            nans: 0,
+        };
+        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(None, 76, 2));
+        a.update_batch(&[dec256(vec![Some(i(1)), Some(NUMERIC_NAN), Some(i(2))], 2)])
+            .unwrap();
+        assert_eq!(
+            a.evaluate().unwrap(),
+            ScalarValue::Decimal256(Some(NUMERIC_NAN), 76, 2)
+        );
+        a.retract_batch(&[dec256(vec![Some(i(1)), Some(NUMERIC_NAN)], 2)])
+            .unwrap();
+        assert_eq!(
+            a.evaluate().unwrap(),
+            ScalarValue::Decimal256(Some(i(2)), 76, 2)
+        );
+        a.retract_batch(&[dec256(vec![Some(i(2)), None], 2)])
+            .unwrap();
+        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(None, 76, 2));
+    }
+
     #[test]
     fn round_is_numeric_round() {
         let i = |v: i128| i256::from_i128(v);
@@ -1495,7 +2666,7 @@ mod tests {
     }
 
     #[test]
-    fn nan_survives_rescaling_and_marks_sums() {
+    fn nan_survives_rescaling_and_arithmetic() {
         let x: ArrayRef = Arc::new(
             Decimal256Array::from(vec![
                 Some(i256::from_i128(150)),
@@ -1516,22 +2687,6 @@ mod tests {
                 true,
                 i256::from_i128(-100)
             )
-        );
-        let z = call(NumericFn::NanToZero, vec![x.clone()]);
-        assert_eq!(decimal(&z).unwrap().value(1), i256::ZERO);
-        let isnan = call(NumericFn::IsNan, vec![x.clone()]);
-        assert!(isnan.as_boolean().value(1) && !isnan.as_boolean().value(0));
-        let flag: ArrayRef = Arc::new(BooleanArray::from(vec![
-            Some(true),
-            Some(false),
-            Some(true),
-            None,
-        ]));
-        let m = call(NumericFn::NanIf, vec![x, flag]);
-        let m = decimal(&m).unwrap();
-        assert_eq!(
-            (m.value(0), m.value(1), m.is_null(2), m.value(3)),
-            (NUMERIC_NAN, NUMERIC_NAN, true, i256::from_i128(-1))
         );
         // 1.50 * -0.01 = -0.0150 (scales add up); NaN in, NaN out
         let y: ArrayRef = Arc::new(

@@ -39,6 +39,18 @@
 //!
 //! The build side is read to its end before the probe side, the order in
 //! which the main thread feeds a slice's inputs.
+//!
+//! AJ1: unless the probe side joins or aggregates (`derived`) and reads
+//! its own inputs (PAX scans the partitions read, nothing the main thread
+//! feeds, no set another input fills; `reads_itself`).  Then a partition reads up to `PEEK_ROWS` probe
+//! rows first; a probe side that ends within them is joined the other way
+//! round, its rows the hash table and the build side streamed past it,
+//! unless the build side ends within as many rows.  The planner's estimate
+//! of a side can be far off: TPC-H Q18's `o_orderkey IN (... HAVING
+//! sum(l_quantity) > 300)` is estimated at a third of the orders, against a
+//! few thousand, and on three segments PostgreSQL hashed orders joined
+//! with customer (50 million rows a segment) to probe them with the
+//! lineitem rows of those few thousand orders.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -64,9 +76,12 @@ use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
-use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricsSet, SpillMetrics};
+use datafusion::physical_plan::metrics::{
+    Count, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, SpillMetrics,
+};
 use datafusion::physical_plan::spill::{get_record_batch_memory_size, SpillManager};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::StreamingTableExec;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
@@ -84,6 +99,58 @@ const HASH_ROW_BYTES: usize = 40;
 /// Bytes of a bucket's rows gathered before they are written as one batch
 /// (or the session's batch size in rows, whichever comes first).
 const BUCKET_BATCH_BYTES: usize = 1 << 20;
+/// AJ1: probe rows a partition reads before its build side, and the bytes
+/// they may take at most.
+const PEEK_ROWS: usize = 128 * 1024;
+const PEEK_BYTES: usize = 32 << 20;
+
+/// AJ1: whether `plan` joins or aggregates: the planner's estimates of
+/// those go wrong, a table's rows (filtered) seldom by much.  Reading a scan
+/// of a large table ahead decodes its first groups early, to be held while
+/// the build side is read (TPC-H Q18 at scale factor 10, where the planner
+/// chose well, took 15% longer peeking at lineitem and orders).
+fn derived(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut found = false;
+    let _ = plan.apply(|node| {
+        found = matches!(
+            node.name(),
+            "HashJoinExec"
+                | "SpillingHashJoinExec"
+                | "SortMergeJoinExec"
+                | "NestedLoopJoinExec"
+                | "CrossJoinExec"
+                | "AggregateExec"
+        );
+        Ok(if found { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+    });
+    found
+}
+
+/// AJ1: whether every input under `plan` is read by the partitions
+/// themselves: PAX scans (PaxPartition), empty relations, no set or scalar
+/// subquery waiting for another input.  Reading such a side before the
+/// other cannot wait on the main thread, which feeds its inputs in order.
+/// `memory_leaves`: in-memory tables count too (the tests').
+fn reads_itself(plan: &Arc<dyn ExecutionPlan>, memory_leaves: bool) -> bool {
+    let mut ok = true;
+    let _ = plan.apply(|node| {
+        if let Some(s) = node.downcast_ref::<StreamingTableExec>() {
+            ok = s.partitions().iter().all(|p| format!("{p:?}") == "PaxPartition");
+        } else if node.children().is_empty() {
+            ok = matches!(node.name(), "EmptyExec" | "PlaceholderRowExec")
+                || (memory_leaves && node.name() == "DataSourceExec");
+        }
+        if ok {
+            node.apply_expressions(&mut |e| {
+                let text = e.to_string();
+                ok = !text.contains("pg_in_set") && !text.contains("pg_scalar_subquery");
+                Ok(if ok { TreeNodeRecursion::Continue } else { TreeNodeRecursion::Stop })
+            })?;
+        }
+        Ok(if ok { TreeNodeRecursion::Continue } else { TreeNodeRecursion::Stop })
+    });
+    ok
+}
 
 /// Bytes DataFusion's hash join reserves to concatenate a build side's
 /// batches into one: none for a single batch, which it keeps as it is; the
@@ -107,7 +174,11 @@ fn concat_bytes(batches: &[RecordBatch]) -> Result<usize> {
 /// Replaces each partitioned HashJoinExec (and one reading single
 /// partitions) by a SpillingHashJoinExec.
 #[derive(Debug, Default)]
-pub struct SpillHashJoins;
+pub struct SpillHashJoins {
+    /// AJ1 over in-memory tables too, joined or aggregated or not, for the
+    /// tests
+    memory_leaves: bool,
+}
 
 impl PhysicalOptimizerRule for SpillHashJoins {
     fn optimize(
@@ -132,7 +203,8 @@ impl PhysicalOptimizerRule for SpillHashJoins {
                 return Ok(Transformed::no(plan));
             }
             Ok(Transformed::yes(
-                Arc::new(SpillingHashJoinExec::new(plan.clone())?) as Arc<dyn ExecutionPlan>,
+                Arc::new(SpillingHashJoinExec::new(plan.clone(), self.memory_leaves)?)
+                    as Arc<dyn ExecutionPlan>,
             ))
         })
         .data()
@@ -159,6 +231,8 @@ struct JoinSpec {
     right_schema: SchemaRef,
     /// the join's output
     schema: SchemaRef,
+    /// AJ1: the sides may be swapped once the probe side is known small
+    adaptive: bool,
 }
 
 impl JoinSpec {
@@ -196,6 +270,42 @@ impl JoinSpec {
             false,
         )?;
         join.execute(0, ctx)
+    }
+
+    /// AJ1: the join over a small probe side, collected, and the build side
+    /// streamed past it: DataFusion's own swap of the join's inputs, which
+    /// swaps the join type and filter and restores the column order.
+    fn swapped(
+        &self,
+        build: SendableRecordBatchStream,
+        probe: SendableRecordBatchStream,
+        ctx: &TaskContext,
+        held: MemoryReservation,
+    ) -> Result<SendableRecordBatchStream> {
+        let mut env = (*ctx.runtime_env()).clone();
+        env.memory_pool = Arc::new(HeldPool::new(ctx.memory_pool().clone(), held));
+        let ctx = Arc::new(TaskContext::new(
+            ctx.task_id(),
+            ctx.session_id(),
+            ctx.session_config().clone(),
+            ctx.scalar_functions().clone(),
+            ctx.higher_order_functions().clone(),
+            ctx.aggregate_functions().clone(),
+            ctx.window_functions().clone(),
+            Arc::new(env),
+        ));
+        let join = HashJoinExec::try_new(
+            Arc::new(OneShotExec::new(build)),
+            Arc::new(OneShotExec::new(probe)),
+            self.on.clone(),
+            self.filter.clone(),
+            &self.join_type,
+            self.projection.clone(),
+            PartitionMode::CollectLeft,
+            self.null_equality,
+            false,
+        )?;
+        join.swap_inputs(PartitionMode::CollectLeft)?.execute(0, ctx)
     }
 }
 
@@ -286,10 +396,11 @@ pub struct SpillingHashJoinExec {
     join: Arc<dyn ExecutionPlan>,
     spec: Arc<JoinSpec>,
     metrics: ExecutionPlanMetricsSet,
+    memory_leaves: bool,
 }
 
 impl SpillingHashJoinExec {
-    fn new(join: Arc<dyn ExecutionPlan>) -> Result<Self> {
+    fn new(join: Arc<dyn ExecutionPlan>, memory_leaves: bool) -> Result<Self> {
         let Some(hj) = join.downcast_ref::<HashJoinExec>() else {
             return internal_err!("SpillingHashJoinExec wraps a HashJoinExec");
         };
@@ -302,11 +413,15 @@ impl SpillingHashJoinExec {
             left_schema: hj.left.schema(),
             right_schema: hj.right.schema(),
             schema: join.schema(),
+            adaptive: hj.join_type.supports_swap()
+                && (memory_leaves || derived(&hj.right))
+                && reads_itself(&hj.right, memory_leaves),
         };
         Ok(SpillingHashJoinExec {
             join,
             spec: Arc::new(spec),
             metrics: ExecutionPlanMetricsSet::new(),
+            memory_leaves,
         })
     }
 }
@@ -344,7 +459,7 @@ impl ExecutionPlan for SpillingHashJoinExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let join = self.join.clone().with_new_children(children)?;
-        Ok(Arc::new(SpillingHashJoinExec::new(join)?))
+        Ok(Arc::new(SpillingHashJoinExec::new(join, self.memory_leaves)?))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -373,6 +488,7 @@ impl ExecutionPlan for SpillingHashJoinExec {
                 self.spec.right_schema.clone(),
             ),
             partition,
+            swapped: MetricBuilder::new(&self.metrics).counter("swapped", partition),
         };
         let schema = self.schema();
         let stream = futures::stream::once(Arc::new(run).start(build, probe)).try_flatten();
@@ -387,6 +503,8 @@ struct Run {
     build_spill: SpillManager,
     probe_spill: SpillManager,
     partition: usize,
+    /// AJ1: 1 once the sides are swapped
+    swapped: Count,
 }
 
 /// A build side read so far: the batches held, and the rest of it if it did
@@ -449,7 +567,62 @@ impl Run {
         build: SendableRecordBatchStream,
         probe: SendableRecordBatchStream,
     ) -> Result<SendableRecordBatchStream> {
-        self.join_parts(build, Some(probe), 0, 0).await
+        if !self.spec.adaptive {
+            return self.join_parts(build, Some(probe), 0, 0).await;
+        }
+        // AJ1: the probe side first, while it is small
+        let (small, rows, rest, held) = self.read_up_to(probe, PEEK_ROWS).await?;
+        let probe = self.stream_of(&self.spec.right_schema, small);
+        let Some(held) = held else {
+            let probe = Box::pin(RecordBatchStreamAdapter::new(
+                self.spec.right_schema.clone(),
+                probe.chain(rest),
+            ));
+            return self.join_parts(build, Some(probe), 0, 0).await;
+        };
+        // a build side no larger keeps its role
+        let (first, _, rest, build_held) = self.read_up_to(build, rows + 1).await?;
+        let build = self.stream_of(&self.spec.left_schema, first);
+        if build_held.is_some() {
+            return self.join_parts(build, Some(probe), 0, 0).await;
+        }
+        let build = Box::pin(RecordBatchStreamAdapter::new(
+            self.spec.left_schema.clone(),
+            build.chain(rest),
+        ));
+        self.swapped.add(1);
+        self.spec.swapped(build, probe, &self.ctx, held)
+    }
+
+    /// AJ1: a side's first batches, until they pass `limit` rows or
+    /// PEEK_BYTES or the pool's room: their rows, the rest of the side, and
+    /// the reservation they are held under when the side ended within them
+    /// (None when it did not).
+    async fn read_up_to(
+        &self,
+        mut input: SendableRecordBatchStream,
+        limit: usize,
+    ) -> Result<(Vec<RecordBatch>, usize, SendableRecordBatchStream, Option<MemoryReservation>)> {
+        let reservation = MemoryConsumer::new(format!(
+            "SpillingHashJoin[{}] small side",
+            self.partition
+        ))
+        .register(self.ctx.memory_pool());
+        let mut batches = Vec::new();
+        let mut rows = 0;
+        while let Some(batch) = input.next().await {
+            let batch = batch?;
+            rows += batch.num_rows();
+            let size = get_record_batch_memory_size(&batch) + batch.num_rows() * HASH_ROW_BYTES;
+            let fits = rows <= limit
+                && reservation.size() + size <= PEEK_BYTES
+                && reservation.try_grow(size).is_ok();
+            batches.push(batch);
+            if !fits {
+                return Ok((batches, rows, input, None));
+            }
+        }
+        Ok((batches, rows, input, Some(reservation)))
     }
 
     /// Bytes DataFusion's hash join reserves for the table of a build side
@@ -802,6 +975,12 @@ mod tests {
     /// A context of 4 partitions; with `limit`, a pool of that many bytes and
     /// the spilling joins.
     fn context(limit: Option<usize>) -> SessionContext {
+        context_with(limit, false, 12000)
+    }
+
+    /// `context`, the spilling joins swapping sides over in-memory tables
+    /// too (AJ1) when `memory_leaves`, and `r` of `r_rows` rows.
+    fn context_with(limit: Option<usize>, memory_leaves: bool, r_rows: i32) -> SessionContext {
         let mut config = SessionConfig::new()
             .with_target_partitions(4)
             .with_batch_size(1024);
@@ -813,6 +992,8 @@ mod tests {
             .options_mut()
             .optimizer
             .hash_join_single_partition_threshold_rows = 0;
+        // the sides as written, as the extension's sessions keep them
+        config.options_mut().optimizer.join_reordering = false;
         let mut runtime = RuntimeEnvBuilder::new().with_disk_manager_builder(
             DiskManagerBuilder::default()
                 .with_mode(DiskManagerMode::Directories(vec![std::env::temp_dir()])),
@@ -825,11 +1006,11 @@ mod tests {
             .with_runtime_env(runtime.build_arc().unwrap())
             .with_default_features();
         if limit.is_some() {
-            state = state.with_physical_optimizer_rule(Arc::new(SpillHashJoins));
+            state = state.with_physical_optimizer_rule(Arc::new(SpillHashJoins { memory_leaves }));
         }
         let ctx = SessionContext::new_with_state(state.build());
         ctx.register_table("l", table(20000, 7, 97, 10)).unwrap();
-        ctx.register_table("r", table(12000, 11, 89, 23)).unwrap();
+        ctx.register_table("r", table(r_rows, 11, 89, 23)).unwrap();
         ctx
     }
 
@@ -1018,6 +1199,78 @@ mod tests {
         });
     }
 
+    /// AJ1: the times the plan's spilling joins swapped sides.
+    fn swaps(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let own = if plan.name() == "SpillingHashJoinExec" {
+            plan.metrics()
+                .and_then(|m| m.sum_by_name("swapped"))
+                .map_or(0, |v| v.as_usize())
+        } else {
+            0
+        };
+        own + plan.children().into_iter().map(swaps).sum::<usize>()
+    }
+
+    /// AJ1: every join type, with and without a filter, gives the same rows
+    /// with its sides swapped, a small probe side (300 rows of r) collected
+    /// and the build side streamed past it, as in memory (queries 12-14,
+    /// of a few build keys, swap or not by partition).
+    #[test]
+    fn swapped_joins_give_the_rows_of_joins_in_memory() {
+        crate::runtime::init(2).unwrap();
+        let handle = crate::runtime::handle().unwrap();
+        handle.block_on(async {
+            let plain = context_with(None, false, 300);
+            let adaptive = context_with(Some(1 << 30), true, 300);
+            for i in 0..15 {
+                let (want, _) = run(&plain, i).await;
+                let plan = query(&adaptive, i).await.create_physical_plan().await.unwrap();
+                let batches =
+                    datafusion::physical_plan::collect(plan.clone(), adaptive.task_ctx())
+                        .await
+                        .unwrap();
+                let mut got = Vec::new();
+                for b in &batches {
+                    for r in 0..b.num_rows() {
+                        let row = (0..b.num_columns())
+                            .map(|c| {
+                                format!("{:?}", ScalarValue::try_from_array(b.column(c), r).unwrap())
+                            })
+                            .collect::<Vec<_>>();
+                        got.push(row.join("|"));
+                    }
+                }
+                got.sort();
+                assert_eq!(got, want, "query {i}");
+                if i < 12 {
+                    assert!(swaps(&plan) > 0, "query {i} kept its sides");
+                }
+            }
+        });
+    }
+
+    /// AJ1: a probe side past PEEK_ROWS in a partition keeps its role, the
+    /// rows read ahead joined first.
+    #[test]
+    fn large_probe_sides_keep_their_role() {
+        crate::runtime::init(2).unwrap();
+        let handle = crate::runtime::handle().unwrap();
+        handle.block_on(async {
+            let plain = context_with(None, false, 600_000);
+            let adaptive = context_with(Some(1 << 30), true, 600_000);
+            for i in 4..8 {
+                let (want, _) = run(&plain, i).await;
+                let (got, _) = run(&adaptive, i).await;
+                assert_eq!(got, want, "query {i}");
+                let plan = query(&adaptive, i).await.create_physical_plan().await.unwrap();
+                let _ = datafusion::physical_plan::collect(plan.clone(), adaptive.task_ctx())
+                    .await
+                    .unwrap();
+                assert_eq!(swaps(&plan), 0, "query {i}");
+            }
+        });
+    }
+
     /// A build side split once fits in its buckets, and each row is
     /// spilled once: read back from the spill files, the rows of a bucket
     /// count the memory they take, not the chunks of the file they share.
@@ -1124,7 +1377,7 @@ mod tests {
                 .with_config(config)
                 .with_runtime_env(runtime)
                 .with_default_features()
-                .with_physical_optimizer_rule(Arc::new(SpillHashJoins))
+                .with_physical_optimizer_rule(Arc::new(SpillHashJoins::default()))
                 .build();
             let ctx = SessionContext::new_with_state(state);
             ctx.register_table("b", table()).unwrap();
