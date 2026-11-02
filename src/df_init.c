@@ -162,6 +162,18 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("datafusion.key_filters",
+							 "Lets a hash join's build side filter the PAX scans of its probe side.",
+							 "Once a hash join run in DataFusion has read its build side, the "
+							 "PAX scans its probe side's key comes from drop the rows whose key "
+							 "the build side does not have, before building their other columns. "
+							 "Integer and date keys of one column.",
+							 &df_key_filters,
+							 true,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("datafusion.motion_batches",
 							 "Experimental: send Arrow batches through Gather Motions between DataFusion slices.",
 							 "When both the sending and the receiving slice of a Gather Motion run "

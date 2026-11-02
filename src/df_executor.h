@@ -370,6 +370,7 @@ extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */
 
 /* M7b: Gather Motions between DataFusion slices carry Arrow IPC batches */
 extern bool df_motion_batches;	/* GUC datafusion.motion_batches */
+extern bool df_key_filters;		/* GUC datafusion.key_filters */
 extern bool df_cluster_collation_c;	/* GUC datafusion.cluster_collation_c */
 extern void df_sync_cluster_collation(void);
 extern bool df_motion_sends_batches(PlannedStmt *stmt, Motion *motion);

@@ -46,6 +46,7 @@ not know; it must not skip it.
   "sort":   [ <sort key>, ... ],           optional
   "limit":  {"skip": n, "fetch": m},       optional
   "batch_rows": n,                         optional
+  "key_filters": b,                        optional
   "trim":   [k, ...],                      optional, Motion senders only
   "narrow": [[k, digits], ...],            optional, Motion senders only
   "route":  <route> }                      optional, Motion senders only
@@ -62,6 +63,9 @@ not know; it must not skip it.
 - `limit`: after the sort, skip `skip` rows (default 0) and keep `fetch`
   (all without it).
 - `batch_rows`: rows per result batch the host wants, at most 8192; a hint.
+- `key_filters`: false keeps a hash join's build side from filtering the
+  scans of its probe side (the reference reader's KF1, on by default); a
+  hint that changes no row.
 - `trim`, `narrow`, `route`: how a slice that sends through a Motion lays
   out its Arrow IPC streams; see [Motion output](#motion-output).
 

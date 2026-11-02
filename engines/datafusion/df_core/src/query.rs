@@ -33,7 +33,7 @@ use std::ffi::{c_char, c_void};
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -82,6 +82,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::cdbhash::{self, KeyHash};
+use crate::keyfilter::{self, KeyFilter, PaxTables};
 use crate::memory::TrackingPool;
 use crate::pgfloat::{is_float, FloatFn};
 use crate::pgfunc::{to_pg_error, ArithOp, PgArith, PgAssert, PgError};
@@ -1262,6 +1263,9 @@ pub struct PaxScan {
     /// LT1: the columns left to read_rows, ascending; the batches then end
     /// with the rows' locators instead
     pub(crate) late: Vec<usize>,
+    /// KF1: the joins' key filters of the scan's columns, set before the
+    /// plan runs
+    key_filters: OnceLock<Vec<(usize, Arc<KeyFilter>)>>,
 }
 
 /// LM1: conditions of the filter right above a PAX input on columns cheap
@@ -1604,7 +1608,24 @@ impl PaxScan {
             late_fn: None,
             rows_fn: None,
             late: Vec::new(),
+            key_filters: OnceLock::new(),
         }
+    }
+
+    /// KF1: the key filters of the scan's columns (keyfilter.rs), once,
+    /// before any read.
+    pub(crate) fn set_key_filters(&self, filters: Vec<(usize, Arc<KeyFilter>)>) {
+        let _ = self.key_filters.set(filters);
+    }
+
+    /// KF1: the rows the scan's key filters checked and kept.
+    fn key_counts(&self) -> (u64, u64) {
+        self.key_filters.get().map_or((0, 0), |fs| {
+            fs.iter().fold((0, 0), |(s, k), (_, f)| {
+                let (fs, fk) = f.counts();
+                (s + fs, k + fk)
+            })
+        })
     }
 
     /// LT1: the reader's late and read_rows (both, or neither is used).
@@ -1909,6 +1930,26 @@ unsafe extern "C" fn pax_emit(
                 }
                 if keep.len() < m {
                     narrow(&mut built, &mut rows, keep)?;
+                }
+            }
+        }
+        // KF1: then the joins' key filters, once their build sides are read
+        if let Some(filters) = ctx.scan.key_filters.get() {
+            for (i, f) in filters {
+                if f.get().is_none() {
+                    continue;
+                }
+                if built[*i].is_none() {
+                    built[*i] = Some(column(*i, rows.as_deref())?);
+                }
+                let m = rows.as_ref().map_or(n, Vec::len);
+                if let Some(keep) = f.keep(built[*i].as_ref().unwrap()) {
+                    if keep.is_empty() {
+                        return Ok(None);
+                    }
+                    if keep.len() < m {
+                        narrow(&mut built, &mut rows, keep)?;
+                    }
                 }
             }
         }
@@ -2968,6 +3009,9 @@ pub struct QueryStats {
     pub spill_count: u64,
     /// Peak bytes the PAX reader reported holding (direct PAX scans).
     pub pax_decode_peak: u64,
+    /// KF1: rows the PAX scans' key filters checked and kept
+    pub key_rows_checked: u64,
+    pub key_rows_kept: u64,
 }
 
 fn add_spills(plan: &Arc<dyn ExecutionPlan>, stats: &mut QueryStats) {
@@ -3126,6 +3170,8 @@ impl Query {
         let mut decoders = Vec::new();
         let mut tables = Vec::with_capacity(sources.len());
         let mut pax_scans = Vec::new();
+        // KF1: the PAX scans by the partitions of their tables
+        let mut pax_tables = PaxTables::new();
         let mut sets: Vec<(usize, Arc<SetHolder>, BatchReceiver)> = Vec::new();
         for (j, source) in sources.into_iter().enumerate() {
             let schema = in_schemas[j].clone();
@@ -3266,6 +3312,9 @@ impl Query {
                             }) as Arc<dyn PartitionStream>
                         })
                         .collect();
+                    for p in &parts {
+                        pax_tables.insert(keyfilter::address(p), scan.clone());
+                    }
                     (
                         None,
                         None,
@@ -3466,6 +3515,8 @@ impl Query {
         let mut config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
+        // KF1: joins' build sides filter their probe sides' PAX scans
+        let key_filters = spec.get("key_filters").and_then(Value::as_bool).unwrap_or(true);
         // The inputs are fed one after the other, each to its end, in the
         // order PostgreSQL's plan reads them: a join's build side (its Hash
         // side) first.  DataFusion must not swap a join's sides by its
@@ -3513,6 +3564,9 @@ impl Query {
                 let mut physical = state.create_physical_plan(&plan).await?;
                 if partial {
                     physical = partial_only(physical)?;
+                }
+                if key_filters {
+                    keyfilter::plan_key_filters(&physical, &pax_tables)?;
                 }
                 if let Some((scan, types, exprs)) = late_final {
                     physical = late_outputs_plan(physical, scan, types, exprs)?;
@@ -3638,6 +3692,11 @@ impl Query {
             pax_decode_peak: self.pax_shared.as_ref().map_or(0, |m| m.memory.peak()),
             ..Default::default()
         };
+        for scan in &self.pax_scans {
+            let (checked, kept) = scan.key_counts();
+            s.key_rows_checked += checked;
+            s.key_rows_kept += kept;
+        }
         if let Ok(slot) = self.physical.lock() {
             if let Some(p) = slot.as_ref() {
                 add_spills(p, &mut s);
@@ -5725,6 +5784,164 @@ mod tests {
         // The scan ends as the query is released.
         assert_eq!(fake.ended.load(Ordering::SeqCst), 1);
         (row, peak)
+    }
+
+    /// KF1: the count(*) of a join over fake PAX scans (and input 0 pushed
+    /// with `pushed`'s int4 keys, when given), and the query's figures.
+    fn run_key_join(
+        spec: &str,
+        sources: Vec<Source>,
+        pushed: Option<Vec<i32>>,
+        partitions: usize,
+    ) -> (i64, QueryStats) {
+        runtime::init(2).unwrap();
+        let dir = std::env::temp_dir();
+        let mut q =
+            Query::start_multi(spec, partitions, 64 << 20, dir.to_str().unwrap(), sources, false)
+                .unwrap();
+        if let Some(keys) = pushed {
+            let nulls = vec![0u8; keys.len()];
+            let cols = [RawColumn::fixed(keys.as_ptr() as *const u8, nulls.as_ptr())];
+            while !unsafe { q.push_input(0, &cols, keys.len()) }.unwrap() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            q.finish_input_at(0);
+        }
+        let mut count = None;
+        loop {
+            match q.poll(Duration::from_millis(50)) {
+                Poll::Batch(_) => {
+                    count = Some(unsafe { *(q.output_column(0).unwrap().values as *const i64) })
+                }
+                Poll::Pending => {}
+                Poll::Done => break,
+                Poll::Failed(e) => panic!("{e:?}"),
+                Poll::Panicked(m) => panic!("{m}"),
+                Poll::Bytes(_) => panic!("unexpected IPC output"),
+            }
+        }
+        (count.unwrap(), q.stats())
+    }
+
+    /// KF1: a small build side's keys filter its probe side's PAX scan
+    /// before any of its rows is joined; the join's rows are the same.  The
+    /// fake scan's 2000 rows are 0..1999, every tenth from 3 NULL: 7, 42 and
+    /// 1500 join, 1003 meets a NULL, 5000 nothing.
+    #[test]
+    fn build_sides_filter_their_probe_scans() {
+        for partitions in [1, 4] {
+            for on in [true, false] {
+                let spec = format!(
+                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
+                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
+                        "on":[[{{"col":0}},{{"col":0,"input":1}}]],"filter":null}}}},
+                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                );
+                let fake = FakeScan::default();
+                let scan = PaxScan::new(
+                    &fake as *const FakeScan as *mut c_void,
+                    200,
+                    fake_read,
+                    fake_end,
+                    fake_groups,
+                );
+                let (count, stats) = run_key_join(
+                    &spec,
+                    vec![Source::Pushed, Source::Pax(scan)],
+                    Some(vec![7, 42, 1003, 1500, 5000]),
+                    partitions,
+                );
+                assert_eq!(count, 3, "partitions {partitions} filters {on}");
+                let figures = (stats.key_rows_checked, stats.key_rows_kept);
+                assert_eq!(figures, if on { (2000, 3) } else { (0, 0) }, "partitions {partitions}");
+            }
+        }
+    }
+
+    /// KF1: a join that keeps its probe side's rows without a match (right,
+    /// full and right anti joins) has no filter of them; the others give the
+    /// same rows filtered or not.
+    #[test]
+    fn join_types_give_their_rows_with_key_filters() {
+        // (type, rows of 5 keys against the scan's 2000, filtered)
+        let cases = [
+            ("inner", 3, true),
+            ("left", 5, true),
+            ("rightsemi", 3, true),
+            ("leftanti", 2, true),
+            ("right", 2000, false),
+            ("full", 2002, false),
+            ("rightanti", 1997, false),
+        ];
+        for (kind, rows, filtered) in cases {
+            for partitions in [1, 4] {
+                for on in [true, false] {
+                    let spec = format!(
+                        r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
+                        "plan":{{"aggregate":{{"input":{{"join":{{"type":"{kind}","left":{{"input":0}},"right":{{"input":1}},
+                            "on":[[{{"col":0}},{{"col":0,"input":1}}]],"filter":null}}}},
+                            "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
+                        "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                    );
+                    let fake = FakeScan::default();
+                    let scan = PaxScan::new(
+                        &fake as *const FakeScan as *mut c_void,
+                        200,
+                        fake_read,
+                        fake_end,
+                        fake_groups,
+                    );
+                    let (count, stats) = run_key_join(
+                        &spec,
+                        vec![Source::Pushed, Source::Pax(scan)],
+                        Some(vec![7, 42, 1003, 1500, 5000]),
+                        partitions,
+                    );
+                    let what = format!("{kind} partitions {partitions} filters {on}");
+                    assert_eq!(count, rows, "{what}");
+                    assert_eq!(stats.key_rows_checked > 0, on && filtered, "{what}");
+                }
+            }
+        }
+    }
+
+    /// KF1: where AJ1 swaps a join's sides, its small probe side's keys
+    /// filter the build side's PAX scan.  The probe side groups the ten
+    /// rows of a one-block scan (0..9, 3 NULL): nine keys join.
+    #[test]
+    fn swapped_probe_sides_filter_their_build_scans() {
+        for partitions in [1, 4] {
+            for on in [true, false] {
+                let spec = format!(
+                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
+                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},
+                        "right":{{"aggregate":{{"input":{{"input":1}},"group":[{{"col":0,"input":1}}],
+                            "aggs":[],"having":null,"name":"s"}}}},
+                        "on":[[{{"col":0}},{{"name":"s_g0"}}]],"filter":null}}}},
+                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                );
+                let (big, small) = (FakeScan::default(), FakeScan::default());
+                let scan = |f: &FakeScan, n| {
+                    PaxScan::new(f as *const FakeScan as *mut c_void, n, fake_read, fake_end, fake_groups)
+                };
+                let (count, stats) = run_key_join(
+                    &spec,
+                    vec![Source::Pax(scan(&big, 200)), Source::Pax(scan(&small, 1))],
+                    None,
+                    partitions,
+                );
+                assert_eq!(count, 9, "partitions {partitions} filters {on}");
+                let (checked, kept) = (stats.key_rows_checked, stats.key_rows_kept);
+                if on {
+                    // the build rows read before every partition swapped pass
+                    assert!(checked >= 1000 && kept <= 9, "partitions {partitions}: {checked} {kept}");
+                } else {
+                    assert_eq!((checked, kept), (0, 0));
+                }
+            }
+        }
     }
 
     /// A query released while a partition is inside its scan ends the scan

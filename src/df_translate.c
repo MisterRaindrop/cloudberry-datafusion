@@ -4238,8 +4238,9 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		}
 		spec->batch_rows = Min(DF_BATCH_MAX_ROWS,
 							   Max(DF_BATCH_MIN_ROWS, DF_BATCH_BYTES / Max(df_slice_width(root), 1)));
-		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d}",
-						 node.data, outputs.data, sortlimit.data, spec->batch_rows);
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d%s}",
+						 node.data, outputs.data, sortlimit.data, spec->batch_rows,
+						 df_key_filters ? "" : ",\"key_filters\":false");
 	}
 
 	spec->json = json.data;

@@ -64,7 +64,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use datafusion::arrow::array::{Array, UInt32Array};
 use datafusion::arrow::compute::{concat_batches, take_record_batch};
@@ -101,6 +101,8 @@ use datafusion::physical_plan::{
 };
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
+
+use crate::keyfilter::KeyFilter;
 
 /// Buckets a spilled build side is split into, at each depth.
 const FANOUT: usize = 16;
@@ -341,6 +343,7 @@ impl Collect {
         join: &HashJoinExec,
         spec: &JoinSpec,
         ctx: &Arc<TaskContext>,
+        filters: &Filters,
     ) -> Result<Mode> {
         let reservation = Arc::new(Mutex::new(
             MemoryConsumer::new("SpillingHashJoin collected")
@@ -388,6 +391,8 @@ impl Collect {
             let need = bytes + join_table_bytes(spec, ctx, rows)? + concat_bytes(&batches)?;
             let short = need.saturating_sub(reservation.size());
             if short == 0 || reservation.try_grow(short).is_ok() {
+                // KF1: every partition's build side at once
+                filters.add(spec, true, None, &batches)?;
                 let probes = Arc::new(StreamsExec::new(self.probe.schema(), self.partitions));
                 let build = Box::pin(RecordBatchStreamAdapter::new(
                     spec.left_schema.clone(),
@@ -643,9 +648,69 @@ pub struct SpillingHashJoinExec {
     /// RC1: the join's properties but its partitioning, which the
     /// collected build side does not give
     properties: Arc<PlanProperties>,
+    /// KF1: the filters of the build side's keys over the probe side's
+    /// scans, and of the probe side's over the build side's (AJ1)
+    filters: Arc<OnceLock<Filters>>,
+}
+
+/// KF1: a join's key filters (keyfilter.rs).
+#[derive(Debug, Default)]
+struct Filters {
+    probe: Option<Arc<KeyFilter>>,
+    build: Option<Arc<KeyFilter>>,
+}
+
+impl Filters {
+    /// The keys of `batches`, the build side's (`build`) or the probe side's,
+    /// of partition `partition` (None: of all), to the filter they make.
+    fn add(
+        &self,
+        spec: &JoinSpec,
+        build: bool,
+        partition: Option<usize>,
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let Some(f) = (if build { &self.probe } else { &self.build }) else {
+            return Ok(());
+        };
+        let key = if build { &spec.on[0].0 } else { &spec.on[0].1 };
+        let keys = batches
+            .iter()
+            .map(|b| key.evaluate(b).and_then(|v| v.into_array(b.num_rows())))
+            .collect::<Result<Vec<_>>>()?;
+        f.add(partition, &keys);
+        Ok(())
+    }
+
+    /// No filter of the build side's keys (`build`) or of the probe side's.
+    fn fail(&self, build: bool) {
+        if let Some(f) = if build { &self.probe } else { &self.build } {
+            f.fail();
+        }
+    }
 }
 
 impl SpillingHashJoinExec {
+    /// The HashJoinExec wrapped.
+    pub(crate) fn hash_join(&self) -> Option<&HashJoinExec> {
+        self.join.downcast_ref::<HashJoinExec>()
+    }
+
+    /// AJ1: whether the sides may be swapped.
+    pub(crate) fn adaptive(&self) -> bool {
+        self.spec.adaptive
+    }
+
+    /// KF1: the filters planned for this join, once, before it runs.
+    pub(crate) fn set_key_filters(&self, probe: Option<Arc<KeyFilter>>, build: Option<Arc<KeyFilter>>) {
+        let _ = self.filters.set(Filters { probe, build });
+    }
+
+    fn filters(&self) -> &Filters {
+        static NONE: Filters = Filters { probe: None, build: None };
+        self.filters.get().unwrap_or(&NONE)
+    }
+
     fn new(join: Arc<dyn ExecutionPlan>, memory_leaves: bool, collect_rows: usize) -> Result<Self> {
         let Some(hj) = join.downcast_ref::<HashJoinExec>() else {
             return internal_err!("SpillingHashJoinExec wraps a HashJoinExec");
@@ -684,6 +749,7 @@ impl SpillingHashJoinExec {
             collect_rows,
             collect,
             properties,
+            filters: Arc::new(OnceLock::new()),
         })
     }
 }
@@ -751,13 +817,16 @@ impl ExecutionPlan for SpillingHashJoinExec {
             collect_rows: self.collect_rows,
             collect: None,
             properties: self.properties.clone(),
+            filters: self.filters.clone(),
         };
         let collected = MetricBuilder::new(&self.metrics).counter("collected", partition);
         let stream = futures::stream::once(async move {
             let join = this.join.downcast_ref::<HashJoinExec>().unwrap();
             let mode = collect
                 .mode
-                .get_or_init(|| async { collect.start(join, &this.spec, &ctx).await.map_err(Arc::new) })
+                .get_or_init(|| async {
+                    collect.start(join, &this.spec, &ctx, this.filters()).await.map_err(Arc::new)
+                })
                 .await;
             match mode {
                 Err(e) => Err(DataFusionError::Shared(e.clone())),
@@ -802,6 +871,7 @@ impl SpillingHashJoinExec {
             ),
             partition,
             swapped: MetricBuilder::new(&self.metrics).counter("swapped", partition),
+            filters: self.filters.clone(),
         };
         let stream = futures::stream::once(Arc::new(run).start(build, probe)).try_flatten();
         Box::pin(RecordBatchStreamAdapter::new(self.schema(), stream))
@@ -817,6 +887,8 @@ struct Run {
     partition: usize,
     /// AJ1: 1 once the sides are swapped
     swapped: Count,
+    /// KF1
+    filters: Arc<OnceLock<Filters>>,
 }
 
 /// A build side read so far: the batches held, and the rest of it if it did
@@ -827,6 +899,11 @@ enum Collected {
 }
 
 impl Run {
+    fn filters(&self) -> &Filters {
+        static NONE: Filters = Filters { probe: None, build: None };
+        self.filters.get().unwrap_or(&NONE)
+    }
+
     fn reservation(&self, depth: u32) -> MemoryReservation {
         MemoryConsumer::new(format!(
             "SpillingHashJoin[{}] depth {depth}",
@@ -884,6 +961,13 @@ impl Run {
         }
         // AJ1: the probe side first, while it is small
         let (small, rows, rest, held) = self.read_up_to(probe, PEEK_ROWS).await?;
+        if held.is_some() {
+            // KF1: the probe side's keys, which filter the build side's
+            // scans whichever side is hashed (`build_filtered`)
+            self.filters().add(&self.spec, false, Some(self.partition), &small)?;
+        } else {
+            self.filters().fail(false);
+        }
         let probe = self.stream_of(&self.spec.right_schema, small);
         let Some(held) = held else {
             let probe = Box::pin(RecordBatchStreamAdapter::new(
@@ -898,6 +982,8 @@ impl Run {
         if build_held.is_some() {
             return self.join_parts(build, Some(probe), 0, 0).await;
         }
+        // KF1: the build side is streamed past the probe side's rows
+        self.filters().fail(true);
         let build = Box::pin(RecordBatchStreamAdapter::new(
             self.spec.left_schema.clone(),
             build.chain(rest),
@@ -952,7 +1038,17 @@ impl Run {
     ) -> BoxFuture<'static, Result<SendableRecordBatchStream>> {
         async move {
             let probe = probe.unwrap_or_else(|| self.empty(&self.spec.right_schema));
-            match self.collect(build, depth).await? {
+            let collected = self.collect(build, depth).await?;
+            if depth == 0 {
+                // KF1: this partition's build side, whole or not
+                match &collected {
+                    Collected::All(batches, _) => {
+                        self.filters().add(&self.spec, true, Some(self.partition), batches)?
+                    }
+                    Collected::Overflow(..) => self.filters().fail(true),
+                }
+            }
+            match collected {
                 Collected::All(batches, reservation) => {
                     let build = self.stream_of(&self.spec.left_schema, batches);
                     self.spec.in_memory(build, probe, &self.ctx, reservation)
