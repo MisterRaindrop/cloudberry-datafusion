@@ -598,13 +598,26 @@ fn all_i64(v: &[i256]) -> bool {
     v.iter().fold(true, |all, &x| all & fits_i64(x))
 }
 
-#[inline]
-fn narrow_op(op: NumOp) -> fn(i128, i128) -> i128 {
-    match op {
-        NumOp::Add => |a, b| a + b,
-        NumOp::Sub => |a, b| a - b,
-        NumOp::Mul => |a, b| a * b,
-    }
+/// `$body` once per operator, `$f` that operator of values fitting an
+/// i64: inlined in the loops (a fn pointer cost a call per row, 2% of Q1)
+/// and * one widening multiply.
+macro_rules! with_op {
+    ($op:expr, $f:ident => $body:expr) => {
+        match $op {
+            NumOp::Add => {
+                let $f = |x: i128, y: i128| (x as i64 as i128) + (y as i64 as i128);
+                $body
+            }
+            NumOp::Sub => {
+                let $f = |x: i128, y: i128| (x as i64 as i128) - (y as i64 as i128);
+                $body
+            }
+            NumOp::Mul => {
+                let $f = |x: i128, y: i128| (x as i64 as i128) * (y as i64 as i128);
+                $body
+            }
+        }
+    };
 }
 
 /// The second operand of `narrow_arith`.
@@ -618,9 +631,8 @@ fn narrow_arith(op: NumOp, xs: &Decimal256Array, b: Operand) -> Option<Decimal25
     if !all_i64(xs.values()) {
         return None;
     }
-    let f = narrow_op(op);
     let lo = |v: i256| v.as_i128();
-    let values: Vec<i256> = match b {
+    let values: Vec<i256> = with_op!(op, f => match b {
         Operand::One(b) => {
             if !fits_i64(b) {
                 return None;
@@ -638,7 +650,7 @@ fn narrow_arith(op: NumOp, xs: &Decimal256Array, b: Operand) -> Option<Decimal25
                 .map(|(&a, &b)| i256::from_i128(f(lo(a), lo(b))))
                 .collect()
         }
-    };
+    });
     let nulls = match b {
         Operand::One(_) => xs.nulls().cloned(),
         Operand::Each(ys) => NullBuffer::union(xs.nulls(), ys.nulls()),
@@ -707,7 +719,6 @@ fn beyond_digits() -> ArrowError {
 fn arith_narrow(op: NumOp, a: Narrow, b: Narrow, n: usize, out: &DataType) -> Result<ArrayRef> {
     let nulls = NullBuffer::union(a.nulls(), b.nulls());
     let fast = a.all_i64() && b.all_i64();
-    let f = narrow_op(op);
     let checked = |x: i128, y: i128| match op {
         NumOp::Add => x.checked_add(y),
         NumOp::Sub => x.checked_sub(y),
@@ -717,7 +728,7 @@ fn arith_narrow(op: NumOp, a: Narrow, b: Narrow, n: usize, out: &DataType) -> Re
     let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
     if let DataType::Decimal128(..) = out {
         let values: Vec<i128> = if fast {
-            map_narrow(n, a, b, f)
+            with_op!(op, f => map_narrow(n, a, b, f))
         } else {
             let mut v = Vec::with_capacity(n);
             for r in 0..n {
@@ -740,7 +751,7 @@ fn arith_narrow(op: NumOp, a: Narrow, b: Narrow, n: usize, out: &DataType) -> Re
         ));
     }
     let values: Vec<i256> = if fast {
-        map_narrow(n, a, b, |x, y| i256::from_i128(f(x, y)))
+        with_op!(op, f => map_narrow(n, a, b, |x, y| i256::from_i128(f(x, y))))
     } else {
         let mut v = Vec::with_capacity(n);
         for r in 0..n {
@@ -888,14 +899,9 @@ impl AggregateUDFImpl for PgSumDecimal {
         &self,
         args: AccumulatorArgs,
     ) -> Result<Box<dyn GroupsAccumulator>> {
-        Ok(Box::new(SumDecimalGroups {
-            data_type: args.return_field.data_type().clone(),
-            sums: Vec::new(),
-            narrow: Vec::new(),
-            narrow_rows: 0,
-            nan: Vec::new(),
-            seen: Vec::new(),
-        }))
+        Ok(Box::new(SumDecimalGroups::new(
+            args.return_field.data_type().clone(),
+        )))
     }
 }
 
@@ -966,17 +972,37 @@ impl Accumulator for SumDecimal {
 /// pg_sum_decimal of many groups.
 struct SumDecimalGroups {
     data_type: DataType,
-    sums: Vec<i256>,
-    /// N4: the part of each sum from batches of values that all fit an
-    /// i64, added in i128: within 2^63 each, 2^63 of them cannot overflow
+    /// N4: each sum's part from batches of values that all fit an i64,
+    /// added in i128: within 2^63 each, 2^63 of them cannot overflow
     narrow: Vec<i128>,
-    /// values added to `narrow` since it was last folded into `sums`
+    /// values added to `narrow` since it was last folded into `wide`
     narrow_rows: u64,
+    /// the rest of each sum, and whether it is NaN: empty until a value
+    /// needs them (`spread`), so a group takes 17 bytes, not 50; at 50
+    /// Q18's 50M groups a segment spilled
+    wide: Vec<i256>,
     nan: Vec<bool>,
     seen: Vec<bool>,
 }
 
 impl SumDecimalGroups {
+    fn new(data_type: DataType) -> Self {
+        SumDecimalGroups {
+            data_type,
+            narrow: Vec::new(),
+            narrow_rows: 0,
+            wide: Vec::new(),
+            nan: Vec::new(),
+            seen: Vec::new(),
+        }
+    }
+
+    /// Gives every group a `wide` part and a `nan` flag.
+    fn spread(&mut self) {
+        self.wide.resize(self.narrow.len(), i256::ZERO);
+        self.nan.resize(self.narrow.len(), false);
+    }
+
     fn add(
         &mut self,
         a: &ArrayRef,
@@ -984,10 +1010,11 @@ impl SumDecimalGroups {
         filter: Option<&BooleanArray>,
         total: usize,
     ) -> Result<()> {
-        self.sums.resize(total, i256::ZERO);
         self.narrow.resize(total, 0);
-        self.nan.resize(total, false);
         self.seen.resize(total, false);
+        if !self.wide.is_empty() {
+            self.spread();
+        }
         if let Some(xs) = narrow_array(a) {
             return self.add_narrow(xs, groups, filter);
         }
@@ -1013,11 +1040,12 @@ impl SumDecimalGroups {
             }
             return Ok(());
         }
+        self.spread();
         let mut one = |g: usize, v: i256| {
             if v == NUMERIC_NAN {
                 self.nan[g] = true;
             } else {
-                self.sums[g] = self.sums[g].wrapping_add(v);
+                self.wide[g] = self.wide[g].wrapping_add(v);
             }
             self.seen[g] = true;
         };
@@ -1066,11 +1094,12 @@ impl SumDecimalGroups {
             }
             return Ok(());
         }
+        self.spread();
         for (r, &g) in groups.iter().enumerate() {
             if dense || take(r) {
                 match values[r] {
                     NARROW_NAN => self.nan[g] = true,
-                    v => self.sums[g] = self.sums[g].wrapping_add(i256::from_i128(v)),
+                    v => self.wide[g] = self.wide[g].wrapping_add(i256::from_i128(v)),
                 }
                 self.seen[g] = true;
             }
@@ -1079,10 +1108,21 @@ impl SumDecimalGroups {
     }
 
     fn fold_narrow(&mut self) {
-        for (s, n) in self.sums.iter_mut().zip(self.narrow.iter_mut()) {
+        self.spread();
+        for (s, n) in self.wide.iter_mut().zip(self.narrow.iter_mut()) {
             *s = s.wrapping_add(i256::from_i128(std::mem::take(n)));
         }
         self.narrow_rows = 0;
+    }
+}
+
+/// `emit_to.take_needed` of a vector that may be empty (none of its groups
+/// needed it yet).
+fn take_spread<T>(emit_to: EmitTo, v: &mut Vec<T>) -> Vec<T> {
+    if v.is_empty() {
+        Vec::new()
+    } else {
+        emit_to.take_needed(v)
     }
 }
 
@@ -1107,21 +1147,20 @@ impl GroupsAccumulator for SumDecimalGroups {
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        self.fold_narrow();
-        let sums = emit_to.take_needed(&mut self.sums);
-        emit_to.take_needed(&mut self.narrow);
-        let nan = emit_to.take_needed(&mut self.nan);
+        let narrow = emit_to.take_needed(&mut self.narrow);
+        let wide = take_spread(emit_to, &mut self.wide);
+        let nan = take_spread(emit_to, &mut self.nan);
         let seen = emit_to.take_needed(&mut self.seen);
-        let values: Vec<i256> = sums
-            .into_iter()
-            .zip(nan)
-            .map(|(s, n)| if n { NUMERIC_NAN } else { s })
-            .collect();
+        let wide_sum = |g: usize| wide[g].wrapping_add(i256::from_i128(narrow[g]));
         if let DataType::Decimal128(..) = self.data_type {
             // N6: within its digits (`return_type`)
-            let values = values
-                .into_iter()
-                .map(|v| narrow_value(v).ok_or_else(beyond_digits))
+            let values = (0..narrow.len())
+                .map(|g| match (nan.is_empty(), wide.is_empty()) {
+                    (false, _) if nan[g] => Some(NARROW_NAN),
+                    (_, true) => Some(narrow[g]).filter(|v| *v < NARROW_PINF && *v > NARROW_NINF),
+                    _ => narrow_value(wide_sum(g)),
+                })
+                .map(|v| v.ok_or_else(beyond_digits))
                 .collect::<Result<Vec<i128>, ArrowError>>()
                 .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))?;
             return Ok(Arc::new(
@@ -1129,6 +1168,13 @@ impl GroupsAccumulator for SumDecimalGroups {
                     .with_data_type(self.data_type.clone()),
             ));
         }
+        let values: Vec<i256> = (0..narrow.len())
+            .map(|g| match (nan.is_empty(), wide.is_empty()) {
+                (false, _) if nan[g] => NUMERIC_NAN,
+                (_, true) => i256::from_i128(narrow[g]),
+                _ => wide_sum(g),
+            })
+            .collect();
         Ok(Arc::new(
             Decimal256Array::new(ScalarBuffer::from(values), Some(NullBuffer::from(seen)))
                 .with_data_type(self.data_type.clone()),
@@ -1172,7 +1218,7 @@ impl GroupsAccumulator for SumDecimalGroups {
     }
 
     fn size(&self) -> usize {
-        self.sums.capacity() * std::mem::size_of::<i256>()
+        self.wide.capacity() * std::mem::size_of::<i256>()
             + self.narrow.capacity() * std::mem::size_of::<i128>()
             + self.nan.capacity()
             + self.seen.capacity()
@@ -2477,14 +2523,7 @@ mod tests {
             }
             // sums: narrow and general batches into the same groups
             let groups: Vec<usize> = (0..n).map(|_| (next() % 5) as usize).collect();
-            let mut g = SumDecimalGroups {
-                data_type: numeric_type(2),
-                sums: vec![],
-                narrow: Vec::new(),
-                narrow_rows: 0,
-                nan: vec![],
-                seen: vec![],
-            };
+            let mut g = SumDecimalGroups::new(numeric_type(2));
             g.update_batch(&[xa.clone()], &groups, None, 5).unwrap();
             g.update_batch(&[xb.clone()], &groups, None, 5).unwrap();
             let out = g.evaluate(EmitTo::All).unwrap();
@@ -2515,6 +2554,49 @@ mod tests {
     }
 
     #[test]
+    fn sum_decimal_groups_spread_when_a_value_needs_it() {
+        let i = |v: i128| i256::from_i128(v);
+        let big = 1i128 << 70;
+        // wide: values within an i64 leave groups 17 bytes; one beyond it
+        // or a NaN after groups were emitted spreads to all groups left
+        let mut g = SumDecimalGroups::new(numeric_type(2));
+        let small = dec256(vec![Some(i(1)), Some(i(2)), Some(i(3))], 2);
+        g.update_batch(&[small], &[0, 1, 2], None, 3).unwrap();
+        assert!(g.wide.is_empty() && g.nan.is_empty());
+        let out = g.evaluate(EmitTo::First(1)).unwrap();
+        assert_eq!(decimal(&out).unwrap().value(0), i(1));
+        let more = dec256(vec![Some(i(big)), Some(NUMERIC_NAN), Some(i(5))], 2);
+        g.update_batch(&[more], &[0, 2, 1], None, 3).unwrap();
+        assert_eq!(g.wide.len(), 3);
+        // and keeps up with groups that small values add afterwards
+        g.update_batch(&[dec256(vec![Some(i(7))], 2)], &[3], None, 4).unwrap();
+        let out = g.evaluate(EmitTo::All).unwrap();
+        let out = decimal(&out).unwrap();
+        assert_eq!(
+            (out.value(0), out.value(1), out.value(2), out.value(3)),
+            (i(big + 2), i(8), NUMERIC_NAN, i(7))
+        );
+        // narrow: the same as Decimal128 values and sums
+        let t = DataType::Decimal128(38, 2);
+        let d128 = |v: Vec<Option<i128>>| -> ArrayRef {
+            Arc::new(Decimal128Array::from(v).with_data_type(DataType::Decimal128(18, 2)))
+        };
+        let mut g = SumDecimalGroups::new(t.clone());
+        g.update_batch(&[d128(vec![Some(1), None, Some(3)])], &[0, 1, 2], None, 3)
+            .unwrap();
+        assert!(g.wide.is_empty());
+        let out = g.evaluate(EmitTo::First(1)).unwrap();
+        assert_eq!(out.as_primitive::<Decimal128Type>().value(0), 1);
+        g.update_batch(&[d128(vec![Some(big), Some(NARROW_NAN), Some(5)])], &[0, 2, 1], None, 3)
+            .unwrap();
+        let out = g.evaluate(EmitTo::All).unwrap();
+        let out = out.as_primitive::<Decimal128Type>();
+        assert_eq!(out.data_type(), &t);
+        assert_eq!((out.value(0), out.value(1), out.value(2)), (big, 3 + 5, NARROW_NAN));
+        assert!(out.is_valid(0) && out.is_valid(2));
+    }
+
+    #[test]
     fn sum_decimal_is_numeric_sum() {
         let i = |v: i128| i256::from_i128(v);
         let t = numeric_type(2);
@@ -2539,14 +2621,7 @@ mod tests {
             Some(true),
             None,
         ]);
-        let mut g = SumDecimalGroups {
-            data_type: t.clone(),
-            sums: vec![],
-            narrow: Vec::new(),
-            narrow_rows: 0,
-            nan: vec![],
-            seen: vec![],
-        };
+        let mut g = SumDecimalGroups::new(t.clone());
         g.update_batch(&[x.clone()], &groups, Some(&filter), 4)
             .unwrap();
         let out = g.evaluate(EmitTo::All).unwrap();
@@ -2557,14 +2632,7 @@ mod tests {
         // states merge as values; a NaN state keeps the group NaN; First(n) emits the first n
         g.update_batch(&[x.clone()], &groups, None, 4).unwrap();
         let st = g.state(EmitTo::All).unwrap();
-        let mut m = SumDecimalGroups {
-            data_type: t.clone(),
-            sums: vec![],
-            narrow: Vec::new(),
-            narrow_rows: 0,
-            nan: vec![],
-            seen: vec![],
-        };
+        let mut m = SumDecimalGroups::new(t.clone());
         m.merge_batch(&st, &[1, 1, 0, 0], 2).unwrap();
         m.merge_batch(&[dec256(vec![Some(i(5))], 2)], &[0], 2)
             .unwrap();

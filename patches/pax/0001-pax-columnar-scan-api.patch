@@ -30,7 +30,7 @@ new file mode 100644
 index 0000000..c4e1a7d
 --- /dev/null
 +++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-@@ -0,0 +1,987 @@
+@@ -0,0 +1,1005 @@
 +/*-------------------------------------------------------------------------
 + *
 + * Licensed to the Apache Software Foundation (ASF) under one
@@ -208,9 +208,24 @@ index 0000000..c4e1a7d
 +constexpr int kFixedDigits = 38;
 +const uint32_t kPow10U32[] = {1, 10, 100, 1000, 10000};
 +
++// The value whose 64-bit halves are lo and hi, as w bytes: two 8-byte
++// stores.  A 16-byte value built in memory by two 8-byte stores and read
++// back at once waits for them (no store forwarding), about a third of
++// TPC-H Q1's conversions.
++void StoreHalves(uint64_t lo, uint64_t hi, char *out, int w) {
++  std::memcpy(out, &lo, sizeof(lo));
++  std::memcpy(out + sizeof(lo), &hi, sizeof(hi));
++  if (w > 16) std::memset(out + 16, static_cast<int64_t>(hi) < 0 ? 0xFF : 0, 16);
++}
++
 +void StoreFixed(__int128 v, char *out, int w) {
-+  std::memcpy(out, &v, sizeof(v));
-+  if (w > 16) std::memset(out + sizeof(v), v < 0 ? 0xFF : 0, sizeof(v));
++  StoreHalves(static_cast<uint64_t>(v),
++              static_cast<uint64_t>(static_cast<unsigned __int128>(v) >> 64), out, w);
++}
++
++// d / 10^k for k of 1 to 3, by constants: a multiply, not a division.
++inline uint32_t DivPow10(uint32_t d, int k) {
++  return k == 1 ? d / 10 : k == 2 ? d / 100 : d / 1000;
 +}
 +
 +// tag: 1 +Infinity, 2 NaN, 3 -Infinity
@@ -276,7 +291,7 @@ index 0000000..c4e1a7d
 +      e = de;
 +    } else {
 +      // 32-bit: a 128-bit division would be a libgcc call per value
-+      if (de > -4) acc64 = acc64 * kPow10U32[4 + de] + d / kPow10U32[-de];
++      if (de > -4) acc64 = acc64 * kPow10U32[4 + de] + DivPow10(d, -de);
 +      e = 0;
 +      last = true;
 +      break;
@@ -291,18 +306,20 @@ index 0000000..c4e1a7d
 +      acc = acc * 10000 + d;
 +      e = de;
 +    } else {
-+      if (de > -4) acc = acc * kPow10U32[4 + de] + d / kPow10U32[-de];
++      if (de > -4) acc = acc * kPow10U32[4 + de] + DivPow10(d, -de);
 +      e = 0;
 +      break;
 +    }
 +  }
-+  // within 18 digits the scaling stays in 64 bits too
++  // within 18 digits the scaling stays in 64 bits too, and so does the
++  // sign: the halves of -r are 0 - r and all ones (unless r is 0)
 +  if (acc < static_cast<__int128>(1000000000000000000LL) && e <= 18 &&
-+      static_cast<uint64_t>(acc) <= UINT64_MAX / static_cast<uint64_t>(kPow10I128[e]))
-+    acc = static_cast<__int128>(static_cast<uint64_t>(acc) *
-+                                static_cast<uint64_t>(kPow10I128[e]));
-+  else
-+    acc *= kPow10I128[e];
++      static_cast<uint64_t>(acc) <= UINT64_MAX / static_cast<uint64_t>(kPow10I128[e])) {
++    const uint64_t r = static_cast<uint64_t>(acc) * static_cast<uint64_t>(kPow10I128[e]);
++    StoreHalves(neg ? 0 - r : r, neg && r != 0 ? ~uint64_t{0} : 0, out, w);
++    return true;
++  }
++  acc *= kPow10I128[e];
 +  StoreFixed(neg ? -acc : acc, out, w);
 +  return true;
 +}
@@ -657,8 +674,9 @@ index 0000000..c4e1a7d
 +  // Rows go out in chunks of kChunkRows, so that the caller can start on
 +  // them while the rest of the group is converted, and whose string bytes
 +  // stay below kChunkBytes, so that their int32 offsets cannot overflow (a
-+  // value has at most 1 GB).
-+  constexpr size_t kChunkRows = 8192;
++  // value has at most 1 GB).  kChunkRows is DataFusion's batch size: a
++  // chunk's columns stay in cache while its batch goes through the plan.
++  constexpr size_t kChunkRows = 4096;
 +  constexpr size_t kChunkBytes = 64 << 20;
 +
 +  const size_t nkept = all_kept ? rows : keep.size();

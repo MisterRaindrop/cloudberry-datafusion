@@ -308,6 +308,16 @@ SET datafusion.mode = on;
 SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
 SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
+-- AN1: the columns kept beside the numbers come out as they went in, NULL
+-- ones too (min stands in for first_value)
+UPDATE df_ri_o SET c = NULL WHERE id % 3 = 0;
+UPDATE df_ri_o SET n = NULL WHERE id % 4 = 0;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
+SET datafusion.mode = off;
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
+SET datafusion.mode = on;
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
 RESET datafusion.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
 

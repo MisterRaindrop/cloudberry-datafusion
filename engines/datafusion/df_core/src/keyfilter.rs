@@ -33,7 +33,7 @@
 //! and filters nothing until it has them all: a probe row of one
 //! partition never meets another partition's build rows, but the scan
 //! below the repartition feeds every partition.  A build side that spills,
-//! or whose keys pass `MAX_KEYS`, gives no filter.  So does a side that is
+//! or whose distinct keys pass `MAX_KEYS`, gives no filter.  So does a side that is
 //! not joined as the build side after all: where AJ1 swaps a join's sides,
 //! the probe side's keys filter the build side's scans instead (the
 //! join's second filter).  Rows read before a filter is complete pass:
@@ -48,7 +48,9 @@
 //! join's side that keeps only rows with a match, an aggregation's group
 //! key.  A node or scan read by more than one parent is left alone.
 //!
-//! Keys are integers and dates, of one column, compared as i64.  A set of
+//! Keys are integers and dates compared as i64; a join of more keys gets a
+//! filter for each such key (KF2), as a matching row has each among the
+//! other side's.  A set of
 //! many keys is a Bloom filter, small enough to stay in cache, which lets
 //! a few rows the join drops through.  A filter that keeps more than 90%
 //! of the first `DECIDE_ROWS` rows it sees switches itself off: the join
@@ -73,7 +75,7 @@ use datafusion::physical_plan::streaming::StreamingTableExec;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, PhysicalExpr};
 
 use crate::query::PaxScan;
-use crate::spilljoin::SpillingHashJoinExec;
+use crate::spilljoin::{Filters, SpillingHashJoinExec};
 
 /// Keys of a build side past which it gives no filter (32 MB of keys).
 pub const MAX_KEYS: usize = 1 << 22;
@@ -323,9 +325,16 @@ impl KeyFilter {
             }
         }
         if state.keys.len() > MAX_KEYS {
-            state.keys = Vec::new();
-            drop(state);
-            return self.fail();
+            // a side of more rows than keys (TPC-H Q9's 11M rows a segment
+            // hold 1.1M part keys): drop the copies before giving up, and
+            // give up while half full, not to sort again and again
+            state.keys.sort_unstable();
+            state.keys.dedup();
+            if state.keys.len() > MAX_KEYS / 2 {
+                state.keys = Vec::new();
+                drop(state);
+                return self.fail();
+            }
         }
         if state.got.iter().all(|&g| g) {
             let set = KeySet::new(&state.keys);
@@ -538,10 +547,10 @@ fn key_column(e: &Arc<dyn PhysicalExpr>, plan: &Arc<dyn ExecutionPlan>) -> Optio
     key_type(plan.schema().field(c.index()).data_type()).then(|| c.index())
 }
 
-/// Plan the filters of `plan`'s joins: each SpillingHashJoinExec of one
-/// integer key gets a filter of its build side's keys over the scans its
-/// probe side's key comes from, and where AJ1 may swap its sides one of its
-/// probe side's keys over its build side's.  The scans get theirs at once.
+/// Plan the filters of `plan`'s joins: each integer key of a
+/// SpillingHashJoinExec gets a filter of its build side's keys over the scan
+/// its probe side's key comes from, and where AJ1 may swap its sides one of
+/// its probe side's keys over its build side's.  The scans get theirs at once.
 /// Before the plan runs.
 pub fn plan_key_filters(plan: &Arc<dyn ExecutionPlan>, tables: &PaxTables) -> Result<usize> {
     if tables.is_empty() {
@@ -555,13 +564,9 @@ pub fn plan_key_filters(plan: &Arc<dyn ExecutionPlan>, tables: &PaxTables) -> Re
             return Ok(TreeNodeRecursion::Continue);
         };
         let j = s.hash_join().unwrap();
-        if j.on.len() != 1 || j.null_equality != NullEquality::NullEqualsNothing {
+        if j.null_equality != NullEquality::NullEqualsNothing {
             return Ok(TreeNodeRecursion::Continue);
         }
-        let (l, r) = &j.on[0];
-        let (Some(lc), Some(rc)) = (key_column(l, &j.left), key_column(r, &j.right)) else {
-            return Ok(TreeNodeRecursion::Continue);
-        };
         let partitions = node.output_partitioning().partition_count();
         let mut add = |side: &Arc<dyn ExecutionPlan>, c: usize| -> Option<Arc<KeyFilter>> {
             let (scan, col) = trace(side, c, tables, &parents)?;
@@ -574,11 +579,23 @@ pub fn plan_key_filters(plan: &Arc<dyn ExecutionPlan>, tables: &PaxTables) -> Re
             planned += 1;
             Some(f)
         };
-        let probe = probe_filtered(j.join_type).then(|| add(&j.right, rc)).flatten();
-        let build = (s.adaptive() && build_filtered(j.join_type))
-            .then(|| add(&j.left, lc))
-            .flatten();
-        s.set_key_filters(probe, build);
+        // KF2: a join of more keys, one filter per integer key: a row
+        // matching has each of its keys among the other side's.  One that
+        // keeps nearly every row switches itself off (TPC-H Q9's suppkey
+        // beside its partkey).
+        let mut filters = Filters::default();
+        for (k, (l, r)) in j.on.iter().enumerate() {
+            let (Some(lc), Some(rc)) = (key_column(l, &j.left), key_column(r, &j.right)) else {
+                continue;
+            };
+            if probe_filtered(j.join_type) {
+                filters.probe.extend(add(&j.right, rc).map(|f| (k, f)));
+            }
+            if s.adaptive() && build_filtered(j.join_type) {
+                filters.build.extend(add(&j.left, lc).map(|f| (k, f)));
+            }
+        }
+        s.set_key_filters(filters);
         Ok(TreeNodeRecursion::Continue)
     });
     for (_, (scan, filters)) in scans {
@@ -647,6 +664,20 @@ mod tests {
         let g = KeyFilter::new(2);
         g.add(Some(0), &[ints(&[Some(1)])]);
         g.add(Some(0), &[ints(&[Some(1)])]);
+        assert!(g.get().is_none());
+    }
+
+    #[test]
+    fn many_rows_of_few_keys_still_filter() {
+        // MAX_KEYS + 1000 rows of 3000 keys: a filter
+        let f = KeyFilter::new(1);
+        let rows = (MAX_KEYS + 1000) as i32;
+        f.add(None, &[ints(&(0..rows).map(|i| Some(i % 3000)).collect::<Vec<_>>())]);
+        let keep = f.keep(&ints(&[Some(5), Some(2999), Some(3000)])).unwrap();
+        assert_eq!(keep, vec![0, 1]);
+        // as many keys: none
+        let g = KeyFilter::new(1);
+        g.add(None, &[ints(&(0..rows).map(Some).collect::<Vec<_>>())]);
         assert!(g.get().is_none());
     }
 

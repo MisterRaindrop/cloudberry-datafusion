@@ -653,16 +653,17 @@ pub struct SpillingHashJoinExec {
     filters: Arc<OnceLock<Filters>>,
 }
 
-/// KF1: a join's key filters (keyfilter.rs).
+/// KF1: a join's key filters (keyfilter.rs), each of one of its keys (the
+/// index into `on`).
 #[derive(Debug, Default)]
-struct Filters {
-    probe: Option<Arc<KeyFilter>>,
-    build: Option<Arc<KeyFilter>>,
+pub(crate) struct Filters {
+    pub(crate) probe: Vec<(usize, Arc<KeyFilter>)>,
+    pub(crate) build: Vec<(usize, Arc<KeyFilter>)>,
 }
 
 impl Filters {
     /// The keys of `batches`, the build side's (`build`) or the probe side's,
-    /// of partition `partition` (None: of all), to the filter they make.
+    /// of partition `partition` (None: of all), to the filters they make.
     fn add(
         &self,
         spec: &JoinSpec,
@@ -670,21 +671,20 @@ impl Filters {
         partition: Option<usize>,
         batches: &[RecordBatch],
     ) -> Result<()> {
-        let Some(f) = (if build { &self.probe } else { &self.build }) else {
-            return Ok(());
-        };
-        let key = if build { &spec.on[0].0 } else { &spec.on[0].1 };
-        let keys = batches
-            .iter()
-            .map(|b| key.evaluate(b).and_then(|v| v.into_array(b.num_rows())))
-            .collect::<Result<Vec<_>>>()?;
-        f.add(partition, &keys);
+        for (k, f) in if build { &self.probe } else { &self.build } {
+            let key = if build { &spec.on[*k].0 } else { &spec.on[*k].1 };
+            let keys = batches
+                .iter()
+                .map(|b| key.evaluate(b).and_then(|v| v.into_array(b.num_rows())))
+                .collect::<Result<Vec<_>>>()?;
+            f.add(partition, &keys);
+        }
         Ok(())
     }
 
-    /// No filter of the build side's keys (`build`) or of the probe side's.
+    /// No filters of the build side's keys (`build`) or of the probe side's.
     fn fail(&self, build: bool) {
-        if let Some(f) = if build { &self.probe } else { &self.build } {
+        for (_, f) in if build { &self.probe } else { &self.build } {
             f.fail();
         }
     }
@@ -702,12 +702,12 @@ impl SpillingHashJoinExec {
     }
 
     /// KF1: the filters planned for this join, once, before it runs.
-    pub(crate) fn set_key_filters(&self, probe: Option<Arc<KeyFilter>>, build: Option<Arc<KeyFilter>>) {
-        let _ = self.filters.set(Filters { probe, build });
+    pub(crate) fn set_key_filters(&self, filters: Filters) {
+        let _ = self.filters.set(filters);
     }
 
     fn filters(&self) -> &Filters {
-        static NONE: Filters = Filters { probe: None, build: None };
+        static NONE: Filters = Filters { probe: Vec::new(), build: Vec::new() };
         self.filters.get().unwrap_or(&NONE)
     }
 
@@ -900,7 +900,7 @@ enum Collected {
 
 impl Run {
     fn filters(&self) -> &Filters {
-        static NONE: Filters = Filters { probe: None, build: None };
+        static NONE: Filters = Filters { probe: Vec::new(), build: Vec::new() };
         self.filters.get().unwrap_or(&NONE)
     }
 

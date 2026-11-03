@@ -98,6 +98,16 @@ pub const IR_VERSION: u64 = 1;
 /// Rows per input batch the main thread pushes.
 pub const BATCH_ROWS: usize = 8192;
 
+/// Rows per batch DataFusion's operators make, and per chunk of the PAX
+/// reader's (kChunkRows): a batch's columns stay in cache through the
+/// plan.  On TPC-H at SF100, 4096 took 5% less time than 8192 (Q1 8%);
+/// 2048 made Q13 and Q3 slower.
+pub const PLAN_BATCH_ROWS: usize = 4096;
+
+/// SK1: groups per row in a partial aggregation's first rows above which it
+/// stops aggregating (`skip_partial_aggregation_probe_ratio_threshold`).
+pub const SKIP_PARTIAL_RATIO: f64 = 0.2;
+
 /// Batches buffered in each direction.
 const CHANNEL_DEPTH: usize = 4;
 
@@ -887,6 +897,7 @@ fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, S
     };
     let need = |a: Option<Expr>| a.ok_or_else(|| format!("aggregate {name} needs an argument"));
     Ok(match name {
+        "any" => any_value(need(arg)?, input),
         "count" => count(arg.unwrap_or_else(|| lit(1i64))),
         // 0 instead of NULL without rows: see the projection after the
         // aggregate in Query::start_with.
@@ -899,6 +910,20 @@ fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, S
         "min" | "max" if v.get("collate").is_some() => collated_min_max(v, need(arg)?)?,
         _ => aggregate_of(name, need(arg)?)?,
     })
+}
+
+/// AN1: "any" of `a` over `input`, a column every row of the group has alike
+/// (one the groups determine, as RowIdExpr's do): its min where DataFusion
+/// keeps min in flat arrays, else first_value.  first_value's partial
+/// states took TPC-H Q21 400 ns a row each; min passes values through.
+fn any_value(a: Expr, input: &DFSchema) -> Expr {
+    use DataType::*;
+    match a.get_type(input) {
+        Ok(Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 | Float32 | Float64
+        | Decimal128(..) | Decimal256(..) | Date32 | Date64 | Time32(_) | Time64(_)
+        | Timestamp(..) | Utf8 | LargeUtf8 | Utf8View | Binary | LargeBinary | BinaryView) => min(a),
+        _ => datafusion::functions_aggregate::expr_fn::first_value(a, vec![]),
+    }
 }
 
 /// CU2: min or max of strings under the libc locale "collate" names.
@@ -3506,12 +3531,12 @@ impl Query {
         }
 
         // Rows per batch, from the widest row the planner expects (the C
-        // side pushes batches of the same size).
+        // side pushes batches of that size), at most PLAN_BATCH_ROWS
         let batch_rows = spec
             .get("batch_rows")
             .and_then(Value::as_u64)
-            .map(|n| (n as usize).clamp(1, BATCH_ROWS))
-            .unwrap_or(BATCH_ROWS);
+            .map(|n| (n as usize).clamp(1, PLAN_BATCH_ROWS))
+            .unwrap_or(PLAN_BATCH_ROWS);
         let mut config = SessionConfig::new()
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
@@ -3538,6 +3563,15 @@ impl Query {
         // A sort reserves this much up front to merge its spilled runs
         // (10 MB by default): keep it within a partition's share.
         let execution = &mut config.options_mut().execution;
+        // SK1: a partial aggregation that has not shrunk its first rows 5x
+        // passes them on as states (DataFusion waits for 1.25x).  Its table
+        // would hold as many groups as the final one, each a cache miss to
+        // add: in TPC-H Q18 the partial step turned 200M rows into 50M groups
+        // a segment and the final step found 0.08% of them twice.  Not when
+        // the states go through a Motion, where rows cost more.
+        if !partial {
+            execution.skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_RATIO;
+        }
         execution.sort_spill_reservation_bytes = execution
             .sort_spill_reservation_bytes
             .min(memory_limit / (4 * partitions * consumers.max(1)))
@@ -5791,7 +5825,7 @@ mod tests {
     fn run_key_join(
         spec: &str,
         sources: Vec<Source>,
-        pushed: Option<Vec<i32>>,
+        pushed: Option<Vec<Vec<i32>>>,
         partitions: usize,
     ) -> (i64, QueryStats) {
         runtime::init(2).unwrap();
@@ -5800,9 +5834,13 @@ mod tests {
             Query::start_multi(spec, partitions, 64 << 20, dir.to_str().unwrap(), sources, false)
                 .unwrap();
         if let Some(keys) = pushed {
-            let nulls = vec![0u8; keys.len()];
-            let cols = [RawColumn::fixed(keys.as_ptr() as *const u8, nulls.as_ptr())];
-            while !unsafe { q.push_input(0, &cols, keys.len()) }.unwrap() {
+            let n = keys[0].len();
+            let nulls = vec![0u8; n];
+            let cols: Vec<RawColumn> = keys
+                .iter()
+                .map(|k| RawColumn::fixed(k.as_ptr() as *const u8, nulls.as_ptr()))
+                .collect();
+            while !unsafe { q.push_input(0, &cols, n) }.unwrap() {
                 std::thread::sleep(Duration::from_millis(1));
             }
             q.finish_input_at(0);
@@ -5849,12 +5887,53 @@ mod tests {
                 let (count, stats) = run_key_join(
                     &spec,
                     vec![Source::Pushed, Source::Pax(scan)],
-                    Some(vec![7, 42, 1003, 1500, 5000]),
+                    Some(vec![vec![7, 42, 1003, 1500, 5000]]),
                     partitions,
                 );
                 assert_eq!(count, 3, "partitions {partitions} filters {on}");
                 let figures = (stats.key_rows_checked, stats.key_rows_kept);
                 assert_eq!(figures, if on { (2000, 3) } else { (0, 0) }, "partitions {partitions}");
+            }
+        }
+    }
+
+    /// KF2: a join of two integer keys gets a filter for each; a probe row
+    /// is kept when each of its keys is among the build side's.  Both keys
+    /// here are the scan's one column: 7, 42 and 1500 join; (8, 9) and
+    /// (10, 100) pass the first filter only.
+    #[test]
+    fn joins_of_two_keys_filter_by_each() {
+        for partitions in [1, 4] {
+            for on in [true, false] {
+                let spec = format!(
+                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}},{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
+                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
+                        "on":[[{{"col":0}},{{"col":0,"input":1}}],[{{"col":1}},{{"col":0,"input":1}}]],"filter":null}}}},
+                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                );
+                let fake = FakeScan::default();
+                let scan = PaxScan::new(
+                    &fake as *const FakeScan as *mut c_void,
+                    200,
+                    fake_read,
+                    fake_end,
+                    fake_groups,
+                );
+                let (count, stats) = run_key_join(
+                    &spec,
+                    vec![Source::Pushed, Source::Pax(scan)],
+                    Some(vec![
+                        vec![7, 42, 1003, 1500, 5000, 8, 10],
+                        vec![7, 42, 1003, 1500, 5000, 9, 100],
+                    ]),
+                    partitions,
+                );
+                assert_eq!(count, 3, "partitions {partitions} filters {on}");
+                // the first filter checks 2000 rows and keeps 7, 8, 10, 42 and
+                // 1500 (1003 is NULL); the second keeps 3 of those 5
+                let figures = (stats.key_rows_checked, stats.key_rows_kept);
+                assert_eq!(figures, if on { (2005, 8) } else { (0, 0) }, "partitions {partitions}");
             }
         }
     }
@@ -5895,7 +5974,7 @@ mod tests {
                     let (count, stats) = run_key_join(
                         &spec,
                         vec![Source::Pushed, Source::Pax(scan)],
-                        Some(vec![7, 42, 1003, 1500, 5000]),
+                        Some(vec![vec![7, 42, 1003, 1500, 5000]]),
                         partitions,
                     );
                     let what = format!("{kind} partitions {partitions} filters {on}");

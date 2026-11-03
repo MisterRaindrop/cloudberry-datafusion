@@ -1472,6 +1472,117 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
  29 | 29 | c1   | 7.25
 (34 rows)
 
+-- AN1: the columns kept beside the numbers come out as they went in, NULL
+-- ones too (min stands in for first_value)
+UPDATE df_ri_o SET c = NULL WHERE id % 3 = 0;
+UPDATE df_ri_o SET n = NULL WHERE id % 4 = 0;
+SET datafusion.mode = explain;
+EXPLAIN (COSTS OFF) SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   Merge Key: o.id, o.k, o.c, o.n
+   ->  Sort
+         Sort Key: o.id, o.k, o.c, o.n
+         ->  HashAggregate
+               Group Key: (RowIdExpr)
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: (RowIdExpr)
+                     ->  Hash Join
+                           Hash Cond: (df_ri_i.k = o.k)
+                           ->  Seq Scan on df_ri_i
+                                 Filter: (v < 3000)
+                           ->  Hash
+                                 ->  Broadcast Motion 3:3  (slice3; segments: 3)
+                                       ->  Seq Scan on df_ri_o o
+                                             Filter: (id < 30)
+ Optimizer: Postgres query optimizer
+ DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ DataFusion: slice 1 eligible
+ DataFusion: slice 2 eligible, sends Arrow batches
+ DataFusion: slice 3 eligible, sends Arrow batches
+(21 rows)
+
+SET datafusion.mode = off;
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
+ id | k  |  c   |  n   
+----+----+------+------
+  1 |  1 | c1   | 0.25
+  2 |  2 | c2   | 0.50
+  3 |  3 |      | 0.75
+  4 |  4 | c4   |     
+  5 |  5 | c5   | 1.25
+  5 |  5 | c5   | 1.25
+  6 |  6 |      | 1.50
+  7 |  7 | c0   | 1.75
+  8 |  8 | c1   |     
+  9 |  9 |      | 2.25
+ 10 | 10 | c3   | 2.50
+ 10 | 10 | c3   | 2.50
+ 11 | 11 | c4   | 2.75
+ 12 | 12 |      |     
+ 13 | 13 | c6   | 3.25
+ 14 | 14 | c0   | 3.50
+ 15 | 15 |      | 3.75
+ 15 | 15 |      | 3.75
+ 16 | 16 | c2   |     
+ 17 | 17 | c3   | 4.25
+ 18 | 18 |      | 4.50
+ 19 | 19 | c5   | 4.75
+ 20 | 20 | c6   |     
+ 20 | 20 | c6   |     
+ 21 | 21 |      | 5.25
+ 22 | 22 | c1   | 5.50
+ 23 | 23 | c2   | 5.75
+ 24 | 24 |      |     
+ 25 | 25 | c4   | 6.25
+ 25 | 25 | c4   | 6.25
+ 26 | 26 | c5   | 6.50
+ 27 | 27 |      | 6.75
+ 28 | 28 | c0   |     
+ 29 | 29 | c1   | 7.25
+(34 rows)
+
+SET datafusion.mode = on;
+SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
+ id | k  |  c   |  n   
+----+----+------+------
+  1 |  1 | c1   | 0.25
+  2 |  2 | c2   | 0.50
+  3 |  3 |      | 0.75
+  4 |  4 | c4   |     
+  5 |  5 | c5   | 1.25
+  5 |  5 | c5   | 1.25
+  6 |  6 |      | 1.50
+  7 |  7 | c0   | 1.75
+  8 |  8 | c1   |     
+  9 |  9 |      | 2.25
+ 10 | 10 | c3   | 2.50
+ 10 | 10 | c3   | 2.50
+ 11 | 11 | c4   | 2.75
+ 12 | 12 |      |     
+ 13 | 13 | c6   | 3.25
+ 14 | 14 | c0   | 3.50
+ 15 | 15 |      | 3.75
+ 15 | 15 |      | 3.75
+ 16 | 16 | c2   |     
+ 17 | 17 | c3   | 4.25
+ 18 | 18 |      | 4.50
+ 19 | 19 | c5   | 4.75
+ 20 | 20 | c6   |     
+ 20 | 20 | c6   |     
+ 21 | 21 |      | 5.25
+ 22 | 22 | c1   | 5.50
+ 23 | 23 | c2   | 5.75
+ 24 | 24 |      |     
+ 25 | 25 | c4   | 6.25
+ 25 | 25 | c4   | 6.25
+ 26 | 26 | c5   | 6.50
+ 27 | 27 |      | 6.75
+ 28 | 28 | c0   |     
+ 29 | 29 | c1   | 7.25
+(34 rows)
+
 RESET datafusion.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
 -- GPORCA's Result (R1): a projection and filter over its child's rows,

@@ -175,8 +175,10 @@ fn match_text(t: &[u8], p: &[u8], depth: usize) -> Result<Like> {
 #[derive(Debug)]
 enum Pattern {
     /// The text equals the only piece, or with %'s: starts with the first
-    /// piece, ends with the last and holds the middle ones in order.
-    Pieces(Vec<Vec<u8>>),
+    /// piece, ends with the last and holds the middle ones in order, which
+    /// the finders look for (built once: str::find built its searcher for
+    /// every value, a quarter of TPC-H Q13's LIKE).
+    Pieces(Vec<Vec<u8>>, Vec<memchr::memmem::Finder<'static>>),
     General(Vec<u8>),
 }
 
@@ -186,7 +188,7 @@ enum Pattern {
 /// with the last and holds the middle ones in order, byte for byte.
 pub fn like_pieces(p: &[u8]) -> Option<Vec<Vec<u8>>> {
     match Pattern::new(p) {
-        Pattern::Pieces(pieces) => Some(pieces),
+        Pattern::Pieces(pieces, _) => Some(pieces),
         Pattern::General(_) => None,
     }
 }
@@ -208,14 +210,19 @@ impl Pattern {
             }
             i += 1;
         }
-        Pattern::Pieces(pieces)
+        let middle = pieces.len().saturating_sub(1).max(1);
+        let finders = pieces[1..middle]
+            .iter()
+            .map(|piece| memchr::memmem::Finder::new(piece).into_owned())
+            .collect();
+        Pattern::Pieces(pieces, finders)
     }
 
     fn matches(&self, t: &[u8]) -> Result<bool> {
         match self {
             Pattern::General(p) => Ok(match_text(t, p, 0)? == Like::True),
-            Pattern::Pieces(pieces) if pieces.len() == 1 => Ok(t == pieces[0].as_slice()),
-            Pattern::Pieces(pieces) => {
+            Pattern::Pieces(pieces, _) if pieces.len() == 1 => Ok(t == pieces[0].as_slice()),
+            Pattern::Pieces(pieces, finders) => {
                 let (first, last) = (&pieces[0], &pieces[pieces.len() - 1]);
                 if t.len() < first.len() + last.len() || !t.starts_with(first) || !t.ends_with(last)
                 {
@@ -223,9 +230,9 @@ impl Pattern {
                 }
                 // UTF-8 pieces can only match at character boundaries.
                 let mut rest = &t[first.len()..t.len() - last.len()];
-                for piece in &pieces[1..pieces.len() - 1] {
-                    match find(rest, piece) {
-                        Some(at) => rest = &rest[at + piece.len()..],
+                for f in finders {
+                    match f.find(rest) {
+                        Some(at) => rest = &rest[at + f.needle().len()..],
                         None => return Ok(false),
                     }
                 }
@@ -233,20 +240,6 @@ impl Pattern {
             }
         }
     }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    // Both are UTF-8 (whole characters), so str's searcher applies.
-    let (h, n) = unsafe {
-        (
-            std::str::from_utf8_unchecked(hay),
-            std::str::from_utf8_unchecked(needle),
-        )
-    };
-    h.find(n)
 }
 
 /// B1: a character value as bpcharcmp, hashbpchar and the cast to text see
