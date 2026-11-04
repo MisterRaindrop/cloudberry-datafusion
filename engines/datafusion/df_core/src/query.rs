@@ -115,6 +115,11 @@ const CHANNEL_DEPTH: usize = 4;
 /// over a chunk (a few kB) at a time.
 const IPC_CHANNEL_DEPTH: usize = 64;
 
+/// Bound each Redistribute route's pending IPC stream bytes before handing
+/// them to the main thread. A 4096-row batch split among 32 receivers makes
+/// tiny writes; the interconnect can copy several messages in one call.
+const MOTION_ROUTE_FLUSH_BYTES: usize = 64 * 1024;
+
 /// How long `push_ipc` waits for room in a full queue.
 const IPC_PUSH_WAIT: Duration = Duration::from_millis(1);
 
@@ -3646,9 +3651,10 @@ impl Query {
                                 Entry::Vacant(e) => e.insert(MotionWriter::try_new(&wire)?),
                             };
                             w.write(&part)?;
-                            let bytes = w.take();
-                            if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
-                                return Ok(());
+                            if let Some(bytes) = w.take_if_full() {
+                                if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
+                                    return Ok(());
+                                }
                             }
                         }
                     }
@@ -4168,6 +4174,16 @@ impl MotionWriter {
     /// The bytes written since the last call.
     fn take(&mut self) -> Vec<u8> {
         std::mem::take(self.w.get_mut())
+    }
+
+    /// Give a route's accumulated, complete IPC messages to the main thread
+    /// only once their combined size can amortize an interconnect call.
+    fn take_if_full(&mut self) -> Option<Vec<u8>> {
+        if self.w.get_mut().len() >= MOTION_ROUTE_FLUSH_BYTES {
+            Some(self.take())
+        } else {
+            None
+        }
     }
 }
 
@@ -5445,6 +5461,47 @@ mod tests {
             d.finish().unwrap();
         }
         assert_eq!(total, 1000);
+    }
+
+    #[test]
+    fn motion_route_flush_preserves_stream() {
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(0..256))],
+        )
+        .unwrap();
+        let mut writer = MotionWriter::try_new(&schema).unwrap();
+        let mut pieces = Vec::new();
+        for _ in 0..50 {
+            writer.write(&batch).unwrap();
+            if let Some(bytes) = writer.take_if_full() {
+                pieces.push(bytes);
+            }
+        }
+        writer.finish().unwrap();
+        pieces.push(writer.take());
+        assert!(pieces.len() > 1, "the route must flush before its end");
+        assert!(pieces[..pieces.len() - 1]
+            .iter()
+            .all(|bytes| bytes.len() >= MOTION_ROUTE_FLUSH_BYTES));
+
+        let mut decoder = StreamDecoder::new();
+        let mut rows = 0;
+        for bytes in pieces {
+            let mut buf = Buffer::from_vec(bytes);
+            while !buf.is_empty() {
+                if let Some(got) = decoder.decode(&mut buf).unwrap() {
+                    let values = got.column(0).as_primitive::<Int64Type>();
+                    assert_eq!(values.value(0), 0);
+                    assert_eq!(values.value(got.num_rows() - 1), 255);
+                    rows += got.num_rows();
+                }
+            }
+        }
+        decoder.finish().unwrap();
+        assert_eq!(rows, 50 * 256);
     }
 
     /// MZ1: a batch mostly of strings goes compressed, one of numbers as it
