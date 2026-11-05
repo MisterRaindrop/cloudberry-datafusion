@@ -112,3 +112,74 @@ SELECT count(*) FROM df_pd_skip;
 SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
 
 DROP TABLE df_pd, df_pd_vec, df_pd_skip, df_pd_date;
+
+-- DC1: the decoded-column cache (datafusion.pax_decode_cache), in a
+-- directory of the coordinator's data directory.  The first scans fill it;
+-- run again, they read all 4 groups from it each and write nothing.
+-- Entries that do not fit what they should hold, one cut short and one
+-- with offsets out of order, are removed and rebuilt.  A cache at its size
+-- limit takes no more.  Every result matches the table AM's.
+SET pax.max_tuples_per_group = 5000;
+CREATE TABLE df_pd_cache (a int4, b int8, n numeric(15, 2), t text, v varchar(10)) USING pax;
+INSERT INTO df_pd_cache SELECT i, i * 7, i / 100.0,
+  CASE WHEN i % 9 = 0 THEN NULL ELSE 'v' || i END,
+  CASE WHEN i % 5 = 0 THEN '' ELSE repeat('x', i % 10) END
+FROM generate_series(1, 20000) i;
+RESET pax.max_tuples_per_group;
+DELETE FROM df_pd_cache WHERE a % 777 = 0;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
+SET datafusion.mode = on;
+SELECT current_setting('data_directory') AS dd \gset
+\setenv DF_PD_DD :dd
+SET datafusion.pax_decode_cache = 'df_pd_cache_dir';
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
+SELECT fills - :f0 > 0 AS filled, bad - :b0 AS bad, unusable FROM datafusion_debug_pax_cache();
+SELECT hits AS h0, fills AS f0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
+SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM datafusion_debug_pax_cache();
+-- one micro-partition: one directory of entries
+SELECT count(*) FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep';
+SELECT :'dd' || '/df_pd_cache_dir/' || d AS mp FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' \gset
+-- Column t of group 0 cut short.  Column v of group 1 with its second
+-- offset past the third: v has no NULLs, so its offsets follow the header
+-- (40 bytes) at once.
+-- (a large object is seen from the statement after the one creating it;
+-- Cloudberry refuses lo_unlink, the objects go with the database)
+SELECT lo_from_bytea(0, substr(b, 1, length(b) - 3)) AS lo
+FROM pg_read_binary_file(:'mp' || '/g0_c3_w-1_s-1') b \gset
+SELECT lo_export(:lo, :'mp' || '/g0_c3_w-1_s-1');
+SELECT lo_from_bytea(0, overlay(b PLACING '\xffffff7f'::bytea FROM 41 + 4 FOR 4)) AS lo
+FROM pg_read_binary_file(:'mp' || '/g1_c4_w-1_s-1') b \gset
+SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1');
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM datafusion_debug_pax_cache();
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM datafusion_debug_pax_cache();
+-- a cache of 1 MB, smaller than the table's columns (about 200 kB a group)
+INSERT INTO df_pd_cache SELECT * FROM df_pd_cache;
+SET datafusion.pax_decode_cache = 'df_pd_cache_small';
+SET datafusion.pax_decode_cache_size = '1MB';
+SELECT refused AS r0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SET datafusion.mode = off;
+SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
+SET datafusion.mode = on;
+SELECT refused - :r0 > 0 AS refused FROM datafusion_debug_pax_cache();
+SELECT sum((pg_stat_file('df_pd_cache_small/' || d || '/' || f)).size) <= 1024 * 1024 AS within_limit
+FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WHERE d <> '.sweep';
+-- a directory that cannot be used leaves scans without the cache
+SET datafusion.pax_decode_cache = '/proc/df_pd_no_cache';
+SELECT unusable AS u0 FROM datafusion_debug_pax_cache() \gset
+SELECT count(*), sum(a) FROM df_pd_cache;
+SELECT unusable - :u0 AS unusable FROM datafusion_debug_pax_cache();
+RESET datafusion.pax_decode_cache;
+RESET datafusion.pax_decode_cache_size;
+\! rm -rf "$DF_PD_DD/df_pd_cache_dir" "$DF_PD_DD/df_pd_cache_small"
+DROP TABLE df_pd_cache;

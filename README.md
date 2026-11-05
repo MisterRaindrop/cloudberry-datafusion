@@ -308,6 +308,28 @@ micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
 and filtered on one thread, slower than through the table AM; on one
 segment it now takes 23 ms against 32 ms through the table AM.
 
+`datafusion.pax_decode_cache` (DC1, empty by default: off) names a
+directory where the reader keeps each group's columns as it hands them
+out, a file per column, read back through mmap by later scans, which skip
+PAX's decompression and decoding; a relative path is in each segment's data
+directory, and segments on one host may share an absolute one.  Each
+micro-partition's entries are in a directory named by its file's device,
+inode, size and modification time, so a rewritten file misses.  Entries
+are checked against the group before use (sizes, string offsets) and one
+that does not fit is removed and rebuilt.  `datafusion.pax_decode_cache_size`
+(16 GB by default) bounds the disk space all segments using the directory
+take: one process at a time measures it and removes micro-partitions unused
+for ten minutes, least recently used first; while nothing can go, scans add
+nothing, since evicting for a working set bigger than the cache would make
+every scan miss.  Both are superuser settings.  On TPC-H at scale factor
+100 (32 segments, data in memory, 85 GB of cache) the 22 queries took
+36.2 s from the cache against 39.2 s without it, and 49-58 s for the run
+that fills it.  At scale factor 1000 the cache (700 GB, the decoded columns
+being larger than PAX's compressed files) no longer fit the 430 GB of page
+cache: reading it took 400 s against 372 s without it, 609 s to fill, and
+its files pushed PAX's out of memory.  Use it only where it fits in memory.
+`datafusion_debug_pax_cache()` reports what it did in the backend.
+
 Conditions on cheap columns come first (LM1).  Converting a numeric costs
 far more than copying an integer, and a scan converted every row's
 numerics before the filter above it saw any: under TPC-DS Q28's
@@ -713,6 +735,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
 | C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
+| DC1 | datafusion.pax_decode_cache: decoded PAX columns cached on disk, bounded by datafusion.pax_decode_cache_size (scan interface 10) |
 | LM1 | Direct PAX reader: conditions on integer and date columns first, other columns built for the rows that pass |
 | LM2 | Direct PAX reader: then narrow numerics, then strings compared on the reader's bytes; strings built for the rows left |
 | N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |

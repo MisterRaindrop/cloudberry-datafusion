@@ -58,16 +58,18 @@ PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
 PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
 PG_FUNCTION_INFO_V1(datafusion_debug_pax_direct_scans);
 PG_FUNCTION_INFO_V1(datafusion_debug_last_pax);
+PG_FUNCTION_INFO_V1(datafusion_debug_pax_cache);
 PG_FUNCTION_INFO_V1(datafusion_debug_cdbhash_check);
 
 static Datum
 df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
 {
 	TupleDesc	tupdesc;
-	Datum		values[5];
-	bool		nulls[5] = {false, false, false, false, false};
+	Datum		values[8];
+	bool		nulls[8] = {false};
 	int			i;
 
+	Assert(n <= lengthof(values));
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	for (i = 0; i < n; i++)
@@ -307,6 +309,41 @@ datafusion_debug_last_pax(PG_FUNCTION_ARGS)
 	v[3] = df_last_pax_scan.groups_skipped;
 	v[4] = (int64) ((df_last_run.pax_decode_peak + 1023) / 1024);
 	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
+}
+
+/*
+ * datafusion_debug_pax_cache(OUT hits int8, OUT fills int8, OUT bad int8,
+ *                            OUT evicted int8, OUT refused int8,
+ *                            OUT unusable int8)
+ * What the direct PAX reader's decoded-column cache did in this backend
+ * (datafusion.pax_decode_cache); NULLs if the reader is not loaded.
+ */
+Datum
+datafusion_debug_pax_cache(PG_FUNCTION_ARGS)
+{
+	const DfPaxReader *reader = df_pax_reader_loaded();
+	DfPaxCacheStats s;
+	int64		v[6];
+
+	if (reader == NULL)
+	{
+		TupleDesc	tupdesc;
+		Datum		values[6] = {0};
+		bool		nulls[6] = {true, true, true, true, true, true};
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		tupdesc = BlessTupleDesc(tupdesc);
+		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+	}
+	reader->cache_stats(&s);
+	v[0] = s.hits;
+	v[1] = s.fills;
+	v[2] = s.bad;
+	v[3] = s.evicted;
+	v[4] = s.refused;
+	v[5] = s.unusable;
+	PG_RETURN_DATUM(df_int8_record(fcinfo, 6, v));
 }
 
 /* ---------------------------------------------------------------------

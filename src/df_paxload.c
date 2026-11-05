@@ -178,3 +178,10 @@ df_pax_reader_get(void)
 	}
 	return df_pax_ok ? df_pax_reader : NULL;
 }
+
+/* The direct PAX reader if this backend has loaded it already, else NULL. */
+const DfPaxReader *
+df_pax_reader_loaded(void)
+{
+	return df_pax_tried && df_pax_ok ? df_pax_reader : NULL;
+}

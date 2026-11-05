@@ -126,6 +126,32 @@ _PG_init(void)
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);
 
+	DefineCustomStringVariable("datafusion.pax_decode_cache",
+							   "Directory where the direct PAX reader caches decoded columns.",
+							   "Each group's columns are kept there as the reader hands them "
+							   "out, in files read back through mmap by later scans, which "
+							   "then skip PAX's decompression and decoding.  A relative path "
+							   "is in each segment's data directory; segments on one host may "
+							   "share an absolute one.  Entries of a rewritten micro-partition "
+							   "are not used again and go once the size limit needs room.  "
+							   "Empty (the default): no cache.",
+							   &df_pax_decode_cache,
+							   "",
+							   PGC_SUSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("datafusion.pax_decode_cache_size",
+							"Most disk space the decoded-column cache takes.",
+							"For all segments using the directory.  Once it is reached, "
+							"micro-partitions unused for ten minutes are removed, least "
+							"recently used first; while nothing can go, scans add nothing.",
+							&df_pax_decode_cache_mb,
+							16384, 1, INT_MAX,
+							PGC_SUSET,
+							GUC_GPDB_NEED_SYNC | GUC_UNIT_MB,
+							NULL, NULL, NULL);
+
 	DefineCustomIntVariable("datafusion.pax_max_decoders",
 							"Most PAX groups the direct reader decodes at once per query.",
 							"Each holds a decoded group, about 30 MB of a QE's memory on "

@@ -1,0 +1,1046 @@
+--- a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
++++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
+@@ -36,7 +36,8 @@
+  * the rows it hands out.  The file footer and PAX's small bookkeeping
+  * objects are not counted, nor the values PAX decodes for GetDatum (toast,
+  * the vectorized format's strings) until the group is done; uncompressed
+- * columns that point into the read buffer are counted twice.
++ * columns that point into the read buffer are counted twice.  A group read
++ * from the decoded-column cache (DC1) counts its mapped entries instead.
+  *
+  * contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
+  *
+@@ -47,9 +48,23 @@
+ 
+ #include "access/datafusion_scan_api.h"
+ 
++#include <dirent.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sys/file.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <climits>
++#include <cstdio>
+ #include <cstring>
++#include <ctime>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <vector>
+ 
+@@ -92,6 +107,10 @@
+   std::vector<bool> late;    // per handed-out column: left to read_rows
+   size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
+   DatafusionPaxScanInfo info;
++  // DC1: the decoded-column cache's directory ("" without the cache) and
++  // the bytes it may take (cache_config)
++  std::string cache_dir;
++  int64_t cache_limit = 0;
+ };
+ 
+ // A numeric of the vectorized format (comm/vec_numeric.cc), 16 bytes: the
+@@ -470,8 +489,40 @@
+   int scale;
+   // dense columns with nulls: the value index of each row
+   std::vector<uint32_t> index;
++  // DC1: the column comes from the decoded-column cache, one slot a row
++  bool cached;
++  const uint8_t *cnulls;   // a byte a row, or null: no row is NULL
++  const char *cvals;       // fixed-width slots, or the strings' bytes
++  int cwidth;              // a slot's bytes: 8 for a 16-byte value narrowed
++  const uint32_t *coffs;   // strings: rows + 1 offsets into cvals
+ };
+ 
++// The state of column 'col' of a group of 'rows' rows, decoded by PAX.
++void InitCol(ColState &st, pax::PaxColumn *col, size_t rows) {
++  // In the plain format only non-null values are stored, in row
++  // order; in the vectorized format every row has a slot.  That
++  // format keeps booleans bit-packed in memory, one bit per row,
++  // least significant bit first; the plain format has already
++  // decoded them to one byte per value.
++  st.col = col;
++  st.buf = col->GetBuffer().first;
++  st.bm = col->GetBitmap().get();
++  st.dense = col->GetStorageFormat() !=
++             pax::PaxStorageFormat::kTypeStoragePorcVec;
++  st.bits = col->GetPaxColumnTypeInMem() ==
++            pax::PaxColumnTypeInMem::kTypeVecBitPacked;
++  st.vec_numeric = col->GetPaxColumnTypeInMem() ==
++                   pax::PaxColumnTypeInMem::kTypeVecDecimal;
++  if (st.bm && st.dense) {
++    st.index.resize(rows);
++    uint32_t i = 0;
++    for (size_t r = 0; r < rows; r++) {
++      st.index[r] = i;
++      if (st.bm->Test(static_cast<uint32>(r))) i++;
++    }
++  }
++}
++
+ // The chunk 'emit' is handed: rows j0 .. j1 - 1 of the group's kept rows
+ // ('keep' lists them unless all are).  Its fixed-width columns are
+ // converted when the consumer fetches them, for the rows it asks for: those
+@@ -566,6 +617,43 @@
+     const size_t n = rows ? nrows : ch->j1 - ch->j0;
+     auto &nulls = (*ch->nulls)[k];
+     auto &values = (*ch->values)[k];
++    // DC1: a cached column, a slot a row: in place when all rows are
++    // wanted at the slot width, else copied (and widened)
++    if (st.cached) {
++      out->offsets = nullptr;
++      if (!rows && ch->all_kept && st.cwidth == w) {
++        if (st.cnulls) {
++          out->nulls = st.cnulls + ch->j0;
++        } else {
++          nulls.assign(std::max<size_t>(n, 1), 0);
++          out->nulls = nulls.data();
++        }
++        out->values = st.cvals + ch->j0 * w;
++        return 0;
++      }
++      nulls.resize(std::max<size_t>(n, 1));
++      values.resize(std::max<size_t>(n, 1) * w);
++      char *dst = values.data();
++      uint8_t *nl = nulls.data();
++      for (size_t t = 0; t < n; t++) {
++        const size_t j = ch->j0 + (rows ? rows[t] : t);
++        const size_t r = ch->all_kept ? j : (*ch->keep)[j];
++        nl[t] = st.cnulls ? st.cnulls[r] : 0;
++        if (st.cwidth == w) {
++          std::memcpy(dst + t * w, st.cvals + r * w, w);
++        } else {
++          int64_t v;
++          std::memcpy(&v, st.cvals + r * 8, 8);
++          const uint64_t lo = static_cast<uint64_t>(v);
++          const uint64_t hi = v < 0 ? ~uint64_t{0} : 0;
++          std::memcpy(dst + t * w, &lo, 8);
++          std::memcpy(dst + t * w + 8, &hi, 8);
++        }
++      }
++      out->values = dst;
++      out->nulls = nl;
++      return 0;
++    }
+     // A column without nulls of a group without deleted rows: the stored
+     // values themselves when all rows are wanted.
+     if (!st.bm && ch->all_kept && !st.bits && st.scale < 0) {
+@@ -619,8 +707,628 @@
+   }
+   ch->failed = true;
+   return -1;
++}
++
++// DC1: a cache of decoded columns, as files read through mmap, under the
++// directory datafusion.pax_decode_cache names (cache_config).  A group's
++// column is kept as read_block hands it out, a slot a row: fixed-width
++// values converted (16-byte ones that all fit 8 bytes narrowed), strings
++// without their headers.  Each micro-partition has a directory of its own,
++// named by its file's device, inode, size and modification time, so that a
++// rewritten file misses.  In it:
++//   n                                  the file's number of groups
++//   g<group>                           the group's rows, their offset
++//   g<group>_c<col>_w<width>_s<scale>  a column of the group read so
++// Entries are written to a file of their own and renamed into place.  They
++// are checked against what the group needs before use (CheckColumn); one
++// that does not fit is removed, so that the next read rebuilds it.  A column
++// that cannot be cached (toast left, strings past the offsets' range) gets
++// an entry of a header only marked kUncacheable, so that it is not tried
++// again.  The size is kept to the limit by CacheAdmit and CacheSweep.
++constexpr uint64_t kCacheMagic = 0x32434644ULL;  // "DFC2"
++constexpr int32_t kUncacheable = INT32_MIN;
++// what an entry's header may say: PAX groups have far fewer rows, files
++// far fewer groups
++constexpr uint64_t kCacheMaxRows = uint64_t{1} << 30;
++constexpr uint64_t kCacheMaxGroups = uint64_t{1} << 24;
++
++struct CacheHeader {
++  uint64_t magic;
++  uint64_t rows;        // n: the number of groups
++  uint64_t row_offset;
++  int32_t width;        // the width asked for: <= 0 strings
++  int32_t stored;       // fixed-width: a slot's bytes; strings: width
++  uint32_t has_nulls;   // a byte a row follows the header, padded to 8
++  uint32_t pad;
++};
++
++// What the cache did in this process, for datafusion_debug_pax_cache().
++struct CacheCounters {
++  std::atomic<int64_t> hits{0};      // groups read from the cache
++  std::atomic<int64_t> fills{0};     // entries written
++  std::atomic<int64_t> bad{0};       // entries that did not fit, removed
++  std::atomic<int64_t> evicted{0};   // micro-partitions removed by sweeps
++  std::atomic<int64_t> refused{0};   // groups not cached: the cache was full
++  std::atomic<int64_t> unusable{0};  // scans whose directory was unusable
++};
++CacheCounters g_cache;
++
++size_t Pad8(size_t n) { return (n + 7) / 8 * 8; }
++
++int64_t NowSeconds() { return static_cast<int64_t>(time(nullptr)); }
++
++// The directory of the cache entries of micro-partition 'file', or "".
++std::string CacheKey(const std::string &dir, const std::string &file) {
++  struct stat st;
++  if (stat(file.c_str(), &st) != 0) return "";
++  char buf[128];
++  snprintf(buf, sizeof(buf), "/%llx_%llx_%lld_%lld",
++           static_cast<unsigned long long>(st.st_dev),
++           static_cast<unsigned long long>(st.st_ino),
++           static_cast<long long>(st.st_size),
++           static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL +
++               static_cast<long long>(st.st_mtim.tv_nsec));
++  return dir + buf;
++}
++
++// Whether 'name' is a micro-partition directory's, as CacheKey makes them.
++bool IsKeyName(const char *name) {
++  int seps = 0;
++  for (const char *p = name; *p; p++) {
++    if (*p == '_')
++      seps++;
++    else if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f')))
++      return false;
++  }
++  return seps == 3;
++}
++
++std::string GroupEntry(const std::string &key, size_t g) {
++  return key + "/g" + std::to_string(g);
++}
++
++std::string ColumnEntry(const std::string &key, size_t g, int col, int width,
++                        int scale) {
++  return key + "/g" + std::to_string(g) + "_c" + std::to_string(col) + "_w" +
++         std::to_string(width) + "_s" + std::to_string(scale);
++}
++
++// A cache entry mapped read-only.
++class Mapped {
++ public:
++  enum Status { kMissing, kBad, kOk };
++  Mapped() = default;
++  Mapped(const Mapped &) = delete;
++  Mapped &operator=(const Mapped &) = delete;
++  ~Mapped() {
++    if (p_) munmap(p_, n_);
++  }
++  // kBad: the file is there but is no entry
++  Status Open(const std::string &path) {
++    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
++    if (fd < 0) return kMissing;
++    struct stat st;
++    if (fstat(fd, &st) != 0) {
++      close(fd);
++      return kMissing;
++    }
++    if (st.st_size < static_cast<off_t>(sizeof(CacheHeader))) {
++      close(fd);
++      return kBad;
++    }
++    void *m = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ,
++                   MAP_SHARED | MAP_POPULATE, fd, 0);
++    close(fd);
++    if (m == MAP_FAILED) return kMissing;
++    p_ = m;
++    n_ = static_cast<size_t>(st.st_size);
++    if (header()->magic != kCacheMagic) {
++      munmap(p_, n_);
++      p_ = nullptr;
++      n_ = 0;
++      return kBad;
++    }
++    return kOk;
++  }
++  const char *data() const { return static_cast<const char *>(p_); }
++  size_t size() const { return n_; }
++  const CacheHeader *header() const {
++    return reinterpret_cast<const CacheHeader *>(p_);
++  }
++
++ private:
++  void *p_ = nullptr;
++  size_t n_ = 0;
++};
++
++// Removes entry 'path', which does not fit what it should hold.
++void DropBad(const std::string &path) {
++  if (unlink(path.c_str()) == 0) g_cache.bad++;
++}
++
++// Whether the header-only entry 'm' (n, g<group>) is sound.
++bool CheckSmall(const Mapped &m, uint64_t max_rows) {
++  const CacheHeader *h = m.header();
++  return m.size() == sizeof(CacheHeader) && h->rows <= max_rows &&
++         h->row_offset + h->rows <= UINT32_MAX && h->width == 0 &&
++         h->stored == 0 && h->has_nulls == 0 && h->pad == 0;
++}
++
++enum class Fit { kYes, kNo, kUncacheable };
++
++// Whether column entry 'm' holds a column of 'rows' rows read at 'width',
++// laid out as BuildEntry lays it out: sizes, offsets and all.
++Fit CheckColumn(const Mapped &m, size_t rows, int width) {
++  const CacheHeader *h = m.header();
++  if (h->stored == kUncacheable)
++    return m.size() == sizeof(CacheHeader) && h->rows == rows ? Fit::kUncacheable
++                                                              : Fit::kNo;
++  if (h->rows != rows || h->width != width || h->has_nulls > 1 || h->pad != 0)
++    return Fit::kNo;
++  const size_t head = sizeof(CacheHeader) + (h->has_nulls ? Pad8(rows) : 0);
++  if (width > 0) {
++    if (h->stored != width && !(width == 16 && h->stored == 8)) return Fit::kNo;
++    return m.size() == head + rows * static_cast<size_t>(h->stored) ? Fit::kYes
++                                                                    : Fit::kNo;
++  }
++  if (h->stored != width) return Fit::kNo;
++  const size_t offs_bytes = Pad8((rows + 1) * sizeof(uint32_t));
++  if (m.size() < head + offs_bytes) return Fit::kNo;
++  const uint32_t *offs = reinterpret_cast<const uint32_t *>(m.data() + head);
++  if (offs[0] != 0) return Fit::kNo;
++  for (size_t r = 0; r < rows; r++)
++    if (offs[r + 1] < offs[r]) return Fit::kNo;
++  return m.size() - head - offs_bytes == offs[rows] ? Fit::kYes : Fit::kNo;
++}
++
++// Writes an entry: to a file of its own first, renamed into place, so that
++// readers see all of it or none.  Failures leave no entry.
++bool WriteEntry(const std::string &path, const std::vector<char> &bytes) {
++  char tmp_suffix[64];
++  snprintf(tmp_suffix, sizeof(tmp_suffix), ".tmp%d_%lx", static_cast<int>(getpid()),
++           static_cast<unsigned long>(pthread_self()));
++  const std::string tmp = path + tmp_suffix;
++  int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
++  if (fd < 0) return false;
++  size_t done = 0;
++  while (done < bytes.size()) {
++    ssize_t w = write(fd, bytes.data() + done, bytes.size() - done);
++    if (w < 0 && errno == EINTR) continue;
++    if (w <= 0) break;
++    done += static_cast<size_t>(w);
++  }
++  close(fd);
++  if (done != bytes.size() || rename(tmp.c_str(), path.c_str()) != 0) {
++    unlink(tmp.c_str());
++    return false;
++  }
++  return true;
++}
++
++template <typename T>
++void Append(std::vector<char> &out, const T *p, size_t n) {
++  const char *b = reinterpret_cast<const char *>(p);
++  out.insert(out.end(), b, b + n * sizeof(T));
++}
++
++// The cache's size.  Its bytes on disk are measured by sweeps (CacheSweep),
++// of every micro-partition directory, by one process at a time (the one
++// holding an exclusive lock on the file .sweep), at most once every
++// kSweepEvery seconds; the total goes into .sweep for the others.  A
++// process sweeps when it does not know the total or has written a 512th of
++// the limit (16 MB at least) since: what processes write between sweeps
++// goes past the limit, a few percent of it with a few dozen processes.
++// Writers count their entries in blocks of 4 kB, as the disk holds them.  A sweep finding more
++// than the limit removes micro-partitions unused for kIdleSeconds, least
++// recently used first, down to 90% of it; a directory is used when an
++// entry is written into it or a group is read from it (read_block touches
++// it, once a minute at most).  Writers add no entry while the last total
++// plus what they wrote since reaches the limit: a working set bigger than
++// the cache keeps what it has, where evicting would make the next scan miss
++// everything.  Writers' files a crash left are removed after an hour.
++constexpr int64_t kSweepEvery = 5;
++constexpr int64_t kIdleSeconds = 600;
++constexpr uint64_t kSweepMagic = 0x57534644ULL;  // "DFSW"
++
++struct SweepRecord {
++  uint64_t magic;
++  int64_t total;  // bytes measured
++  int64_t when;   // seconds since the epoch
++};
++
++// This process's view of the cache's size.
++struct CacheUse {
++  std::mutex mu;
++  std::string dir;
++  int64_t total = -1;      // the last sweep's total, -1 unknown
++  int64_t when = 0;        // that sweep's time
++  int64_t written = 0;     // bytes this process wrote since
++  int64_t checked = 0;     // when .sweep was last read
++  bool sweeping = false;   // a thread of this process sweeps
++};
++CacheUse g_use;
++
++bool ReadSweep(int fd, SweepRecord *rec) {
++  return pread(fd, rec, sizeof(*rec), 0) == static_cast<ssize_t>(sizeof(*rec)) &&
++         rec->magic == kSweepMagic && rec->total >= 0;
++}
++
++// Removes micro-partition directory 'path' and its entries.
++void RemoveKeyDir(const std::string &path) {
++  DIR *d = opendir(path.c_str());
++  if (d == nullptr) return;
++  while (struct dirent *e = readdir(d)) {
++    if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
++    unlinkat(dirfd(d), e->d_name, 0);
++  }
++  closedir(d);
++  if (rmdir(path.c_str()) == 0) g_cache.evicted++;
++}
++
++// Measures the cache under 'dir' and trims it to 'limit' as described
++// above.  Returns the bytes it then holds.
++int64_t CacheSweep(const std::string &dir, int64_t limit) {
++  struct Item {
++    int64_t used;
++    int64_t bytes;
++    std::string path;
++  };
++  std::vector<Item> items;
++  int64_t total = 0;
++  const int64_t now = NowSeconds();
++  DIR *d = opendir(dir.c_str());
++  if (d == nullptr) return 0;
++  while (struct dirent *e = readdir(d)) {
++    if (!IsKeyName(e->d_name)) continue;
++    std::string path = dir + "/" + e->d_name;
++    struct stat ds;
++    if (lstat(path.c_str(), &ds) != 0 || !S_ISDIR(ds.st_mode)) continue;
++    int64_t bytes = static_cast<int64_t>(ds.st_blocks) * 512;
++    DIR *sd = opendir(path.c_str());
++    if (sd == nullptr) continue;
++    while (struct dirent *f = readdir(sd)) {
++      if (f->d_name[0] == '.') continue;
++      struct stat fs;
++      if (fstatat(dirfd(sd), f->d_name, &fs, AT_SYMLINK_NOFOLLOW) != 0) continue;
++      if (strstr(f->d_name, ".tmp") != nullptr && fs.st_mtime < now - 3600) {
++        unlinkat(dirfd(sd), f->d_name, 0);
++        continue;
++      }
++      bytes += static_cast<int64_t>(fs.st_blocks) * 512;
++    }
++    closedir(sd);
++    total += bytes;
++    items.push_back({static_cast<int64_t>(ds.st_mtime), bytes, std::move(path)});
++  }
++  closedir(d);
++  if (total > limit) {
++    std::sort(items.begin(), items.end(),
++              [](const Item &a, const Item &b) { return a.used < b.used; });
++    const int64_t target = limit / 10 * 9;
++    for (const Item &it : items) {
++      if (total <= target || it.used > now - kIdleSeconds) break;
++      RemoveKeyDir(it.path);
++      total -= it.bytes;
++    }
++  }
++  return total;
++}
++
++// Sweeps the cache under 'dir' if no process did for kSweepEvery seconds
++// and none sweeps now.  Fills 'rec' with the total then known.
++bool TrySweep(const std::string &dir, int64_t limit, SweepRecord *rec) {
++  int fd = open((dir + "/.sweep").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
++  if (fd < 0) return false;
++  bool known = false;
++  if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
++    const int64_t now = NowSeconds();
++    if (ReadSweep(fd, rec) && rec->when > now - kSweepEvery) {
++      known = true;
++    } else {
++      *rec = SweepRecord{kSweepMagic, CacheSweep(dir, limit), NowSeconds()};
++      known = pwrite(fd, rec, sizeof(*rec), 0) == static_cast<ssize_t>(sizeof(*rec));
++    }
++    flock(fd, LOCK_UN);
++  }
++  close(fd);
++  return known;
++}
++
++// Whether 'bytes' more may go into the cache of 'scan': counted as written
++// if so.  Sweeps when it is this process's turn (see above).
++bool CacheAdmit(const DfScan *scan, int64_t bytes) {
++  std::unique_lock<std::mutex> lock(g_use.mu);
++  const int64_t now = NowSeconds();
++  if (g_use.dir != scan->cache_dir) {
++    g_use.dir = scan->cache_dir;
++    g_use.total = -1;
++    g_use.when = 0;
++    g_use.written = 0;
++    g_use.checked = 0;
++  }
++  if (now - g_use.checked >= 2) {
++    g_use.checked = now;
++    int fd = open((g_use.dir + "/.sweep").c_str(), O_RDONLY | O_CLOEXEC);
++    SweepRecord rec;
++    if (fd >= 0) {
++      if (ReadSweep(fd, &rec) && rec.when != g_use.when) {
++        g_use.total = rec.total;
++        g_use.when = rec.when;
++        g_use.written = 0;
++      }
++      close(fd);
++    }
++  }
++  const int64_t share = std::max<int64_t>(scan->cache_limit / 512, int64_t{16} << 20);
++  bytes = (bytes + 4095) / 4096 * 4096;
++  if ((g_use.total < 0 || g_use.written >= share) && !g_use.sweeping) {
++    g_use.sweeping = true;
++    const std::string dir = g_use.dir;
++    lock.unlock();
++    SweepRecord rec;
++    const bool known = TrySweep(dir, scan->cache_limit, &rec);
++    lock.lock();
++    g_use.sweeping = false;
++    if (known && g_use.dir == dir && rec.when != g_use.when) {
++      g_use.total = rec.total;
++      g_use.when = rec.when;
++      g_use.written = 0;
++    }
++  }
++  if (g_use.total < 0 || g_use.total + g_use.written + bytes > scan->cache_limit)
++    return false;
++  g_use.written += bytes;
++  return true;
+ }
+ 
++// Marks micro-partition directory 'key' used, once a minute at most.
++void TouchKey(const std::string &key) {
++  struct stat st;
++  if (stat(key.c_str(), &st) == 0 && st.st_mtime < NowSeconds() - 60)
++    utimensat(AT_FDCWD, key.c_str(), nullptr, 0);
++}
++
++// Column 'st' as it is to be read from cache entry 'entry', which
++// CheckColumn found fit for a group of 'rows' rows.
++void SetCached(ColState &st, const char *entry, size_t rows) {
++  auto h = reinterpret_cast<const CacheHeader *>(entry);
++  const char *p = entry + sizeof(CacheHeader);
++  st.cached = true;
++  st.col = nullptr;
++  st.bm = nullptr;
++  st.cnulls = nullptr;
++  if (h->has_nulls) {
++    st.cnulls = reinterpret_cast<const uint8_t *>(p);
++    p += Pad8(rows);
++  }
++  st.coffs = nullptr;
++  st.cwidth = h->stored;
++  if (h->width <= 0) {
++    st.coffs = reinterpret_cast<const uint32_t *>(p);
++    p += Pad8((rows + 1) * sizeof(uint32_t));
++  }
++  st.cvals = p;
++}
++
++// The cache entry of column 'st' (decoded by PAX) of a group of 'rows'
++// rows at 'row_offset' in its file, or false when it is not cached.
++bool BuildEntry(const ColState &st, size_t rows, size_t row_offset,
++                std::vector<char> &out) {
++  CacheHeader h{kCacheMagic, rows, row_offset, st.width, st.width, 0, 0};
++  std::vector<uint8_t> nl(rows, 0);
++  std::vector<char> vals;
++  std::vector<uint32_t> offs;
++  char err[128];
++  if (st.width > 0) {
++    const int w = st.width;
++    vals.resize(rows * w);
++    for (size_t r = 0; r < rows; r++) {
++      const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
++      if (!ConvertFixed(st, r, i, vals.data() + r * w, &nl[r], err, sizeof(err)))
++        return false;
++    }
++    if (w == 16) {
++      bool narrow = true;
++      for (size_t r = 0; r < rows && narrow; r++) {
++        int64_t lo, hi;
++        std::memcpy(&lo, vals.data() + r * 16, 8);
++        std::memcpy(&hi, vals.data() + r * 16 + 8, 8);
++        narrow = hi == (lo < 0 ? -1 : 0);
++      }
++      if (narrow) {
++        for (size_t r = 0; r < rows; r++)
++          std::memmove(vals.data() + r * 8, vals.data() + r * 16, 8);
++        vals.resize(rows * 8);
++        h.stored = 8;
++      }
++    }
++  } else {
++    offs.reserve(rows + 1);
++    offs.push_back(0);
++    for (size_t r = 0; r < rows; r++) {
++      const bool present = !st.bm || st.bm->Test(static_cast<uint32>(r));
++      const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
++      if (present) {
++        if (st.vec_numeric) {
++          AppendVecNumeric(st.buf + i * 16, vals);
++        } else {
++          const struct varlena *v = reinterpret_cast<const struct varlena *>(
++              DatumGetPointer(st.col->GetDatum(i)));
++          if (VARATT_IS_EXTERNAL(v) || VARATT_IS_COMPRESSED(v)) return false;
++          vals.insert(vals.end(), VARDATA_ANY(v),
++                      VARDATA_ANY(v) + VARSIZE_ANY_EXHDR(v));
++        }
++      } else {
++        nl[r] = 1;
++      }
++      // chunks of the group are handed out in place: int32 offsets
++      if (vals.size() >= (size_t{1} << 30)) return false;
++      offs.push_back(static_cast<uint32_t>(vals.size()));
++    }
++  }
++  for (size_t r = 0; r < rows && !h.has_nulls; r++) h.has_nulls = nl[r];
++  out.clear();
++  Append(out, &h, 1);
++  if (h.has_nulls) {
++    Append(out, nl.data(), rows);
++    out.resize(out.size() + (8 - rows % 8) % 8, 0);
++  }
++  if (st.width <= 0) {
++    Append(out, offs.data(), offs.size());
++    out.resize(out.size() + (8 - offs.size() * 4 % 8) % 8, 0);
++  }
++  Append(out, vals.data(), vals.size());
++  return true;
++}
++
++// A header-only entry: n, g<group>, or a column's kUncacheable mark.
++std::vector<char> SmallEntry(uint64_t rows, uint64_t row_offset, int32_t width,
++                             int32_t stored) {
++  CacheHeader h{kCacheMagic, rows, row_offset, width, stored, 0, 0};
++  std::vector<char> bytes;
++  Append(bytes, &h, 1);
++  return bytes;
++}
++
++// Looks group 'g' up in the cache: its entry and those of all its columns
++// but the late ones ('maps'), or false.  Entries that do not fit are
++// removed, all of the group's: the miss rebuilds them at once.
++bool LookupGroup(const DfScan *scan, const std::string &key, size_t g,
++                 Mapped &meta, std::vector<Mapped> &maps) {
++  const std::string group_path = GroupEntry(key, g);
++  switch (meta.Open(group_path)) {
++    case Mapped::kMissing:
++      return false;
++    case Mapped::kBad:
++      DropBad(group_path);
++      return false;
++    case Mapped::kOk:
++      break;
++  }
++  if (!CheckSmall(meta, kCacheMaxRows)) {
++    DropBad(group_path);
++    return false;
++  }
++  const size_t rows = meta.header()->rows;
++  bool hit = true;
++  bool bad = false;
++  for (size_t k = 0; k < scan->cols.size() && (hit || bad); k++) {
++    if (scan->late[k]) continue;
++    const std::string path =
++        ColumnEntry(key, g, scan->cols[k], scan->widths[k], scan->scales[k]);
++    switch (maps[k].Open(path)) {
++      case Mapped::kMissing:
++        hit = false;
++        continue;
++      case Mapped::kBad:
++        DropBad(path);
++        hit = false;
++        bad = true;
++        continue;
++      case Mapped::kOk:
++        break;
++    }
++    switch (CheckColumn(maps[k], rows, scan->widths[k])) {
++      case Fit::kYes:
++        break;
++      case Fit::kUncacheable:
++        hit = false;
++        break;
++      case Fit::kNo:
++        DropBad(path);
++        hit = false;
++        bad = true;
++        break;
++    }
++  }
++  return hit;
++}
++
++// Puts the columns of group 'g' of 'rows' rows at 'row_offset', decoded
++// into 'colv', in the cache: those it lacks, then the group's entry, as far
++// as CacheAdmit lets them in.
++void FillGroup(const DfScan *scan, const std::string &key, size_t g,
++               const std::vector<pax::PaxColumn *> &colv, size_t rows,
++               size_t row_offset) {
++  if (!CacheAdmit(scan, 0)) {
++    g_cache.refused++;
++    return;
++  }
++  if (mkdir(key.c_str(), 0700) != 0 && errno != EEXIST) return;
++  std::vector<char> bytes;
++  for (size_t k = 0; k < scan->cols.size(); k++) {
++    if (scan->late[k]) continue;
++    const std::string path =
++        ColumnEntry(key, g, scan->cols[k], scan->widths[k], scan->scales[k]);
++    if (access(path.c_str(), F_OK) == 0) continue;
++    ColState st{};
++    st.width = scan->widths[k];
++    st.scale = scan->scales[k];
++    InitCol(st, colv[k], rows);
++    if (!BuildEntry(st, rows, row_offset, bytes))
++      bytes = SmallEntry(rows, row_offset, scan->widths[k], kUncacheable);
++    if (!CacheAdmit(scan, static_cast<int64_t>(bytes.size()))) {
++      g_cache.refused++;
++      return;
++    }
++    if (WriteEntry(path, bytes)) g_cache.fills++;
++  }
++  const std::string group_path = GroupEntry(key, g);
++  if (access(group_path.c_str(), F_OK) != 0 &&
++      CacheAdmit(scan, sizeof(CacheHeader)) &&
++      WriteEntry(group_path, SmallEntry(rows, row_offset, 0, 0)))
++    g_cache.fills++;
++}
++
++// The number of groups of the micro-partition of cache directory 'key':
++// from its n entry, else -1.
++int64_t CachedGroupCount(const std::string &key) {
++  const std::string path = key + "/n";
++  Mapped m;
++  switch (m.Open(path)) {
++    case Mapped::kMissing:
++      return -1;
++    case Mapped::kBad:
++      DropBad(path);
++      return -1;
++    case Mapped::kOk:
++      break;
++  }
++  if (!CheckSmall(m, kCacheMaxGroups) || m.header()->row_offset != 0) {
++    DropBad(path);
++    return -1;
++  }
++  return static_cast<int64_t>(m.header()->rows);
++}
++
++// DatafusionPaxScanApi.cache_config
++void CacheConfig(void *scan_arg, const char *dir, int64_t limit) {
++  auto scan = static_cast<DfScan *>(scan_arg);
++  scan->cache_dir.clear();
++  scan->cache_limit = 0;
++  if (dir == nullptr || dir[0] == '\0' || limit <= 0) return;
++  struct stat st;
++  if ((mkdir(dir, 0700) != 0 && errno != EEXIST) || stat(dir, &st) != 0 ||
++      !S_ISDIR(st.st_mode) || access(dir, R_OK | W_OK | X_OK) != 0) {
++    g_cache.unusable++;
++    return;
++  }
++  scan->cache_dir = dir;
++  while (scan->cache_dir.size() > 1 && scan->cache_dir.back() == '/')
++    scan->cache_dir.pop_back();
++  scan->cache_limit = limit;
++}
++
++// DatafusionPaxScanApi.cache_stats
++void CacheStats(DatafusionPaxCacheStats *out) {
++  out->hits = g_cache.hits.load();
++  out->fills = g_cache.fills.load();
++  out->bad = g_cache.bad.load();
++  out->evicted = g_cache.evicted.load();
++  out->refused = g_cache.refused.load();
++  out->unusable = g_cache.unusable.load();
++}
++
+ // Hands out rows of one decoded group, of 'nrows' rows: those 'keep' lists
+ // (positions in the group) unless 'all_kept', in chunks.  'colv' holds the
+ // group's column of each handed-out column, null for one this read does
+@@ -629,8 +1337,10 @@
+               const std::vector<pax::PaxColumn *> &colv, size_t rows,
+               const std::vector<uint32_t> &keep, bool all_kept, Ledger &ledger,
+               int64_t base, DatafusionPaxEmit emit, void *ctx, char *err,
+-              size_t errlen) {
++              size_t errlen, const std::vector<const char *> *cache) {
+   const size_t ncols = scan->cols.size();
++  // DC1: cached strings handed out in place, per column
++  std::vector<const char *> in_place(ncols, nullptr);
+   std::vector<std::vector<char>> values(ncols);
+   std::vector<std::vector<uint8_t>> nulls(ncols);
+   std::vector<std::vector<int32_t>> offsets(ncols);
+@@ -653,38 +1363,25 @@
+   for (size_t k = 0; k < ncols; k++) {
+     ColState &st = cols[k];
+     pax::PaxColumn *col = colv[k];
+-    st.active = col != nullptr;
++    const char *entry = cache ? (*cache)[k] : nullptr;
++    st.active = col != nullptr || entry != nullptr;
+     st.width = scan->widths[k];
+     st.scale = scan->scales[k];
+     if (!st.active) continue;
+-    // In the plain format only non-null values are stored, in row
+-    // order; in the vectorized format every row has a slot.  That
+-    // format keeps booleans bit-packed in memory, one bit per row,
+-    // least significant bit first; the plain format has already
+-    // decoded them to one byte per value.
+-    st.col = col;
+-    st.buf = col->GetBuffer().first;
+-    st.bm = col->GetBitmap().get();
+-    st.dense = col->GetStorageFormat() !=
+-               pax::PaxStorageFormat::kTypeStoragePorcVec;
+-    st.bits = col->GetPaxColumnTypeInMem() ==
+-              pax::PaxColumnTypeInMem::kTypeVecBitPacked;
+-    st.vec_numeric = col->GetPaxColumnTypeInMem() ==
+-                     pax::PaxColumnTypeInMem::kTypeVecDecimal;
+-    if (st.bm && st.dense) {
+-      st.index.resize(rows);
+-      uint32_t i = 0;
+-      for (size_t r = 0; r < rows; r++) {
+-        st.index[r] = i;
+-        if (st.bm->Test(static_cast<uint32>(r))) i++;
+-      }
++    size_t stored_bytes;
++    if (entry) {
++      SetCached(st, entry, rows);
++      stored_bytes = st.coffs ? st.coffs[rows] : 0;
++    } else {
++      InitCol(st, col, rows);
++      stored_bytes = col->GetBuffer().second;
+     }
+     if (st.width <= 0) {
+       // A chunk's share of the group's stored bytes, as a first guess
+       // that spares growing the chunk's bytes value by value (copies).
+       const size_t per_chunk = std::min(nkept, kChunkRows);
+       offsets[k].reserve(per_chunk + 1);
+-      values[k].reserve(col->GetBuffer().second / std::max<size_t>(rows, 1) *
++      values[k].reserve(stored_bytes / std::max<size_t>(rows, 1) *
+                         per_chunk * 5 / 4);
+     }
+     nulls[k].resize(std::min(nkept, kChunkRows));
+@@ -697,7 +1394,7 @@
+     size_t j1 = std::min(nkept, j0 + kChunkRows);
+     for (size_t k = 0; k < ncols; k++) {
+       ColState &st = cols[k];
+-      if (!st.active || st.width > 0) continue;
++      if (!st.active || st.width > 0 || st.cached) continue;
+       uint8_t *nl = nulls[k].data();
+       values[k].clear();
+       offsets[k].assign(1, 0);
+@@ -744,8 +1441,35 @@
+               values[q].resize(static_cast<size_t>(offsets[q].back()));
+             }
+           break;
++        }
++      }
++    }
++
++    // DC1: cached strings, once the chunk's end is known; all rows kept,
++    // their bytes are handed out where the cache has them
++    for (size_t k = 0; k < ncols; k++) {
++      ColState &st = cols[k];
++      in_place[k] = nullptr;
++      if (!st.active || st.width > 0 || !st.cached) continue;
++      uint8_t *nl = nulls[k].data();
++      values[k].clear();
++      offsets[k].assign(1, 0);
++      if (all_kept) {
++        const uint32_t from = st.coffs[j0];
++        for (size_t j = j0; j < j1; j++) {
++          nl[j - j0] = st.cnulls ? st.cnulls[j] : 0;
++          offsets[k].push_back(static_cast<int32_t>(st.coffs[j + 1] - from));
+         }
++        in_place[k] = st.cvals + from;
++        continue;
+       }
++      for (size_t j = j0; j < j1; j++) {
++        const size_t r = row_of(j);
++        nl[j - j0] = st.cnulls ? st.cnulls[r] : 0;
++        values[k].insert(values[k].end(), st.cvals + st.coffs[r],
++                         st.cvals + st.coffs[r + 1]);
++        offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++      }
+     }
+ 
+     auto held = [&]() {
+@@ -763,7 +1487,9 @@
+         out[k] = DatafusionPaxColumn{nullptr, nullptr, nullptr};
+         continue;
+       }
+-      out[k].values = values[k].empty() ? &kNoBytes : values[k].data();
++      out[k].values = in_place[k]          ? in_place[k]
++                      : values[k].empty() ? &kNoBytes
++                                          : values[k].data();
+       out[k].nulls = nulls[k].data();
+       out[k].offsets = offsets[k].data();
+     }
+@@ -833,19 +1559,85 @@
+       visimap_bytes = static_cast<int64_t>(len);
+     }
+ 
+-    auto read_buffer =
+-        std::make_shared<pax::DataBuffer<char>>(scan->read_buffer_size);
+-    auto reader = OpenReader(block, std::move(proj), read_buffer);
++    // DC1: the file is opened only for groups the cache misses
++    const std::string key =
++        scan->cache_dir.empty() ? "" : CacheKey(scan->cache_dir, block.file);
++    bool touched = false;
++    std::shared_ptr<pax::DataBuffer<char>> read_buffer;
++    std::unique_ptr<pax::MicroPartitionReader> reader;
++    auto open_reader = [&]() {
++      if (reader) return;
++      read_buffer = std::make_shared<pax::DataBuffer<char>>(scan->read_buffer_size);
++      reader = OpenReader(block, std::vector<bool>(proj), read_buffer);
++    };
+ 
+     // The block's groups to read are numbered 0 .. ngroups - 1; this call
+     // reads 'count' of them from 'first' (all from there if count < 0).
+-    const size_t ngroups =
+-        block.all_groups ? reader->GetGroupNums() : block.groups.size();
++    size_t ngroups = block.groups.size();
++    if (block.all_groups) {
++      const int64_t cached = key.empty() ? -1 : CachedGroupCount(key);
++      if (cached >= 0) {
++        ngroups = static_cast<size_t>(cached);
++      } else {
++        open_reader();
++        ngroups = reader->GetGroupNums();
++        if (!key.empty() && CacheAdmit(scan, sizeof(CacheHeader)) &&
++            (mkdir(key.c_str(), 0700) == 0 || errno == EEXIST) &&
++            WriteEntry(key + "/n", SmallEntry(ngroups, 0, 0, 0)))
++          g_cache.fills++;
++      }
++    }
+     const size_t from = std::min(static_cast<size_t>(std::max(first, 0)), ngroups);
+     const size_t to =
+         count < 0 ? ngroups : std::min(from + static_cast<size_t>(count), ngroups);
+     for (size_t n = from; n < to; n++) {
+       const size_t g = block.all_groups ? n : block.groups[n];
++      // DC1: every column handed out from the cache, or none
++      if (!key.empty()) {
++        Mapped meta;
++        std::vector<Mapped> maps(ncols);
++        if (LookupGroup(scan, key, g, meta, maps)) {
++          g_cache.hits++;
++          if (!touched) {
++            TouchKey(key);
++            touched = true;
++          }
++          const size_t rows = meta.header()->rows;
++          const size_t offset = meta.header()->row_offset;
++          if (locators && (index >= kLocatorBlocks || static_cast<int64_t>(g) >= kLocatorGroups ||
++                           static_cast<int64_t>(rows) > kLocatorRows)) {
++            SetError(err, errlen, "PAX read", "block, group or row beyond a row locator");
++            return -1;
++          }
++          std::vector<const char *> cache(ncols, nullptr);
++          for (size_t k = 0; k < ncols; k++)
++            if (!scan->late[k]) cache[k] = maps[k].data();
++          std::vector<uint32_t> keep;
++          bool all_kept = true;
++          if (visimap) {
++            size_t r = 0;
++            while (r < rows && !visimap->Test(static_cast<uint32>(offset + r))) r++;
++            if (r < rows) {
++              all_kept = false;
++              keep.reserve(rows);
++              for (size_t i = 0; i < rows; i++)
++                if (!visimap->Test(static_cast<uint32>(offset + i)))
++                  keep.push_back(static_cast<uint32_t>(i));
++            }
++          }
++          // the entries are mapped: counted as the decoded columns are
++          int64_t base = visimap_bytes;
++          for (size_t k = 0; k < ncols; k++) base += static_cast<int64_t>(maps[k].size());
++          const std::vector<pax::PaxColumn *> none(ncols, nullptr);
++          ledger.Set(base);
++          if (EmitGroup(scan, index, static_cast<uint32_t>(g), none, rows, keep,
++                        all_kept, ledger, base, emit, ctx, err, errlen,
++                        &cache) != 0)
++            return -1;
++          continue;
++        }
++      }
++      open_reader();
+       auto group = reader->ReadGroup(g);
+       auto &columns = *group->GetAllColumns();
+       const size_t rows = group->GetRows();
+@@ -889,10 +1681,12 @@
+         }
+       }
+       if (EmitGroup(scan, index, static_cast<uint32_t>(g), colv, rows, keep,
+-                    all_kept, ledger, base, emit, ctx, err, errlen) != 0)
++                    all_kept, ledger, base, emit, ctx, err, errlen, nullptr) != 0)
+         return -1;
++      // DC1: fill the cache with the group's columns
++      if (!key.empty()) FillGroup(scan, key, g, colv, rows, offset);
+     }
+-    reader->Close();
++    if (reader) reader->Close();
+     return 0;
+   } catch (cbdb::CException &e) {
+     SetError(err, errlen, "cannot read PAX micro-partition", e.What().c_str());
+@@ -970,7 +1764,7 @@
+         static_cast<int64_t>(read_buffer->Capacity()) + DecodedBytes(colv);
+     ledger.Set(base);
+     if (EmitGroup(scan, index, static_cast<uint32_t>(group_no), colv, nrows_group,
+-                  keep, false, ledger, base, emit, ctx, err, errlen) != 0)
++                  keep, false, ledger, base, emit, ctx, err, errlen, nullptr) != 0)
+       return -1;
+     reader->Close();
+     return 0;
+@@ -995,6 +1789,8 @@
+     BlockGroups,
+     Late,
+     ReadRows,
++    CacheConfig,
++    CacheStats,
+ };
+ 
+ }  // namespace
+--- a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
++++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
+@@ -54,7 +54,7 @@
+ extern "C" {
+ #endif
+ 
+-#define DATAFUSION_PAX_SCAN_API_VERSION 9
++#define DATAFUSION_PAX_SCAN_API_VERSION 10
+ 
+ struct List;
+ struct RelationData;
+@@ -109,6 +109,16 @@
+   int64_t groups_skipped; /* skipped by their statistics */
+ } DatafusionPaxScanInfo;
+ 
++/* What the decoded-column cache did in this process (cache_stats). */
++typedef struct DatafusionPaxCacheStats {
++  int64_t hits;     /* groups read from the cache */
++  int64_t fills;    /* entries written */
++  int64_t bad;      /* entries that did not fit what they should hold, removed */
++  int64_t evicted;  /* micro-partitions removed to keep the size limit */
++  int64_t refused;  /* groups left out: the cache was full */
++  int64_t unusable; /* scans whose cache directory could not be used */
++} DatafusionPaxCacheStats;
++
+ typedef struct DatafusionPaxScanApi {
+   uint32_t version; /* DATAFUSION_PAX_SCAN_API_VERSION */
+   /* GNU build ID of the pax.so this table was built against, in hex. */
+@@ -156,6 +166,15 @@
+                    uint32_t nrows, DatafusionPaxEmit emit,
+                    DatafusionPaxAccount account, void *ctx, char *err,
+                    size_t errlen);
++  /* Have read_block keep the groups' decoded columns in files under
++   * directory 'dir' (created if missing; relative to the working
++   * directory), up to 'limit' bytes for all processes using it, and read
++   * them from there when they are; NULL, "" or a limit <= 0: no cache.  A
++   * directory that cannot be used leaves the scan without one.  Call it
++   * before any read_block. */
++  void (*cache_config)(void *scan, const char *dir, int64_t limit);
++  /* What the cache did in this process so far.  Any thread. */
++  void (*cache_stats)(DatafusionPaxCacheStats *out);
+ } DatafusionPaxScanApi;
+ 
+ const DatafusionPaxScanApi *datafusion_pax_scan_api(void);

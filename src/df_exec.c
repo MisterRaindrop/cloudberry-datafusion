@@ -125,6 +125,8 @@ uint64		df_runs_completed = 0;
 VecQueryStats df_last_run;
 bool		df_pax_direct_read = true;
 int			df_pax_max_decoders = 0;
+char	   *df_pax_decode_cache = NULL;
+int			df_pax_decode_cache_mb = 16384;
 int			df_slice_partitions = 0;
 uint64		df_pax_direct_scans = 0;
 bool		df_last_run_pax = false;
@@ -811,6 +813,9 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("datafusion: %s", buf)));
+	/* DC1: the decoded-column cache, if one is configured */
+	reader->cache_config(scan, df_pax_decode_cache,
+						 (int64) df_pax_decode_cache_mb * 1024 * 1024);
 	reader->info(scan, &info);
 	x->pax_info.files += info.files;
 	x->pax_info.files_skipped += info.files_skipped;

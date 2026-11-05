@@ -328,7 +328,7 @@ extern bool df_translate_slice(Plan *root, const DfTails *tails, bool tuples, Df
  * access/datafusion_scan_api.h, version DF_PAX_SCAN_API_VERSION; keep the
  * two identical.
  */
-#define DF_PAX_SCAN_API_VERSION 9
+#define DF_PAX_SCAN_API_VERSION 10
 
 /* What the scan's min/max skipping did (DatafusionPaxScanInfo). */
 typedef struct DfPaxScanInfo
@@ -344,6 +344,20 @@ typedef void *(*DfPaxBegin) (Relation rel, Snapshot snapshot, List *qual,
 							 const int *scales, int ncols,
 							 char *err, size_t errlen);
 typedef int (*DfPaxNBlocks) (void *scan);
+
+/* What the decoded-column cache did in this backend (DatafusionPaxCacheStats). */
+typedef struct DfPaxCacheStats
+{
+	int64		hits;			/* groups read from the cache */
+	int64		fills;			/* entries written */
+	int64		bad;			/* entries that did not fit, removed */
+	int64		evicted;		/* micro-partitions removed for the limit */
+	int64		refused;		/* groups left out: the cache was full */
+	int64		unusable;		/* scans whose cache directory was unusable */
+} DfPaxCacheStats;
+
+typedef void (*DfPaxCacheConfig) (void *scan, const char *dir, int64 limit);
+typedef void (*DfPaxCacheStatsFn) (DfPaxCacheStats *out);
 typedef void (*DfPaxInfo) (void *scan, DfPaxScanInfo *out);
 
 typedef struct DfPaxReader
@@ -358,12 +372,17 @@ typedef struct DfPaxReader
 	VecPaxGroups block_groups;
 	VecPaxLate	late;
 	VecPaxReadRows read_rows;
+	DfPaxCacheConfig cache_config;
+	DfPaxCacheStatsFn cache_stats;
 } DfPaxReader;
 
 extern bool df_pax_direct_read;	/* GUC datafusion.pax_direct_read */
 extern int	df_pax_max_decoders;	/* GUC datafusion.pax_max_decoders */
+extern char *df_pax_decode_cache;	/* GUC datafusion.pax_decode_cache */
+extern int	df_pax_decode_cache_mb; /* GUC datafusion.pax_decode_cache_size */
 extern int	df_slice_partitions;	/* GUC datafusion.slice_partitions */
 extern const DfPaxReader *df_pax_reader_get(void);
+extern const DfPaxReader *df_pax_reader_loaded(void);
 extern uint64 df_pax_direct_scans;	/* scans read through it */
 extern bool df_last_run_pax;	/* df_last_run read PAX directly */
 extern DfPaxScanInfo df_last_pax_scan;	/* and skipped this */

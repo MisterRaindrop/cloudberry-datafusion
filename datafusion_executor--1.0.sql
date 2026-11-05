@@ -123,6 +123,21 @@ LANGUAGE C VOLATILE;
 
 REVOKE ALL ON FUNCTION datafusion_debug_last_pax() FROM PUBLIC;
 
+-- What the direct PAX reader's decoded-column cache
+-- (datafusion.pax_decode_cache) did in this backend: groups read from it,
+-- entries written, entries that did not fit and were removed,
+-- micro-partitions evicted for the size limit, groups left out while it was
+-- full, scans whose directory could not be used.  NULLs if the reader is
+-- not loaded.
+CREATE FUNCTION datafusion_debug_pax_cache(OUT hits int8, OUT fills int8, OUT bad int8,
+                                           OUT evicted int8, OUT refused int8,
+                                           OUT unusable int8)
+RETURNS record
+AS 'MODULE_PATHNAME', 'datafusion_debug_pax_cache'
+LANGUAGE C VOLATILE;
+
+REVOKE ALL ON FUNCTION datafusion_debug_pax_cache() FROM PUBLIC;
+
 -- Rows (of nrows random keys per key-type combination) that the Rust
 -- transcription of Cloudberry's distribution hash routes differently from
 -- cdbhash(); must be 0 (M7c).
