@@ -50,6 +50,13 @@ REGRESS += paxdirect
 endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
+# Level 0 of checking an engine (docs/engines.md): the regression tests'
+# rows with vec.engine = $(ENGINE) against PostgreSQL's (the null engine).
+ENGINE ?= datafusion
+.PHONY: installcheck-engine
+installcheck-engine:
+	python3 tools/engine_check.py --engine $(ENGINE) $(REGRESS)
+
 PG_CPPFLAGS = -Isrc -Iinclude
 
 CARGO ?= cargo

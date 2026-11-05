@@ -9,5 +9,7 @@
 /results/
 /regression.diffs
 /regression.out
+/results-engine/
 /log/
 /pax_build/
+__pycache__/
