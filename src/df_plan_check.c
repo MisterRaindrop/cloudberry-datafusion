@@ -7300,6 +7300,7 @@ df_slice_producers(Plan *plan)
  */
 bool		df_motion_batches = false;
 bool		df_key_filters = true;
+double		df_partial_agg_skip_ratio = 0.2;
 bool		df_cluster_collation_c = false;
 
 /*

@@ -167,9 +167,21 @@ _PG_init(void)
 							 "Once a hash join run in DataFusion has read its build side, the "
 							 "PAX scans its probe side's key comes from drop the rows whose key "
 							 "the build side does not have, before building their other columns. "
-							 "Integer and date keys of one column.",
+							 "Each integer or date key of the join gets such a filter.",
 							 &df_key_filters,
 							 true,
+							 PGC_USERSET,
+							 GUC_GPDB_NEED_SYNC,
+							 NULL, NULL, NULL);
+
+	DefineCustomRealVariable("datafusion.partial_agg_skip_ratio",
+							 "Groups per row above which a partial aggregation passes its rows on unaggregated.",
+							 "A partial aggregation run in DataFusion whose states do not cross "
+							 "a Motion checks its first rows: when they made more than this many "
+							 "groups per row, it stops aggregating and gives the final aggregation "
+							 "the rows as states.  DataFusion's own default is 0.8.",
+							 &df_partial_agg_skip_ratio,
+							 0.2, 0.0, 1.0,
 							 PGC_USERSET,
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);

@@ -56,6 +56,7 @@ use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -105,7 +106,8 @@ pub const BATCH_ROWS: usize = 8192;
 pub const PLAN_BATCH_ROWS: usize = 4096;
 
 /// SK1: groups per row in a partial aggregation's first rows above which it
-/// stops aggregating (`skip_partial_aggregation_probe_ratio_threshold`).
+/// stops aggregating (`skip_partial_aggregation_probe_ratio_threshold`),
+/// unless the spec gives `skip_partial_ratio` (datafusion.partial_agg_skip_ratio).
 pub const SKIP_PARTIAL_RATIO: f64 = 0.2;
 
 /// Batches buffered in each direction.
@@ -3573,9 +3575,14 @@ impl Query {
         // would hold as many groups as the final one, each a cache miss to
         // add: in TPC-H Q18 the partial step turned 200M rows into 50M groups
         // a segment and the final step found 0.08% of them twice.  Not when
-        // the states go through a Motion, where rows cost more.
+        // the states go through a Motion, where rows cost more.  The ratio
+        // is datafusion.partial_agg_skip_ratio.
         if !partial {
-            execution.skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_RATIO;
+            execution.skip_partial_aggregation_probe_ratio_threshold = spec
+                .get("skip_partial_ratio")
+                .and_then(Value::as_f64)
+                .filter(|r| (0.0..=1.0).contains(r))
+                .unwrap_or(SKIP_PARTIAL_RATIO);
         }
         execution.sort_spill_reservation_bytes = execution
             .sort_spill_reservation_bytes
@@ -3605,7 +3612,7 @@ impl Query {
                     physical = partial_only(physical)?;
                 }
                 if key_filters {
-                    keyfilter::plan_key_filters(&physical, &pax_tables)?;
+                    keyfilter::plan_key_filters(&physical, &pax_tables, ctx.task_ctx().memory_pool())?;
                 }
                 if let Some((scan, types, exprs)) = late_final {
                     physical = late_outputs_plan(physical, scan, types, exprs)?;
@@ -3619,7 +3626,8 @@ impl Query {
                 if let Some(route) = route {
                     // One stream per receiving route, opened on its first
                     // rows; a route without rows gets end-of-stream only.
-                    let mut writers: HashMap<u32, MotionWriter> = HashMap::new();
+                    let mut buffers =
+                        RouteBuffers::new(wire.clone(), ctx.task_ctx().memory_pool());
                     while let Some(batch) = stream.next().await {
                         let batch = batch?;
                         let n = batch.num_rows();
@@ -3646,21 +3654,14 @@ impl Query {
                                 .map(|c| take(c.as_ref(), &idx, None))
                                 .collect::<Result<Vec<_>, _>>()?;
                             let part = RecordBatch::try_new(wire.clone(), cols)?;
-                            let w = match writers.entry(r) {
-                                Entry::Occupied(e) => e.into_mut(),
-                                Entry::Vacant(e) => e.insert(MotionWriter::try_new(&wire)?),
-                            };
-                            w.write(&part)?;
-                            if let Some(bytes) = w.take_if_full() {
+                            if let Some(bytes) = buffers.write(r, &part)? {
                                 if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
                                     return Ok(());
                                 }
                             }
                         }
                     }
-                    for (r, mut w) in writers {
-                        w.finish()?;
-                        let bytes = w.take();
+                    for (r, bytes) in buffers.finish()? {
                         if out_tx.send(Ok(Out::Bytes(r as i32, bytes))).await.is_err() {
                             return Ok(());
                         }
@@ -4176,14 +4177,71 @@ impl MotionWriter {
         std::mem::take(self.w.get_mut())
     }
 
-    /// Give a route's accumulated, complete IPC messages to the main thread
-    /// only once their combined size can amortize an interconnect call.
-    fn take_if_full(&mut self) -> Option<Vec<u8>> {
-        if self.w.get_mut().len() >= MOTION_ROUTE_FLUSH_BYTES {
-            Some(self.take())
-        } else {
-            None
+    /// Bytes allocated for what `take` has not yet given.
+    fn held(&self) -> usize {
+        self.w.get_ref().capacity()
+    }
+
+    /// Bytes written that `take` has not yet given.
+    fn pending(&self) -> usize {
+        self.w.get_ref().len()
+    }
+}
+
+/// MB1: a Redistribute Motion's stream to each receiving route, its bytes
+/// held until they amount to MOTION_ROUTE_FLUSH_BYTES: a batch split among
+/// 32 receivers made messages of a few hundred bytes, an interconnect call
+/// each.  What the routes hold is reserved in the query's pool (routes x
+/// 64 KB at most); a route the pool has no room for goes at once.  Bytes do
+/// not go on a timer: sending those of routes held over 10 ms while the
+/// plan paused between batches cost TPC-H Q22 11% at SF100 (small messages
+/// again).
+struct RouteBuffers {
+    wire: SchemaRef,
+    /// each route's stream and the bytes of it reserved (its `held` once
+    /// the pool granted them)
+    writers: HashMap<u32, (MotionWriter, usize)>,
+    /// the sum of the routes' reserved bytes
+    reservation: MemoryReservation,
+}
+
+impl RouteBuffers {
+    fn new(wire: SchemaRef, pool: &Arc<dyn MemoryPool>) -> Self {
+        RouteBuffers {
+            wire,
+            writers: HashMap::new(),
+            reservation: MemoryConsumer::new("Redistribute Motion routes").register(pool),
         }
+    }
+
+    /// `part` onto route `r`'s stream (opened on its first rows, with the
+    /// schema); the route's bytes when they are to go now.
+    fn write(&mut self, r: u32, part: &RecordBatch) -> Result<Option<Vec<u8>>, DataFusionError> {
+        let (w, reserved) = match self.writers.entry(r) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert((MotionWriter::try_new(&self.wire)?, 0)),
+        };
+        w.write(part)?;
+        let held = w.held();
+        if w.pending() < MOTION_ROUTE_FLUSH_BYTES
+            && self.reservation.try_grow(held.saturating_sub(*reserved)).is_ok()
+        {
+            *reserved = held.max(*reserved);
+            return Ok(None);
+        }
+        self.reservation.shrink(std::mem::take(reserved));
+        Ok(Some(w.take()))
+    }
+
+    /// Each route's last bytes and end of stream.
+    fn finish(mut self) -> Result<Vec<(u32, Vec<u8>)>, DataFusionError> {
+        let mut out = Vec::with_capacity(self.writers.len());
+        for (r, (mut w, _)) in self.writers.drain() {
+            w.finish()?;
+            out.push((r, w.take()));
+        }
+        self.reservation.free();
+        Ok(out)
     }
 }
 
@@ -5463,30 +5521,8 @@ mod tests {
         assert_eq!(total, 1000);
     }
 
-    #[test]
-    fn motion_route_flush_preserves_stream() {
-        use datafusion::arrow::array::Int64Array;
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int64Array::from_iter_values(0..256))],
-        )
-        .unwrap();
-        let mut writer = MotionWriter::try_new(&schema).unwrap();
-        let mut pieces = Vec::new();
-        for _ in 0..50 {
-            writer.write(&batch).unwrap();
-            if let Some(bytes) = writer.take_if_full() {
-                pieces.push(bytes);
-            }
-        }
-        writer.finish().unwrap();
-        pieces.push(writer.take());
-        assert!(pieces.len() > 1, "the route must flush before its end");
-        assert!(pieces[..pieces.len() - 1]
-            .iter()
-            .all(|bytes| bytes.len() >= MOTION_ROUTE_FLUSH_BYTES));
-
+    /// The rows of one route's IPC pieces, in order, decoded as one stream.
+    fn decode_route(pieces: Vec<Vec<u8>>) -> usize {
         let mut decoder = StreamDecoder::new();
         let mut rows = 0;
         for bytes in pieces {
@@ -5501,7 +5537,55 @@ mod tests {
             }
         }
         decoder.finish().unwrap();
-        assert_eq!(rows, 50 * 256);
+        rows
+    }
+
+    fn route_batch() -> RecordBatch {
+        use datafusion::arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from_iter_values(0..256))]).unwrap()
+    }
+
+    #[test]
+    fn motion_route_flush_preserves_stream() {
+        // MB1: two routes' streams held to 64 KB pieces, reserved meanwhile
+        let batch = route_batch();
+        let pool: Arc<dyn MemoryPool> = Arc::new(TrackingPool::new(1 << 30));
+        let mut buffers = RouteBuffers::new(batch.schema(), &pool);
+        let mut pieces: HashMap<u32, Vec<Vec<u8>>> = HashMap::new();
+        for _ in 0..50 {
+            for r in [3, 7] {
+                if let Some(bytes) = buffers.write(r, &batch).unwrap() {
+                    assert!(bytes.len() >= MOTION_ROUTE_FLUSH_BYTES);
+                    pieces.entry(r).or_default().push(bytes);
+                }
+            }
+            let held: usize = buffers.writers.values().map(|(w, _)| w.held()).sum();
+            assert_eq!(pool.reserved(), held);
+        }
+        assert!(!pieces[&3].is_empty(), "the route must flush before its end");
+        for (r, bytes) in buffers.finish().unwrap() {
+            pieces.entry(r).or_default().push(bytes);
+        }
+        assert_eq!(pool.reserved(), 0);
+        for r in [3, 7] {
+            assert_eq!(decode_route(pieces.remove(&r).unwrap()), 50 * 256);
+        }
+    }
+
+    #[test]
+    fn motion_route_flush_without_room() {
+        // MB1: a pool without room sends each write at once
+        let batch = route_batch();
+        let small: Arc<dyn MemoryPool> = Arc::new(datafusion::execution::memory_pool::GreedyMemoryPool::new(1));
+        let mut buffers = RouteBuffers::new(batch.schema(), &small);
+        let mut pieces = Vec::new();
+        for _ in 0..4 {
+            pieces.push(buffers.write(0, &batch).unwrap().expect("no room: sent at once"));
+            assert_eq!(small.reserved(), 0);
+        }
+        pieces.extend(buffers.finish().unwrap().into_iter().map(|(_, b)| b));
+        assert_eq!(decode_route(pieces), 4 * 256);
     }
 
     /// MZ1: a batch mostly of strings goes compressed, one of numbers as it

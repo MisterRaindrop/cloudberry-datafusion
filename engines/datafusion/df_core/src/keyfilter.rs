@@ -65,6 +65,7 @@ use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::datatypes::{DataType, Date32Type, Int16Type, Int32Type, Int64Type};
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::common::{JoinType, NullEquality, Result};
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use datafusion::physical_plan::filter::FilterExec;
@@ -160,6 +161,14 @@ impl KeySet {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Bytes the set takes.
+    fn bytes(&self) -> usize {
+        match &self.probe {
+            Probe::Exact(e) => e.slots.len() * std::mem::size_of::<i64>(),
+            Probe::Bloom(blocks) => blocks.len() * std::mem::size_of::<[u32; 8]>(),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -279,6 +288,24 @@ struct Gather {
     /// partitions whose keys are in
     got: Vec<bool>,
     keys: Vec<i64>,
+    /// KF3: what `keys`, then the set, take, in the query's pool (none in
+    /// tests)
+    reservation: Option<MemoryReservation>,
+}
+
+impl Gather {
+    /// Whether the pool grants `bytes` in all.
+    fn reserve(&mut self, bytes: usize) -> bool {
+        self.reservation.as_mut().is_none_or(|r| r.try_resize(bytes).is_ok())
+    }
+
+    /// Lets go of the keys gathered and what they took.
+    fn clear(&mut self) {
+        self.keys = Vec::new();
+        if let Some(r) = self.reservation.as_mut() {
+            r.free();
+        }
+    }
 }
 
 impl fmt::Debug for KeyFilter {
@@ -298,12 +325,21 @@ impl KeyFilter {
             state: Mutex::new(Gather {
                 got: vec![false; partitions.max(1)],
                 keys: Vec::new(),
+                reservation: None,
             }),
             set: OnceLock::new(),
             seen: AtomicU64::new(0),
             kept: AtomicU64::new(0),
             off: AtomicBool::new(false),
         }
+    }
+
+    /// KF3: keeps what the keys and the set take reserved in `pool`; a
+    /// filter the pool has no room for is none.
+    pub fn with_pool(self, pool: &Arc<dyn MemoryPool>) -> Self {
+        self.state.lock().unwrap().reservation =
+            Some(MemoryConsumer::new("KeyFilter").register(pool));
+        self
     }
 
     /// The whole side of partition `partition`'s keys, or of all
@@ -313,15 +349,18 @@ impl KeyFilter {
             return;
         }
         let mut state = self.state.lock().unwrap();
+        // checked again under the lock: `fail` may have cleared the keys
+        if self.set.get().is_some() {
+            return;
+        }
         match partition {
             Some(p) if p < state.got.len() && !state.got[p] => state.got[p] = true,
-            Some(_) => return self.fail(),
+            Some(_) => return self.give_up(&mut state),
             None => state.got.iter_mut().for_each(|g| *g = true),
         }
         for a in keys {
             if !values(a, &mut state.keys) {
-                drop(state);
-                return self.fail();
+                return self.give_up(&mut state);
             }
         }
         if state.keys.len() > MAX_KEYS {
@@ -331,21 +370,33 @@ impl KeyFilter {
             state.keys.sort_unstable();
             state.keys.dedup();
             if state.keys.len() > MAX_KEYS / 2 {
-                state.keys = Vec::new();
-                drop(state);
-                return self.fail();
+                return self.give_up(&mut state);
             }
+        }
+        let held = state.keys.capacity() * std::mem::size_of::<i64>();
+        if !state.reserve(held) {
+            return self.give_up(&mut state);
         }
         if state.got.iter().all(|&g| g) {
             let set = KeySet::new(&state.keys);
             state.keys = Vec::new();
+            if !state.reserve(set.bytes()) {
+                return self.give_up(&mut state);
+            }
             let _ = self.set.set(Some(Arc::new(set)));
         }
     }
 
+    /// No filter, the keys gathered let go; under the lock.
+    fn give_up(&self, state: &mut Gather) {
+        state.clear();
+        let _ = self.set.set(None);
+    }
+
     /// A partition whose keys cannot be had: no filter.
     pub fn fail(&self) {
-        let _ = self.set.set(None);
+        let mut state = self.state.lock().unwrap();
+        self.give_up(&mut state);
     }
 
     /// The set, once complete and while worth checking.
@@ -552,7 +603,11 @@ fn key_column(e: &Arc<dyn PhysicalExpr>, plan: &Arc<dyn ExecutionPlan>) -> Optio
 /// its probe side's key comes from, and where AJ1 may swap its sides one of
 /// its probe side's keys over its build side's.  The scans get theirs at once.
 /// Before the plan runs.
-pub fn plan_key_filters(plan: &Arc<dyn ExecutionPlan>, tables: &PaxTables) -> Result<usize> {
+pub fn plan_key_filters(
+    plan: &Arc<dyn ExecutionPlan>,
+    tables: &PaxTables,
+    pool: &Arc<dyn MemoryPool>,
+) -> Result<usize> {
     if tables.is_empty() {
         return Ok(0);
     }
@@ -570,7 +625,7 @@ pub fn plan_key_filters(plan: &Arc<dyn ExecutionPlan>, tables: &PaxTables) -> Re
         let partitions = node.output_partitioning().partition_count();
         let mut add = |side: &Arc<dyn ExecutionPlan>, c: usize| -> Option<Arc<KeyFilter>> {
             let (scan, col) = trace(side, c, tables, &parents)?;
-            let f = Arc::new(KeyFilter::new(partitions));
+            let f = Arc::new(KeyFilter::new(partitions).with_pool(pool));
             scans
                 .entry(address(&scan))
                 .or_insert_with(|| (scan.clone(), Vec::new()))
@@ -665,6 +720,39 @@ mod tests {
         g.add(Some(0), &[ints(&[Some(1)])]);
         g.add(Some(0), &[ints(&[Some(1)])]);
         assert!(g.get().is_none());
+    }
+
+    #[test]
+    fn filters_reserve_what_they_hold() {
+        use crate::memory::TrackingPool;
+        use datafusion::execution::memory_pool::GreedyMemoryPool;
+        // KF3: keys gathered, then the set, reserved; released on failure
+        let pool: Arc<dyn MemoryPool> = Arc::new(TrackingPool::new(1 << 30));
+        let f = KeyFilter::new(2).with_pool(&pool);
+        f.add(Some(0), &[ints(&(0..20_000).map(Some).collect::<Vec<_>>())]);
+        assert!(pool.reserved() >= 20_000 * 8);
+        f.add(Some(1), &[ints(&[Some(1)])]);
+        let set = f.get().expect("a filter");
+        assert_eq!(pool.reserved(), set.bytes());
+        drop(f);
+        assert_eq!(pool.reserved(), 0);
+
+        let g = KeyFilter::new(2).with_pool(&pool);
+        g.add(Some(0), &[ints(&[Some(1), Some(2)])]);
+        assert!(pool.reserved() > 0);
+        g.fail();
+        assert_eq!(pool.reserved(), 0);
+        assert!(g.get().is_none());
+        // keys arriving after the failure stay out
+        g.add(Some(1), &[ints(&[Some(3)])]);
+        assert_eq!(pool.reserved(), 0);
+
+        // a pool without room: no filter, nothing held
+        let small: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64));
+        let h = KeyFilter::new(1).with_pool(&small);
+        h.add(None, &[ints(&(0..1000).map(Some).collect::<Vec<_>>())]);
+        assert!(h.get().is_none());
+        assert_eq!(small.reserved(), 0);
     }
 
     #[test]

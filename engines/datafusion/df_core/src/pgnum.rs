@@ -888,6 +888,8 @@ impl AggregateUDFImpl for PgSumDecimal {
             sum: i256::ZERO,
             values: 0,
             nans: 0,
+            pinfs: 0,
+            ninfs: 0,
         }))
     }
 
@@ -905,14 +907,53 @@ impl AggregateUDFImpl for PgSumDecimal {
     }
 }
 
+/// NI1: the special values a sum saw, as bits: numeric_add makes NaN of a
+/// NaN or of both infinities, an infinity of one of them (adding them to
+/// the sum as numbers made +Infinity + 1 NaN's encoding and -Infinity + 1
+/// a number).  No plan gives a sum infinities yet: a column of numeric(p, s)
+/// cannot hold them, and a sum of numeric of unknown precision stays in
+/// PostgreSQL (df_plan_check.c); the values still reach the readers'
+/// conversion, which keeps them.
+const SAW_NAN: u8 = 1;
+const SAW_PINF: u8 = 2;
+const SAW_NINF: u8 = 4;
+
+/// The special value `v` is, as a SAW_ bit; 0 for a number.
+#[inline]
+fn special_bit(v: i256) -> u8 {
+    match v {
+        NUMERIC_NAN => SAW_NAN,
+        NUMERIC_PINF => SAW_PINF,
+        NUMERIC_NINF => SAW_NINF,
+        _ => 0,
+    }
+}
+
+/// The sum of values among which were the specials `saw`, if any.
+#[inline]
+fn special_sum(saw: u8) -> Option<i256> {
+    if saw & SAW_NAN != 0 || saw & (SAW_PINF | SAW_NINF) == SAW_PINF | SAW_NINF {
+        Some(NUMERIC_NAN)
+    } else if saw & SAW_PINF != 0 {
+        Some(NUMERIC_PINF)
+    } else if saw & SAW_NINF != 0 {
+        Some(NUMERIC_NINF)
+    } else {
+        None
+    }
+}
+
 /// pg_sum_decimal of one group, or of a window frame: the values it saw
-/// and the NaNs among them are counted so that a frame can drop them.
+/// and the NaNs and infinities among them are counted so that a frame can
+/// drop them.
 #[derive(Debug)]
 struct SumDecimal {
     data_type: DataType,
     sum: i256,
     values: i64,
     nans: i64,
+    pinfs: i64,
+    ninfs: i64,
 }
 
 impl SumDecimal {
@@ -920,6 +961,10 @@ impl SumDecimal {
         for v in decimal(a)?.iter().flatten() {
             if v == NUMERIC_NAN {
                 self.nans += sign;
+            } else if v == NUMERIC_PINF {
+                self.pinfs += sign;
+            } else if v == NUMERIC_NINF {
+                self.ninfs += sign;
             } else if sign > 0 {
                 self.sum = self.sum.wrapping_add(v);
             } else {
@@ -953,7 +998,9 @@ impl Accumulator for SumDecimal {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let v = (self.values > 0).then_some(if self.nans > 0 { NUMERIC_NAN } else { self.sum });
+        let flag = |n: i64, bit: u8| if n > 0 { bit } else { 0 };
+        let saw = flag(self.nans, SAW_NAN) | flag(self.pinfs, SAW_PINF) | flag(self.ninfs, SAW_NINF);
+        let v = (self.values > 0).then(|| special_sum(saw).unwrap_or(self.sum));
         if let DataType::Decimal128(..) = self.data_type {
             let v = v
                 .map(|v| narrow_value(v).ok_or_else(beyond_digits))
@@ -981,7 +1028,8 @@ struct SumDecimalGroups {
     /// needs them (`spread`), so a group takes 17 bytes, not 50; at 50
     /// Q18's 50M groups a segment spilled
     wide: Vec<i256>,
-    nan: Vec<bool>,
+    /// NI1: the special values each group saw (SAW_ bits)
+    special: Vec<u8>,
     seen: Vec<bool>,
 }
 
@@ -992,15 +1040,15 @@ impl SumDecimalGroups {
             narrow: Vec::new(),
             narrow_rows: 0,
             wide: Vec::new(),
-            nan: Vec::new(),
+            special: Vec::new(),
             seen: Vec::new(),
         }
     }
 
-    /// Gives every group a `wide` part and a `nan` flag.
+    /// Gives every group a `wide` part and `special` bits.
     fn spread(&mut self) {
         self.wide.resize(self.narrow.len(), i256::ZERO);
-        self.nan.resize(self.narrow.len(), false);
+        self.special.resize(self.narrow.len(), 0);
     }
 
     fn add(
@@ -1042,10 +1090,9 @@ impl SumDecimalGroups {
         }
         self.spread();
         let mut one = |g: usize, v: i256| {
-            if v == NUMERIC_NAN {
-                self.nan[g] = true;
-            } else {
-                self.wide[g] = self.wide[g].wrapping_add(v);
+            match special_bit(v) {
+                0 => self.wide[g] = self.wide[g].wrapping_add(v),
+                bit => self.special[g] |= bit,
             }
             self.seen[g] = true;
         };
@@ -1098,7 +1145,9 @@ impl SumDecimalGroups {
         for (r, &g) in groups.iter().enumerate() {
             if dense || take(r) {
                 match values[r] {
-                    NARROW_NAN => self.nan[g] = true,
+                    NARROW_NAN => self.special[g] |= SAW_NAN,
+                    NARROW_PINF => self.special[g] |= SAW_PINF,
+                    NARROW_NINF => self.special[g] |= SAW_NINF,
                     v => self.wide[g] = self.wide[g].wrapping_add(i256::from_i128(v)),
                 }
                 self.seen[g] = true;
@@ -1149,14 +1198,14 @@ impl GroupsAccumulator for SumDecimalGroups {
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
         let narrow = emit_to.take_needed(&mut self.narrow);
         let wide = take_spread(emit_to, &mut self.wide);
-        let nan = take_spread(emit_to, &mut self.nan);
+        let special = take_spread(emit_to, &mut self.special);
         let seen = emit_to.take_needed(&mut self.seen);
         let wide_sum = |g: usize| wide[g].wrapping_add(i256::from_i128(narrow[g]));
         if let DataType::Decimal128(..) = self.data_type {
             // N6: within its digits (`return_type`)
             let values = (0..narrow.len())
-                .map(|g| match (nan.is_empty(), wide.is_empty()) {
-                    (false, _) if nan[g] => Some(NARROW_NAN),
+                .map(|g| match (special.is_empty(), wide.is_empty()) {
+                    (false, _) if special[g] != 0 => special_sum(special[g]).and_then(narrow_value),
                     (_, true) => Some(narrow[g]).filter(|v| *v < NARROW_PINF && *v > NARROW_NINF),
                     _ => narrow_value(wide_sum(g)),
                 })
@@ -1169,8 +1218,8 @@ impl GroupsAccumulator for SumDecimalGroups {
             ));
         }
         let values: Vec<i256> = (0..narrow.len())
-            .map(|g| match (nan.is_empty(), wide.is_empty()) {
-                (false, _) if nan[g] => NUMERIC_NAN,
+            .map(|g| match (special.is_empty(), wide.is_empty()) {
+                (false, _) if special[g] != 0 => special_sum(special[g]).unwrap(),
                 (_, true) => i256::from_i128(narrow[g]),
                 _ => wide_sum(g),
             })
@@ -1220,7 +1269,7 @@ impl GroupsAccumulator for SumDecimalGroups {
     fn size(&self) -> usize {
         self.wide.capacity() * std::mem::size_of::<i256>()
             + self.narrow.capacity() * std::mem::size_of::<i128>()
-            + self.nan.capacity()
+            + self.special.capacity()
             + self.seen.capacity()
     }
 }
@@ -2562,7 +2611,7 @@ mod tests {
         let mut g = SumDecimalGroups::new(numeric_type(2));
         let small = dec256(vec![Some(i(1)), Some(i(2)), Some(i(3))], 2);
         g.update_batch(&[small], &[0, 1, 2], None, 3).unwrap();
-        assert!(g.wide.is_empty() && g.nan.is_empty());
+        assert!(g.wide.is_empty() && g.special.is_empty());
         let out = g.evaluate(EmitTo::First(1)).unwrap();
         assert_eq!(decimal(&out).unwrap().value(0), i(1));
         let more = dec256(vec![Some(i(big)), Some(NUMERIC_NAN), Some(i(5))], 2);
@@ -2594,6 +2643,59 @@ mod tests {
         assert_eq!(out.data_type(), &t);
         assert_eq!((out.value(0), out.value(1), out.value(2)), (big, 3 + 5, NARROW_NAN));
         assert!(out.is_valid(0) && out.is_valid(2));
+    }
+
+    #[test]
+    fn sum_decimal_of_infinities() {
+        // NI1: numeric_add's infinities: +Inf + 1 = +Inf, -Inf + 1 = -Inf,
+        // +Inf + -Inf = NaN, NaN + Inf = NaN; wide and narrow, one group
+        // and many, and a frame dropping them
+        let i = |v: i128| i256::from_i128(v);
+        let cases = [
+            (vec![NUMERIC_PINF, i(1)], NUMERIC_PINF),
+            (vec![i(1), NUMERIC_NINF], NUMERIC_NINF),
+            (vec![NUMERIC_PINF, NUMERIC_NINF], NUMERIC_NAN),
+            (vec![NUMERIC_NAN, NUMERIC_PINF], NUMERIC_NAN),
+            (vec![NUMERIC_PINF, NUMERIC_PINF], NUMERIC_PINF),
+        ];
+        for (vals, want) in cases {
+            let n = vals.len();
+            let mut g = SumDecimalGroups::new(numeric_type(2));
+            g.update_batch(&[dec256(vals.iter().copied().map(Some).collect(), 2)], &vec![0; n], None, 1)
+                .unwrap();
+            assert_eq!(decimal(&g.evaluate(EmitTo::All).unwrap()).unwrap().value(0), want, "{vals:?}");
+            // narrow: Decimal128 values and sum
+            let t = DataType::Decimal128(38, 2);
+            let narrow: Vec<Option<i128>> = vals.iter().map(|&v| narrow_value(v)).collect();
+            let a: ArrayRef = Arc::new(Decimal128Array::from(narrow).with_data_type(DataType::Decimal128(18, 2)));
+            let mut g = SumDecimalGroups::new(t);
+            g.update_batch(&[a], &vec![0; n], None, 1).unwrap();
+            let out = g.evaluate(EmitTo::All).unwrap();
+            assert_eq!(Some(out.as_primitive::<Decimal128Type>().value(0)), narrow_value(want), "{vals:?}");
+            let mut a = SumDecimal {
+                data_type: numeric_type(2),
+                sum: i256::ZERO,
+                values: 0,
+                nans: 0,
+                pinfs: 0,
+                ninfs: 0,
+            };
+            a.update_batch(&[dec256(vals.iter().copied().map(Some).collect(), 2)]).unwrap();
+            assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(want), 76, 2), "{vals:?}");
+        }
+        // a frame: +Inf in it, then out of it
+        let mut a = SumDecimal {
+            data_type: numeric_type(2),
+            sum: i256::ZERO,
+            values: 0,
+            nans: 0,
+            pinfs: 0,
+            ninfs: 0,
+        };
+        a.update_batch(&[dec256(vec![Some(NUMERIC_PINF), Some(i(3))], 2)]).unwrap();
+        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(NUMERIC_PINF), 76, 2));
+        a.retract_batch(&[dec256(vec![Some(NUMERIC_PINF)], 2)]).unwrap();
+        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(i(3)), 76, 2));
     }
 
     #[test]
@@ -2649,6 +2751,8 @@ mod tests {
             sum: i256::ZERO,
             values: 0,
             nans: 0,
+            pinfs: 0,
+            ninfs: 0,
         };
         assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(None, 76, 2));
         a.update_batch(&[dec256(vec![Some(i(1)), Some(NUMERIC_NAN), Some(i(2))], 2)])
