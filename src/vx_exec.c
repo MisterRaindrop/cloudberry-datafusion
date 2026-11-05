@@ -970,6 +970,7 @@ vx_exec_begin(VxExec *x)
 	args.pax_groups = reader ? reader->block_groups : NULL;
 	args.pax_max_readers = (uint32_t) vx_pax_max_decoders;
 	args.pax_late = reader ? reader->late : NULL;
+	args.engine_options = vx_engine_options ? vx_engine_options : "";
 	args.pax_read_rows = reader ? reader->read_rows : NULL;
 
 	/* From here on the query owns the PAX scans, even if this fails. */

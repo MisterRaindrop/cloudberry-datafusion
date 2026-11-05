@@ -38,6 +38,7 @@
 PG_MODULE_MAGIC;
 
 char	   *vx_engine_name = NULL;
+char	   *vx_engine_options = NULL;
 int			vx_debug_features_off = 0;
 int			vx_debug_result_offset = 0;
 
@@ -188,29 +189,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
-	DefineCustomBoolVariable("vec.key_filters",
-							 "Lets a hash join's build side filter the PAX scans of its probe side.",
-							 "Once a hash join run in the engine has read its build side, the "
-							 "PAX scans its probe side's key comes from drop the rows whose key "
-							 "the build side does not have, before building their other columns. "
-							 "Each integer or date key of the join gets such a filter.",
-							 &vx_key_filters,
-							 true,
-							 PGC_USERSET,
-							 GUC_GPDB_NEED_SYNC,
-							 NULL, NULL, NULL);
-
-	DefineCustomRealVariable("vec.partial_agg_skip_ratio",
-							 "Groups per row above which a partial aggregation passes its rows on unaggregated.",
-							 "A partial aggregation run in DataFusion whose states do not cross "
-							 "a Motion checks its first rows: when they made more than this many "
-							 "groups per row, it stops aggregating and gives the final aggregation "
-							 "the rows as states.  DataFusion's own default is 0.8.",
-							 &vx_partial_agg_skip_ratio,
-							 0.2, 0.0, 1.0,
-							 PGC_USERSET,
-							 GUC_GPDB_NEED_SYNC,
-							 NULL, NULL, NULL);
+	DefineCustomStringVariable("vec.engine_options",
+							   "Settings of the engine, passed to it as they are.",
+							   "A list name=value, ... that the engine reads; the host does "
+							   "not.  An option the engine does not know fails the query.  "
+							   "DataFusion's: key_filters (on, off; on by default: a hash "
+							   "join's build side filters the PAX scans of its probe side) "
+							   "and partial_agg_skip_ratio (0 to 1, 0.2 by default: groups "
+							   "per row above which a partial aggregation passes its rows "
+							   "on unaggregated).",
+							   &vx_engine_options,
+							   "",
+							   PGC_USERSET,
+							   GUC_GPDB_NEED_SYNC,
+							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("vec.motion_batches",
 							 "Experimental: send Arrow batches through Gather Motions between engine slices.",

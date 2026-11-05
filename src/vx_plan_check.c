@@ -7301,8 +7301,6 @@ vx_slice_producers(Plan *plan)
  * ---------------------------------------------------------------------
  */
 bool		vx_motion_batches = false;
-bool		vx_key_filters = true;
-double		vx_partial_agg_skip_ratio = 0.2;
 bool		vx_cluster_collation_c = false;
 
 /*

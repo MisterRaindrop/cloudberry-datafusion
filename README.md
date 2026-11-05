@@ -2187,6 +2187,18 @@ version.  Two settings exist for the tests only:
 missing, and `vec.debug_result_offset` has an engine with test
 functions give its result batches at an offset.
 
+An engine's own settings are not the host's: `vec.engine_options`, a list
+`name=value, ...` that the host passes to `query_start` unread (engine ABI
+6), and the engine fails the query on a name or value it does not take.
+DataFusion's are `key_filters` (on by default: KF1, a hash join's build
+side filters its probe side's PAX scans) and `partial_agg_skip_ratio`
+(0.2 by default: SK1, the groups per row above which a partial
+aggregation passes its rows on as they are).  They were the GUCs
+`datafusion.key_filters` and `datafusion.partial_agg_skip_ratio`.
+
+`docs/engines.md` is for whoever adds a second engine: what the host
+still assumes of DataFusion, and the designs for changing it.
+
 ## License
 
 Apache License 2.0. See `LICENSE`.

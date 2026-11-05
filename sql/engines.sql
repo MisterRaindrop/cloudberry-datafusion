@@ -81,6 +81,17 @@ SET vec.debug_features_off = 1;	-- any slice
 EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_en GROUP BY d;
 RESET vec.debug_features_off;
 
+-- Engine options (vec.engine_options) reach the engine as they are:
+-- DataFusion takes key_filters and partial_agg_skip_ratio, and fails the
+-- query on an unknown name or a bad value.
+SET vec.engine_options = 'key_filters=off, partial_agg_skip_ratio=0.5';
+SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w ORDER BY w;
+SET vec.engine_options = 'key_filter=off';
+SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w ORDER BY w;
+SET vec.engine_options = 'partial_agg_skip_ratio=2';
+SELECT count(*) FROM df_en;
+RESET vec.engine_options;
+
 -- Result batches at an offset: bitmaps, strings and values read from
 -- there.  Each query runs with vec.mode off, then on.
 SET vec.debug_result_offset = 3;

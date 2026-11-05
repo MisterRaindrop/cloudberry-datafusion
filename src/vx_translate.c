@@ -4238,11 +4238,8 @@ vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *s
 		}
 		spec->batch_rows = Min(VX_BATCH_MAX_ROWS,
 							   Max(VX_BATCH_MIN_ROWS, VX_BATCH_BYTES / Max(vx_slice_width(root), 1)));
-		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d%s,"
-						 "\"skip_partial_ratio\":%.17g}",
-						 node.data, outputs.data, sortlimit.data, spec->batch_rows,
-						 vx_key_filters ? "" : ",\"key_filters\":false",
-						 vx_partial_agg_skip_ratio);
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d}",
+						 node.data, outputs.data, sortlimit.data, spec->batch_rows);
 	}
 
 	spec->json = json.data;

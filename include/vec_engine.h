@@ -57,7 +57,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	5
+#define VEC_ENGINE_ABI	6
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -217,6 +217,13 @@ typedef struct VecQueryArgs
 	/* NULL, or what reads a PAX input's columns after a Limit (LT1) */
 	VecPaxLate	pax_late;
 	VecPaxReadRows pax_read_rows;
+
+	/*
+	 * vec.engine_options as the user set it, "" by default: the engine's own
+	 * settings, "name=value, ..." by convention.  The host does not read
+	 * them; the engine fails the query (22023) on one it does not know.
+	 */
+	const char *engine_options;
 } VecQueryArgs;
 
 /* Memory and spill figures of a query, for EXPLAIN ANALYZE. */

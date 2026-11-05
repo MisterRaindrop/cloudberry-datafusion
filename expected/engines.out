@@ -75,7 +75,7 @@ ERROR:  vec_executor: engine null has no test functions
 \c
 SET vec.engine = 'null_abi1';
 SELECT vec_version();
-ERROR:  vec_executor: engine "null_abi1" speaks ABI version 1, this extension 5
+ERROR:  vec_executor: engine "null_abi1" speaks ABI version 1, this extension 6
 HINT:  Install the engine built with this extension.
 -- DataFusion without one feature: what needs it stays on PostgreSQL, the
 -- rest still runs in DataFusion.
@@ -307,6 +307,26 @@ EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_en GROUP BY d;
 (12 rows)
 
 RESET vec.debug_features_off;
+-- Engine options (vec.engine_options) reach the engine as they are:
+-- DataFusion takes key_filters and partial_agg_skip_ratio, and fails the
+-- query on an unknown name or a bad value.
+SET vec.engine_options = 'key_filters=off, partial_agg_skip_ratio=0.5';
+SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w ORDER BY w;
+ w  | count 
+----+-------
+ w0 |   143
+ w1 |   143
+ w2 |   143
+(3 rows)
+
+SET vec.engine_options = 'key_filter=off';
+SELECT w, count(*) FROM df_en JOIN df_en2 USING (a) GROUP BY w ORDER BY w;
+ERROR:  unrecognized engine option "key_filter"  (seg0 slice1 172.17.0.2:40000 pid=30524)
+DETAIL:  The DataFusion engine takes key_filters and partial_agg_skip_ratio.
+SET vec.engine_options = 'partial_agg_skip_ratio=2';
+SELECT count(*) FROM df_en;
+ERROR:  invalid value for engine option "partial_agg_skip_ratio": "2"
+RESET vec.engine_options;
 -- Result batches at an offset: bitmaps, strings and values read from
 -- there.  Each query runs with vec.mode off, then on.
 SET vec.debug_result_offset = 3;

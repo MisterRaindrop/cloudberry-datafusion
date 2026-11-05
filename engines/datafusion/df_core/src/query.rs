@@ -107,8 +107,69 @@ pub const PLAN_BATCH_ROWS: usize = 4096;
 
 /// SK1: groups per row in a partial aggregation's first rows above which it
 /// stops aggregating (`skip_partial_aggregation_probe_ratio_threshold`),
-/// unless the spec gives `skip_partial_ratio` (vec.partial_agg_skip_ratio).
+/// unless the engine options give `partial_agg_skip_ratio`.
 pub const SKIP_PARTIAL_RATIO: f64 = 0.2;
+
+/// The engine's options, from `vec.engine_options` (`name=value, ...`),
+/// which the host passes through without reading them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Options {
+    /// KF1: joins' build sides filter their probe sides' PAX scans.
+    pub key_filters: bool,
+    /// SK1: see SKIP_PARTIAL_RATIO.
+    pub partial_agg_skip_ratio: f64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { key_filters: true, partial_agg_skip_ratio: SKIP_PARTIAL_RATIO }
+    }
+}
+
+impl Options {
+    /// Parse `text`: entries `name=value` separated by commas, blanks around
+    /// either ignored.  An unknown name or a bad value is an error
+    /// (22023), so that a misspelled option does not go unnoticed.
+    pub fn parse(text: &str) -> Result<Options, PgError> {
+        const INVALID: &str = "22023";
+        let mut o = Options::default();
+        for entry in text.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            let (name, value) = entry
+                .split_once('=')
+                .map(|(n, v)| (n.trim(), v.trim()))
+                .ok_or_else(|| {
+                    PgError::new(INVALID, format!("engine option \"{entry}\" has no value"))
+                })?;
+            let bad = || {
+                PgError::new(INVALID, format!("invalid value for engine option \"{name}\": \"{value}\""))
+            };
+            match name {
+                "key_filters" => {
+                    o.key_filters = match value.to_ascii_lowercase().as_str() {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        _ => return Err(bad()),
+                    }
+                }
+                "partial_agg_skip_ratio" => {
+                    o.partial_agg_skip_ratio = value
+                        .parse::<f64>()
+                        .ok()
+                        .filter(|r| (0.0..=1.0).contains(r))
+                        .ok_or_else(bad)?
+                }
+                _ => {
+                    return Err(PgError::new(
+                        INVALID,
+                        format!("unrecognized engine option \"{name}\""),
+                    )
+                    .with_detail("The DataFusion engine takes key_filters and partial_agg_skip_ratio."))
+                }
+            }
+        }
+        Ok(o)
+    }
+}
 
 /// Batches buffered in each direction.
 const CHANNEL_DEPTH: usize = 4;
@@ -3106,6 +3167,27 @@ impl Query {
         sources: Vec<Source>,
         ipc_output: bool,
     ) -> Result<Query, PgError> {
+        Self::start_options(
+            spec,
+            partitions,
+            memory_limit,
+            spill_dir,
+            sources,
+            ipc_output,
+            &Options::default(),
+        )
+    }
+
+    /// Like `start_multi`, under the engine options `options`.
+    pub fn start_options(
+        spec: &str,
+        partitions: usize,
+        memory_limit: usize,
+        spill_dir: &str,
+        sources: Vec<Source>,
+        ipc_output: bool,
+        options: &Options,
+    ) -> Result<Query, PgError> {
         let handle = runtime::handle()
             .ok_or_else(|| PgError::internal("the DataFusion runtime is not running"))?;
         let spec: Value = serde_json::from_str(spec)
@@ -3548,7 +3630,7 @@ impl Query {
             .with_target_partitions(partitions)
             .with_batch_size(batch_rows);
         // KF1: joins' build sides filter their probe sides' PAX scans
-        let key_filters = spec.get("key_filters").and_then(Value::as_bool).unwrap_or(true);
+        let key_filters = options.key_filters;
         // The inputs are fed one after the other, each to its end, in the
         // order PostgreSQL's plan reads them: a join's build side (its Hash
         // side) first.  DataFusion must not swap a join's sides by its
@@ -3576,13 +3658,9 @@ impl Query {
         // add: in TPC-H Q18 the partial step turned 200M rows into 50M groups
         // a segment and the final step found 0.08% of them twice.  Not when
         // the states go through a Motion, where rows cost more.  The ratio
-        // is vec.partial_agg_skip_ratio.
+        // is the engine option partial_agg_skip_ratio.
         if !partial {
-            execution.skip_partial_aggregation_probe_ratio_threshold = spec
-                .get("skip_partial_ratio")
-                .and_then(Value::as_f64)
-                .filter(|r| (0.0..=1.0).contains(r))
-                .unwrap_or(SKIP_PARTIAL_RATIO);
+            execution.skip_partial_aggregation_probe_ratio_threshold = options.partial_agg_skip_ratio;
         }
         execution.sort_spill_reservation_bytes = execution
             .sort_spill_reservation_bytes
@@ -5968,12 +6046,21 @@ mod tests {
         sources: Vec<Source>,
         pushed: Option<Vec<Vec<i32>>>,
         partitions: usize,
+        key_filters: bool,
     ) -> (i64, QueryStats) {
         runtime::init(2).unwrap();
         let dir = std::env::temp_dir();
-        let mut q =
-            Query::start_multi(spec, partitions, 64 << 20, dir.to_str().unwrap(), sources, false)
-                .unwrap();
+        let options = Options { key_filters, ..Options::default() };
+        let mut q = Query::start_options(
+            spec,
+            partitions,
+            64 << 20,
+            dir.to_str().unwrap(),
+            sources,
+            false,
+            &options,
+        )
+        .unwrap();
         if let Some(keys) = pushed {
             let n = keys[0].len();
             let nulls = vec![0u8; n];
@@ -6002,6 +6089,26 @@ mod tests {
         (count.unwrap(), q.stats())
     }
 
+    /// Engine options: names and values as `vec.engine_options` gives
+    /// them; an unknown name or a bad value fails, so that a typo shows.
+    #[test]
+    fn engine_options_parse() {
+        assert_eq!(Options::parse("").unwrap(), Options::default());
+        let o = Options::parse(" key_filters = off , partial_agg_skip_ratio=0.5 ").unwrap();
+        assert!(!o.key_filters);
+        assert_eq!(o.partial_agg_skip_ratio, 0.5);
+        assert!(Options::parse("key_filters=ON").unwrap().key_filters);
+        for (text, message) in [
+            ("key_filter=off", "unrecognized engine option \"key_filter\""),
+            ("key_filters", "engine option \"key_filters\" has no value"),
+            ("key_filters=maybe", "invalid value for engine option \"key_filters\": \"maybe\""),
+            ("partial_agg_skip_ratio=1.5", "invalid value for engine option \"partial_agg_skip_ratio\": \"1.5\""),
+        ] {
+            let e = Options::parse(text).unwrap_err();
+            assert_eq!((e.sqlstate, e.message.as_str()), ("22023", message), "{text}");
+        }
+    }
+
     /// KF1: a small build side's keys filter its probe side's PAX scan
     /// before any of its rows is joined; the join's rows are the same.  The
     /// fake scan's 2000 rows are 0..1999, every tenth from 3 NULL: 7, 42 and
@@ -6015,7 +6122,7 @@ mod tests {
                     "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
                         "on":[[{{"col":0}},{{"col":0,"input":1}}]],"filter":null}}}},
                         "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
                 );
                 let fake = FakeScan::default();
                 let scan = PaxScan::new(
@@ -6030,6 +6137,7 @@ mod tests {
                     vec![Source::Pushed, Source::Pax(scan)],
                     Some(vec![vec![7, 42, 1003, 1500, 5000]]),
                     partitions,
+                    on,
                 );
                 assert_eq!(count, 3, "partitions {partitions} filters {on}");
                 let figures = (stats.key_rows_checked, stats.key_rows_kept);
@@ -6051,7 +6159,7 @@ mod tests {
                     "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
                         "on":[[{{"col":0}},{{"col":0,"input":1}}],[{{"col":1}},{{"col":0,"input":1}}]],"filter":null}}}},
                         "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
                 );
                 let fake = FakeScan::default();
                 let scan = PaxScan::new(
@@ -6069,6 +6177,7 @@ mod tests {
                         vec![7, 42, 1003, 1500, 5000, 9, 100],
                     ]),
                     partitions,
+                    on,
                 );
                 assert_eq!(count, 3, "partitions {partitions} filters {on}");
                 // the first filter checks 2000 rows and keeps 7, 8, 10, 42 and
@@ -6102,7 +6211,7 @@ mod tests {
                         "plan":{{"aggregate":{{"input":{{"join":{{"type":"{kind}","left":{{"input":0}},"right":{{"input":1}},
                             "on":[[{{"col":0}},{{"col":0,"input":1}}]],"filter":null}}}},
                             "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                        "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                        "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
                     );
                     let fake = FakeScan::default();
                     let scan = PaxScan::new(
@@ -6117,6 +6226,7 @@ mod tests {
                         vec![Source::Pushed, Source::Pax(scan)],
                         Some(vec![vec![7, 42, 1003, 1500, 5000]]),
                         partitions,
+                        on,
                     );
                     let what = format!("{kind} partitions {partitions} filters {on}");
                     assert_eq!(count, rows, "{what}");
@@ -6140,7 +6250,7 @@ mod tests {
                             "aggs":[],"having":null,"name":"s"}}}},
                         "on":[[{{"col":0}},{{"name":"s_g0"}}]],"filter":null}}}},
                         "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}],"key_filters":{on}}}"#
+                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
                 );
                 let (big, small) = (FakeScan::default(), FakeScan::default());
                 let scan = |f: &FakeScan, n| {
@@ -6151,6 +6261,7 @@ mod tests {
                     vec![Source::Pax(scan(&big, 200)), Source::Pax(scan(&small, 1))],
                     None,
                     partitions,
+                    on,
                 );
                 assert_eq!(count, 9, "partitions {partitions} filters {on}");
                 let (checked, kept) = (stats.key_rows_checked, stats.key_rows_kept);

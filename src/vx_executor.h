@@ -62,6 +62,8 @@ extern int	vx_worker_threads;
 
 /* GUC vec.engine */
 extern char *vx_engine_name;
+/* GUC vec.engine_options, passed to the engine as it is */
+extern char *vx_engine_options;
 
 /* GUCs vec.debug_features_off, vec.debug_result_offset */
 extern int	vx_debug_features_off;
@@ -389,8 +391,6 @@ extern VxPaxScanInfo vx_last_pax_scan;	/* and skipped this */
 
 /* M7b: Gather Motions between DataFusion slices carry Arrow IPC batches */
 extern bool vx_motion_batches;	/* GUC vec.motion_batches */
-extern bool vx_key_filters;		/* GUC vec.key_filters */
-extern double vx_partial_agg_skip_ratio;	/* GUC vec.partial_agg_skip_ratio */
 extern bool vx_cluster_collation_c;	/* GUC vec.cluster_collation_c */
 extern void vx_sync_cluster_collation(void);
 extern bool vx_motion_sends_batches(PlannedStmt *stmt, Motion *motion);

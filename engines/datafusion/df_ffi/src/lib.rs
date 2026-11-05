@@ -44,7 +44,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `include/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 5;
+pub const VEC_ENGINE_ABI: u32 = 6;
 
 /// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
@@ -296,6 +296,7 @@ pub struct VecQueryArgs {
     pub pax_max_readers: u32,
     pub pax_late: Option<df_core::query::PaxLateFn>,
     pub pax_read_rows: Option<df_core::query::PaxRowsFn>,
+    pub engine_options: *const c_char,
 }
 
 /// Build the plan `args.ir` describes, its inputs' batches laid out as
@@ -308,7 +309,8 @@ pub struct VecQueryArgs {
 /// gives it a PAX scan, which the workers read with `pax_read`, `pax_end`
 /// and `pax_groups`, at most `pax_max_readers` groups at once (0: no
 /// limit), and which the query owns from the call on, even if it fails.
-/// The runtime must be running.  Writes the struct schema of the result
+/// `engine_options` (null or `name=value, ...`) are DataFusion's options
+/// (`df_core::query::Options`).  The runtime must be running.  Writes the struct schema of the result
 /// batches to `*out_schema`, the caller's to release.
 extern "C" fn query_start(
     args: *const VecQueryArgs,
@@ -345,13 +347,20 @@ extern "C" fn query_start(
         // SAFETY: the caller passes NUL-terminated strings.
         let ir = unsafe { CStr::from_ptr(a.ir) }.to_string_lossy();
         let dir = unsafe { CStr::from_ptr(a.spill_dir) }.to_string_lossy();
-        let q = df_core::query::Query::start_multi(
+        let options = if a.engine_options.is_null() {
+            df_core::query::Options::default()
+        } else {
+            // SAFETY: as above.
+            df_core::query::Options::parse(&unsafe { CStr::from_ptr(a.engine_options) }.to_string_lossy())?
+        };
+        let q = df_core::query::Query::start_options(
             &ir,
             a.partitions as usize,
             a.memory_limit as usize,
             &dir,
             sources,
             a.flags & VEC_QUERY_IPC_OUTPUT != 0,
+            &options,
         )?;
         for j in 0..a.ninputs as usize {
             // SAFETY: `input_schemas` holds `ninputs` schemas.
@@ -922,6 +931,7 @@ mod tests {
             pax_max_readers: 0,
             pax_late: None,
             pax_read_rows: None,
+            engine_options: std::ptr::null(),
         };
         let mut out_schema = FFI_ArrowSchema::empty();
         let mut q = std::ptr::null_mut();
