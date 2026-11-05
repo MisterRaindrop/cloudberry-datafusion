@@ -89,8 +89,8 @@ _PG_init(void)
 	DefineCustomEnumVariable("datafusion.join_estimates",
 							 "How a hash join's build side size is checked.",
 							 "spill: not at all, the join spills what does not fit "
-							 "(except a NOT IN anti join, checked as with trusted).  With "
-							 "DataFusion's own hash join, which cannot spill, a slice "
+							 "(except a NOT IN anti join, checked as with trusted).  The "
+							 "others check as if the join could not spill: a slice "
 							 "whose build side may outgrow its budget stays on "
 							 "PostgreSQL.  trusted: by the planner's estimate.  bounded: "
 							 "a build side coming from a join may hold as many rows as "

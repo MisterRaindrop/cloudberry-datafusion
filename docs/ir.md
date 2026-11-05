@@ -47,6 +47,7 @@ not know; it must not skip it.
   "limit":  {"skip": n, "fetch": m},       optional
   "batch_rows": n,                         optional
   "key_filters": b,                        optional
+  "skip_partial_ratio": r,                 optional
   "trim":   [k, ...],                      optional, Motion senders only
   "narrow": [[k, digits], ...],            optional, Motion senders only
   "route":  <route> }                      optional, Motion senders only
@@ -66,6 +67,12 @@ not know; it must not skip it.
 - `key_filters`: false keeps a hash join's build side from filtering the
   scans of its probe side (the reference reader's KF1, on by default); a
   hint that changes no row.
+- `skip_partial_ratio`: for an engine that splits an aggregate into a
+  partial and a final step of its own, the groups per row, from 0 to 1, of
+  the partial step's first rows above which it stops aggregating and passes
+  rows on as they are (the reference reader's SK1, 0.2 without it;
+  `datafusion.partial_agg_skip_ratio`).  Not used when the plan's top
+  aggregate is `partial`.  A hint that changes no row.
 - `trim`, `narrow`, `route`: how a slice that sends through a Motion lays
   out its Arrow IPC streams; see [Motion output](#motion-output).
 
@@ -426,7 +433,7 @@ Every member name and every value of a member that selects a kind.
 `tools/ir_keys.py` checks a corpus of plans against it.
 
 ```catalog
-member ir inputs plan output sort limit batch_rows trim narrow route
+member ir inputs plan output sort limit batch_rows key_filters skip_partial_ratio trim narrow route
 member columns type motion_columns motion_pad motion_narrow set
 member input filter pred aggregate group aggs having name sets partial
 member fn arg arg2 distinct collate

@@ -3921,8 +3921,10 @@ df_hash_estimate(Plan *hash)
  * join, and the most rows the planner expects of any node.  A join's own
  * estimate is the one to doubt: TPC-H Q9 at scale factor 10 builds a hash
  * table on partsupp joined with lineitem, estimated at 40 rows, while it
- * holds about a million per segment, and DataFusion's hash join cannot
- * spill.
+ * holds about a million per segment.  Only datafusion.join_estimates other
+ * than 'spill' asks this: they check a build side as if the join could not
+ * spill, which was so before SHJ (spilljoin.rs) and still is for a NOT IN
+ * anti join.
  */
 static void
 df_build_inputs(Plan *plan, bool *join, double *rows)
