@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# The DataFusion engine of the datafusion_executor extension.  Built by
+# The DataFusion engine of the vec_executor extension.  Built by
 # ../../Makefile: df_ffi becomes vec_engine_datafusion.so, which the
 # extension opens at run time.
 

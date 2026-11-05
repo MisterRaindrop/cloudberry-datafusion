@@ -17,7 +17,7 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_exec.c
+ * vx_exec.c
  *	  Run a slice in DataFusion behind PostgreSQL's executor interface.
  *
  * The slice's top PlanState keeps its place in the executor; only its
@@ -29,20 +29,20 @@
  *   - the main thread scans the table (heap, AO, AOCS or PAX) through the
  *     table AM interface with the query's snapshot, or pulls the rows a
  *     receiving Motion gets from another slice (M7a), and packs the needed
- *     columns into batches of DF_BATCH_ROWS rows;
+ *     columns into batches of VX_BATCH_ROWS rows;
  *   - batches go to DataFusion through a bounded queue, which filters and
  *     aggregates them on the runtime's threads;
  *   - result batches come back and are handed out one row at a time.
  *
  * Between two DataFusion slices a Gather Motion carries Arrow IPC batches
- * instead of tuples (M7b, datafusion.motion_batches; df_motion_sends_batches
+ * instead of tuples (M7b, vec.motion_batches; vx_motion_sends_batches
  * decides).  The sending slice then runs in place of the Motion node: the
  * workers encode the results, and the main thread cuts the bytes into
  * tuple chunks of a type of its own and sends them, then end-of-stream.
  * The receiving slice takes the chunks straight from the interconnect,
  * hands their bytes to the workers to decode, and keeps the motion layer's
  * end-of-stream accounting the way cdbmotion.c does for an unordered
- * receiver.  Each stream starts with DF_BATCH_MAGIC and the Motion's
+ * receiver.  Each stream starts with VX_BATCH_MAGIC and the Motion's
  * signature, which the receiver checks.
  *
  * The scan descriptor is installed in the Seq Scan node, so ExecEndSeqScan
@@ -59,11 +59,11 @@
  *     hash aggregation spills to this backend's temporary directory instead
  *     of growing past it;
  *   - everything Rust allocates is leased from the vmem tracker between
- *     waits (df_vmem_sync), so per-query and segment memory limits apply;
+ *     waits (vx_vmem_sync), so per-query and segment memory limits apply;
  *   - the peak and the spill volume go into the top node's Instrumentation
  *     and, for EXPLAIN ANALYZE, onto a DataFusion line.
  *
- * src/df_exec.c
+ * src/vx_exec.c
  *
  *-------------------------------------------------------------------------
  */
@@ -92,60 +92,60 @@
 #include "utils/numeric.h"
 #include "utils/snapmgr.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
 /* Rows per input batch; matches df_core::query::BATCH_ROWS. */
-#define DF_BATCH_ROWS		8192
+#define VX_BATCH_ROWS		8192
 /*
  * A batch also ends once one of its string columns holds this many bytes,
  * for rows much wider than the planner expected.
  */
-#define DF_BATCH_STRING_BYTES	(4 * 1024 * 1024)
+#define VX_BATCH_STRING_BYTES	(4 * 1024 * 1024)
 
 /* Wait for results this long when there is nothing else to do. */
-#define DF_POLL_IDLE_MS		10
+#define VX_POLL_IDLE_MS		10
 
 /* Wait this long when the input queue was full. */
-#define DF_POLL_FULL_MS		1
+#define VX_POLL_FULL_MS		1
 
 /*
  * Tuple-chunk type of Arrow IPC bytes (M7b), outside PostgreSQL's
  * TupleChunkType range so that its receiver rejects them.
  */
-#define DF_CHUNK_TYPE		0x4446
+#define VX_CHUNK_TYPE		0x4446
 
 /* What each batch stream starts with, followed by the Motion's signature. */
-#define DF_BATCH_MAGIC		"DFARROW1"
-#define DF_BATCH_HEAD		16
+#define VX_BATCH_MAGIC		"DFARROW1"
+#define VX_BATCH_HEAD		16
 
 /* The vmem lease runs ahead of Rust's heap by budget/8, at least this much. */
-#define DF_MIN_HEADROOM		(1024 * 1024)
+#define VX_MIN_HEADROOM		(1024 * 1024)
 
-uint64		df_runs_completed = 0;
-VecQueryStats df_last_run;
-bool		df_pax_direct_read = true;
-int			df_pax_max_decoders = 0;
-char	   *df_pax_decode_cache = NULL;
-int			df_pax_decode_cache_mb = 16384;
-int			df_slice_partitions = 0;
-uint64		df_pax_direct_scans = 0;
-bool		df_last_run_pax = false;
-DfPaxScanInfo df_last_pax_scan;
+uint64		vx_runs_completed = 0;
+VecQueryStats vx_last_run;
+bool		vx_pax_direct_read = true;
+int			vx_pax_max_decoders = 0;
+char	   *vx_pax_decode_cache = NULL;
+int			vx_pax_decode_cache_mb = 16384;
+int			vx_slice_partitions = 0;
+uint64		vx_pax_direct_scans = 0;
+bool		vx_last_run_pax = false;
+VxPaxScanInfo vx_last_pax_scan;
 
 /* PS1: a column read from PostgreSQL's partial state */
-#define DF_PART_NONE	0
-#define DF_PART_SUM		1
-#define DF_PART_COUNT	2
+#define VX_PART_NONE	0
+#define VX_PART_SUM		1
+#define VX_PART_COUNT	2
 
-#define DF_STATE_NUMERIC	1	/* numeric_avg_serialize */
-#define DF_STATE_INT8		2	/* int8_avg_serialize */
-#define DF_STATE_INT_ARRAY	3	/* int4_avg_accum's int8[] {count, sum} */
+#define VX_STATE_NUMERIC	1	/* numeric_avg_serialize */
+#define VX_STATE_INT8		2	/* int8_avg_serialize */
+#define VX_STATE_INT_ARRAY	3	/* int4_avg_accum's int8[] {count, sum} */
 
 /* One input of the slice: a table scanned, or a Motion received from. */
-typedef struct DfInput
+typedef struct VxInput
 {
 	int			index;			/* in the plan's inputs */
-	DfSliceInput *spec;			/* the columns read */
+	VxSliceInput *spec;			/* the columns read */
 	SeqScanState *scan;			/* the scan whose table we read, or NULL */
 	MotionState *motion;		/* else the receiving Motion we read */
 	PlanState  *reader;			/* else the Shared Scan reader we pull */
@@ -159,15 +159,15 @@ typedef struct DfInput
 	 * formats; NULL without states.
 	 */
 	AttrNumber *tupatt;
-	uint8	   *statepart;		/* DF_PART_* */
-	uint8	   *stateformat;	/* DF_STATE_* */
+	uint8	   *statepart;		/* VX_PART_* */
+	uint8	   *stateformat;	/* VX_STATE_* */
 	MemoryContext statecxt;
 
 	/* batch being assembled or offered */
 	char	  **invalues;		/* string columns: their bytes; bool: a bitmap */
 	uint8	  **invalid;		/* validity bitmaps, 1: not NULL */
 	int64	   *innull;			/* NULLs in the batch */
-	int32	  **inoffsets;		/* string columns: DF_BATCH_ROWS + 1 offsets */
+	int32	  **inoffsets;		/* string columns: VX_BATCH_ROWS + 1 offsets */
 	Size	   *incap;			/* string columns: bytes allocated */
 	struct ArrowArray inbatch;	/* the batch, lent to the engine */
 	struct ArrowSchema inschema;
@@ -178,7 +178,7 @@ typedef struct DfInput
 
 	/* M7b: 'motion' delivers batches */
 	bool		ipc;
-	uint8		rx_head[DF_BATCH_HEAD];	/* expected head of each stream */
+	uint8		rx_head[VX_BATCH_HEAD];	/* expected head of each stream */
 	TupleChunkListItem rx_items;	/* chunks received, not yet released */
 	int16		rx_route;
 	VecSlice    *rx_slices;		/* their payloads, past each stream's head */
@@ -188,15 +188,15 @@ typedef struct DfInput
 	int			rx_nroutes;
 	int		   *rx_head_seen;	/* per route: head bytes checked */
 	bool	   *rx_ended;		/* per route: end-of-stream received */
-} DfInput;
+} VxInput;
 
-typedef struct DfExec
+typedef struct VxExec
 {
 	PlanState  *root;			/* the slice's top node below any sending Motion */
 	PlanState  *procnode;		/* the node whose ExecProcNode is ours: root,
 								 * or the Motion we send batches through */
 	int			ninputs;
-	DfInput    *inputs;			/* fed in this order, each to its end */
+	VxInput    *inputs;			/* fed in this order, each to its end */
 	int			nprerun;
 	PlanState **prerun;			/* Shared Scan producers PostgreSQL runs
 								 * first, as their Sequences would */
@@ -205,11 +205,11 @@ typedef struct DfExec
 	MotionState *send;			/* the Motion we send batches through */
 	int			send_nroutes;	/* its receivers */
 	bool	   *head_sent_to;	/* per route: stream head sent */
-	uint8		tx_head[DF_BATCH_HEAD];	/* head of the streams we send */
+	uint8		tx_head[VX_BATCH_HEAD];	/* head of the streams we send */
 	bool		stopped;		/* the receiver asked us to stop */
 	MemoryContext chunkcxt;		/* chunks being sent */
 	EState	   *estate;
-	DfSliceSpec spec;
+	VxSliceSpec spec;
 	int64		memory_limit;	/* operator memory budget, bytes */
 	int64		headroom;		/* vmem lease ahead of the heap, bytes */
 	int			slices_together;	/* slices of the plan running with ours */
@@ -217,7 +217,7 @@ typedef struct DfExec
 
 	VecQuery    *query;			/* NULL until the first row is requested */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
-	DfPaxScanInfo pax_info;
+	VxPaxScanInfo pax_info;
 	bool		input_done;		/* every input is done */
 
 	/* output batch being handed out */
@@ -228,26 +228,26 @@ typedef struct DfExec
 	ExprContext *tailcxt;
 	MemoryContext rowcxt;		/* the strings of the row handed out */
 	struct ArrowArray outbatch;	/* the engine's result batch, until released */
-	DfOutCol   *outcols;		/* its columns */
+	VxOutCol   *outcols;		/* its columns */
 	uint32		out_nrows;
 	uint32		out_row;
 	bool		done;
 
-	struct DfExec *next;
+	struct VxExec *next;
 	MemoryContextCallback release;
-} DfExec;
+} VxExec;
 
-static DfExec *df_execs = NULL;
+static VxExec *vx_execs = NULL;
 
 static bool
-df_type_is_string(Oid type)
+vx_type_is_string(Oid type)
 {
 	return type == TEXTOID || type == VARCHAROID || type == BPCHAROID;
 }
 
 /* Bytes per value of a fixed-width type. */
 static int
-df_type_width(Oid type)
+vx_type_width(Oid type)
 {
 	switch (type)
 	{
@@ -260,7 +260,7 @@ df_type_width(Oid type)
 		case DATEOID:
 			return 4;
 		case NUMERICOID:
-			return DF_NUMERIC_BYTES;	/* Decimal256 */
+			return VX_NUMERIC_BYTES;	/* Decimal256 */
 		default:
 			return 8;
 	}
@@ -268,18 +268,18 @@ df_type_width(Oid type)
 
 /* Bytes of each value of a result column of 'type': 0 a bool, -1 a string. */
 static int
-df_out_width(Oid type)
+vx_out_width(Oid type)
 {
 	if (type == BOOLOID)
 		return 0;
-	if (df_type_is_string(type))
+	if (vx_type_is_string(type))
 		return -1;
-	return df_type_width(type);
+	return vx_type_width(type);
 }
 
 /* Release the result batch the engine handed out, if any. */
 static void
-df_release_out(DfExec *x)
+vx_release_out(VxExec *x)
 {
 	if (x->outbatch.release != NULL)
 		x->outbatch.release(&x->outbatch);
@@ -288,7 +288,7 @@ df_release_out(DfExec *x)
 
 /* Do the engine's result batches have the columns the slice reads? */
 static void
-df_check_out_schema(DfExec *x, struct ArrowSchema *schema)
+vx_check_out_schema(VxExec *x, struct ArrowSchema *schema)
 {
 	int			c;
 	char	   *bad = NULL;
@@ -297,7 +297,7 @@ df_check_out_schema(DfExec *x, struct ArrowSchema *schema)
 		bad = psprintf("%d columns, not %d", (int) schema->n_children, x->spec.nout);
 	for (c = 0; bad == NULL && c < x->spec.nout; c++)
 	{
-		const char *want = df_arrow_format(x->spec.out_types[c], x->spec.out_scales[c]);
+		const char *want = vx_arrow_format(x->spec.out_types[c], x->spec.out_scales[c]);
 
 		if (strcmp(schema->children[c]->format, want) != 0)
 			bad = psprintf("column %d is \"%s\", not \"%s\"", c,
@@ -306,23 +306,23 @@ df_check_out_schema(DfExec *x, struct ArrowSchema *schema)
 	if (schema->release != NULL)
 		schema->release(schema);
 	if (bad != NULL)
-		elog(ERROR, "datafusion: the engine's result batches: %s", bad);
+		elog(ERROR, "vec_executor: the engine's result batches: %s", bad);
 }
 
 static void
-df_exec_release(void *arg)
+vx_exec_release(void *arg)
 {
-	DfExec	   *x = (DfExec *) arg;
-	DfExec	  **link;
+	VxExec	   *x = (VxExec *) arg;
+	VxExec	  **link;
 
-	df_release_out(x);
+	vx_release_out(x);
 	if (x->query != NULL)
 	{
-		df_engine->query_free(x->query);
+		vx_engine->query_free(x->query);
 		x->query = NULL;
-		df_vmem_trim();
+		vx_vmem_trim();
 	}
-	for (link = &df_execs; *link != NULL; link = &(*link)->next)
+	for (link = &vx_execs; *link != NULL; link = &(*link)->next)
 	{
 		if (*link == x)
 		{
@@ -332,20 +332,20 @@ df_exec_release(void *arg)
 	}
 }
 
-static DfExec *
-df_exec_lookup(PlanState *pstate)
+static VxExec *
+vx_exec_lookup(PlanState *pstate)
 {
-	DfExec	   *x;
+	VxExec	   *x;
 
-	for (x = df_execs; x != NULL; x = x->next)
+	for (x = vx_execs; x != NULL; x = x->next)
 		if (x->procnode == pstate)
 			return x;
-	elog(ERROR, "datafusion: no execution state for this plan node");
+	elog(ERROR, "vec_executor: no execution state for this plan node");
 	return NULL;				/* keep compiler quiet */
 }
 
 static void
-df_raise_query(int32 status, VecError *err)
+vx_raise_query(int32 status, VecError *err)
 {
 	char	   *msg = err->message;
 	const char *sqlstate = err->sqlstate;
@@ -354,7 +354,7 @@ df_raise_query(int32 status, VecError *err)
 	if (status == VEC_PANIC)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("datafusion panicked: %s", msg)));
+				 errmsg("engine panicked: %s", msg)));
 	if (detail)
 		*detail++ = '\0';
 	ereport(ERROR,
@@ -371,7 +371,7 @@ df_raise_query(int32 status, VecError *err)
  */
 /* Bytes for the hash tables of the slice's nodes from 'ps' down. */
 static double
-df_hash_memory(PlanState *ps)
+vx_hash_memory(PlanState *ps)
 {
 	double		bytes = 0;
 
@@ -387,15 +387,15 @@ df_hash_memory(PlanState *ps)
 		bytes += kb * hash_mem_multiplier * 1024.0;
 	}
 	else if (IsA(ps, HashState))
-		bytes += df_hash_budget(ps->plan);
+		bytes += vx_hash_budget(ps->plan);
 	else if (IsA(ps, SortState))
 		bytes += PlanStateOperatorMemKB(ps) * 1024.0;	/* as nodeSort.c (S1) */
 	else if (IsA(ps, SequenceState))
 	{
-		/* its last input; PostgreSQL runs the others (df_exec_prerun) */
+		/* its last input; PostgreSQL runs the others (vx_exec_prerun) */
 		SequenceState *ss = (SequenceState *) ps;
 
-		return df_hash_memory(ss->subplans[ss->numSubplans - 1]);
+		return vx_hash_memory(ss->subplans[ss->numSubplans - 1]);
 	}
 	else if (IsA(ps, AppendState))
 	{
@@ -403,15 +403,15 @@ df_hash_memory(PlanState *ps)
 		int			i;
 
 		for (i = 0; i < as->as_nplans; i++)
-			bytes += df_hash_memory(as->appendplans[i]);
+			bytes += vx_hash_memory(as->appendplans[i]);
 	}
-	return bytes + df_hash_memory(outerPlanState(ps)) + df_hash_memory(innerPlanState(ps));
+	return bytes + vx_hash_memory(outerPlanState(ps)) + vx_hash_memory(innerPlanState(ps));
 }
 
 static int64
-df_slice_memory(PlanState *root)
+vx_slice_memory(PlanState *root)
 {
-	double		bytes = df_hash_memory(root);
+	double		bytes = vx_hash_memory(root);
 
 	/*
 	 * Only hashed aggregates, Hash Join tables and sorts are limited by
@@ -427,16 +427,16 @@ df_slice_memory(PlanState *root)
 
 /* The query produced all its rows: keep its figures. */
 static void
-df_exec_finished(DfExec *x)
+vx_exec_finished(VxExec *x)
 {
 	VecQueryStats s;
 
-	df_engine->query_stats(x->query, &s);
-	df_last_run = s;
-	df_last_run_pax = x->pax_direct;
+	vx_engine->query_stats(x->query, &s);
+	vx_last_run = s;
+	vx_last_run_pax = x->pax_direct;
 	if (x->pax_direct)
-		df_last_pax_scan = x->pax_info;
-	df_runs_completed++;
+		vx_last_pax_scan = x->pax_info;
+	vx_runs_completed++;
 
 	if (x->root->instrument)
 	{
@@ -447,14 +447,14 @@ df_exec_finished(DfExec *x)
 }
 
 static uint32_t
-df_query_flags(DfExec *x)
+vx_query_flags(VxExec *x)
 {
 	return x->send ? VEC_QUERY_IPC_OUTPUT : 0;
 }
 
 /* Bit j set: input j arrives as batches from a Motion. */
 static uint64
-df_ipc_inputs(DfExec *x)
+vx_ipc_inputs(VxExec *x)
 {
 	uint64		mask = 0;
 	int			j;
@@ -473,11 +473,11 @@ df_ipc_inputs(DfExec *x)
 /*
  * Send 'len' bytes of the batch stream for receiver 'route' (0 for a
  * Gather; a Broadcast's one stream goes to every receiver), cut into tuple
- * chunks of DF_CHUNK_TYPE.  Sets x->stopped if the receiver asked the
+ * chunks of VX_CHUNK_TYPE.  Sets x->stopped if the receiver asked the
  * senders to stop.
  */
 static void
-df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
+vx_send_bytes(VxExec *x, int route, const uint8 *data, size_t len)
 {
 	Motion	   *motion = (Motion *) x->send->ps.plan;
 	size_t		maxdata = Gp_max_tuple_chunk_size - TUPLE_CHUNK_HEADER_SIZE;
@@ -496,7 +496,7 @@ df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
 		item->inplace = NULL;
 		item->chunk_length = TUPLE_CHUNK_HEADER_SIZE + n;
 		SetChunkDataSize(item->chunk_data, n);
-		SetChunkType(item->chunk_data, DF_CHUNK_TYPE);
+		SetChunkType(item->chunk_data, VX_CHUNK_TYPE);
 		memcpy(item->chunk_data + TUPLE_CHUNK_HEADER_SIZE, data, n);
 		if (last)
 			last->p_next = item;
@@ -525,7 +525,7 @@ df_send_bytes(DfExec *x, int route, const uint8 *data, size_t len)
 
 /* Free the received chunks and give their receive buffer back. */
 static void
-df_rx_release(DfExec *x, DfInput *in, int16 motion_id)
+vx_rx_release(VxExec *x, VxInput *in, int16 motion_id)
 {
 	TupleChunkListItem item = in->rx_items;
 
@@ -547,7 +547,7 @@ df_rx_release(DfExec *x, DfInput *in, int16 motion_id)
  * payloads in in->rx_slices, checking the head of each stream.
  */
 static void
-df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
+vx_rx_take(VxExec *x, VxInput *in, int16 motion_id, MotionNodeEntry *entry)
 {
 	MotionLayerState *ml = (MotionLayerState *) x->estate->motionlayer_context;
 	TupleChunkListItem item;
@@ -577,7 +577,7 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 	if (route < 0 || route >= in->rx_nroutes)
 		ereport(ERROR,
 				(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-				 errmsg("datafusion: chunks from unexpected route %d of Motion %d",
+				 errmsg("vec_executor: chunks from unexpected route %d of Motion %d",
 						route, motion_id)));
 
 	for (item = in->rx_items; item != NULL; item = item->p_next)
@@ -590,36 +590,36 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
 		if (item->chunk_length < TUPLE_CHUNK_HEADER_SIZE)
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-					 errmsg("datafusion: tuple chunk of %u bytes from route %d of Motion %d",
+					 errmsg("vec_executor: tuple chunk of %u bytes from route %d of Motion %d",
 							item->chunk_length, route, motion_id)));
 		GetChunkType(item, &type);
 		if (in->rx_eos)
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-					 errmsg("datafusion: data after end-of-stream from route %d of Motion %d",
+					 errmsg("vec_executor: data after end-of-stream from route %d of Motion %d",
 							route, motion_id)));
 		if (type == TC_END_OF_STREAM)
 		{
 			in->rx_eos = true;
 			continue;
 		}
-		if (type != DF_CHUNK_TYPE)
+		if (type != VX_CHUNK_TYPE)
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-					 errmsg("datafusion: Motion %d received tuples where DataFusion batches were expected",
+					 errmsg("vec_executor: Motion %d received tuples where batches were expected",
 							motion_id),
-					 errdetail("The sending slice on route %d did not run in DataFusion.", route)));
+					 errdetail("The sending slice on route %d did not run in the engine.", route)));
 
 		data = (uint8 *) GetChunkDataPtr(item) + TUPLE_CHUNK_HEADER_SIZE;
 		len = item->chunk_length - TUPLE_CHUNK_HEADER_SIZE;
-		if (*seen < DF_BATCH_HEAD)
+		if (*seen < VX_BATCH_HEAD)
 		{
-			size_t		k = Min(len, (size_t) (DF_BATCH_HEAD - *seen));
+			size_t		k = Min(len, (size_t) (VX_BATCH_HEAD - *seen));
 
 			if (memcmp(data, in->rx_head + *seen, k) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-						 errmsg("datafusion: Motion %d received batches of another plan",
+						 errmsg("vec_executor: Motion %d received batches of another plan",
 								motion_id),
 						 errdetail("The stream from route %d does not start with this Motion's signature.",
 								   route)));
@@ -648,7 +648,7 @@ df_rx_take(DfExec *x, DfInput *in, int16 motion_id, MotionNodeEntry *entry)
  * queue was full.
  */
 static void
-df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
+vx_exec_receive(VxExec *x, VxInput *in, bool *pushed, bool *full)
 {
 	VecError	err;
 	int16		motion_id = ((Motion *) in->motion->ps.plan)->motionID;
@@ -661,11 +661,11 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		{
 			/* every sender has ended its stream */
 			x->estate->active_recv_id = -1;
-			df_engine->query_finish_input(x->query, (uint32_t) in->index);
+			vx_engine->query_finish_input(x->query, (uint32_t) in->index);
 			in->done = true;
 			return;
 		}
-		df_rx_take(x, in, motion_id, entry);
+		vx_rx_take(x, in, motion_id, entry);
 		if (in->rx_items == NULL)
 			return;
 	}
@@ -674,8 +674,8 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 	{
 		int32		status;
 
-		DF_ERROR_INIT(err);
-		status = df_engine->query_push_ipc(x->query, (uint32_t) in->index,
+		VX_ERROR_INIT(err);
+		status = vx_engine->query_push_ipc(x->query, (uint32_t) in->index,
 										   in->rx_route, in->rx_slices,
 										   (uint32_t) in->rx_nslices, &err);
 
@@ -689,7 +689,7 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 			return;
 		}
 		if (status != VEC_OK)
-			df_raise_query(status, &err);
+			vx_raise_query(status, &err);
 		*pushed = true;
 	}
 
@@ -699,7 +699,7 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 		if (in->rx_ended[in->rx_route])
 			ereport(ERROR,
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
-					 errmsg("datafusion: second end-of-stream from route %d of Motion %d",
+					 errmsg("vec_executor: second end-of-stream from route %d of Motion %d",
 							in->rx_route, motion_id)));
 		in->rx_ended[in->rx_route] = true;
 		entry->num_stream_ends_recvd++;
@@ -709,7 +709,7 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 													  motion_id, in->rx_route,
 													  "end of stream");
 	}
-	df_rx_release(x, in, motion_id);
+	vx_rx_release(x, in, motion_id);
 
 	/*
 	 * Taken, even without bytes for DataFusion: a stream's head alone (the
@@ -723,7 +723,7 @@ df_exec_receive(DfExec *x, DfInput *in, bool *pushed, bool *full)
 
 /* Does input 'in' scan a PAX table the direct reader may read? */
 static bool
-df_input_scans_pax(DfInput *in)
+vx_input_scans_pax(VxInput *in)
 {
 	char	   *amname;
 
@@ -741,18 +741,18 @@ df_input_scans_pax(DfInput *in)
  * empty.  The scan's min/max skipping is added to the slice's.
  */
 static bool
-df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInput *pax)
+vx_pax_begin_input(VxExec *x, VxInput *in, const VxPaxReader *reader, VecPaxInput *pax)
 {
 	Relation	rel;
 	char		buf[VEC_MSG_LEN];
-	DfPaxScanInfo info;
+	VxPaxScanInfo info;
 	int		   *cols;
 	int		   *widths;
 	int		   *scales;
 	void	   *scan;
 	int			c;
 
-	if (!df_input_scans_pax(in))
+	if (!vx_input_scans_pax(in))
 		return false;
 	rel = in->scan->ss.ss_currentRelation;
 	/*
@@ -773,9 +773,9 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 
 		cols[c] = in->spec->attnos[c] - 1;
 		/* strings and numerics as their bytes (C1, C2) */
-		widths[c] = df_type_is_string(in->spec->types[c]) ||
+		widths[c] = vx_type_is_string(in->spec->types[c]) ||
 			in->spec->types[c] == NUMERICOID ? -1 :
-			df_type_width(in->spec->types[c]);
+			vx_type_width(in->spec->types[c]);
 		scales[c] = -1;
 		/*
 		 * SC2: a numeric(p, s) column of p <= 38 read at s, its own scale,
@@ -784,11 +784,11 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 		 * narrow, as it does every such column.
 		 */
 		if (in->spec->types[c] == NUMERICOID &&
-			df_numeric_typmod(TupleDescAttr(RelationGetDescr(rel), cols[c])->atttypmod,
+			vx_numeric_typmod(TupleDescAttr(RelationGetDescr(rel), cols[c])->atttypmod,
 							  &precision, &scale) &&
 			precision <= 38 && scale == in->spec->scales[c])
 		{
-			widths[c] = in->spec->digits[c] > 0 ? DF_NARROW_BYTES : DF_NUMERIC_BYTES;
+			widths[c] = in->spec->digits[c] > 0 ? VX_NARROW_BYTES : VX_NUMERIC_BYTES;
 			scales[c] = scale;
 		}
 		else if (in->spec->digits[c] > 0)
@@ -812,10 +812,10 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 	if (scan == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("datafusion: %s", buf)));
+				 errmsg("vec_executor: %s", buf)));
 	/* DC1: the decoded-column cache, if one is configured */
-	reader->cache_config(scan, df_pax_decode_cache,
-						 (int64) df_pax_decode_cache_mb * 1024 * 1024);
+	reader->cache_config(scan, vx_pax_decode_cache,
+						 (int64) vx_pax_decode_cache_mb * 1024 * 1024);
 	reader->info(scan, &info);
 	x->pax_info.files += info.files;
 	x->pax_info.files_skipped += info.files_skipped;
@@ -825,13 +825,13 @@ df_pax_begin_input(DfExec *x, DfInput *in, const DfPaxReader *reader, VecPaxInpu
 	pax->scan = scan;
 	pax->nblocks = (uint32_t) reader->nblocks(scan);
 	in->done = true;			/* nothing to push from the main thread */
-	df_pax_direct_scans++;
+	vx_pax_direct_scans++;
 	return true;
 }
 
 /* The top slice of slice 'index''s tree (parentIndex -1). */
 static int
-df_slice_tree_root(PlannedStmt *stmt, int index)
+vx_slice_tree_root(PlannedStmt *stmt, int index)
 {
 	int			steps = 0;
 
@@ -848,7 +848,7 @@ df_slice_tree_root(PlannedStmt *stmt, int index)
  * the main plan's.
  */
 static int
-df_slices_together(PlannedStmt *stmt, int index)
+vx_slices_together(PlannedStmt *stmt, int index)
 {
 	int			root;
 	int			n = 0;
@@ -856,9 +856,9 @@ df_slices_together(PlannedStmt *stmt, int index)
 
 	if (stmt == NULL || index < 0 || index >= stmt->numSlices)
 		return 1;
-	root = df_slice_tree_root(stmt, index);
+	root = vx_slice_tree_root(stmt, index);
 	for (i = 0; i < stmt->numSlices; i++)
-		if (df_slice_tree_root(stmt, i) == root)
+		if (vx_slice_tree_root(stmt, i) == root)
 			n++;
 	return Max(n, 1);
 }
@@ -871,7 +871,7 @@ df_slices_together(PlannedStmt *stmt, int index)
  * them.
  */
 static int
-df_host_segments(void)
+vx_host_segments(void)
 {
 	int			n = host_primary_segment_count;
 
@@ -887,7 +887,7 @@ df_host_segments(void)
 /*
  * Partitions of a query, out of 'workers' threads, while 'slices' slices of
  * the plan run together in each of 'segments' primaries on the host:
- * datafusion.slice_partitions, else 8 * workers / (slices * segments), at
+ * vec.slice_partitions, else 8 * workers / (slices * segments), at
  * least 1, at most 'workers'.  Every slice that took a partition per thread
  * made the slices of a plan of many crowd the host's cores: TPC-DS at scale
  * factor 1, 3 segments on 10 cores, took 100 s with 10 partitions, 89 s
@@ -897,37 +897,37 @@ df_host_segments(void)
  * of many from crowding more.
  */
 static int
-df_query_partitions(int workers, int slices, int segments)
+vx_query_partitions(int workers, int slices, int segments)
 {
-	int			n = df_slice_partitions > 0 ? df_slice_partitions :
+	int			n = vx_slice_partitions > 0 ? vx_slice_partitions :
 		8 * workers / (Max(slices, 1) * Max(segments, 1));
 
 	return Max(Min(n, workers), 1);
 }
 
 static void
-df_exec_begin(DfExec *x)
+vx_exec_begin(VxExec *x)
 {
 	VecError	err;
 	sigset_t	saved;
 	int			workers;
 	int32		status;
 	int			j;
-	const DfPaxReader *reader = NULL;
+	const VxPaxReader *reader = NULL;
 	VecPaxInput *pax = NULL;
 	VecQueryArgs args;
 	struct ArrowSchema *schemas;
 	struct ArrowSchema out_schema;
 
-	workers = df_runtime_ensure();
-	if (df_engine->debug != NULL)
-		df_engine->debug->result_offset((uint32_t) df_debug_result_offset);
-	if (df_pax_direct_read && (df_engine_features() & VEC_F_PAX_DIRECT) != 0)
+	workers = vx_runtime_ensure();
+	if (vx_engine->debug != NULL)
+		vx_engine->debug->result_offset((uint32_t) vx_debug_result_offset);
+	if (vx_pax_direct_read && (vx_engine_features() & VEC_F_PAX_DIRECT) != 0)
 	{
 		/* loaded only once a PAX table is read: pax.so is loaded by then */
 		for (j = 0; j < x->ninputs && reader == NULL; j++)
-			if (df_input_scans_pax(&x->inputs[j]))
-				reader = df_pax_reader_get();
+			if (vx_input_scans_pax(&x->inputs[j]))
+				reader = vx_pax_reader_get();
 	}
 	if (reader != NULL)
 	{
@@ -936,7 +936,7 @@ df_exec_begin(DfExec *x)
 		{
 			PG_TRY();
 			{
-				df_pax_begin_input(x, &x->inputs[j], reader, &pax[j]);
+				vx_pax_begin_input(x, &x->inputs[j], reader, &pax[j]);
 			}
 			PG_CATCH();
 			{
@@ -957,37 +957,37 @@ df_exec_begin(DfExec *x)
 	memset(&args, 0, sizeof(args));
 	args.ir = x->spec.json;
 	args.input_schemas = schemas;
-	args.partitions = (uint32_t) df_query_partitions(workers, x->slices_together,
+	args.partitions = (uint32_t) vx_query_partitions(workers, x->slices_together,
 													 x->host_segments);
 	args.memory_limit = (uint64_t) x->memory_limit;
-	args.spill_dir = df_spill_dir();
-	args.flags = df_query_flags(x);
+	args.spill_dir = vx_spill_dir();
+	args.flags = vx_query_flags(x);
 	args.ninputs = (uint32_t) x->ninputs;
-	args.ipc_inputs = df_ipc_inputs(x);
+	args.ipc_inputs = vx_ipc_inputs(x);
 	args.pax_inputs = pax;
 	args.pax_read = reader ? reader->read : NULL;
 	args.pax_end = reader ? reader->end : NULL;
 	args.pax_groups = reader ? reader->block_groups : NULL;
-	args.pax_max_readers = (uint32_t) df_pax_max_decoders;
+	args.pax_max_readers = (uint32_t) vx_pax_max_decoders;
 	args.pax_late = reader ? reader->late : NULL;
 	args.pax_read_rows = reader ? reader->read_rows : NULL;
 
 	/* From here on the query owns the PAX scans, even if this fails. */
-	DF_ERROR_INIT(err);
-	df_signals_block(&saved);
-	status = df_engine->query_start(&args, &out_schema, &x->query, &err);
-	df_signals_restore(&saved);
+	VX_ERROR_INIT(err);
+	vx_signals_block(&saved);
+	status = vx_engine->query_start(&args, &out_schema, &x->query, &err);
+	vx_signals_restore(&saved);
 	if (status != VEC_OK)
 	{
 		x->query = NULL;
-		df_raise_query(status, &err);
+		vx_raise_query(status, &err);
 	}
-	df_check_out_schema(x, &out_schema);
-	df_vmem_sync(x->headroom);
+	vx_check_out_schema(x, &out_schema);
+	vx_vmem_sync(x->headroom);
 
 	for (j = 0; j < x->ninputs; j++)
 	{
-		DfInput    *in = &x->inputs[j];
+		VxInput    *in = &x->inputs[j];
 		Relation	rel;
 
 		if (in->scan == NULL || in->done)
@@ -1018,7 +1018,7 @@ df_exec_begin(DfExec *x)
 }
 
 /*
- * Read up to the slice's rows per batch (at most DF_BATCH_ROWS) of the
+ * Read up to the slice's rows per batch (at most VX_BATCH_ROWS) of the
  * needed columns of input 'in'.
  */
 /*
@@ -1027,18 +1027,18 @@ df_exec_begin(DfExec *x)
  * reads the same fields as int16.  Returns the bytes read.
  */
 static int
-df_recv_numericvar(const char *p, int len, Datum *out)
+vx_recv_numericvar(const char *p, int len, Datum *out)
 {
 	StringInfoData wire;
 	int32		f[4];
 	int			i;
 
 	if (len < 16)
-		elog(ERROR, "datafusion: short partial aggregate state");
+		elog(ERROR, "vec_executor: short partial aggregate state");
 	for (i = 0; i < 4; i++)
 		f[i] = (int32) pg_ntoh32(*(const uint32 *) (p + 4 * i));
 	if (f[0] < 0 || len < 16 + 2 * f[0])
-		elog(ERROR, "datafusion: short partial aggregate state");
+		elog(ERROR, "vec_executor: short partial aggregate state");
 	initStringInfo(&wire);
 	for (i = 0; i < 4; i++)
 		pq_sendint16(&wire, (int16) f[i]);
@@ -1053,13 +1053,13 @@ df_recv_numericvar(const char *p, int len, Datum *out)
  * sum, NULL without values and NaN after a NaN, or its count of values.
  */
 static Datum
-df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
+vx_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
 {
 	int64		count;
 	Datum		sum = (Datum) 0;
 
 	*isnull = false;
-	if (format == DF_STATE_INT_ARRAY)
+	if (format == VX_STATE_INT_ARRAY)
 	{
 		ArrayType  *a = DatumGetArrayTypeP(d);
 		Datum	   *elems;
@@ -1068,7 +1068,7 @@ df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
 		deconstruct_array(a, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE,
 						  &elems, NULL, &n);
 		if (n != 2)
-			elog(ERROR, "datafusion: unexpected avg state");
+			elog(ERROR, "vec_executor: unexpected avg state");
 		count = DatumGetInt64(elems[0]);
 		sum = NumericGetDatum(int64_to_numeric(DatumGetInt64(elems[1])));
 	}
@@ -1080,10 +1080,10 @@ df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
 		int			used;
 
 		if (len < 8)
-			elog(ERROR, "datafusion: short partial aggregate state");
+			elog(ERROR, "vec_executor: short partial aggregate state");
 		count = (int64) pg_ntoh64(*(const uint64 *) p);
-		used = 8 + df_recv_numericvar(p + 8, len - 8, &sum);
-		if (format == DF_STATE_NUMERIC)
+		used = 8 + vx_recv_numericvar(p + 8, len - 8, &sum);
+		if (format == VX_STATE_NUMERIC)
 		{
 			int64		nans,
 						pinfs,
@@ -1091,12 +1091,12 @@ df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
 
 			/* maxScale (int32) and maxScaleCount (int64): an inverse transition's */
 			if (len < used + 12 + 24)
-				elog(ERROR, "datafusion: short partial aggregate state");
+				elog(ERROR, "vec_executor: short partial aggregate state");
 			nans = (int64) pg_ntoh64(*(const uint64 *) (p + used + 12));
 			pinfs = (int64) pg_ntoh64(*(const uint64 *) (p + used + 20));
 			ninfs = (int64) pg_ntoh64(*(const uint64 *) (p + used + 28));
 			if (pinfs > 0 || ninfs > 0)
-				elog(ERROR, "datafusion: infinite numeric in a partial aggregate state");
+				elog(ERROR, "vec_executor: infinite numeric in a partial aggregate state");
 			if (nans > 0)
 				sum = DirectFunctionCall3(numeric_in, CStringGetDatum("NaN"),
 										  ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
@@ -1105,14 +1105,14 @@ df_state_part(Datum d, uint8 format, uint8 part, bool *isnull)
 				count = nans;
 		}
 	}
-	if (part == DF_PART_COUNT)
+	if (part == VX_PART_COUNT)
 		return Int64GetDatum(count);
 	*isnull = (count == 0);
 	return sum;
 }
 
 static void
-df_exec_fill(DfExec *x, DfInput *in)
+vx_exec_fill(VxExec *x, VxInput *in)
 {
 	TupleTableSlot *slot = in->scan ? in->scan->ss.ss_ScanTupleSlot : NULL;
 	int			n = 0;
@@ -1158,7 +1158,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 				isnull = slot->tts_isnull[att];
 				d = slot->tts_values[att];
 			}
-			if (in->statepart && in->statepart[c] != DF_PART_NONE)
+			if (in->statepart && in->statepart[c] != VX_PART_NONE)
 			{
 				/* PS1: a part of PostgreSQL's partial state */
 				MemoryContext oldcxt = MemoryContextSwitchTo(in->statecxt);
@@ -1171,11 +1171,11 @@ df_exec_fill(DfExec *x, DfInput *in)
 					 * no rows keeps its NULL initial state, which the
 					 * strict serial function leaves NULL
 					 */
-					isnull = in->statepart[c] == DF_PART_SUM;
+					isnull = in->statepart[c] == VX_PART_SUM;
 					d = Int64GetDatum(0);
 				}
 				else
-					d = df_state_part(d, in->stateformat[c], in->statepart[c], &isnull);
+					d = vx_state_part(d, in->stateformat[c], in->statepart[c], &isnull);
 				MemoryContextSwitchTo(oldcxt);
 			}
 
@@ -1199,9 +1199,9 @@ df_exec_fill(DfExec *x, DfInput *in)
 					break;
 				case INT4OID:
 				case DATEOID:
-					if (in->spec->scales[c] == DF_SCALE_DSCALE)
+					if (in->spec->scales[c] == VX_SCALE_DSCALE)
 						/* DN1: the display scale of the numeric value */
-						((int32 *) dst)[n] = isnull ? 0 : df_numeric_dscale(d);
+						((int32 *) dst)[n] = isnull ? 0 : vx_numeric_dscale(d);
 					else
 						((int32 *) dst)[n] = isnull ? 0 : DatumGetInt32(d);
 					break;
@@ -1228,30 +1228,30 @@ df_exec_fill(DfExec *x, DfInput *in)
 					{
 						/*
 						 * N6: 16 bytes, the narrow sentinels being
-						 * DF_NUMERIC_NAN and the infinities as they are
+						 * VX_NUMERIC_NAN and the infinities as they are
 						 */
 						int128		v = 0;
 
 						if (!isnull &&
-							df_numeric_value(d, in->spec->scales[c], &v) == DF_NUMERIC_TOO_LONG)
-							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
+							vx_numeric_value(d, in->spec->scales[c], &v) == VX_NUMERIC_TOO_LONG)
+							elog(ERROR, "vec_executor: numeric value beyond numeric(%d, %d)",
 								 in->spec->digits[c], in->spec->scales[c]);
-						memcpy((uint8 *) dst + (size_t) n * DF_NARROW_BYTES, &v, sizeof(v));
+						memcpy((uint8 *) dst + (size_t) n * VX_NARROW_BYTES, &v, sizeof(v));
 					}
 					else
 					{
-						uint8	   *out = (uint8 *) dst + (size_t) n * DF_NUMERIC_BYTES;
+						uint8	   *out = (uint8 *) dst + (size_t) n * VX_NUMERIC_BYTES;
 
 						/*
 						 * An infinity can only be a year of an infinite date
 						 * (DT2), which the planner hook allows
 						 */
 						if (isnull)
-							df_numeric_store(0, out);
-						else if (df_numeric_value_wide(d, in->spec->scales[c], out) ==
-								 DF_NUMERIC_TOO_LONG)
-							elog(ERROR, "datafusion: numeric value beyond numeric(%d, %d)",
-								 DF_NUMERIC_MAX_EXPR_PRECISION, in->spec->scales[c]);
+							vx_numeric_store(0, out);
+						else if (vx_numeric_value_wide(d, in->spec->scales[c], out) ==
+								 VX_NUMERIC_TOO_LONG)
+							elog(ERROR, "vec_executor: numeric value beyond numeric(%d, %d)",
+								 VX_NUMERIC_MAX_EXPR_PRECISION, in->spec->scales[c]);
 					}
 					break;
 				case TEXTOID:
@@ -1278,7 +1278,7 @@ df_exec_fill(DfExec *x, DfInput *in)
 							end += len;
 						}
 						off[n + 1] = (int32) end;
-						if (end >= DF_BATCH_STRING_BYTES)
+						if (end >= VX_BATCH_STRING_BYTES)
 							strings_full = true;
 					}
 					break;
@@ -1289,60 +1289,60 @@ df_exec_fill(DfExec *x, DfInput *in)
 	/* the strings' bytes may have moved as they grew */
 	in->inbatch.length = n;
 	for (c = 0; c < in->spec->ncols; c++)
-		df_arrow_set_column(in->inbatch.children[c], n, in->innull[c], in->invalid[c],
+		vx_arrow_set_column(in->inbatch.children[c], n, in->innull[c], in->invalid[c],
 							in->invalues[c],
-							df_type_is_string(in->spec->types[c]) ? in->inoffsets[c] : NULL);
+							vx_type_is_string(in->spec->types[c]) ? in->inoffsets[c] : NULL);
 	in->batch_rows = n;
 	in->batch_ready = (n > 0);
 	if (in->ended && !in->batch_ready)
 	{
-		df_engine->query_finish_input(x->query, (uint32_t) in->index);
+		vx_engine->query_finish_input(x->query, (uint32_t) in->index);
 		in->done = true;
 	}
 }
 
 /*
  * Feed input 'in' one step: push the batch it has ready, reading the next
- * one if needed.  Sets *pushed or *full as df_exec_receive does.
+ * one if needed.  Sets *pushed or *full as vx_exec_receive does.
  */
 static void
-df_exec_feed(DfExec *x, DfInput *in, bool *pushed, bool *full)
+vx_exec_feed(VxExec *x, VxInput *in, bool *pushed, bool *full)
 {
 	VecError	err;
 	int32		status;
 
 	if (in->ipc)
 	{
-		df_exec_receive(x, in, pushed, full);
+		vx_exec_receive(x, in, pushed, full);
 		return;
 	}
 	if (!in->batch_ready)
-		df_exec_fill(x, in);
+		vx_exec_fill(x, in);
 	if (!in->batch_ready)
 		return;
-	DF_ERROR_INIT(err);
-	status = df_engine->query_push(x->query, (uint32_t) in->index, &in->inbatch, &err);
+	VX_ERROR_INIT(err);
+	status = vx_engine->query_push(x->query, (uint32_t) in->index, &in->inbatch, &err);
 	if (status == VEC_OK)
 	{
 		*pushed = true;
 		in->batch_ready = false;
 		if (in->ended)
 		{
-			df_engine->query_finish_input(x->query, (uint32_t) in->index);
+			vx_engine->query_finish_input(x->query, (uint32_t) in->index);
 			in->done = true;
 		}
 	}
 	else if (status == VEC_PENDING)
 		*full = true;
 	else
-		df_raise_query(status, &err);
+		vx_raise_query(status, &err);
 }
 
 /* Row 'r' of a Decimal256 column. */
 static const uint8 *
-df_numeric_at(const void *values, uint32 r)
+vx_numeric_at(const void *values, uint32 r)
 {
-	return (const uint8 *) values + (size_t) r * DF_NUMERIC_BYTES;
+	return (const uint8 *) values + (size_t) r * VX_NUMERIC_BYTES;
 }
 
 /*
@@ -1351,7 +1351,7 @@ df_numeric_at(const void *values, uint32 r)
  * numeric_send gives the same fields as int16.
  */
 static void
-df_send_numericvar(StringInfo buf, Datum num)
+vx_send_numericvar(StringInfo buf, Datum num)
 {
 	bytea	   *wire = DatumGetByteaPP(DirectFunctionCall1(numeric_send, num));
 	const char *p = VARDATA_ANY(wire);
@@ -1372,14 +1372,14 @@ df_send_numericvar(StringInfo buf, Datum num)
  * all but the NaNs, which make the result NaN.
  */
 static Datum
-df_numeric_state(Datum sum, bool sumnull, int scale, int64 count)
+vx_numeric_state(Datum sum, bool sumnull, int scale, int64 count)
 {
 	StringInfoData buf;
 	bool		nan = !sumnull && numeric_is_nan(DatumGetNumeric(sum));
 
 	pq_begintypsend(&buf);
 	pq_sendint64(&buf, count);
-	df_send_numericvar(&buf, sumnull || nan || count == 0 ?
+	vx_send_numericvar(&buf, sumnull || nan || count == 0 ?
 					   NumericGetDatum(int64_to_numeric(0)) : sum);
 	pq_sendint32(&buf, count == 0 ? 0 : scale);	/* maxScale */
 	pq_sendint64(&buf, count == 0 ? 0 : count - (nan ? 1 : 0));	/* maxScaleCount */
@@ -1391,19 +1391,19 @@ df_numeric_state(Datum sum, bool sumnull, int scale, int64 count)
 
 /* PS1: the state int8_avg_serialize writes: the count, the sum (an int128). */
 static Datum
-df_int8_state(Datum sum, bool sumnull, int64 count)
+vx_int8_state(Datum sum, bool sumnull, int64 count)
 {
 	StringInfoData buf;
 
 	pq_begintypsend(&buf);
 	pq_sendint64(&buf, count);
-	df_send_numericvar(&buf, sumnull || count == 0 ?
+	vx_send_numericvar(&buf, sumnull || count == 0 ?
 					   NumericGetDatum(int64_to_numeric(0)) : sum);
 	return PointerGetDatum(pq_endtypsend(&buf));
 }
 
 static TupleTableSlot *
-df_exec_emit(DfExec *x)
+vx_exec_emit(VxExec *x)
 {
 	TupleTableSlot *slot = x->valslot ? x->valslot : x->outslot;
 	uint32		r = x->out_row++;
@@ -1415,13 +1415,13 @@ df_exec_emit(DfExec *x)
 	for (c = 0; c < x->spec.nout; c++)
 	{
 		const void *v = x->outcols[c].values;
-		bool		isnull = df_out_isnull(&x->outcols[c], r);
-		uint8		kind = x->spec.out_kinds ? x->spec.out_kinds[c] : DF_OUT_PLAIN;
+		bool		isnull = vx_out_isnull(&x->outcols[c], r);
+		uint8		kind = x->spec.out_kinds ? x->spec.out_kinds[c] : VX_OUT_PLAIN;
 		MemoryContext oldcxt;
 
-		if (kind == DF_OUT_PART)
+		if (kind == VX_OUT_PART)
 			continue;
-		if (kind == DF_OUT_NUMERIC_MIXED)
+		if (kind == VX_OUT_NUMERIC_MIXED)
 		{
 			/*
 			 * MS1: a sum at the largest scale of its argument's branches,
@@ -1429,7 +1429,7 @@ df_exec_emit(DfExec *x)
 			 * PostgreSQL's sum does; the digits past it are 0
 			 */
 			int			scale = x->spec.out_scales[c];
-			int			shown = df_out_isnull(&x->outcols[c + 1], r) ? scale :
+			int			shown = vx_out_isnull(&x->outcols[c + 1], r) ? scale :
 				((const int32 *) x->outcols[c + 1].values)[r];
 
 			slot->tts_isnull[k] = isnull;
@@ -1437,7 +1437,7 @@ df_exec_emit(DfExec *x)
 			if (!isnull)
 			{
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
-				slot->tts_values[k] = df_numeric_datum(df_numeric_at(v, r), scale);
+				slot->tts_values[k] = vx_numeric_datum(vx_numeric_at(v, r), scale);
 				if (shown < scale)
 					slot->tts_values[k] = DirectFunctionCall2(numeric_round, slot->tts_values[k],
 															  Int32GetDatum(shown));
@@ -1446,8 +1446,8 @@ df_exec_emit(DfExec *x)
 			k++;
 			continue;
 		}
-		if (kind == DF_OUT_STATE_NUMERIC || kind == DF_OUT_STATE_INT8 ||
-			kind == DF_OUT_STATE_INT_ARRAY)
+		if (kind == VX_OUT_STATE_NUMERIC || kind == VX_OUT_STATE_INT8 ||
+			kind == VX_OUT_STATE_INT_ARRAY)
 		{
 			/*
 			 * PS1: PostgreSQL's state of a partial sum or avg, for the
@@ -1457,16 +1457,16 @@ df_exec_emit(DfExec *x)
 			 * function and argument (sum and avg of a column) and combines
 			 * it from one of their columns: the states agree, count and all.
 			 */
-			int64		count = df_out_isnull(&x->outcols[c + 1], r) ? 0 :
+			int64		count = vx_out_isnull(&x->outcols[c + 1], r) ? 0 :
 				((const int64 *) x->outcols[c + 1].values)[r];
 			Datum		sum = (Datum) 0;
 
 			oldcxt = MemoryContextSwitchTo(x->rowcxt);
 			if (!isnull)
-				sum = df_numeric_datum(df_numeric_at(v, r), x->spec.out_scales[c]);
-			if (kind == DF_OUT_STATE_NUMERIC)
-				slot->tts_values[k] = df_numeric_state(sum, isnull, x->spec.out_scales[c], count);
-			else if (kind == DF_OUT_STATE_INT_ARRAY)
+				sum = vx_numeric_datum(vx_numeric_at(v, r), x->spec.out_scales[c]);
+			if (kind == VX_OUT_STATE_NUMERIC)
+				slot->tts_values[k] = vx_numeric_state(sum, isnull, x->spec.out_scales[c], count);
+			else if (kind == VX_OUT_STATE_INT_ARRAY)
 			{
 				/* int4_avg_accum's Int8TransTypeData: {count, sum} */
 				Datum		elems[2];
@@ -1478,16 +1478,16 @@ df_exec_emit(DfExec *x)
 																	  FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
 			}
 			else
-				slot->tts_values[k] = df_int8_state(sum, isnull, count);
+				slot->tts_values[k] = vx_int8_state(sum, isnull, count);
 			MemoryContextSwitchTo(oldcxt);
 			slot->tts_isnull[k] = false;
 			k++;
 			continue;
 		}
-		if (kind == DF_OUT_NUMERIC_AVG)
+		if (kind == VX_OUT_NUMERIC_AVG)
 		{
 			/* avg(int) = numeric_div(sum, count), as int8_avg and numeric_poly_avg */
-			int64		count = df_out_isnull(&x->outcols[c + 1], r) ? 0 :
+			int64		count = vx_out_isnull(&x->outcols[c + 1], r) ? 0 :
 				((const int64 *) x->outcols[c + 1].values)[r];
 
 			slot->tts_isnull[k] = isnull || count == 0;
@@ -1497,7 +1497,7 @@ df_exec_emit(DfExec *x)
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
 				slot->tts_values[k] =
 					DirectFunctionCall2(numeric_div,
-										df_numeric_datum(df_numeric_at(v, r),
+										vx_numeric_datum(vx_numeric_at(v, r),
 														 x->spec.out_scales[c]),
 										NumericGetDatum(int64_to_numeric(count)));
 				MemoryContextSwitchTo(oldcxt);
@@ -1514,7 +1514,7 @@ df_exec_emit(DfExec *x)
 		switch (x->spec.out_types[c])
 		{
 			case BOOLOID:
-				slot->tts_values[k] = BoolGetDatum(df_out_bool(&x->outcols[c], r));
+				slot->tts_values[k] = BoolGetDatum(vx_out_bool(&x->outcols[c], r));
 				break;
 			case INT2OID:
 				slot->tts_values[k] = Int16GetDatum(((const int16 *) v)[r]);
@@ -1563,7 +1563,7 @@ df_exec_emit(DfExec *x)
 				break;
 			case NUMERICOID:
 				oldcxt = MemoryContextSwitchTo(x->rowcxt);
-				slot->tts_values[k] = df_numeric_datum(df_numeric_at(v, r),
+				slot->tts_values[k] = vx_numeric_datum(vx_numeric_at(v, r),
 													   x->spec.out_scales[c]);
 				MemoryContextSwitchTo(oldcxt);
 				break;
@@ -1602,7 +1602,7 @@ df_exec_emit(DfExec *x)
  * inputs, find it complete.
  */
 static void
-df_exec_prerun(DfExec *x)
+vx_exec_prerun(VxExec *x)
 {
 	int			i;
 
@@ -1615,14 +1615,14 @@ df_exec_prerun(DfExec *x)
 }
 
 static TupleTableSlot *
-df_exec_next(DfExec *x)
+vx_exec_next(VxExec *x)
 {
 	VecError	err;
 
 	if (x->query == NULL && !x->done)
 	{
-		df_exec_prerun(x);
-		df_exec_begin(x);
+		vx_exec_prerun(x);
+		vx_exec_begin(x);
 	}
 
 	for (;;)
@@ -1633,7 +1633,7 @@ df_exec_next(DfExec *x)
 		int32		status;
 
 		if (x->out_row < x->out_nrows)
-			return df_exec_emit(x);
+			return vx_exec_emit(x);
 		if (x->done)
 			return ExecClearTuple(x->outslot);
 
@@ -1657,7 +1657,7 @@ df_exec_next(DfExec *x)
 				x->input_done = true;
 			else
 			{
-				df_exec_feed(x, &x->inputs[j], &pushed, &full);
+				vx_exec_feed(x, &x->inputs[j], &pushed, &full);
 
 				/*
 				 * An input that has just ended is progress too: go on to the
@@ -1670,24 +1670,24 @@ df_exec_next(DfExec *x)
 			}
 		}
 
-		df_release_out(x);		/* every row of it is out */
-		DF_ERROR_INIT(err);
-		status = df_engine->query_poll(x->query,
-									   pushed ? 0 : (full ? DF_POLL_FULL_MS : DF_POLL_IDLE_MS),
+		vx_release_out(x);		/* every row of it is out */
+		VX_ERROR_INIT(err);
+		status = vx_engine->query_poll(x->query,
+									   pushed ? 0 : (full ? VX_POLL_FULL_MS : VX_POLL_IDLE_MS),
 									   &nrows, &err);
 		if (status == VEC_OK)
 		{
 			int			c;
 
-			if (df_engine->query_result(x->query, &x->outbatch) != VEC_OK)
-				elog(ERROR, "datafusion: no result batch after a poll gave one");
+			if (vx_engine->query_result(x->query, &x->outbatch) != VEC_OK)
+				elog(ERROR, "vec_executor: no result batch after a poll gave one");
 			if (x->outbatch.n_children != x->spec.nout || x->outbatch.length != nrows)
-				elog(ERROR, "datafusion: a result batch of %d columns and " INT64_FORMAT
+				elog(ERROR, "vec_executor: a result batch of %d columns and " INT64_FORMAT
 					 " rows, not %d and %u", (int) x->outbatch.n_children,
 					 x->outbatch.length, x->spec.nout, nrows);
 			for (c = 0; c < x->spec.nout; c++)
-				df_arrow_out_column(&x->outcols[c], &x->outbatch, c,
-									df_out_width(x->spec.out_types[c]));
+				vx_arrow_out_column(&x->outcols[c], &x->outbatch, c,
+									vx_out_width(x->spec.out_types[c]));
 			x->out_nrows = nrows;
 			x->out_row = 0;
 		}
@@ -1698,19 +1698,19 @@ df_exec_next(DfExec *x)
 			int32		route;
 
 			/* Our results, for one of the Motion's receivers. */
-			df_engine->query_bytes(x->query, &route, &data, &len);
+			vx_engine->query_bytes(x->query, &route, &data, &len);
 			if (route < 0)
 				route = 0;		/* a Gather's only receiver */
 			if (route >= x->send_nroutes)
-				elog(ERROR, "datafusion: route %d of a Motion with %d receivers",
+				elog(ERROR, "vec_executor: route %d of a Motion with %d receivers",
 					 route, x->send_nroutes);
 			if (!x->head_sent_to[route])
 			{
-				df_send_bytes(x, route, x->tx_head, DF_BATCH_HEAD);
+				vx_send_bytes(x, route, x->tx_head, VX_BATCH_HEAD);
 				x->head_sent_to[route] = true;
 			}
 			if (!x->stopped)
-				df_send_bytes(x, route, data, len);
+				vx_send_bytes(x, route, data, len);
 			if (x->stopped)
 			{
 				/*
@@ -1719,15 +1719,15 @@ df_exec_next(DfExec *x)
 				 */
 				x->send->stopRequested = true;
 				x->done = true;
-				df_engine->query_free(x->query);
+				vx_engine->query_free(x->query);
 				x->query = NULL;
-				df_vmem_trim();
+				vx_vmem_trim();
 			}
 		}
 		else if (status == VEC_DONE)
 		{
 			x->done = true;
-			df_exec_finished(x);
+			vx_exec_finished(x);
 			if (x->send)
 			{
 				SendEndOfStream(x->estate->motionlayer_context,
@@ -1737,26 +1737,26 @@ df_exec_next(DfExec *x)
 			}
 		}
 		else if (status != VEC_PENDING)
-			df_raise_query(status, &err);
+			vx_raise_query(status, &err);
 
-		df_vmem_sync(x->headroom);
+		vx_vmem_sync(x->headroom);
 		CHECK_FOR_INTERRUPTS();
 	}
 }
 
 static TupleTableSlot *
-df_exec_proc_node(PlanState *pstate)
+vx_exec_proc_node(PlanState *pstate)
 {
-	return df_exec_next(df_exec_lookup(pstate));
+	return vx_exec_next(vx_exec_lookup(pstate));
 }
 
 /* The head of a batch stream through 'motion': magic, then signature. */
 static void
-df_batch_head(uint8 *head, PlannedStmt *stmt, Motion *motion)
+vx_batch_head(uint8 *head, PlannedStmt *stmt, Motion *motion)
 {
-	uint64		sig = df_motion_signature(stmt, motion);
+	uint64		sig = vx_motion_signature(stmt, motion);
 
-	memcpy(head, DF_BATCH_MAGIC, 8);
+	memcpy(head, VX_BATCH_MAGIC, 8);
 	memcpy(head + 8, &sig, 8);
 }
 
@@ -1772,7 +1772,7 @@ df_batch_head(uint8 *head, PlannedStmt *stmt, Motion *motion)
  * which belongs to another slice.
  */
 static PlanState *
-df_find_state(PlanState *ps, Plan *leaf)
+vx_find_state(PlanState *ps, Plan *leaf)
 {
 	PlanState  *found;
 
@@ -1793,21 +1793,21 @@ df_find_state(PlanState *ps, Plan *leaf)
 				return sps->planstate;
 			/* SC1: the Motion below a correlated one's aggregate */
 			if (sps->planstate != NULL &&
-				(found = df_find_state(sps->planstate, leaf)) != NULL)
+				(found = vx_find_state(sps->planstate, leaf)) != NULL)
 				return found;
 		}
 	}
 	if (IsA(ps, MotionState))
 		return NULL;
 	if (IsA(ps, SubqueryScanState))
-		return df_find_state(((SubqueryScanState *) ps)->subplan, leaf);
+		return vx_find_state(((SubqueryScanState *) ps)->subplan, leaf);
 	if (IsA(ps, AppendState))
 	{
 		AppendState *as = (AppendState *) ps;
 		int			i;
 
 		for (i = 0; i < as->as_nplans; i++)
-			if ((found = df_find_state(as->appendplans[i], leaf)) != NULL)
+			if ((found = vx_find_state(as->appendplans[i], leaf)) != NULL)
 				return found;
 		return NULL;
 	}
@@ -1818,7 +1818,7 @@ df_find_state(PlanState *ps, Plan *leaf)
 		int			i;
 
 		for (i = 0; i < ms->ms_nplans; i++)
-			if ((found = df_find_state(ms->mergeplans[i], leaf)) != NULL)
+			if ((found = vx_find_state(ms->mergeplans[i], leaf)) != NULL)
 				return found;
 		return NULL;
 	}
@@ -1828,19 +1828,19 @@ df_find_state(PlanState *ps, Plan *leaf)
 		int			i;
 
 		for (i = 0; i < ss->numSubplans; i++)
-			if ((found = df_find_state(ss->subplans[i], leaf)) != NULL)
+			if ((found = vx_find_state(ss->subplans[i], leaf)) != NULL)
 				return found;
 		return NULL;
 	}
-	found = df_find_state(outerPlanState(ps), leaf);
-	return found ? found : df_find_state(innerPlanState(ps), leaf);
+	found = vx_find_state(outerPlanState(ps), leaf);
+	return found ? found : vx_find_state(innerPlanState(ps), leaf);
 }
 
 /* The PlanState of 'plan' below 'ps' in this slice, or NULL (T2). */
 PlanState *
-df_exec_find_state(PlanState *ps, Plan *plan)
+vx_exec_find_state(PlanState *ps, Plan *plan)
 {
-	return df_find_state(ps, plan);
+	return vx_find_state(ps, plan);
 }
 
 /*
@@ -1850,20 +1850,20 @@ df_exec_find_state(PlanState *ps, Plan *plan)
  * that state is PostgreSQL's, in one column.
  */
 static void
-df_input_states(DfInput *in, Motion *motion)
+vx_input_states(VxInput *in, Motion *motion)
 {
 	int			ncols = list_length(motion->plan.targetlist);
 	int			c;
 
 	for (c = 1; c <= ncols; c++)
-		if (df_motion_state_columns(motion, c) > 0)
+		if (vx_motion_state_columns(motion, c) > 0)
 			break;
 	if (c > ncols)
 		return;					/* no states: stream and tuple columns agree */
 	in->tupatt = palloc0(sizeof(AttrNumber) * Max(in->spec->ncols, 1));
 	in->statepart = palloc0(sizeof(uint8) * Max(in->spec->ncols, 1));
 	in->stateformat = palloc0(sizeof(uint8) * Max(in->spec->ncols, 1));
-	in->statecxt = AllocSetContextCreate(CurrentMemoryContext, "datafusion states",
+	in->statecxt = AllocSetContextCreate(CurrentMemoryContext, "vec states",
 										 ALLOCSET_SMALL_SIZES);
 	for (c = 0; c < in->spec->ncols; c++)
 	{
@@ -1878,7 +1878,7 @@ df_input_states(DfInput *in, Motion *motion)
 		}
 		for (r = 1; r <= ncols; r++)
 		{
-			int			width = df_motion_state_columns(motion, r);
+			int			width = vx_motion_state_columns(motion, r);
 
 			if (pos < start + Max(width, 1))
 			{
@@ -1886,52 +1886,52 @@ df_input_states(DfInput *in, Motion *motion)
 				if (width > 0)
 				{
 					Plan	   *agg = NULL;
-					Aggref	   *partial = df_motion_column_partial(motion, r, &agg);
-					DfAggState	state = df_agg_state_at(agg, partial);
+					Aggref	   *partial = vx_motion_column_partial(motion, r, &agg);
+					VxAggState	state = vx_agg_state_at(agg, partial);
 
-					in->statepart[c] = pos == start ? DF_PART_SUM : DF_PART_COUNT;
+					in->statepart[c] = pos == start ? VX_PART_SUM : VX_PART_COUNT;
 					in->stateformat[c] =
-						state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ?
-						DF_STATE_NUMERIC :
-						state == DF_AGG_AVG_INT && linitial_oid(partial->aggargtypes) != INT8OID ?
-						DF_STATE_INT_ARRAY : DF_STATE_INT8;
+						state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC ?
+						VX_STATE_NUMERIC :
+						state == VX_AGG_AVG_INT && linitial_oid(partial->aggargtypes) != INT8OID ?
+						VX_STATE_INT_ARRAY : VX_STATE_INT8;
 				}
 				break;
 			}
 			start += Max(width, 1);
 		}
 		if (r > ncols)
-			elog(ERROR, "datafusion: stream column %d beyond Motion %d", pos, motion->motionID);
+			elog(ERROR, "vec_executor: stream column %d beyond Motion %d", pos, motion->motionID);
 	}
 }
 
 bool
-df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
-			   const DfTails *tails, char *reason, size_t reasonlen)
+vx_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
+			   const VxTails *tails, char *reason, size_t reasonlen)
 {
 	EState	   *estate = queryDesc->estate;
 	MemoryContext oldcxt;
-	DfExec	   *x;
+	VxExec	   *x;
 	volatile bool ok = false;
 	const char **formats;
 	int			c,
 				j;
 
 	oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
-	x = palloc0(sizeof(DfExec));
+	x = palloc0(sizeof(VxExec));
 	/* IP1: init plan values become constants of the plan */
-	df_param_values = estate->es_param_exec_vals;
-	df_param_econtext = GetPerTupleExprContext(estate);
-	df_numeric_stmt = queryDesc->plannedstmt;
+	vx_param_values = estate->es_param_exec_vals;
+	vx_param_econtext = GetPerTupleExprContext(estate);
+	vx_numeric_stmt = queryDesc->plannedstmt;
 	PG_TRY();
 	{
-		ok = df_translate_slice(root->plan, tails, send == NULL, &x->spec, reason, reasonlen);
+		ok = vx_translate_slice(root->plan, tails, send == NULL, &x->spec, reason, reasonlen);
 	}
 	PG_FINALLY();
 	{
-		df_param_values = NULL;
-		df_param_econtext = NULL;
-		df_numeric_stmt = NULL;
+		vx_param_values = NULL;
+		vx_param_econtext = NULL;
+		vx_numeric_stmt = NULL;
 	}
 	PG_END_TRY();
 	if (!ok)
@@ -1946,11 +1946,11 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	 * Shared Scan reader.
 	 */
 	x->ninputs = x->spec.ninputs;
-	x->inputs = palloc0(sizeof(DfInput) * Max(x->ninputs, 1));
+	x->inputs = palloc0(sizeof(VxInput) * Max(x->ninputs, 1));
 	for (j = 0; j < x->ninputs; j++)
 	{
-		DfInput    *in = &x->inputs[j];
-		PlanState  *ps = df_find_state(root, x->spec.inputs[j].leaf);
+		VxInput    *in = &x->inputs[j];
+		PlanState  *ps = vx_find_state(root, x->spec.inputs[j].leaf);
 
 		in->index = j;
 		in->spec = &x->spec.inputs[j];
@@ -1959,9 +1959,9 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		else if (ps != NULL && IsA(ps, MotionState) && ps != root)
 		{
 			in->motion = (MotionState *) ps;
-			in->ipc = df_motion_sends_batches(queryDesc->plannedstmt, (Motion *) ps->plan);
+			in->ipc = vx_motion_sends_batches(queryDesc->plannedstmt, (Motion *) ps->plan);
 			if (in->ipc)
-				df_batch_head(in->rx_head, queryDesc->plannedstmt, (Motion *) ps->plan);
+				vx_batch_head(in->rx_head, queryDesc->plannedstmt, (Motion *) ps->plan);
 		}
 		else if (ps != NULL && IsA(ps, ShareInputScanState))
 			in->reader = ps;
@@ -1976,14 +1976,14 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		if (in->motion != NULL && !in->ipc)
 		{
 			/* its states' scales may come from a Shared Scan's producer */
-			df_numeric_stmt = queryDesc->plannedstmt;
+			vx_numeric_stmt = queryDesc->plannedstmt;
 			PG_TRY();
 			{
-				df_input_states(in, (Motion *) in->motion->ps.plan);
+				vx_input_states(in, (Motion *) in->motion->ps.plan);
 			}
 			PG_FINALLY();
 			{
-				df_numeric_stmt = NULL;
+				vx_numeric_stmt = NULL;
 			}
 			PG_END_TRY();
 		}
@@ -1997,33 +1997,33 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		{
 			formats[c] = in->spec->digits[c] > 0 ?
 				psprintf("d:%d,%d", in->spec->digits[c], in->spec->scales[c]) :
-				df_arrow_format(in->spec->types[c], in->spec->scales[c]);
-			if (df_type_is_string(in->spec->types[c]))
+				vx_arrow_format(in->spec->types[c], in->spec->scales[c]);
+			if (vx_type_is_string(in->spec->types[c]))
 			{
-				in->incap[c] = DF_BATCH_ROWS * 16;
+				in->incap[c] = VX_BATCH_ROWS * 16;
 				in->invalues[c] = palloc(in->incap[c]);
-				in->inoffsets[c] = palloc(sizeof(int32) * (DF_BATCH_ROWS + 1));
+				in->inoffsets[c] = palloc(sizeof(int32) * (VX_BATCH_ROWS + 1));
 				in->inoffsets[c][0] = 0;
 			}
 			else
-				in->invalues[c] = palloc(DF_BATCH_ROWS * (in->spec->digits[c] > 0 ? DF_NARROW_BYTES :
-														  df_type_width(in->spec->types[c])));
-			in->invalid[c] = palloc(DF_BATCH_ROWS / 8);
+				in->invalues[c] = palloc(VX_BATCH_ROWS * (in->spec->digits[c] > 0 ? VX_NARROW_BYTES :
+														  vx_type_width(in->spec->types[c])));
+			in->invalid[c] = palloc(VX_BATCH_ROWS / 8);
 			in->maxattno = Max(in->maxattno,
 							   in->tupatt ? in->tupatt[c] : in->spec->attnos[c]);
 		}
-		df_arrow_struct_schema(&in->inschema, in->spec->ncols, formats);
-		df_arrow_struct_array(&in->inbatch, in->spec->ncols);
+		vx_arrow_struct_schema(&in->inschema, in->spec->ncols, formats);
+		vx_arrow_struct_array(&in->inbatch, in->spec->ncols);
 	}
 	{
-		List	   *producers = df_slice_producers(root->plan);
+		List	   *producers = vx_slice_producers(root->plan);
 		ListCell   *lc;
 
 		x->nprerun = list_length(producers);
 		x->prerun = palloc0(sizeof(PlanState *) * Max(x->nprerun, 1));
 		foreach(lc, producers)
 		{
-			PlanState  *ps = df_find_state(root, lfirst(lc));
+			PlanState  *ps = vx_find_state(root, lfirst(lc));
 
 			if (ps == NULL)
 			{
@@ -2045,28 +2045,28 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		int			nnarrow = 0;
 
 		x->send = send;
-		df_batch_head(x->tx_head, queryDesc->plannedstmt, motion);
-		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion chunks",
+		vx_batch_head(x->tx_head, queryDesc->plannedstmt, motion);
+		x->chunkcxt = AllocSetContextCreate(estate->es_query_cxt, "vec chunks",
 											ALLOCSET_DEFAULT_SIZES);
 		initStringInfo(&json);
 		appendBinaryStringInfo(&json, x->spec.json, strlen(x->spec.json) - 1);
 
 		/* CP1: character(n) values go without their trailing blanks */
 		for (r = 1; r <= list_length(motion->plan.targetlist); r++)
-			if (df_motion_bpchar_pad(queryDesc->plannedstmt, motion, r) > 0)
+			if (vx_motion_bpchar_pad(queryDesc->plannedstmt, motion, r) > 0)
 				appendStringInfo(&json, "%s%d", ntrim++ > 0 ? "," : ",\"trim\":[",
-								 df_motion_stream_column(motion, r));
+								 vx_motion_stream_column(motion, r));
 		if (ntrim > 0)
 			appendStringInfoChar(&json, ']');
 
 		/* NW1: numeric values go narrowed to their digits */
 		for (r = 1; r <= list_length(motion->plan.targetlist); r++)
 		{
-			int			digits = df_motion_numeric_digits(queryDesc->plannedstmt, motion, r);
+			int			digits = vx_motion_numeric_digits(queryDesc->plannedstmt, motion, r);
 
 			if (digits > 0)
 				appendStringInfo(&json, "%s[%d,%d]", nnarrow++ > 0 ? "," : ",\"narrow\":[",
-								 df_motion_stream_column(motion, r), digits);
+								 vx_motion_stream_column(motion, r), digits);
 		}
 		if (nnarrow > 0)
 			appendStringInfoChar(&json, ']');
@@ -2083,12 +2083,12 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 				int			column;
 				const char *tag;
 
-				if (!df_motion_hash_key(motion, i, &column, &tag))
-					elog(ERROR, "datafusion: unsupported distribution key in Motion %d",
+				if (!vx_motion_hash_key(motion, i, &column, &tag))
+					elog(ERROR, "vec_executor: unsupported distribution key in Motion %d",
 						 motion->motionID);
 				appendStringInfo(&json, "%s{\"col\":%d,\"hash\":\"%s\"}",
 								 i > 0 ? "," : "",
-								 df_motion_stream_column(motion, column + 1), tag);
+								 vx_motion_stream_column(motion, column + 1), tag);
 			}
 			appendStringInfo(&json, "],\"segments\":%d,\"workers\":%d}",
 							 send->numHashSegments, Max(send->parallel_workers, 1));
@@ -2098,13 +2098,13 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 		x->head_sent_to = palloc0(sizeof(bool) * x->send_nroutes);
 	}
 	x->estate = estate;
-	x->memory_limit = df_slice_memory(root);
-	x->headroom = Max(x->memory_limit / 8, DF_MIN_HEADROOM);
-	x->slices_together = df_slices_together(queryDesc->plannedstmt,
+	x->memory_limit = vx_slice_memory(root);
+	x->headroom = Max(x->memory_limit / 8, VX_MIN_HEADROOM);
+	x->slices_together = vx_slices_together(queryDesc->plannedstmt,
 											LocallyExecutingSliceIndex(estate));
-	x->host_segments = df_host_segments();
+	x->host_segments = vx_host_segments();
 
-	x->outcols = palloc0(sizeof(DfOutCol) * Max(x->spec.nout, 1));
+	x->outcols = palloc0(sizeof(VxOutCol) * Max(x->spec.nout, 1));
 	x->outslot = ExecInitExtraTupleSlot(estate, ExecGetResultType(root), &TTSOpsVirtual);
 	if (x->spec.col_tail != NULL)
 	{
@@ -2120,18 +2120,18 @@ df_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 			if (x->spec.col_tail[c] != NULL)
 				x->tail_states[c] = ExecInitExpr(x->spec.col_tail[c], NULL);
 	}
-	x->rowcxt = AllocSetContextCreate(estate->es_query_cxt, "datafusion row",
+	x->rowcxt = AllocSetContextCreate(estate->es_query_cxt, "vec row",
 									  ALLOCSET_SMALL_SIZES);
 
-	x->release.func = df_exec_release;
+	x->release.func = vx_exec_release;
 	x->release.arg = x;
 	MemoryContextRegisterResetCallback(estate->es_query_cxt, &x->release);
-	x->next = df_execs;
-	df_execs = x;
+	x->next = vx_execs;
+	vx_execs = x;
 	MemoryContextSwitchTo(oldcxt);
 
-	elog(DEBUG1, "datafusion plan: %s%s%s", x->spec.json,
-		 df_ipc_inputs(x) ? " (batches in)" : "", x->send ? " (batches out)" : "");
-	ExecSetExecProcNode(x->procnode, df_exec_proc_node);
+	elog(DEBUG1, "engine plan: %s%s%s", x->spec.json,
+		 vx_ipc_inputs(x) ? " (batches in)" : "", x->send ? " (batches out)" : "");
+	ExecSetExecProcNode(x->procnode, vx_exec_proc_node);
 	return true;
 }

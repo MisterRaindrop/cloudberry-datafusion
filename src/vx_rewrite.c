@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * df_rewrite.c
+ * vx_rewrite.c
  *	  SQ1: rewrites a query before it is planned, so that a correlated
  *	  aggregate subquery only aggregates the rows the outer query can use.
  *
@@ -32,10 +32,10 @@
  * "inner = P.key" compares two values of one type with a hash- or
  * merge-joinable equality; P's conditions are the WHERE clause's other
  * top-level conjuncts that only read P (uncorrelated subqueries included)
- * and have no volatile functions.  Only with datafusion.mode = on and
- * datafusion.subquery_key_filter on.
+ * and have no volatile functions.  Only with vec.mode = on and
+ * vec.subquery_key_filter on.
  *
- * src/df_rewrite.c
+ * src/vx_rewrite.c
  *
  *-------------------------------------------------------------------------
  */
@@ -51,25 +51,25 @@
 #include "rewrite/rewriteManip.h"
 #include "utils/lsyscache.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
-bool		df_subquery_key_filter = true;
+bool		vx_subquery_key_filter = true;
 
 static planner_hook_type prev_planner = NULL;
 
-static void df_rewrite_query(Query *query);
+static void vx_rewrite_query(Query *query);
 
 /* Does 'clause', a conjunct of a query's WHERE clause, read relation 'relid' only? */
-typedef struct DfRelOnly
+typedef struct VxRelOnly
 {
 	int			relid;
 	int			depth;			/* sublinks entered */
 	bool		reads_rel;
 	bool		other;
-} DfRelOnly;
+} VxRelOnly;
 
 static bool
-df_rel_only_walker(Node *node, DfRelOnly *ctx)
+vx_rel_only_walker(Node *node, VxRelOnly *ctx)
 {
 	if (node == NULL)
 		return false;
@@ -99,27 +99,27 @@ df_rel_only_walker(Node *node, DfRelOnly *ctx)
 		bool		r;
 
 		ctx->depth++;
-		r = query_tree_walker((Query *) node, df_rel_only_walker, ctx, 0);
+		r = query_tree_walker((Query *) node, vx_rel_only_walker, ctx, 0);
 		ctx->depth--;
 		return r;
 	}
-	return expression_tree_walker(node, df_rel_only_walker, ctx);
+	return expression_tree_walker(node, vx_rel_only_walker, ctx);
 }
 
 static bool
-df_rel_only(Node *clause, int relid)
+vx_rel_only(Node *clause, int relid)
 {
-	DfRelOnly	ctx = {relid, 0, false, false};
+	VxRelOnly	ctx = {relid, 0, false, false};
 
 	if (contain_volatile_functions(clause))
 		return false;
-	(void) df_rel_only_walker(clause, &ctx);
+	(void) vx_rel_only_walker(clause, &ctx);
 	return ctx.reads_rel && !ctx.other;
 }
 
 /* Is relation 'relid' an item of the FROM list itself (not under a join)? */
 static bool
-df_in_from_list(Query *query, int relid)
+vx_in_from_list(Query *query, int relid)
 {
 	ListCell   *lc;
 
@@ -140,7 +140,7 @@ df_in_from_list(Query *query, int relid)
  * when it matches.
  */
 static void
-df_filter_subquery(Query *outer, List *conjuncts, Node *own, Query *sub)
+vx_filter_subquery(Query *outer, List *conjuncts, Node *own, Query *sub)
 {
 	List	   *sub_conjuncts;
 	ListCell   *lc;
@@ -181,7 +181,7 @@ df_filter_subquery(Query *outer, List *conjuncts, Node *own, Query *sub)
 			key = t;
 		}
 		if (inner->varlevelsup != 0 || key->varlevelsup != 1 || key->varattno <= 0 ||
-			!df_in_from_list(outer, key->varno))
+			!vx_in_from_list(outer, key->varno))
 			continue;
 		type = exprType((Node *) inner);
 		if (type != exprType((Node *) key) ||
@@ -193,7 +193,7 @@ df_filter_subquery(Query *outer, List *conjuncts, Node *own, Query *sub)
 		{
 			Node	   *c = lfirst(lc2);
 
-			if (c != own && df_rel_only(c, key->varno))
+			if (c != own && vx_rel_only(c, key->varno))
 				filters = lappend(filters, copyObject(c));
 		}
 		if (filters == NIL)
@@ -253,13 +253,13 @@ df_filter_subquery(Query *outer, List *conjuncts, Node *own, Query *sub)
 }
 
 /* The scalar subqueries of a WHERE conjunct, not those nested in them. */
-typedef struct DfSubqueries
+typedef struct VxSubqueries
 {
 	List	   *subs;
-} DfSubqueries;
+} VxSubqueries;
 
 static bool
-df_scalar_subqueries_walker(Node *node, DfSubqueries *ctx)
+vx_scalar_subqueries_walker(Node *node, VxSubqueries *ctx)
 {
 	if (node == NULL)
 		return false;
@@ -270,27 +270,27 @@ df_scalar_subqueries_walker(Node *node, DfSubqueries *ctx)
 		if (link->subLinkType == EXPR_SUBLINK && IsA(link->subselect, Query))
 			ctx->subs = lappend(ctx->subs, link->subselect);
 		/* the test expression may hold more; the subquery is not entered */
-		return df_scalar_subqueries_walker(link->testexpr, ctx);
+		return vx_scalar_subqueries_walker(link->testexpr, ctx);
 	}
-	return expression_tree_walker(node, df_scalar_subqueries_walker, ctx);
+	return expression_tree_walker(node, vx_scalar_subqueries_walker, ctx);
 }
 
 /* Every query below this one: subqueries of the range table, CTEs, sublinks. */
 static bool
-df_rewrite_walker(Node *node, void *ctx)
+vx_rewrite_walker(Node *node, void *ctx)
 {
 	if (node == NULL)
 		return false;
 	if (IsA(node, Query))
 	{
-		df_rewrite_query((Query *) node);
+		vx_rewrite_query((Query *) node);
 		return false;
 	}
-	return expression_tree_walker(node, df_rewrite_walker, ctx);
+	return expression_tree_walker(node, vx_rewrite_walker, ctx);
 }
 
 static void
-df_rewrite_query(Query *query)
+vx_rewrite_query(Query *query)
 {
 	check_stack_depth();
 
@@ -302,24 +302,24 @@ df_rewrite_query(Query *query)
 
 		foreach(lc, conjuncts)
 		{
-			DfSubqueries subs = {NIL};
+			VxSubqueries subs = {NIL};
 			ListCell   *lc2;
 
-			(void) df_scalar_subqueries_walker(lfirst(lc), &subs);
+			(void) vx_scalar_subqueries_walker(lfirst(lc), &subs);
 			foreach(lc2, subs.subs)
-				df_filter_subquery(query, conjuncts, lfirst(lc), lfirst(lc2));
+				vx_filter_subquery(query, conjuncts, lfirst(lc), lfirst(lc2));
 		}
 	}
-	(void) query_tree_walker(query, df_rewrite_walker, NULL, 0);
+	(void) query_tree_walker(query, vx_rewrite_walker, NULL, 0);
 }
 
 static PlannedStmt *
-df_planner(Query *parse, const char *query_string, int cursorOptions,
+vx_planner(Query *parse, const char *query_string, int cursorOptions,
 		   ParamListInfo boundParams, OptimizerOptions *optimizer_options)
 {
-	if (df_mode == DF_MODE_ON && df_subquery_key_filter &&
+	if (vx_mode == VX_MODE_ON && vx_subquery_key_filter &&
 		parse->commandType == CMD_SELECT)
-		df_rewrite_query(parse);
+		vx_rewrite_query(parse);
 	if (prev_planner)
 		return prev_planner(parse, query_string, cursorOptions, boundParams,
 							optimizer_options);
@@ -328,8 +328,8 @@ df_planner(Query *parse, const char *query_string, int cursorOptions,
 }
 
 void
-df_install_planner_hook(void)
+vx_install_planner_hook(void)
 {
 	prev_planner = planner_hook;
-	planner_hook = df_planner;
+	planner_hook = vx_planner;
 }

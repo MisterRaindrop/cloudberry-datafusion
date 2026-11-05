@@ -17,13 +17,13 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_numeric.c
+ * vx_numeric.c
  *	  numeric values of a fixed scale as 128-bit integers (N2).
  *
  * A numeric(p, s) column holds values whose display scale is s, so each is
  * an integer times 10^-s; with p <= 38 that integer fits Arrow's
  * Decimal128(38, s).  NaN, which such a column may also hold, is
- * DF_NUMERIC_NAN, above every value of 38 digits: PostgreSQL sorts NaN
+ * VX_NUMERIC_NAN, above every value of 38 digits: PostgreSQL sorts NaN
  * above all numbers and NaN equals NaN, so comparisons, min/max, grouping
  * and joins need nothing more; sum and avg treat it explicitly.  Values are
  * read from PostgreSQL's representation (utils/numeric.h) and written back
@@ -37,11 +37,11 @@
 #include "utils/builtins.h"
 #include "utils/numeric.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
 /* 10^0 .. 10^38 */
 static int128
-df_pow10(int n)
+vx_pow10(int n)
 {
 	int128		v = 1;
 
@@ -51,7 +51,7 @@ df_pow10(int n)
 }
 
 bool
-df_numeric_typmod(int32 typmod, int *precision, int *scale)
+vx_numeric_typmod(int32 typmod, int *precision, int *scale)
 {
 	int			p,
 				s;
@@ -60,7 +60,7 @@ df_numeric_typmod(int32 typmod, int *precision, int *scale)
 		return false;			/* no precision given */
 	p = ((typmod - VARHDRSZ) >> 16) & 0xffff;
 	s = (((typmod - VARHDRSZ) & 0x7ff) ^ 1024) - 1024;
-	if (p < 1 || p > DF_NUMERIC_MAX_PRECISION || s < 0 || s > p)
+	if (p < 1 || p > VX_NUMERIC_MAX_PRECISION || s < 0 || s > p)
 		return false;
 	*precision = p;
 	*scale = s;
@@ -71,7 +71,7 @@ df_numeric_typmod(int32 typmod, int *precision, int *scale)
  * The parts of a numeric value, which may have a short (1-byte) varlena
  * header: its fields are read with memcpy, without making an aligned copy.
  */
-typedef struct DfNumericParts
+typedef struct VxNumericParts
 {
 	bool		special;		/* NaN or an infinity */
 	bool		nan;
@@ -80,10 +80,10 @@ typedef struct DfNumericParts
 	int			dscale;
 	int			ndigits;
 	const char *digits;			/* int16 each, unaligned */
-} DfNumericParts;
+} VxNumericParts;
 
 static void
-df_numeric_parts(struct varlena *v, DfNumericParts *parts)
+vx_numeric_parts(struct varlena *v, VxNumericParts *parts)
 {
 	const char *data = VARDATA_ANY(v);
 	int			len = VARSIZE_ANY_EXHDR(v);
@@ -123,7 +123,7 @@ df_numeric_parts(struct varlena *v, DfNumericParts *parts)
 
 /* Decimal digits before the point (0 for |v| < 1) of a finite value. */
 static int
-df_numeric_int_digits(const DfNumericParts *parts)
+vx_numeric_int_digits(const VxNumericParts *parts)
 {
 	NumericDigit first;
 	int			n;
@@ -140,26 +140,26 @@ df_numeric_int_digits(const DfNumericParts *parts)
 	return n;
 }
 
-DfNumericFit
-df_numeric_value(Datum d, int scale, int128 *out)
+VxNumericFit
+vx_numeric_value(Datum d, int scale, int128 *out)
 {
 	struct varlena *v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d));
-	DfNumericParts parts;
+	VxNumericParts parts;
 	int128		acc = 0;
 	int			exp10;
 	int			i;
-	DfNumericFit fit = DF_NUMERIC_FITS;
+	VxNumericFit fit = VX_NUMERIC_FITS;
 
-	df_numeric_parts(v, &parts);
+	vx_numeric_parts(v, &parts);
 	if (parts.special)
 	{
 		/* an infinity as its value only where the caller allows one */
-		*out = parts.nan ? DF_NUMERIC_NAN : parts.neg ? DF_NUMERIC_NINF : DF_NUMERIC_PINF;
-		fit = parts.nan ? DF_NUMERIC_FITS : DF_NUMERIC_INFINITE;
+		*out = parts.nan ? VX_NUMERIC_NAN : parts.neg ? VX_NUMERIC_NINF : VX_NUMERIC_PINF;
+		fit = parts.nan ? VX_NUMERIC_FITS : VX_NUMERIC_INFINITE;
 	}
 	else if (parts.dscale > scale ||
-			 df_numeric_int_digits(&parts) + scale > DF_NUMERIC_MAX_PRECISION)
-		fit = DF_NUMERIC_TOO_LONG;
+			 vx_numeric_int_digits(&parts) + scale > VX_NUMERIC_MAX_PRECISION)
+		fit = VX_NUMERIC_TOO_LONG;
 	else
 	{
 		/*
@@ -174,9 +174,9 @@ df_numeric_value(Datum d, int scale, int128 *out)
 			memcpy(&dig, parts.digits + i * sizeof(NumericDigit), sizeof(dig));
 			exp10 = (parts.weight - i) * DEC_DIGITS + scale;
 			if (exp10 >= 0)
-				acc += (int128) dig * df_pow10(exp10);
+				acc += (int128) dig * vx_pow10(exp10);
 			else if (exp10 > -DEC_DIGITS)
-				acc += dig / (int) df_pow10(-exp10);	/* dropped digits are 0 */
+				acc += dig / (int) vx_pow10(-exp10);	/* dropped digits are 0 */
 		}
 		*out = parts.neg ? -acc : acc;
 	}
@@ -187,7 +187,7 @@ df_numeric_value(Datum d, int scale, int128 *out)
 
 /* w = w * m + a, on four little-endian 64-bit words */
 static void
-df_wide_muladd(uint64 *w, uint64 m, uint64 a)
+vx_wide_muladd(uint64 *w, uint64 m, uint64 a)
 {
 	uint128		carry = a;
 	int			i;
@@ -202,38 +202,38 @@ df_wide_muladd(uint64 *w, uint64 m, uint64 a)
 }
 
 /*
- * As df_numeric_value, into the Decimal256 value at 'dst', for values of up
+ * As vx_numeric_value, into the Decimal256 value at 'dst', for values of up
  * to 76 digits at 'scale' (N3's expressions): a tuple read into a column of
  * such a type, an avg (AVG1) received from PostgreSQL.  The value is built
  * digit by digit, NBASE at a time, then shifted to the scale.
  */
-DfNumericFit
-df_numeric_value_wide(Datum d, int scale, uint8 *dst)
+VxNumericFit
+vx_numeric_value_wide(Datum d, int scale, uint8 *dst)
 {
 	struct varlena *v;
-	DfNumericParts parts;
+	VxNumericParts parts;
 	uint64		w[4] = {0, 0, 0, 0};
 	int128		narrow;
 	int			exp10 = 0;
 	int			i;
-	DfNumericFit fit;
+	VxNumericFit fit;
 
-	fit = df_numeric_value(d, scale, &narrow);
-	if (fit != DF_NUMERIC_TOO_LONG)
+	fit = vx_numeric_value(d, scale, &narrow);
+	if (fit != VX_NUMERIC_TOO_LONG)
 	{
-		df_numeric_store(narrow, dst);
+		vx_numeric_store(narrow, dst);
 		return fit;
 	}
 	v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d));
-	df_numeric_parts(v, &parts);
+	vx_numeric_parts(v, &parts);
 	if (parts.dscale > scale ||
-		df_numeric_int_digits(&parts) + scale > DF_NUMERIC_MAX_EXPR_PRECISION)
-		fit = DF_NUMERIC_TOO_LONG;
+		vx_numeric_int_digits(&parts) + scale > VX_NUMERIC_MAX_EXPR_PRECISION)
+		fit = VX_NUMERIC_TOO_LONG;
 	else
 	{
 		bool		started = false;
 
-		fit = DF_NUMERIC_FITS;
+		fit = VX_NUMERIC_FITS;
 		for (i = 0; i < parts.ndigits; i++)
 		{
 			NumericDigit dig;
@@ -243,7 +243,7 @@ df_numeric_value_wide(Datum d, int scale, uint8 *dst)
 			if (e >= 0)
 			{
 				/* Horner: the digits so far are then worth 10^e each */
-				df_wide_muladd(w, started ? NBASE : 1, dig);
+				vx_wide_muladd(w, started ? NBASE : 1, dig);
 				started = true;
 				exp10 = e;
 			}
@@ -254,11 +254,11 @@ df_numeric_value_wide(Datum d, int scale, uint8 *dst)
 				{
 					int			k = Min(exp10, 18);
 
-					df_wide_muladd(w, (uint64) df_pow10(k), 0);
+					vx_wide_muladd(w, (uint64) vx_pow10(k), 0);
 					exp10 -= k;
 				}
 				if (e > -DEC_DIGITS)
-					df_wide_muladd(w, 1, dig / (int) df_pow10(-e));
+					vx_wide_muladd(w, 1, dig / (int) vx_pow10(-e));
 				break;
 			}
 		}
@@ -266,7 +266,7 @@ df_numeric_value_wide(Datum d, int scale, uint8 *dst)
 		{
 			int			k = Min(exp10, 18);
 
-			df_wide_muladd(w, (uint64) df_pow10(k), 0);
+			vx_wide_muladd(w, (uint64) vx_pow10(k), 0);
 			exp10 -= k;
 		}
 		if (parts.neg)
@@ -289,49 +289,49 @@ df_numeric_value_wide(Datum d, int scale, uint8 *dst)
 
 /* DN1: the display scale of numeric value 'd' (0 for NaN). */
 int
-df_numeric_dscale(Datum d)
+vx_numeric_dscale(Datum d)
 {
-	DfNumericParts parts;
+	VxNumericParts parts;
 
-	df_numeric_parts(pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d)), &parts);
+	vx_numeric_parts(pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d)), &parts);
 	return parts.special ? 0 : parts.dscale;
 }
 
 bool
-df_numeric_const_ps(Datum d, int *precision, int *scale)
+vx_numeric_const_ps(Datum d, int *precision, int *scale)
 {
 	struct varlena *v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(d));
-	DfNumericParts parts;
+	VxNumericParts parts;
 
-	df_numeric_parts(v, &parts);
+	vx_numeric_parts(v, &parts);
 	if (parts.special)
 	{
-		*precision = 1;			/* NaN fits any column, as DF_NUMERIC_NAN */
+		*precision = 1;			/* NaN fits any column, as VX_NUMERIC_NAN */
 		*scale = 0;
 		return parts.nan;
 	}
 	*scale = parts.dscale;
-	*precision = Max(df_numeric_int_digits(&parts) + parts.dscale, 1);
-	return *precision <= DF_NUMERIC_MAX_PRECISION;
+	*precision = Max(vx_numeric_int_digits(&parts) + parts.dscale, 1);
+	return *precision <= VX_NUMERIC_MAX_PRECISION;
 }
 
 /*
  * 'v' as a Decimal256 value: little-endian two's complement, the upper half
- * extending the sign.  DF_NUMERIC_NAN becomes Decimal256's NaN, i256::MAX,
+ * extending the sign.  VX_NUMERIC_NAN becomes Decimal256's NaN, i256::MAX,
  * and the infinities i256::MAX - 1 and i256::MIN (pgnum.rs).
  */
 void
-df_numeric_store(int128 v, uint8 *dst)
+vx_numeric_store(int128 v, uint8 *dst)
 {
 	uint128		lo = (uint128) v;
 	uint128		hi = v < 0 ? ~(uint128) 0 : 0;
 
-	if (v == DF_NUMERIC_NAN || v == DF_NUMERIC_PINF)
+	if (v == VX_NUMERIC_NAN || v == VX_NUMERIC_PINF)
 	{
-		lo = v == DF_NUMERIC_NAN ? ~(uint128) 0 : ~(uint128) 0 - 1;
+		lo = v == VX_NUMERIC_NAN ? ~(uint128) 0 : ~(uint128) 0 - 1;
 		hi = ~(uint128) 0 >> 1;
 	}
-	else if (v == DF_NUMERIC_NINF)
+	else if (v == VX_NUMERIC_NINF)
 	{
 		lo = 0;
 		hi = (uint128) 1 << 127;
@@ -346,7 +346,7 @@ df_numeric_store(int128 v, uint8 *dst)
  * would be.
  */
 Datum
-df_numeric_datum(const uint8 *src, int scale)
+vx_numeric_datum(const uint8 *src, int scale)
 {
 	uint64		w[4];			/* little-endian 64-bit words */
 	char		digits[96];

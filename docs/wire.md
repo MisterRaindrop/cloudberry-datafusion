@@ -1,7 +1,7 @@
 # Batch Motion wire format
 
 Between two slices that both run in an engine, a Motion can carry Arrow
-IPC batches instead of PostgreSQL tuples (`datafusion.motion_batches`).
+IPC batches instead of PostgreSQL tuples (`vec.motion_batches`).
 The two ends are different processes, often on different hosts, and each
 runs its own copy of the engine.  This document is what both must agree
 on, byte for byte: an engine that writes and reads streams as below can
@@ -10,7 +10,7 @@ of an input) gives the plan members that ask for it.
 
 ## Which Motions
 
-`df_motion_batchable` and `df_batch_motions` (`src/df_plan_check.c`)
+`vx_motion_batchable` and `vx_batch_motions` (`src/vx_plan_check.c`)
 decide, once per statement and alike in every process:
 
 - a Gather (sorted or not: a receiver that reads batches merges nothing),
@@ -23,7 +23,7 @@ decide, once per statement and alike in every process:
 - and an engine that declares `VEC_F_IPC_MOTION`.
 
 Every other Motion carries tuples as before.  A process that expected
-batches and gets tuples fails: "received tuples where DataFusion batches
+batches and gets tuples fails: "received tuples where batches
 were expected".
 
 ## Streams
@@ -53,7 +53,7 @@ head   := "DFARROW1" (8 bytes) signature (8 bytes)
 
 - Chunk boundaries mean nothing: the receiver concatenates the payloads of
   one route and decodes the result.  The head may span chunks.
-- `signature` is `df_motion_signature` (`src/df_plan_check.c`), a 64-bit
+- `signature` is `vx_motion_signature` (`src/vx_plan_check.c`), a 64-bit
   FNV-1a hash in the sending host's byte order, of:
   the engine's name and `VEC_IR_VERSION`; the Motion's ID; the number of
   its columns and, for each, its PostgreSQL type, the length it pads a
@@ -113,7 +113,7 @@ numeric by `hash_numeric` of the value at its column's scale, `date` as
 int4, `time`, `timestamp` and `timestamptz` as int8.  A row routed to the
 wrong segment gives wrong results with no error, so every engine has to
 pass the check that compares its routes with `cdbhash()` value by value
-(`datafusion_debug_cdbhash_check`, through the engine's
+(`vec_debug_cdbhash_check`, through the engine's
 `cdbhash_routes`): every key type with its special values, two
 combinations of several keys, and parallel workers.
 `engines/datafusion/df_core/src/cdbhash.rs` is DataFusion's

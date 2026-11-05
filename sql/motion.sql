@@ -20,14 +20,14 @@
 -- the rows.  Partial aggregates produce PostgreSQL transition states that a
 -- Finalize Aggregate combines (since M7a in DataFusion as well, see
 -- receive.sql).  Each query runs with
--- datafusion.mode off, then on; the two results must match.
+-- vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 -- QEs load the library when they connect.
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 
 CREATE TABLE df_m5 (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_m5 SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
@@ -36,34 +36,34 @@ INSERT INTO df_m5 VALUES (NULL, NULL, NULL, NULL, NULL);
 ANALYZE df_m5;
 
 -- Which slices qualify.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_m5 WHERE e < 50;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_m5 GROUP BY e;
 EXPLAIN (COSTS OFF) SELECT a, b FROM df_m5 WHERE a % 50000 = 0;
 EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_m5;
 
 -- Partial plain aggregate on the segments, finalized on the coordinator.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
 
 -- Partial grouped aggregate, redistributed, finalized on the segments.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
 
 -- Grouping by the distribution key: one stage on the segments.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
 
 -- A filter and projection, gathered.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
 
 -- The scan below the partial aggregate never runs on PostgreSQL.
@@ -74,18 +74,18 @@ SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
 -- primaries on the host) partitions, at least 1: on the coordinator, a
 -- primary of its host with the 3 segments, of the 2 slices of a plain
 -- aggregate's plan, 2 of the 2 threads; of the 3 of a join's, 1.
--- datafusion.slice_partitions fixes them, up to the threads.
+-- vec.slice_partitions fixes them, up to the threads.
 SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
-SELECT partitions FROM datafusion_debug_last_run();
+SELECT partitions FROM vec_debug_last_run();
 SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
-SELECT partitions FROM datafusion_debug_last_run();
-SET datafusion.slice_partitions = 8;
+SELECT partitions FROM vec_debug_last_run();
+SET vec.slice_partitions = 8;
 SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
-SELECT partitions FROM datafusion_debug_last_run();
-SET datafusion.slice_partitions = 1;
+SELECT partitions FROM vec_debug_last_run();
+SET vec.slice_partitions = 1;
 SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
-SELECT partitions FROM datafusion_debug_last_run();
-RESET datafusion.slice_partitions;
+SELECT partitions FROM vec_debug_last_run();
+RESET vec.slice_partitions;
 
 -- AP2: a partial aggregate may produce a group more than once (the
 -- aggregate above combines them, as after a Streaming Partial
@@ -100,10 +100,10 @@ SET optimizer = on;
 SET work_mem = '1MB';
 EXPLAIN (COSTS OFF) SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
 FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
 FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
 FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
 -- Not when the aggregate above counts the partial aggregate's groups: a
@@ -112,10 +112,10 @@ FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_a
 -- count twice.
 EXPLAIN (COSTS OFF) SELECT count(*), sum(s), sum(n), sum(d)
 FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(s), sum(n), sum(d)
 FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(s), sum(n), sum(d)
 FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
 RESET work_mem;
@@ -138,4 +138,4 @@ SELECT count(*) FROM df_m5 WHERE a % 7 = 0;
 
 DROP TABLE df_m5;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

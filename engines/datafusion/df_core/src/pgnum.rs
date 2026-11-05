@@ -19,7 +19,7 @@
 //! Columns and constants are read with up to 38 digits; arithmetic results
 //! have up to 76, sums of up to 66.  NaN, which a numeric column may hold,
 //! is `NUMERIC_NAN`, above every 76-digit value, as the C side writes it
-//! (df_numeric.c): PostgreSQL sorts NaN above all numbers and NaN equals
+//! (vx_numeric.c): PostgreSQL sorts NaN above all numbers and NaN equals
 //! NaN, so comparisons, min/max, grouping and joins work on the integers.
 //! What does not: rescaling and arithmetic (NaN in, NaN out, here) and
 //! sums, which a NaN makes NaN (`sum_decimal` in query.rs adds the others
@@ -912,7 +912,7 @@ impl AggregateUDFImpl for PgSumDecimal {
 /// the sum as numbers made +Infinity + 1 NaN's encoding and -Infinity + 1
 /// a number).  No plan gives a sum infinities yet: a column of numeric(p, s)
 /// cannot hold them, and a sum of numeric of unknown precision stays in
-/// PostgreSQL (df_plan_check.c); the values still reach the readers'
+/// PostgreSQL (vx_plan_check.c); the values still reach the readers'
 /// conversion, which keeps them.
 const SAW_NAN: u8 = 1;
 const SAW_PINF: u8 = 2;
@@ -1874,7 +1874,7 @@ impl ScalarUDFImpl for PgNumCmp {
 }
 
 /// A numeric value in PostgreSQL's representation (utils/numeric.h), the
-/// bytes after its varlena header, at `scale`: as df_numeric_value_wide
+/// bytes after its varlena header, at `scale`: as vx_numeric_value_wide
 /// reads it on the C side, for the direct PAX reader (C2).  NaN and the
 /// infinities become their sentinels; a value with more fractional digits
 /// than `scale`, or more than 76 digits at it, is an error.

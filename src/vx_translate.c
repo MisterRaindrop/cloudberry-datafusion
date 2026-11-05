@@ -17,7 +17,7 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_translate.c
+ * vx_translate.c
  *	  Describe an eligible slice to the Rust side as a JSON plan.
  *
  * The slice is a Seq Scan, optionally under one aggregate, or an aggregate
@@ -37,17 +37,17 @@
  * PostgreSQL's array (M7d): the partial stage outputs sum(x) and count(x),
  * two columns of the stream, and the combining stage divides their sums
  * ("avg_merge").  Input columns from a Motion are therefore numbered by
- * their position in the stream (df_motion_stream_column).
+ * their position in the stream (vx_motion_stream_column).
  *
  * A Sort and a Limit at the top of the slice (S1) pass the rows of the
  * rest through: they become the spec's "sort", by output column, and
  * "limit".
  *
- * df_check_slice has already rejected anything this file cannot express,
+ * vx_check_slice has already rejected anything this file cannot express,
  * so the translator reports a failure only as a safety net, and the slice
  * then stays on the PostgreSQL executor.
  *
- * src/df_translate.c
+ * src/vx_translate.c
  *
  *-------------------------------------------------------------------------
  */
@@ -69,16 +69,16 @@
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
-typedef enum DfLevel
+typedef enum VxLevel
 {
-	DF_LEVEL_SCAN,				/* expressions of node b->ctx, over its inputs */
-	DF_LEVEL_AGG				/* expressions over the aggregate's output */
-} DfLevel;
+	VX_LEVEL_SCAN,				/* expressions of node b->ctx, over its inputs */
+	VX_LEVEL_AGG				/* expressions over the aggregate's output */
+} VxLevel;
 
 /* An input being described: its leaf and the columns read so far. */
-typedef struct DfInputDesc
+typedef struct VxInputDesc
 {
 	Plan	   *leaf;			/* Seq Scan or receiving Motion */
 	List	   *attnos;			/* int: table column, or Motion stream
@@ -86,23 +86,23 @@ typedef struct DfInputDesc
 	List	   *types;			/* oid: type of each */
 	List	   *scales;			/* int: scale of each numeric one */
 	bool		set;			/* SP1: a subquery's rows, read whole first */
-} DfInputDesc;
+} VxInputDesc;
 
 /* A1: an Agg below a join or another Agg, a named node of the plan. */
-typedef struct DfNamedAgg
+typedef struct VxNamedAgg
 {
 	Agg		   *agg;
 	List	   *aggrefs;		/* its distinct aggregate calls */
-	List	   *aggfns;			/* the function of each (df_emit_agg_calls) */
-} DfNamedAgg;
+	List	   *aggfns;			/* the function of each (vx_emit_agg_calls) */
+} VxNamedAgg;
 
-typedef struct DfBuilder
+typedef struct VxBuilder
 {
 	Plan	   *ctx;			/* the node whose expressions are emitted */
-	Agg		   *agg;			/* the Agg of DF_LEVEL_AGG */
+	Agg		   *agg;			/* the Agg of VX_LEVEL_AGG */
 	bool		agg_named;		/* read from above: its columns by name */
-	List	   *named;			/* DfNamedAgg, of the Aggs below the top */
-	List	   *inputs;			/* DfInputDesc, in input order */
+	List	   *named;			/* VxNamedAgg, of the Aggs below the top */
+	List	   *inputs;			/* VxInputDesc, in input order */
 	List	   *aggrefs;		/* distinct aggregate calls, in first-use order */
 	List	   *aggfns;			/* the function of each: NULL for the
 								 * Aggref's own, or "sum" / "count" for the
@@ -112,38 +112,38 @@ typedef struct DfBuilder
 	bool		join_sides;		/* emitting a join's keys or filter, which
 								 * read both sides as they are */
 	int		   *out_col;		/* output column of each value
-								 * (df_emit_outputs) */
+								 * (vx_emit_outputs) */
 	Bitmapset  *sort_values;	/* the values the slice sorts its output by */
-	List	   *correlated;		/* DfCorrelated, of the SubPlans joined (SC1) */
+	List	   *correlated;		/* VxCorrelated, of the SubPlans joined (SC1) */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
-} DfBuilder;
+} VxBuilder;
 
-static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
-static void df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale);
-static void df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
-static void df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
-static void df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k,
+static void vx_emit(VxBuilder *b, StringInfo out, Node *node, VxLevel level);
+static void vx_emit_numeric_const(VxBuilder *b, StringInfo out, Const *c, int scale);
+static void vx_emit_output_of(VxBuilder *b, StringInfo out, Plan *child, AttrNumber resno);
+static void vx_emit_dscale(VxBuilder *b, StringInfo out, Node *node, VxLevel level);
+static void vx_emit_window_avg(VxBuilder *b, StringInfo out, WindowFunc *wf, int k,
 							   bool dscale);
-static int	df_window_index(DfBuilder *b, Node *node);
-static void df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r,
-						   DfLevel level);
-static bool df_is_mixed_sum(Plan *ctx, Node *node);
-static Plan *df_level_ctx(DfBuilder *b, DfLevel level);
-static void df_emit_node(DfBuilder *b, StringInfo out, Plan *plan);
-static void df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
+static int	vx_window_index(VxBuilder *b, Node *node);
+static void vx_emit_numcmp(VxBuilder *b, StringInfo out, const char *op, Node *l, Node *r,
+						   VxLevel level);
+static bool vx_is_mixed_sum(Plan *ctx, Node *node);
+static Plan *vx_level_ctx(VxBuilder *b, VxLevel level);
+static void vx_emit_node(VxBuilder *b, StringInfo out, Plan *plan);
+static void vx_emit_agg_calls(VxBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
 							  List *aggfns);
-static DfNamedAgg *df_named_of(DfBuilder *b, Agg *agg);
-static void df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn);
-static void df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var);
-static bool df_avg_parts(Aggref *agg, const char **sfn, const char **cfn);
-static void df_emit_call_ref(DfBuilder *b, StringInfo out, Aggref *agg, const char *fn);
-static int	df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn);
-static bool df_numbers_rows(Plan *plan);
+static VxNamedAgg *vx_named_of(VxBuilder *b, Agg *agg);
+static void vx_emit_named_call(VxBuilder *b, StringInfo out, Aggref *call, const char *fn);
+static void vx_emit_ungrouped(VxBuilder *b, StringInfo out, Var *var);
+static bool vx_avg_parts(Aggref *agg, const char **sfn, const char **cfn);
+static void vx_emit_call_ref(VxBuilder *b, StringInfo out, Aggref *agg, const char *fn);
+static int	vx_agg_ref(VxBuilder *b, Aggref *agg, const char *fn);
+static bool vx_numbers_rows(Plan *plan);
 
 static void
-df_fail(DfBuilder *b, const char *what)
+vx_fail(VxBuilder *b, const char *what)
 {
 	if (!b->failed)
 		snprintf(b->reason, b->reasonlen, "cannot translate %s", what);
@@ -151,7 +151,7 @@ df_fail(DfBuilder *b, const char *what)
 }
 
 const char *
-df_type_tag(Oid type)
+vx_type_tag(Oid type)
 {
 	switch (type)
 	{
@@ -183,7 +183,7 @@ df_type_tag(Oid type)
 		case BPCHAROID:
 			return "bpchar";
 		case NUMERICOID:
-			/* of scale 0; see df_tag for others */
+			/* of scale 0; see vx_tag for others */
 			return "numeric";
 		default:
 			return NULL;
@@ -192,11 +192,11 @@ df_type_tag(Oid type)
 
 /* The type tag of 'type', for numeric of scale 'scale'. */
 static const char *
-df_tag(Oid type, int scale)
+vx_tag(Oid type, int scale)
 {
 	if (type == NUMERICOID && scale != 0)
 		return psprintf("numeric:%d", scale);
-	return df_type_tag(type);
+	return vx_type_tag(type);
 }
 
 /*
@@ -205,19 +205,19 @@ df_tag(Oid type, int scale)
  * state (bytea) but whose stream column is DataFusion's numeric sum.
  */
 static int
-df_scale_of(Plan *ctx, Node *expr)
+vx_scale_of(Plan *ctx, Node *expr)
 {
 	int			p,
 				s;
 
-	if (!df_numeric_ps(ctx, expr, &p, &s) && !df_numeric_mixed(ctx, expr, &p, &s) &&
-		!df_mixed_sum_scale(ctx, expr, &s))
+	if (!vx_numeric_ps(ctx, expr, &p, &s) && !vx_numeric_mixed(ctx, expr, &p, &s) &&
+		!vx_mixed_sum_scale(ctx, expr, &s))
 		return 0;
 	return s;
 }
 
 static void
-df_emit_float(StringInfo out, double v, bool single)
+vx_emit_float(StringInfo out, double v, bool single)
 {
 	if (isnan(v))
 		appendStringInfoString(out, "\"NaN\"");
@@ -229,7 +229,7 @@ df_emit_float(StringInfo out, double v, bool single)
 
 /* 'len' bytes of UTF-8 as a JSON string. */
 static void
-df_emit_json_string(StringInfo out, const char *s, int len)
+vx_emit_json_string(StringInfo out, const char *s, int len)
 {
 	int			i;
 
@@ -252,9 +252,9 @@ df_emit_json_string(StringInfo out, const char *s, int len)
 }
 
 static void
-df_emit_const(DfBuilder *b, StringInfo out, Const *c)
+vx_emit_const(VxBuilder *b, StringInfo out, Const *c)
 {
-	const char *tag = df_type_tag(c->consttype);
+	const char *tag = vx_type_tag(c->consttype);
 	int			p,
 				s;
 
@@ -262,17 +262,17 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 	{
 		if (c->constisnull)
 			s = 0;
-		else if (!df_numeric_const_ps(c->constvalue, &p, &s))
+		else if (!vx_numeric_const_ps(c->constvalue, &p, &s))
 		{
-			df_fail(b, "a numeric constant");
+			vx_fail(b, "a numeric constant");
 			return;
 		}
-		df_emit_numeric_const(b, out, c, s);
+		vx_emit_numeric_const(b, out, c, s);
 		return;
 	}
 	if (tag == NULL)
 	{
-		df_fail(b, "a constant");
+		vx_fail(b, "a constant");
 		return;
 	}
 	appendStringInfo(out, "{\"lit\":{\"type\":\"%s\"", tag);
@@ -300,10 +300,10 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 				appendStringInfo(out, INT64_FORMAT, DatumGetInt64(c->constvalue));
 				break;
 			case FLOAT4OID:
-				df_emit_float(out, DatumGetFloat4(c->constvalue), true);
+				vx_emit_float(out, DatumGetFloat4(c->constvalue), true);
 				break;
 			case FLOAT8OID:
-				df_emit_float(out, DatumGetFloat8(c->constvalue), false);
+				vx_emit_float(out, DatumGetFloat8(c->constvalue), false);
 				break;
 			case TEXTOID:
 			case VARCHAROID:
@@ -311,7 +311,7 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 				{
 					text	   *t = DatumGetTextPP(c->constvalue);
 
-					df_emit_json_string(out, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
+					vx_emit_json_string(out, VARDATA_ANY(t), VARSIZE_ANY_EXHDR(t));
 				}
 				break;
 		}
@@ -321,20 +321,20 @@ df_emit_const(DfBuilder *b, StringInfo out, Const *c)
 
 /* numeric constant 'c' as a literal of scale 'scale' (it fits: checked). */
 static void
-df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
+vx_emit_numeric_const(VxBuilder *b, StringInfo out, Const *c, int scale)
 {
 	int128		v;
 	char		digits[48];
 	int			n = 0;
 	bool		neg;
 
-	appendStringInfo(out, "{\"lit\":{\"type\":\"%s\"", df_tag(NUMERICOID, scale));
+	appendStringInfo(out, "{\"lit\":{\"type\":\"%s\"", vx_tag(NUMERICOID, scale));
 	if (c->constisnull)
 	{
 		appendStringInfoString(out, ",\"null\":true}}");
 		return;
 	}
-	if (df_numeric_value(c->constvalue, scale, &v) == DF_NUMERIC_TOO_LONG)
+	if (vx_numeric_value(c->constvalue, scale, &v) == VX_NUMERIC_TOO_LONG)
 	{
 		/*
 		 * AVG1: beyond 38 digits at this scale (one compared with an avg):
@@ -355,7 +355,7 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 				break;
 		if (i < nfrac)
 		{
-			df_fail(b, "a numeric constant");
+			vx_fail(b, "a numeric constant");
 			return;
 		}
 		if (*p == '-')
@@ -363,9 +363,9 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 		while (*p == '0' && p[1] != '\0')
 			p++;
 		ndig = strlen(p) + scale;
-		if (ndig > DF_NUMERIC_MAX_EXPR_PRECISION)
+		if (ndig > VX_NUMERIC_MAX_EXPR_PRECISION)
 		{
-			df_fail(b, "a numeric constant");
+			vx_fail(b, "a numeric constant");
 			return;
 		}
 		appendStringInfo(out, ",\"value\":\"%s%s%.*s", text[0] == '-' ? "-" : "", p,
@@ -375,12 +375,12 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 		appendStringInfoString(out, "\"}}");
 		return;
 	}
-	if (df_numeric_value(c->constvalue, scale, &v) != DF_NUMERIC_FITS)
+	if (vx_numeric_value(c->constvalue, scale, &v) != VX_NUMERIC_FITS)
 	{
-		df_fail(b, "a numeric constant");
+		vx_fail(b, "a numeric constant");
 		return;
 	}
-	if (v == DF_NUMERIC_NAN)
+	if (v == VX_NUMERIC_NAN)
 	{
 		/* NaN of the Decimal256 representation is the Rust side's to make */
 		appendStringInfoString(out, ",\"value\":\"NaN\"}}");
@@ -404,8 +404,8 @@ df_emit_numeric_const(DfBuilder *b, StringInfo out, Const *c, int scale)
 }
 
 /* IP1: init plan values for the slice being translated to start it */
-ParamExecData *df_param_values = NULL;
-ExprContext *df_param_econtext = NULL;
+ParamExecData *vx_param_values = NULL;
+ExprContext *vx_param_econtext = NULL;
 
 /*
  * The value of init plan parameter 'param': dispatched, computed before
@@ -414,7 +414,7 @@ ExprContext *df_param_econtext = NULL;
  * batch Motions), where it does not matter.
  */
 static Const *
-df_param_const(Param *param)
+vx_param_const(Param *param)
 {
 	int16		len;
 	bool		byval;
@@ -422,12 +422,12 @@ df_param_const(Param *param)
 	bool		isnull = true;
 
 	get_typlenbyval(param->paramtype, &len, &byval);
-	if (df_param_values != NULL)
+	if (vx_param_values != NULL)
 	{
-		ParamExecData *prm = &df_param_values[param->paramid];
+		ParamExecData *prm = &vx_param_values[param->paramid];
 
 		if (prm->execPlan != NULL)
-			ExecSetParamPlan(prm->execPlan, df_param_econtext, NULL);
+			ExecSetParamPlan(prm->execPlan, vx_param_econtext, NULL);
 		value = prm->value;
 		isnull = prm->isnull;
 	}
@@ -436,14 +436,14 @@ df_param_const(Param *param)
 }
 
 static Datum
-df_numeric_from(const char *s)
+vx_numeric_from(const char *s)
 {
 	return DirectFunctionCall3(numeric_in, CStringGetDatum(s), ObjectIdGetDatum(InvalidOid),
 							   Int32GetDatum(-1));
 }
 
 static int
-df_numeric_cmp(Datum a, Datum b)
+vx_numeric_cmp(Datum a, Datum b)
 {
 	return DatumGetInt32(DirectFunctionCall2(numeric_cmp, a, b));
 }
@@ -456,12 +456,12 @@ df_numeric_cmp(Datum a, Datum b)
  * infinity on its side, NaN stays NaN, so NaN x compare as in PostgreSQL.
  */
 static void
-df_emit_numeric_param_cmp(DfBuilder *b, StringInfo out, OpExpr *op, DfLevel level)
+vx_emit_numeric_param_cmp(VxBuilder *b, StringInfo out, OpExpr *op, VxLevel level)
 {
 	static const char *const swapped[][2] = {
 		{"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}, {"=", "="}, {"<>", "<>"}
 	};
-	Plan	   *ctx = df_level_ctx(b, level);
+	Plan	   *ctx = vx_level_ctx(b, level);
 	Node	   *x;
 	bool		param_left;
 	const char *name = get_opname(op->opno);
@@ -471,13 +471,13 @@ df_emit_numeric_param_cmp(DfBuilder *b, StringInfo out, OpExpr *op, DfLevel leve
 				s,
 				i;
 
-	(void) df_numeric_param_cmp(ctx, op, &x, &param_left);
-	(void) df_numeric_ps(ctx, x, &p, &s);
+	(void) vx_numeric_param_cmp(ctx, op, &x, &param_left);
+	(void) vx_numeric_ps(ctx, x, &p, &s);
 	for (i = 0; param_left && strcmp(swapped[i][0], name) != 0; i++)
 		;
 	if (param_left)
 		name = swapped[i][1];
-	c = df_param_const((Param *) (param_left ? linitial(op->args) : lsecond(op->args)));
+	c = vx_param_const((Param *) (param_left ? linitial(op->args) : lsecond(op->args)));
 	if (!c->constisnull)
 	{
 		Datum		v = c->constvalue;
@@ -486,14 +486,14 @@ df_emit_numeric_param_cmp(DfBuilder *b, StringInfo out, OpExpr *op, DfLevel leve
 		if (numeric_is_nan(n))
 			special = "NaN";
 		else if (numeric_is_inf(n))
-			special = df_numeric_cmp(v, df_numeric_from("0")) > 0 ? "Infinity" : "-Infinity";
+			special = vx_numeric_cmp(v, vx_numeric_from("0")) > 0 ? "Infinity" : "-Infinity";
 		else
 		{
 			Datum		q = DirectFunctionCall2(numeric_trunc, v, Int32GetDatum(s));
-			Datum		ulp = df_numeric_from(psprintf("1e-%d", s));
-			Datum		bound = df_numeric_from(psprintf("1e%d", p - s));
-			bool		exact = df_numeric_cmp(q, v) == 0;
-			int			sign = df_numeric_cmp(v, df_numeric_from("0"));
+			Datum		ulp = vx_numeric_from(psprintf("1e-%d", s));
+			Datum		bound = vx_numeric_from(psprintf("1e%d", p - s));
+			bool		exact = vx_numeric_cmp(q, v) == 0;
+			int			sign = vx_numeric_cmp(v, vx_numeric_from("0"));
 
 			if (exact)
 				v = q;
@@ -508,26 +508,26 @@ df_emit_numeric_param_cmp(DfBuilder *b, StringInfo out, OpExpr *op, DfLevel leve
 				special = "-Infinity";
 			}
 			/* |x| < 10^(p - s): beyond, the infinity on that side answers alike */
-			if (special == NULL && df_numeric_cmp(v, bound) >= 0)
+			if (special == NULL && vx_numeric_cmp(v, bound) >= 0)
 				special = "Infinity";
 			else if (special == NULL &&
-					 df_numeric_cmp(v, DirectFunctionCall1(numeric_uminus, bound)) <= 0)
+					 vx_numeric_cmp(v, DirectFunctionCall1(numeric_uminus, bound)) <= 0)
 				special = "-Infinity";
 			c = makeConst(NUMERICOID, -1, InvalidOid, -1, v, false, false);
 		}
 	}
 	appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[", name);
-	df_emit(b, out, x, level);
+	vx_emit(b, out, x, level);
 	appendStringInfoChar(out, ',');
 	if (special != NULL)
 		appendStringInfo(out, "{\"lit\":{\"type\":\"%s\",\"value\":\"%s\"}}",
-						 df_tag(NUMERICOID, s), special);
+						 vx_tag(NUMERICOID, s), special);
 	else
-		df_emit_numeric_const(b, out, c, s);
+		vx_emit_numeric_const(b, out, c, s);
 	appendStringInfoString(out, "]}");
 }
 
-static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
+static void vx_emit(VxBuilder *b, StringInfo out, Node *node, VxLevel level);
 
 /*
  * numeric expression 'e' of node 'ctx' at scale 'scale' (not below its
@@ -535,38 +535,38 @@ static void df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level);
  * of ten.
  */
 static void
-df_emit_numeric_at(DfBuilder *b, StringInfo out, Node *e, int scale, DfLevel level, Plan *ctx)
+vx_emit_numeric_at(VxBuilder *b, StringInfo out, Node *e, int scale, VxLevel level, Plan *ctx)
 {
 	int			own;
 
 	if (IsA(e, Const))
 	{
-		df_emit_numeric_const(b, out, (Const *) e, scale);
+		vx_emit_numeric_const(b, out, (Const *) e, scale);
 		return;
 	}
-	own = df_scale_of(ctx, e);
+	own = vx_scale_of(ctx, e);
 	if (own == scale)
 	{
-		df_emit(b, out, e, level);
+		vx_emit(b, out, e, level);
 		return;
 	}
 	appendStringInfoString(out, "{\"rescale\":");
-	df_emit(b, out, e, level);
-	appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}", scale - own, df_tag(NUMERICOID, scale));
+	vx_emit(b, out, e, level);
+	appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}", scale - own, vx_tag(NUMERICOID, scale));
 }
 
 /* The context of expressions at 'level'. */
 static Plan *
-df_level_ctx(DfBuilder *b, DfLevel level)
+vx_level_ctx(VxBuilder *b, VxLevel level)
 {
-	return level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+	return level == VX_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
 }
 
 /* The scale numeric 'l' and 'r' are compared at: the larger one. */
 static int
-df_common_scale(Plan *ctx, Node *l, Node *r)
+vx_common_scale(Plan *ctx, Node *l, Node *r)
 {
-	return Max(df_scale_of(ctx, l), df_scale_of(ctx, r));
+	return Max(vx_scale_of(ctx, l), vx_scale_of(ctx, r));
 }
 
 /*
@@ -575,7 +575,7 @@ df_common_scale(Plan *ctx, Node *l, Node *r)
  * 'collation' that is not ordered by the bytes.
  */
 static void
-df_emit_collate(StringInfo out, Oid collation, Node *arg, const char *name)
+vx_emit_collate(StringInfo out, Oid collation, Node *arg, const char *name)
 {
 	Oid			type = exprType(arg);
 	const char *locale;
@@ -584,11 +584,11 @@ df_emit_collate(StringInfo out, Oid collation, Node *arg, const char *name)
 		(strcmp(name, "<") != 0 && strcmp(name, "<=") != 0 && strcmp(name, ">") != 0 &&
 		 strcmp(name, ">=") != 0 && strcmp(name, "min") != 0 && strcmp(name, "max") != 0))
 		return;
-	locale = df_collation_locale(collation);
+	locale = vx_collation_locale(collation);
 	if (locale == NULL)
 		return;
 	appendStringInfoString(out, ",\"collate\":");
-	df_emit_json_string(out, locale, strlen(locale));
+	vx_emit_json_string(out, locale, strlen(locale));
 }
 
 /*
@@ -597,7 +597,7 @@ df_emit_collate(StringInfo out, Oid collation, Node *arg, const char *name)
  * value without its trailing blanks (B1).
  */
 static void
-df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
+vx_emit_compared(VxBuilder *b, StringInfo out, Node *e, VxLevel level)
 {
 	Oid			type = exprType(e);
 	const char *key = type == FLOAT4OID || type == FLOAT8OID ? "floatkey" :
@@ -605,11 +605,11 @@ df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
 
 	if (key == NULL)
 	{
-		df_emit(b, out, e, level);
+		vx_emit(b, out, e, level);
 		return;
 	}
 	appendStringInfo(out, "{\"%s\":", key);
-	df_emit(b, out, e, level);
+	vx_emit(b, out, e, level);
 	appendStringInfoChar(out, '}');
 }
 
@@ -617,75 +617,75 @@ df_emit_compared(DfBuilder *b, StringInfo out, Node *e, DfLevel level)
  * A grouping key, DISTINCT argument: character ones marked, which group by
  * their value without trailing blanks (df_core::query::build_node), except
  * a table's character(n), which holds every value padded to n, so that
- * equal values look alike as they are (df_bpchar_length).
+ * equal values look alike as they are (vx_bpchar_length).
  */
 static bool
-df_bpchar_unpadded(Plan *ctx, Node *e)
+vx_bpchar_unpadded(Plan *ctx, Node *e)
 {
-	return exprType(e) == BPCHAROID && df_bpchar_length(ctx, e) < 0;
+	return exprType(e) == BPCHAROID && vx_bpchar_length(ctx, e) < 0;
 }
 
 static void
-df_emit_grouped(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
+vx_emit_grouped(VxBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 {
 	TargetEntry *tle = get_tle_by_resno(child->targetlist, resno);
-	bool		bp = tle != NULL && df_bpchar_unpadded(child, (Node *) tle->expr);
+	bool		bp = tle != NULL && vx_bpchar_unpadded(child, (Node *) tle->expr);
 
 	if (bp)
 		appendStringInfoString(out, "{\"bpchar\":");
-	df_emit_output_of(b, out, child, resno);
+	vx_emit_output_of(b, out, child, resno);
 	if (bp)
 		appendStringInfoChar(out, '}');
 }
 
 /* "[l, r]", numeric operands at their common scale (E1). */
 static void
-df_emit_operands(DfBuilder *b, StringInfo out, Node *l, Node *r, DfLevel level)
+vx_emit_operands(VxBuilder *b, StringInfo out, Node *l, Node *r, VxLevel level)
 {
 	appendStringInfoChar(out, '[');
 	if (exprType(l) == NUMERICOID)
 	{
-		Plan	   *ctx = df_level_ctx(b, level);
-		int			t = df_common_scale(ctx, l, r);
+		Plan	   *ctx = vx_level_ctx(b, level);
+		int			t = vx_common_scale(ctx, l, r);
 
-		df_emit_numeric_at(b, out, l, t, level, ctx);
+		vx_emit_numeric_at(b, out, l, t, level, ctx);
 		appendStringInfoChar(out, ',');
-		df_emit_numeric_at(b, out, r, t, level, ctx);
+		vx_emit_numeric_at(b, out, r, t, level, ctx);
 	}
 	else
 	{
-		df_emit_compared(b, out, l, level);
+		vx_emit_compared(b, out, l, level);
 		appendStringInfoChar(out, ',');
-		df_emit_compared(b, out, r, level);
+		vx_emit_compared(b, out, r, level);
 	}
 	appendStringInfoChar(out, ']');
 }
 
 /* A result of a CASE or COALESCE of 'type' (numeric: at 'scale'). */
 static void
-df_emit_result(DfBuilder *b, StringInfo out, Node *e, Oid type, int scale, DfLevel level)
+vx_emit_result(VxBuilder *b, StringInfo out, Node *e, Oid type, int scale, VxLevel level)
 {
 	if (type == NUMERICOID)
-		df_emit_numeric_at(b, out, e, scale, level, df_level_ctx(b, level));
+		vx_emit_numeric_at(b, out, e, scale, level, vx_level_ctx(b, level));
 	else
-		df_emit(b, out, e, level);
+		vx_emit(b, out, e, level);
 }
 
 /*
- * SC1: correlated scalar subquery 'sp' grouped (df_subplan_correlated),
+ * SC1: correlated scalar subquery 'sp' grouped (vx_subplan_correlated),
  * one for each SubPlan, whose Agg the join emits and the value reads by
  * name; NULL if it is not one.
  */
-static DfCorrelated *
-df_correlated_of(DfBuilder *b, SubPlan *sp)
+static VxCorrelated *
+vx_correlated_of(VxBuilder *b, SubPlan *sp)
 {
 	ListCell   *lc;
-	DfCorrelated *corr;
+	VxCorrelated *corr;
 
 	foreach(lc, b->correlated)
-		if (((DfCorrelated *) lfirst(lc))->sp == sp)
+		if (((VxCorrelated *) lfirst(lc))->sp == sp)
 			return lfirst(lc);
-	if (df_subplan_correlated(df_numeric_stmt, sp, &corr) != NULL)
+	if (vx_subplan_correlated(vx_numeric_stmt, sp, &corr) != NULL)
 		return NULL;
 	b->correlated = lappend(b->correlated, corr);
 	return corr;
@@ -693,7 +693,7 @@ df_correlated_of(DfBuilder *b, SubPlan *sp)
 
 /* SC1: collect the correlated scalar subqueries in 'node'. */
 static bool
-df_collect_correlated(Node *node, List **sps)
+vx_collect_correlated(Node *node, List **sps)
 {
 	if (node == NULL)
 		return false;
@@ -705,14 +705,14 @@ df_collect_correlated(Node *node, List **sps)
 			*sps = list_append_unique_ptr(*sps, sp);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_correlated, sps);
+	return expression_tree_walker(node, vx_collect_correlated, sps);
 }
 
 /* Add an input reading 'leaf'; returns its index. */
 static int
-df_add_input(DfBuilder *b, Plan *leaf)
+vx_add_input(VxBuilder *b, Plan *leaf)
 {
-	DfInputDesc *in = palloc0(sizeof(DfInputDesc));
+	VxInputDesc *in = palloc0(sizeof(VxInputDesc));
 
 	in->leaf = leaf;
 	b->inputs = lappend(b->inputs, in);
@@ -725,34 +725,34 @@ df_add_input(DfBuilder *b, Plan *leaf)
  * before the others.
  */
 static int
-df_add_set_input(DfBuilder *b, Plan *top)
+vx_add_set_input(VxBuilder *b, Plan *top)
 {
 	ListCell   *lc;
 	int			j;
 
 	foreach(lc, b->inputs)
-		if (((DfInputDesc *) lfirst(lc))->leaf == top)
+		if (((VxInputDesc *) lfirst(lc))->leaf == top)
 			return foreach_current_index(lc);
-	j = df_add_input(b, top);
-	((DfInputDesc *) llast(b->inputs))->set = true;
+	j = vx_add_input(b, top);
+	((VxInputDesc *) llast(b->inputs))->set = true;
 	return j;
 }
 
 /*
  * Column of input 'j' for 'attno', adding it if new; its index there.  -1
- * for a 'j' that is not one of the slice's inputs (df_input_of found no
+ * for a 'j' that is not one of the slice's inputs (vx_input_of found no
  * such leaf): the translation fails rather than read past the list.
  */
 static int
-df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
+vx_input_column(VxBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 {
-	DfInputDesc *in;
+	VxInputDesc *in;
 	ListCell   *lc;
 	int			i = 0;
 
 	if (j < 0 || j >= list_length(b->inputs))
 	{
-		df_fail(b, "a column of a node that is not an input of the slice");
+		vx_fail(b, "a column of a node that is not an input of the slice");
 		return -1;
 	}
 	in = list_nth(b->inputs, j);
@@ -761,7 +761,7 @@ df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
 	{
 		/* DN1: a numeric column's display scales are a column of their own */
 		if (lfirst_int(lc) == attno &&
-			(list_nth_int(in->scales, i) == DF_SCALE_DSCALE) == (scale == DF_SCALE_DSCALE))
+			(list_nth_int(in->scales, i) == VX_SCALE_DSCALE) == (scale == VX_SCALE_DSCALE))
 			return i;
 		i++;
 	}
@@ -779,41 +779,41 @@ df_input_column(DfBuilder *b, int j, AttrNumber attno, Oid type, int scale)
  * At least the scale, as Arrow wants.
  */
 static int
-df_input_digits(DfInputDesc *in, int k)
+vx_input_digits(VxInputDesc *in, int k)
 {
 	int			scale = list_nth_int(in->scales, k);
 	int			attno = list_nth_int(in->attnos, k);
 	int			p = -1;
 	int			s;
 
-	if (list_nth_oid(in->types, k) != NUMERICOID || scale == DF_SCALE_DSCALE)
+	if (list_nth_oid(in->types, k) != NUMERICOID || scale == VX_SCALE_DSCALE)
 		return 0;
 	if (IsA(in->leaf, Motion))
-		p = df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf, attno - 1);
+		p = vx_motion_stream_digits(vx_numeric_stmt, (Motion *) in->leaf, attno - 1);
 	else if ((IsA(in->leaf, SeqScan) || IsA(in->leaf, DynamicSeqScan)) &&
-			 df_numeric_stmt != NULL && attno > 0)
+			 vx_numeric_stmt != NULL && attno > 0)
 	{
 		Oid			relid = rt_fetch(((Scan *) in->leaf)->scanrelid,
-									 df_numeric_stmt->rtable)->relid;
+									 vx_numeric_stmt->rtable)->relid;
 		Oid			typid;
 		int32		typmod;
 		Oid			collid;
 
 		get_atttypetypmodcoll(relid, attno, &typid, &typmod, &collid);
-		if (typid != NUMERICOID || !df_numeric_typmod(typmod, &p, &s) || s != scale)
+		if (typid != NUMERICOID || !vx_numeric_typmod(typmod, &p, &s) || s != scale)
 			p = -1;
 	}
 	if (p < 1)
 		return 0;
 	p = Max(p, scale);
-	return p <= DF_NUMERIC_MAX_PRECISION ? p : 0;
+	return p <= VX_NUMERIC_MAX_PRECISION ? p : 0;
 }
 
 /* Append a reference to that column of input 'j'. */
 static void
-df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, int scale)
+vx_emit_column(VxBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, int scale)
 {
-	int			k = df_input_column(b, j, attno, type, scale);
+	int			k = vx_input_column(b, j, attno, type, scale);
 
 	if (k < 0)
 		return;
@@ -825,14 +825,14 @@ df_emit_column(DfBuilder *b, StringInfo out, int j, AttrNumber attno, Oid type, 
 
 /* The input reading 'leaf', or -1. */
 static int
-df_input_of(DfBuilder *b, Plan *leaf)
+vx_input_of(VxBuilder *b, Plan *leaf)
 {
 	ListCell   *lc;
 	int			j = 0;
 
 	foreach(lc, b->inputs)
 	{
-		if (((DfInputDesc *) lfirst(lc))->leaf == leaf)
+		if (((VxInputDesc *) lfirst(lc))->leaf == leaf)
 			return j;
 		j++;
 	}
@@ -840,13 +840,13 @@ df_input_of(DfBuilder *b, Plan *leaf)
 }
 
 /* A1: the named node of Agg 'agg', or NULL. */
-static DfNamedAgg *
-df_named_of(DfBuilder *b, Agg *agg)
+static VxNamedAgg *
+vx_named_of(VxBuilder *b, Agg *agg)
 {
 	ListCell   *lc;
 
 	foreach(lc, b->named)
-		if (((DfNamedAgg *) lfirst(lc))->agg == agg)
+		if (((VxNamedAgg *) lfirst(lc))->agg == agg)
 			return lfirst(lc);
 	return NULL;
 }
@@ -856,9 +856,9 @@ df_named_of(DfBuilder *b, Agg *agg)
  * by its index in its own HAVING.
  */
 static void
-df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn)
+vx_emit_named_call(VxBuilder *b, StringInfo out, Aggref *call, const char *fn)
 {
-	DfNamedAgg *na = df_named_of(b, b->agg);
+	VxNamedAgg *na = vx_named_of(b, b->agg);
 	int			k = list_length(na->aggrefs);
 	ListCell   *la,
 			   *lf;
@@ -872,7 +872,7 @@ df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn)
 			k = foreach_current_index(la);
 	}
 	if (k == list_length(na->aggrefs))
-		df_fail(b, "an aggregate call");
+		vx_fail(b, "an aggregate call");
 	else if (b->agg_named)
 		appendStringInfo(out, "{\"name\":\"q%d_a%d\"}", b->agg->plan.plan_node_id, k);
 	else
@@ -884,16 +884,16 @@ df_emit_named_call(DfBuilder *b, StringInfo out, Aggref *call, const char *fn)
  * and count calls (*sfn, *cfn) DataFusion keeps?  Not a partial one.
  */
 static bool
-df_avg_parts(Aggref *agg, const char **sfn, const char **cfn)
+vx_avg_parts(Aggref *agg, const char **sfn, const char **cfn)
 {
 	bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
 
-	if ((df_agg_state(agg) != DF_AGG_AVG_NUMERIC && df_agg_state(agg) != DF_AGG_AVG_INT) ||
+	if ((vx_agg_state(agg) != VX_AGG_AVG_NUMERIC && vx_agg_state(agg) != VX_AGG_AVG_INT) ||
 		agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 		return false;
 	if (sfn)
 		*sfn = combine ? "merge_sum" :
-			df_agg_state(agg) == DF_AGG_AVG_NUMERIC ? "sum_decimal" : "sum_numeric";
+			vx_agg_state(agg) == VX_AGG_AVG_NUMERIC ? "sum_decimal" : "sum_numeric";
 	if (cfn)
 		*cfn = combine ? "merge_count" : "count";
 	return true;
@@ -905,44 +905,44 @@ df_avg_parts(Aggref *agg, const char **sfn, const char **cfn)
  * squares, calls of b->agg (df_core pg_stddev).
  */
 static void
-df_emit_stddev(DfBuilder *b, StringInfo out, Aggref *agg, bool dscale)
+vx_emit_stddev(VxBuilder *b, StringInfo out, Aggref *agg, bool dscale)
 {
 	bool		sample,
 				variance;
 
 	bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
 
-	(void) df_stddev_agg(agg, &sample, &variance);
+	(void) vx_stddev_agg(agg, &sample, &variance);
 	appendStringInfo(out, "{\"%s\":[", dscale ? "stddev_numeric_scale" : "stddev_numeric");
 	/* STD2: a combining one's, the partial states added up */
-	df_emit_call_ref(b, out, agg, combine ? "merge_count" : "count");
+	vx_emit_call_ref(b, out, agg, combine ? "merge_count" : "count");
 	appendStringInfoChar(out, ',');
-	df_emit_call_ref(b, out, agg, combine ? "merge_sum" : "sum_numeric");
+	vx_emit_call_ref(b, out, agg, combine ? "merge_sum" : "sum_numeric");
 	appendStringInfoChar(out, ',');
-	df_emit_call_ref(b, out, agg, combine ? "merge_sumsq" : "sum_sq");
+	vx_emit_call_ref(b, out, agg, combine ? "merge_sumsq" : "sum_sq");
 	appendStringInfo(out, "],\"sample\":%s,\"variance\":%s", sample ? "true" : "false",
 					 variance ? "true" : "false");
 	if (!dscale)
-		appendStringInfo(out, ",\"type\":\"%s\"", df_tag(NUMERICOID, DF_STDDEV_MAX_SCALE));
+		appendStringInfo(out, ",\"type\":\"%s\"", vx_tag(NUMERICOID, VX_STDDEV_MAX_SCALE));
 	appendStringInfoChar(out, '}');
 }
 
 /* Call ('agg', 'fn') of b->agg: by name or index below the top (A1). */
 static void
-df_emit_call_ref(DfBuilder *b, StringInfo out, Aggref *agg, const char *fn)
+vx_emit_call_ref(VxBuilder *b, StringInfo out, Aggref *agg, const char *fn)
 {
-	if (df_named_of(b, b->agg) != NULL)
-		df_emit_named_call(b, out, agg, fn);
+	if (vx_named_of(b, b->agg) != NULL)
+		vx_emit_named_call(b, out, agg, fn);
 	else
-		appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, agg, fn));
+		appendStringInfo(out, "{\"agg\":%d}", vx_agg_ref(b, agg, fn));
 }
 
 /*
  * RI1: column 'var' of an Agg's child, as the call any(var) of the Agg
- * (df_emit_agg_calls).
+ * (vx_emit_agg_calls).
  */
 static Aggref *
-df_any_call(Var *var)
+vx_any_call(Var *var)
 {
 	Aggref	   *call = makeNode(Aggref);
 
@@ -958,12 +958,12 @@ df_any_call(Var *var)
 /*
  * DN1: the display scale of numeric column 'col' of an Agg's child that it
  * groups by, whose values have display scales of their own, as the call
- * max(display scale) of the Agg (df_emit_agg_calls).  Equal values make
+ * max(display scale) of the Agg (vx_emit_agg_calls).  Equal values make
  * one group; PostgreSQL keeps the first row's display scale, of an order
  * the plan does not fix, and this is one of them.
  */
 static Aggref *
-df_key_scale_call(AttrNumber col)
+vx_key_scale_call(AttrNumber col)
 {
 	Aggref	   *call = makeNode(Aggref);
 
@@ -980,18 +980,18 @@ df_key_scale_call(AttrNumber col)
 
 /* DN1: is 'col' of Agg 'agg''s child a key it groups by, of such scales? */
 static bool
-df_key_scale_needed(Agg *agg, AttrNumber col)
+vx_key_scale_needed(Agg *agg, AttrNumber col)
 {
-	DfAggGroups g;
+	VxAggGroups g;
 	TargetEntry *tle = get_tle_by_resno(outerPlan(agg)->targetlist, col);
 	int			p,
 				s,
 				k;
 
 	if (tle == NULL || exprType((Node *) tle->expr) != NUMERICOID ||
-		!df_numeric_dyn(outerPlan(agg), (Node *) tle->expr, &p, &s))
+		!vx_numeric_dyn(outerPlan(agg), (Node *) tle->expr, &p, &s))
 		return false;
-	df_agg_groups(agg, &g);
+	vx_agg_groups(agg, &g);
 	for (k = 0; k < g.ncols; k++)
 		if (g.cols[k] == col)
 			return true;
@@ -1005,34 +1005,34 @@ df_key_scale_needed(Agg *agg, AttrNumber col)
  * drops.  Any value of the group is it.
  */
 static void
-df_emit_ungrouped(DfBuilder *b, StringInfo out, Var *var)
+vx_emit_ungrouped(VxBuilder *b, StringInfo out, Var *var)
 {
-	if (df_named_of(b, b->agg) != NULL)
-		df_emit_named_call(b, out, df_any_call(var), "any");
+	if (vx_named_of(b, b->agg) != NULL)
+		vx_emit_named_call(b, out, vx_any_call(var), "any");
 	else
-		appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, df_any_call(var), "any"));
+		appendStringInfo(out, "{\"agg\":%d}", vx_agg_ref(b, vx_any_call(var), "any"));
 }
 
 /* RI1: the columns of an Agg's child it does not group by, outside calls. */
-typedef struct DfUngrouped
+typedef struct VxUngrouped
 {
 	Agg		   *agg;
 	List	   *vars;
-} DfUngrouped;
+} VxUngrouped;
 
 static bool
-df_collect_ungrouped(Node *node, DfUngrouped *c)
+vx_collect_ungrouped(Node *node, VxUngrouped *c)
 {
 	if (node == NULL || IsA(node, Aggref))
 		return false;
 	if (IsA(node, Var) && ((Var *) node)->varno == OUTER_VAR)
 	{
-		if (df_agg_group_index(c->agg, ((Var *) node)->varattno) >= 0)
+		if (vx_agg_group_index(c->agg, ((Var *) node)->varattno) >= 0)
 			return false;
 		c->vars = lappend(c->vars, node);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_ungrouped, c);
+	return expression_tree_walker(node, vx_collect_ungrouped, c);
 }
 
 
@@ -1042,85 +1042,85 @@ df_collect_ungrouped(Node *node, DfUngrouped *c)
  * emitted in the child's own terms, down to the scanned columns.
  */
 static void
-df_emit_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
+vx_emit_output_of(VxBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 {
 	TargetEntry *tle = child ? get_tle_by_resno(child->targetlist, resno) : NULL;
 	Plan	   *saved = b->ctx;
 
 	if (tle == NULL)
-		df_fail(b, "a reference to a child's output");
-	else if (df_empty_result(child))
+		vx_fail(b, "a reference to a child's output");
+	else if (vx_empty_result(child))
 		/* OF1: a column of no rows, of no value */
 		appendStringInfo(out, "{\"lit\":{\"type\":\"%s\",\"null\":true}}",
 						 exprType((Node *) tle->expr) == NUMERICOID ?
-						 df_tag(NUMERICOID, df_scale_of(child, (Node *) tle->expr)) :
-						 df_type_tag(exprType((Node *) tle->expr)));
-	else if (df_append_plans(child) != NIL)
+						 vx_tag(NUMERICOID, vx_scale_of(child, (Node *) tle->expr)) :
+						 vx_type_tag(exprType((Node *) tle->expr)));
+	else if (vx_append_plans(child) != NIL)
 		/* UA1: a column of its union */
 		appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", child->plan_node_id, resno - 1);
 	else if (IsA(child, SetOp) || IsA(child, Unique))
 	{
 		/* SO1, UQ1: its output column, a column it groups by */
 		b->ctx = child;
-		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		vx_emit(b, out, (Node *) tle->expr, VX_LEVEL_SCAN);
 		b->ctx = saved;
 	}
 	else if (IsA(child, Agg))
 	{
 		/*
 		 * A1, D2: an Agg below, its groups and calls by their names
-		 * (df_emit_node)
+		 * (vx_emit_node)
 		 */
 		Agg		   *agg = b->agg;
 		bool		named = b->agg_named;
 
 		b->agg = (Agg *) child;
 		b->agg_named = true;
-		if (df_named_of(b, b->agg) == NULL)
-			df_fail(b, "a reference to an aggregate");
+		if (vx_named_of(b, b->agg) == NULL)
+			vx_fail(b, "a reference to an aggregate");
 		else
-			df_emit(b, out, (Node *) tle->expr, DF_LEVEL_AGG);
+			vx_emit(b, out, (Node *) tle->expr, VX_LEVEL_AGG);
 		b->agg = agg;
 		b->agg_named = named;
 	}
 	else if (IsA(child, Motion))
-		df_emit_column(b, out, df_input_of(b, child),
-					   df_motion_stream_column((Motion *) child, resno) + 1,
+		vx_emit_column(b, out, vx_input_of(b, child),
+					   vx_motion_stream_column((Motion *) child, resno) + 1,
 					   exprType((Node *) tle->expr),
-					   df_scale_of(child, (Node *) tle->expr));
+					   vx_scale_of(child, (Node *) tle->expr));
 	else if (IsA(child, Sequence))
-		df_emit_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
+		vx_emit_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
 	else if (IsA(child, ShareInputScan))
 		/* the producer's input's column at that position */
-		df_emit_column(b, out, df_input_of(b, child), resno,
+		vx_emit_column(b, out, vx_input_of(b, child), resno,
 					   exprType((Node *) tle->expr),
-					   df_scale_of(child, (Node *) tle->expr));
+					   vx_scale_of(child, (Node *) tle->expr));
 	else
 	{
 		b->ctx = child;
-		df_emit(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		vx_emit(b, out, (Node *) tle->expr, VX_LEVEL_SCAN);
 		b->ctx = saved;
 	}
 }
 
 /*
  * DN1: the display scale of output column 'resno' of plan node 'child', as
- * df_emit_output_of finds its value: a Motion's numeric carries it in the
- * value (df_numeric_dscale), the input's column beside it.
+ * vx_emit_output_of finds its value: a Motion's numeric carries it in the
+ * value (vx_numeric_dscale), the input's column beside it.
  */
 static void
-df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
+vx_emit_dscale_output_of(VxBuilder *b, StringInfo out, Plan *child, AttrNumber resno)
 {
 	TargetEntry *tle = child ? get_tle_by_resno(child->targetlist, resno) : NULL;
 	Plan	   *saved = b->ctx;
 
 	if (tle == NULL)
-		df_fail(b, "a reference to a child's output");
-	else if (df_append_plans(child) != NIL)
+		vx_fail(b, "a reference to a child's output");
+	else if (vx_append_plans(child) != NIL)
 	{
 		/* UA1: the display scale its union carries beside the value */
 		b->ctx = child;
-		df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		vx_emit_dscale(b, out, (Node *) tle->expr, VX_LEVEL_SCAN);
 		b->ctx = saved;
 	}
 	else if (IsA(child, Agg))
@@ -1130,25 +1130,25 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
 
 		b->agg = (Agg *) child;
 		b->agg_named = true;
-		if (df_named_of(b, b->agg) == NULL)
-			df_fail(b, "a reference to an aggregate");
+		if (vx_named_of(b, b->agg) == NULL)
+			vx_fail(b, "a reference to an aggregate");
 		else
-			df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_AGG);
+			vx_emit_dscale(b, out, (Node *) tle->expr, VX_LEVEL_AGG);
 		b->agg = agg;
 		b->agg_named = named;
 	}
 	else if (IsA(child, Motion))
-		df_emit_column(b, out, df_input_of(b, child),
-					   df_motion_stream_column((Motion *) child, resno) + 1,
-					   INT4OID, DF_SCALE_DSCALE);
+		vx_emit_column(b, out, vx_input_of(b, child),
+					   vx_motion_stream_column((Motion *) child, resno) + 1,
+					   INT4OID, VX_SCALE_DSCALE);
 	else if (IsA(child, Sequence))
-		df_emit_dscale_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
+		vx_emit_dscale_output_of(b, out, llast(((Sequence *) child)->subplans), resno);
 	else if (IsA(child, ShareInputScan))
-		df_emit_column(b, out, df_input_of(b, child), resno, INT4OID, DF_SCALE_DSCALE);
+		vx_emit_column(b, out, vx_input_of(b, child), resno, INT4OID, VX_SCALE_DSCALE);
 	else
 	{
 		b->ctx = child;
-		df_emit_dscale(b, out, (Node *) tle->expr, DF_LEVEL_SCAN);
+		vx_emit_dscale(b, out, (Node *) tle->expr, VX_LEVEL_SCAN);
 		b->ctx = saved;
 	}
 }
@@ -1163,16 +1163,16 @@ df_emit_dscale_output_of(DfBuilder *b, StringInfo out, Plan *child, AttrNumber r
  * /, or a value added up.
  */
 static void
-df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
+vx_emit_dscale(VxBuilder *b, StringInfo out, Node *node, VxLevel level)
 {
-	Plan	   *ctx = df_level_ctx(b, level);
+	Plan	   *ctx = vx_level_ctx(b, level);
 	Plan	   *saved = b->ctx;
 	int			p,
 				s;
 
 	if (b->failed)
 		return;
-	if (df_numeric_ps(ctx, node, &p, &s) && !df_numeric_varying(ctx, node))
+	if (vx_numeric_ps(ctx, node, &p, &s) && !vx_numeric_varying(ctx, node))
 	{
 		appendStringInfo(out, "{\"lit\":{\"type\":\"int4\",\"value\":%d}}", s);
 		return;
@@ -1182,7 +1182,7 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_Param:
 			{
 				/* IP3: its value's, known when the slice starts */
-				Const	   *c = df_param_const((Param *) node);
+				Const	   *c = vx_param_const((Param *) node);
 				int			cs = 0;
 
 				if (!c->constisnull && !numeric_is_nan(DatumGetNumeric(c->constvalue)))
@@ -1202,26 +1202,26 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (sp->parParam != NIL)
 				{
 					/* SC1: the grouped aggregate's */
-					DfCorrelated *corr = df_correlated_of(b, sp);
+					VxCorrelated *corr = vx_correlated_of(b, sp);
 					Plan	   *saved = b->ctx;
 
-					if (corr == NULL || level != DF_LEVEL_SCAN || !IsA(saved, SeqScan))
+					if (corr == NULL || level != VX_LEVEL_SCAN || !IsA(saved, SeqScan))
 					{
-						df_fail(b, "the display scale of a correlated subquery");
+						vx_fail(b, "the display scale of a correlated subquery");
 						return;
 					}
 					b->ctx = (Plan *) corr->top;
-					df_emit_dscale(b, out, corr->value, level);
+					vx_emit_dscale(b, out, corr->value, level);
 					b->ctx = saved;
 					return;
 				}
-				if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
+				if (vx_subplan_scalar(vx_numeric_stmt, sp, &top, &tle) != NULL)
 				{
-					df_fail(b, "the display scale of a subquery");
+					vx_fail(b, "the display scale of a subquery");
 					return;
 				}
-				j = df_add_set_input(b, top);
-				k = df_input_column(b, j, tle->resno, INT4OID, DF_SCALE_DSCALE);
+				j = vx_add_set_input(b, top);
+				k = vx_input_column(b, j, tle->resno, INT4OID, VX_SCALE_DSCALE);
 				if (k >= 0)
 					appendStringInfo(out, "{\"scalar_of\":%d,\"col\":%d}", j, k);
 				return;
@@ -1230,26 +1230,26 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
-					df_emit_dscale_output_of(b, out, b->ctx, var->varattno);
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
+				if (level == VX_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
+					vx_emit_dscale_output_of(b, out, b->ctx, var->varattno);
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR && vx_append_plans(b->ctx) != NIL)
 					/* UA1: the display scale its union carries beside it */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d_s\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
-					df_emit_dscale_output_of(b, out, outerPlan(b->ctx), var->varattno);
-				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
-					df_emit_dscale_output_of(b, out, innerPlan(b->ctx), var->varattno);
-				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR)
+					vx_emit_dscale_output_of(b, out, outerPlan(b->ctx), var->varattno);
+				else if (level == VX_LEVEL_SCAN && var->varno == INNER_VAR)
+					vx_emit_dscale_output_of(b, out, innerPlan(b->ctx), var->varattno);
+				else if (level == VX_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
 						 ((Scan *) b->ctx)->scanrelid == var->varno)
-					df_emit_dscale_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan,
+					vx_emit_dscale_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan,
 											 var->varattno);
-				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR &&
-						 df_key_scale_needed(b->agg, var->varattno))
-					df_emit_call_ref(b, out, df_key_scale_call(var->varattno), "key_scale");
+				else if (level == VX_LEVEL_AGG && var->varno == OUTER_VAR &&
+						 vx_key_scale_needed(b->agg, var->varattno))
+					vx_emit_call_ref(b, out, vx_key_scale_call(var->varattno), "key_scale");
 				else
 					/* a column the groups determine */
-					df_fail(b, "the display scale of a column");
+					vx_fail(b, "the display scale of a column");
 				return;
 			}
 
@@ -1263,35 +1263,35 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (name != NULL && strcmp(name, "/") == 0)
 				{
 					appendStringInfoString(out, "{\"numdiv_scale\":[");
-					df_emit(b, out, l, level);
+					vx_emit(b, out, l, level);
 					appendStringInfoChar(out, ',');
 					b->ctx = saved;
-					df_emit_dscale(b, out, l, level);
+					vx_emit_dscale(b, out, l, level);
 					appendStringInfoChar(out, ',');
 					b->ctx = saved;
-					df_emit(b, out, r, level);
+					vx_emit(b, out, r, level);
 					appendStringInfoChar(out, ',');
 					b->ctx = saved;
-					df_emit_dscale(b, out, r, level);
+					vx_emit_dscale(b, out, r, level);
 					b->ctx = saved;
 					appendStringInfo(out, "],\"scales\":[%d,%d]}",
-									 df_scale_of(ctx, l), df_scale_of(ctx, r));
+									 vx_scale_of(ctx, l), vx_scale_of(ctx, r));
 					return;
 				}
 				if (name == NULL || (strcmp(name, "+") != 0 && strcmp(name, "-") != 0 &&
 									 strcmp(name, "*") != 0))
 				{
-					df_fail(b, "the display scale of an operator");
+					vx_fail(b, "the display scale of an operator");
 					return;
 				}
 				/* add_var, sub_var: the larger; mul_var: the sum */
 				appendStringInfoString(out, strcmp(name, "*") == 0 ?
 									   "{\"op\":\"+\",\"type\":\"int4\",\"args\":[" :
 									   "{\"greatest\":[");
-				df_emit_dscale(b, out, l, level);
+				vx_emit_dscale(b, out, l, level);
 				appendStringInfoChar(out, ',');
 				b->ctx = saved;
-				df_emit_dscale(b, out, r, level);
+				vx_emit_dscale(b, out, r, level);
 				b->ctx = saved;
 				appendStringInfoString(out, "]}");
 				return;
@@ -1299,7 +1299,7 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 
 		case T_CaseExpr:
 			{
-				CaseExpr   *ce = df_case_searched((CaseExpr *) node);	/* CN1 */
+				CaseExpr   *ce = vx_case_searched((CaseExpr *) node);	/* CN1 */
 				Node	   *saved_arg = b->case_arg;
 				ListCell   *lc;
 
@@ -1312,16 +1312,16 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
 					appendStringInfoString(out, "{\"when\":");
-					df_emit(b, out, (Node *) w->expr, level);
+					vx_emit(b, out, (Node *) w->expr, level);
 					appendStringInfoString(out, ",\"then\":");
 					b->ctx = saved;
-					df_emit_dscale(b, out, (Node *) w->result, level);
+					vx_emit_dscale(b, out, (Node *) w->result, level);
 					b->ctx = saved;
 					appendStringInfoChar(out, '}');
 				}
 				b->case_arg = saved_arg;
 				appendStringInfoString(out, "],\"else\":");
-				df_emit_dscale(b, out, (Node *) ce->defresult, level);
+				vx_emit_dscale(b, out, (Node *) ce->defresult, level);
 				b->ctx = saved;
 				appendStringInfoChar(out, '}');
 				return;
@@ -1341,15 +1341,15 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
 					appendStringInfoString(out, "{\"when\":{\"isnotnull\":");
-					df_emit(b, out, lfirst(lc), level);
+					vx_emit(b, out, lfirst(lc), level);
 					appendStringInfoString(out, "},\"then\":");
 					b->ctx = saved;
-					df_emit_dscale(b, out, lfirst(lc), level);
+					vx_emit_dscale(b, out, lfirst(lc), level);
 					b->ctx = saved;
 					appendStringInfoChar(out, '}');
 				}
 				appendStringInfoString(out, "],\"else\":");
-				df_emit_dscale(b, out, llast(co->args), level);
+				vx_emit_dscale(b, out, llast(co->args), level);
 				b->ctx = saved;
 				appendStringInfoChar(out, '}');
 				return;
@@ -1361,27 +1361,27 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			return;
 
 		case T_NullIfExpr:
-			df_emit_dscale(b, out, linitial(((NullIfExpr *) node)->args), level);
+			vx_emit_dscale(b, out, linitial(((NullIfExpr *) node)->args), level);
 			return;
 
 		case T_FuncExpr:
 			/* numeric_abs keeps its argument's display scale */
 			if (((FuncExpr *) node)->funcid == F_ABS_NUMERIC ||
 				((FuncExpr *) node)->funcid == F_NUMERIC_ABS)
-				df_emit_dscale(b, out, linitial(((FuncExpr *) node)->args), level);
+				vx_emit_dscale(b, out, linitial(((FuncExpr *) node)->args), level);
 			else
-				df_fail(b, "the display scale of a function");
+				vx_fail(b, "the display scale of a function");
 			return;
 
 		case T_WindowFunc:
 			{
 				/* WIN2: the scale numeric_avg picks from the frame's sum and count */
-				int			k = level == DF_LEVEL_SCAN ? df_window_index(b, node) : -1;
+				int			k = level == VX_LEVEL_SCAN ? vx_window_index(b, node) : -1;
 
-				if (k < 0 || !df_window_avg((WindowFunc *) node))
-					df_fail(b, "the display scale of a window function");
+				if (k < 0 || !vx_window_avg((WindowFunc *) node))
+					vx_fail(b, "the display scale of a window function");
 				else
-					df_emit_window_avg(b, out, (WindowFunc *) node, k, true);
+					vx_emit_window_avg(b, out, (WindowFunc *) node, k, true);
 				return;
 			}
 
@@ -1391,46 +1391,46 @@ df_emit_dscale(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				const char *sfn = NULL,
 						   *cfn = NULL;
 
-				if (level == DF_LEVEL_AGG && df_stddev_agg(agg, NULL, NULL))
+				if (level == VX_LEVEL_AGG && vx_stddev_agg(agg, NULL, NULL))
 				{
-					df_emit_stddev(b, out, agg, true);
+					vx_emit_stddev(b, out, agg, true);
 					return;
 				}
-				if (level == DF_LEVEL_AGG && df_avg_parts(agg, &sfn, &cfn))
+				if (level == VX_LEVEL_AGG && vx_avg_parts(agg, &sfn, &cfn))
 				{
 					/* AV2: the scale numeric_avg picks from the sum and count */
 					appendStringInfoString(out, "{\"avg_numeric_scale\":[");
-					df_emit_call_ref(b, out, agg, sfn);
+					vx_emit_call_ref(b, out, agg, sfn);
 					appendStringInfoChar(out, ',');
-					df_emit_call_ref(b, out, agg, cfn);
+					vx_emit_call_ref(b, out, agg, cfn);
 					appendStringInfo(out, "],\"scale\":%d}",
-									 df_agg_state(agg) == DF_AGG_AVG_INT ? 0 :
-									 df_scale_of((Plan *) b->agg,
+									 vx_agg_state(agg) == VX_AGG_AVG_INT ? 0 :
+									 vx_scale_of((Plan *) b->agg,
 												 (Node *) linitial_node(TargetEntry, agg->args)->expr));
 					return;
 				}
-				if (level != DF_LEVEL_AGG || !df_is_mixed_sum((Plan *) b->agg, node))
+				if (level != VX_LEVEL_AGG || !vx_is_mixed_sum((Plan *) b->agg, node))
 				{
-					df_fail(b, "the display scale of an aggregate");
+					vx_fail(b, "the display scale of an aggregate");
 					return;
 				}
-				if (df_named_of(b, b->agg) != NULL)
-					/* A1: an Agg below, whose sums keep it (df_emit_node) */
-					df_emit_named_call(b, out, agg, "mixed_scale");
+				if (vx_named_of(b, b->agg) != NULL)
+					/* A1: an Agg below, whose sums keep it (vx_emit_node) */
+					vx_emit_named_call(b, out, agg, "mixed_scale");
 				else
-					appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, agg, "mixed_scale"));
+					appendStringInfo(out, "{\"agg\":%d}", vx_agg_ref(b, agg, "mixed_scale"));
 				return;
 			}
 
 		default:
-			df_fail(b, "the display scale of an expression");
+			vx_fail(b, "the display scale of an expression");
 			return;
 	}
 }
 
 /* Index of aggregate call ('agg', 'fn'), adding it if new. */
 static int
-df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
+vx_agg_ref(VxBuilder *b, Aggref *agg, const char *fn)
 {
 	ListCell   *la,
 			   *lf;
@@ -1451,24 +1451,24 @@ df_agg_ref(DfBuilder *b, Aggref *agg, const char *fn)
 }
 
 /* The DataFusion state a partial aggregate of Agg 'ctx' sends instead of its own. */
-static DfAggState
-df_partial_state(Plan *ctx, Node *node)
+static VxAggState
+vx_partial_state(Plan *ctx, Node *node)
 {
 	if (!IsA(node, Aggref) || ((Aggref *) node)->aggsplit != AGGSPLIT_INITIAL_SERIAL)
-		return DF_AGG_PLAIN;
-	return df_agg_state_at(ctx, (Aggref *) node);
+		return VX_AGG_PLAIN;
+	return vx_agg_state_at(ctx, (Aggref *) node);
 }
 
 /* Is 'node' a sum of Agg 'ctx' that keeps its display scale (MS1)? */
 static bool
-df_is_mixed_sum(Plan *ctx, Node *node)
+vx_is_mixed_sum(Plan *ctx, Node *node)
 {
 	return IsA(node, Aggref) && IsA(ctx, Agg) &&
-		df_agg_state_at(ctx, (Aggref *) node) == DF_AGG_SUM_NUMERIC_MIXED;
+		vx_agg_state_at(ctx, (Aggref *) node) == VX_AGG_SUM_NUMERIC_MIXED;
 }
 
 static void
-df_emit_list(DfBuilder *b, StringInfo out, List *items, DfLevel level)
+vx_emit_list(VxBuilder *b, StringInfo out, List *items, VxLevel level)
 {
 	ListCell   *lc;
 	bool		first = true;
@@ -1479,29 +1479,29 @@ df_emit_list(DfBuilder *b, StringInfo out, List *items, DfLevel level)
 		if (!first)
 			appendStringInfoChar(out, ',');
 		first = false;
-		df_emit(b, out, lfirst(lc), level);
+		vx_emit(b, out, lfirst(lc), level);
 	}
 	appendStringInfoChar(out, ']');
 }
 
 /* A qual list is an implicit AND. */
 static void
-df_emit_qual(DfBuilder *b, StringInfo out, List *qual, DfLevel level)
+vx_emit_qual(VxBuilder *b, StringInfo out, List *qual, VxLevel level)
 {
 	if (qual == NIL)
 		appendStringInfoString(out, "null");
 	else if (list_length(qual) == 1)
-		df_emit(b, out, linitial(qual), level);
+		vx_emit(b, out, linitial(qual), level);
 	else
 	{
 		appendStringInfoString(out, "{\"and\":");
-		df_emit_list(b, out, qual, level);
+		vx_emit_list(b, out, qual, level);
 		appendStringInfoChar(out, '}');
 	}
 }
 
 static void
-df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
+vx_emit(VxBuilder *b, StringInfo out, Node *node, VxLevel level)
 {
 	if (b->failed)
 		return;
@@ -1512,47 +1512,47 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				Var		   *var = (Var *) node;
 
-				if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR && !b->join_sides &&
+				if (level == VX_LEVEL_SCAN && var->varno == INNER_VAR && !b->join_sides &&
 					IsA(b->ctx, HashJoin) &&
 					((HashJoin *) b->ctx)->join.jointype == JOIN_SEMI &&
-					df_semi_key_for((HashJoin *) b->ctx, var) != NULL)
+					vx_semi_key_for((HashJoin *) b->ctx, var) != NULL)
 				{
 					/* the equal key of the side a semi join keeps */
-					df_emit(b, out, df_semi_key_for((HashJoin *) b->ctx, var), level);
+					vx_emit(b, out, vx_semi_key_for((HashJoin *) b->ctx, var), level);
 					return;
 				}
-				if (level == DF_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
+				if (level == VX_LEVEL_SCAN && IsA(b->ctx, ShareInputScan))
 					/* a reader at the top of the slice: its own column */
-					df_emit_output_of(b, out, b->ctx, var->varattno);
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, SetOp))
-					/* SO1: a column it groups by (df_emit_plan_node) */
+					vx_emit_output_of(b, out, b->ctx, var->varattno);
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, SetOp))
+					/* SO1: a column it groups by (vx_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
-									 df_setop_group((SetOp *) b->ctx, var->varattno));
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Unique))
-					/* UQ1: a column it groups by (df_emit_plan_node) */
+									 vx_setop_group((SetOp *) b->ctx, var->varattno));
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR && IsA(b->ctx, Unique))
+					/* UQ1: a column it groups by (vx_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_g%d\"}", b->ctx->plan_node_id,
-									 df_unique_group((Unique *) b->ctx, var->varattno));
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR && df_append_plans(b->ctx) != NIL)
-					/* UA1: a column of its union (df_emit_plan_node) */
+									 vx_unique_group((Unique *) b->ctx, var->varattno));
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR && vx_append_plans(b->ctx) != NIL)
+					/* UA1: a column of its union (vx_emit_plan_node) */
 					appendStringInfo(out, "{\"name\":\"q%d_c%d\"}", b->ctx->plan_node_id,
 									 var->varattno - 1);
-				else if (level == DF_LEVEL_SCAN && var->varno == OUTER_VAR)
-					df_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
-				else if (level == DF_LEVEL_SCAN && var->varno == INNER_VAR)
-					df_emit_output_of(b, out, innerPlan(b->ctx), var->varattno);
-				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
+				else if (level == VX_LEVEL_SCAN && var->varno == OUTER_VAR)
+					vx_emit_output_of(b, out, outerPlan(b->ctx), var->varattno);
+				else if (level == VX_LEVEL_SCAN && var->varno == INNER_VAR)
+					vx_emit_output_of(b, out, innerPlan(b->ctx), var->varattno);
+				else if (level == VX_LEVEL_SCAN && IsA(b->ctx, SubqueryScan) &&
 						 ((Scan *) b->ctx)->scanrelid == var->varno)
 					/* SQ1: a column of the subquery's plan */
-					df_emit_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan, var->varattno);
-				else if (level == DF_LEVEL_SCAN && IsA(b->ctx, SeqScan) &&
+					vx_emit_output_of(b, out, ((SubqueryScan *) b->ctx)->subplan, var->varattno);
+				else if (level == VX_LEVEL_SCAN && IsA(b->ctx, SeqScan) &&
 						 ((Scan *) b->ctx)->scanrelid == var->varno &&
-						 df_input_of(b, b->ctx) >= 0)
-					df_emit_column(b, out, df_input_of(b, b->ctx),
+						 vx_input_of(b, b->ctx) >= 0)
+					vx_emit_column(b, out, vx_input_of(b, b->ctx),
 								   var->varattno, var->vartype,
-								   df_scale_of(b->ctx, (Node *) var));
-				else if (level == DF_LEVEL_AGG && var->varno == OUTER_VAR)
+								   vx_scale_of(b->ctx, (Node *) var));
+				else if (level == VX_LEVEL_AGG && var->varno == OUTER_VAR)
 				{
-					int			k = df_agg_group_index(b->agg, var->varattno);
+					int			k = vx_agg_group_index(b->agg, var->varattno);
 
 					if (k >= 0 && b->agg_named)
 						appendStringInfo(out, "{\"name\":\"q%d_g%d\"}",
@@ -1560,10 +1560,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					else if (k >= 0)
 						appendStringInfo(out, "{\"group\":%d}", k);
 					else
-						df_emit_ungrouped(b, out, var);
+						vx_emit_ungrouped(b, out, var);
 				}
 				else
-					df_fail(b, "a column reference");
+					vx_fail(b, "a column reference");
 				return;
 			}
 
@@ -1573,27 +1573,27 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			{
 				/*
 				 * GS1: a number of the row's grouping set, one per set of
-				 * the Agg's (df_agg_groups), picked by its "gset" column
+				 * the Agg's (vx_agg_groups), picked by its "gset" column
 				 */
-				DfAggGroups g;
+				VxAggGroups g;
 				int			i;
 
-				if (level != DF_LEVEL_AGG || b->agg == NULL)
+				if (level != VX_LEVEL_AGG || b->agg == NULL)
 				{
-					df_fail(b, "a grouping set function");
+					vx_fail(b, "a grouping set function");
 					return;
 				}
-				df_agg_groups(b->agg, &g);
+				vx_agg_groups(b->agg, &g);
 				if (g.nsets == 0)
 				{
-					df_fail(b, "a grouping set function without grouping sets");
+					vx_fail(b, "a grouping set function without grouping sets");
 					return;
 				}
 				appendStringInfoString(out, "{\"per_set\":[");
 				for (i = 0; i < g.nsets; i++)
 					appendStringInfo(out, "%s%d", i > 0 ? "," : "",
 									 IsA(node, GroupingFunc) ?
-									 df_grouping_value(((GroupingFunc *) node)->cols, g.sets[i]) :
+									 vx_grouping_value(((GroupingFunc *) node)->cols, g.sets[i]) :
 									 IsA(node, GroupId) ? g.group_ids[i] : i);
 				if (b->agg_named)
 					appendStringInfo(out, "],\"set\":{\"name\":\"q%d_gset\"}}",
@@ -1605,9 +1605,9 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 
 		case T_RowIdExpr:
 			/* RI1: the column its node's rows were numbered in */
-			if (level != DF_LEVEL_SCAN || !df_numbers_rows(b->ctx))
+			if (level != VX_LEVEL_SCAN || !vx_numbers_rows(b->ctx))
 			{
-				df_fail(b, "a RowIdExpr");
+				vx_fail(b, "a RowIdExpr");
 				return;
 			}
 			appendStringInfo(out, "{\"name\":\"rowid%d\"}", b->ctx->plan_node_id);
@@ -1645,47 +1645,47 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 						 * SC1: the grouped aggregate's value, joined to the
 						 * scan's rows (T_SeqScan above)
 						 */
-						DfCorrelated *corr = df_correlated_of(b, sp);
+						VxCorrelated *corr = vx_correlated_of(b, sp);
 						Plan	   *saved = b->ctx;
 
-						if (corr == NULL || level != DF_LEVEL_SCAN || !IsA(saved, SeqScan))
+						if (corr == NULL || level != VX_LEVEL_SCAN || !IsA(saved, SeqScan))
 						{
-							df_fail(b, "a correlated subquery");
+							vx_fail(b, "a correlated subquery");
 							return;
 						}
 						b->ctx = (Plan *) corr->top;
-						df_emit(b, out, corr->value, level);
+						vx_emit(b, out, corr->value, level);
 						b->ctx = saved;
 						return;
 					}
-					if (df_subplan_scalar(df_numeric_stmt, sp, &top, &tle) != NULL)
+					if (vx_subplan_scalar(vx_numeric_stmt, sp, &top, &tle) != NULL)
 					{
-						df_fail(b, "a subquery");
+						vx_fail(b, "a subquery");
 						return;
 					}
-					j = df_add_set_input(b, top);
-					k = df_input_column(b, j, tle->resno, exprType((Node *) tle->expr),
-										df_scale_of(top, (Node *) tle->expr));
+					j = vx_add_set_input(b, top);
+					k = vx_input_column(b, j, tle->resno, exprType((Node *) tle->expr),
+										vx_scale_of(top, (Node *) tle->expr));
 					if (k < 0)
 						return;
 					appendStringInfo(out, "{\"scalar_of\":%d,\"col\":%d}", j, k);
 					return;
 				}
-				if (df_subplan_in_set(df_numeric_stmt, sp, &arg) != NULL ||
-					(top = df_subplan_rows(df_numeric_stmt, sp)) == NULL)
+				if (vx_subplan_in_set(vx_numeric_stmt, sp, &arg) != NULL ||
+					(top = vx_subplan_rows(vx_numeric_stmt, sp)) == NULL)
 				{
-					df_fail(b, "a subquery");
+					vx_fail(b, "a subquery");
 					return;
 				}
 				type = exprType(arg);
-				j = df_add_set_input(b, top);
-				if (df_input_column(b, j, 1, type, 0) != 0)
+				j = vx_add_set_input(b, top);
+				if (vx_input_column(b, j, 1, type, 0) != 0)
 				{
-					df_fail(b, "a subquery's column");
+					vx_fail(b, "a subquery's column");
 					return;
 				}
 				appendStringInfoString(out, "{\"in_set\":");
-				df_emit(b, out, arg, level);
+				vx_emit(b, out, arg, level);
 				appendStringInfo(out, ",\"set\":%d,\"key\":\"%s\"}", j,
 								 type == FLOAT4OID || type == FLOAT8OID ? "float" :
 								 type == BPCHAROID ? "bpchar" : "plain");
@@ -1700,40 +1700,40 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				 * IP3: a literal at the scale of its init plan's value,
 				 * which holds it
 				 */
-				df_emit_numeric_const(b, out, df_param_const((Param *) node),
-									  df_scale_of(df_level_ctx(b, level), node));
+				vx_emit_numeric_const(b, out, vx_param_const((Param *) node),
+									  vx_scale_of(vx_level_ctx(b, level), node));
 				return;
 			}
-			df_emit(b, out, (Node *) df_param_const((Param *) node), level);
+			vx_emit(b, out, (Node *) vx_param_const((Param *) node), level);
 			return;
 
 		case T_Const:
-			df_emit_const(b, out, (Const *) node);
+			vx_emit_const(b, out, (Const *) node);
 			return;
 
 		case T_OpExpr:
 			{
 				OpExpr	   *op = (OpExpr *) node;
 				char	   *name = get_opname(op->opno);
-				const char *tag = df_type_tag(op->opresulttype);
+				const char *tag = vx_type_tag(op->opresulttype);
 				Node	   *date_arg;
 				const char *date_cmp;
 				int32		date_value;
 
 				if (name == NULL || tag == NULL)
 				{
-					df_fail(b, "an operator");
+					vx_fail(b, "an operator");
 					return;
 				}
-				if (df_numeric_param_cmp(df_level_ctx(b, level), op, NULL, NULL))
+				if (vx_numeric_param_cmp(vx_level_ctx(b, level), op, NULL, NULL))
 				{
-					df_emit_numeric_param_cmp(b, out, op, level);
+					vx_emit_numeric_param_cmp(b, out, op, level);
 					return;
 				}
-				if (df_numcmp_needed(df_level_ctx(b, level), op))
+				if (vx_numcmp_needed(vx_level_ctx(b, level), op))
 				{
 					/* exactly, each side as PostgreSQL computes it (PgNumCmp) */
-					df_emit_numcmp(b, out, name, linitial(op->args), lsecond(op->args), level);
+					vx_emit_numcmp(b, out, name, linitial(op->args), lsecond(op->args), level);
 					return;
 				}
 				if (op->opfuncid == F_DATE_PLI || op->opfuncid == F_DATE_MII ||
@@ -1743,17 +1743,17 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					bool		swap = op->opfuncid == F_INTEGER_PL_DATE;
 
 					appendStringInfoString(out, "{\"dateadd\":[");
-					df_emit(b, out, swap ? lsecond(op->args) : linitial(op->args), level);
+					vx_emit(b, out, swap ? lsecond(op->args) : linitial(op->args), level);
 					appendStringInfoChar(out, ',');
-					df_emit(b, out, swap ? linitial(op->args) : lsecond(op->args), level);
+					vx_emit(b, out, swap ? linitial(op->args) : lsecond(op->args), level);
 					appendStringInfo(out, "],\"sign\":%d}", op->opfuncid == F_DATE_MII ? -1 : 1);
 					return;
 				}
-				if (df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
+				if (vx_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value))
 				{
 					/* a date against a timestamp constant, as dates (DT1) */
 					appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"bool\",\"args\":[", date_cmp);
-					df_emit(b, out, date_arg, level);
+					vx_emit(b, out, date_arg, level);
 					appendStringInfo(out, ",{\"lit\":{\"type\":\"date\",\"value\":%d}}]}", date_value);
 					return;
 				}
@@ -1764,24 +1764,24 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					 * operands at their own scales and with their display
 					 * scales, at the largest scale it may give
 					 */
-					Plan	   *ctx = df_level_ctx(b, level);
+					Plan	   *ctx = vx_level_ctx(b, level);
 					Node	   *l = linitial(op->args);
 					Node	   *r = lsecond(op->args);
 					Plan	   *saved = b->ctx;
 
 					appendStringInfoString(out, "{\"numdiv\":[");
-					df_emit(b, out, l, level);
+					vx_emit(b, out, l, level);
 					appendStringInfoChar(out, ',');
-					df_emit_dscale(b, out, l, level);
+					vx_emit_dscale(b, out, l, level);
 					appendStringInfoChar(out, ',');
 					b->ctx = saved;
-					df_emit(b, out, r, level);
+					vx_emit(b, out, r, level);
 					appendStringInfoChar(out, ',');
-					df_emit_dscale(b, out, r, level);
+					vx_emit_dscale(b, out, r, level);
 					b->ctx = saved;
 					appendStringInfo(out, "],\"scales\":[%d,%d],\"type\":\"%s\"}",
-									 df_scale_of(ctx, l), df_scale_of(ctx, r),
-									 df_tag(NUMERICOID, df_scale_of(ctx, node)));
+									 vx_scale_of(ctx, l), vx_scale_of(ctx, r),
+									 vx_tag(NUMERICOID, vx_scale_of(ctx, node)));
 					return;
 				}
 				if (op->opresulttype == NUMERICOID)
@@ -1790,20 +1790,20 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					 * numeric + - * (N3): operands of + and - at the result
 					 * scale, those of * at their own (whose sum it is).
 					 */
-					Plan	   *ctx = level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
-					int			rs = df_scale_of(ctx, node);
+					Plan	   *ctx = level == VX_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+					int			rs = vx_scale_of(ctx, node);
 					ListCell   *la;
 
 					appendStringInfo(out, "{\"op\":\"%s\",\"type\":\"%s\",\"args\":[",
-									 name, df_tag(NUMERICOID, rs));
+									 name, vx_tag(NUMERICOID, rs));
 					foreach(la, op->args)
 					{
 						if (foreach_current_index(la) > 0)
 							appendStringInfoChar(out, ',');
 						if (strcmp(name, "*") == 0)
-							df_emit(b, out, lfirst(la), level);
+							vx_emit(b, out, lfirst(la), level);
 						else
-							df_emit_numeric_at(b, out, lfirst(la), rs, level, ctx);
+							vx_emit_numeric_at(b, out, lfirst(la), rs, level, ctx);
 					}
 					appendStringInfoString(out, "]}");
 					return;
@@ -1812,7 +1812,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (exprType(linitial(op->args)) == NUMERICOID)
 				{
 					/* compared at the larger scale (N2) */
-					Plan	   *ctx = level == DF_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
+					Plan	   *ctx = level == VX_LEVEL_AGG ? (Plan *) b->agg : b->ctx;
 					Node	   *l = linitial(op->args);
 					Node	   *r = lsecond(op->args);
 					int			t;
@@ -1822,18 +1822,18 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 								rs = 0;
 
 					if (IsA(l, Const))
-						(void) df_numeric_const_ps(((Const *) l)->constvalue, &lp, &ls);
+						(void) vx_numeric_const_ps(((Const *) l)->constvalue, &lp, &ls);
 					else
-						ls = df_scale_of(ctx, l);
+						ls = vx_scale_of(ctx, l);
 					if (IsA(r, Const))
-						(void) df_numeric_const_ps(((Const *) r)->constvalue, &rp, &rs);
+						(void) vx_numeric_const_ps(((Const *) r)->constvalue, &rp, &rs);
 					else
-						rs = df_scale_of(ctx, r);
+						rs = vx_scale_of(ctx, r);
 					t = Max(ls, rs);
 					appendStringInfoChar(out, '[');
-					df_emit_numeric_at(b, out, l, t, level, ctx);
+					vx_emit_numeric_at(b, out, l, t, level, ctx);
 					appendStringInfoChar(out, ',');
-					df_emit_numeric_at(b, out, r, t, level, ctx);
+					vx_emit_numeric_at(b, out, r, t, level, ctx);
 					appendStringInfoString(out, "]}");
 					return;
 				}
@@ -1841,12 +1841,12 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					strcmp(name, "~~") != 0 && strcmp(name, "!~~") != 0)
 				{
 					/* a comparison (LIKE sees character values padded: bpcharlike) */
-					df_emit_operands(b, out, linitial(op->args), lsecond(op->args), level);
-					df_emit_collate(out, op->inputcollid, linitial(op->args), name);
+					vx_emit_operands(b, out, linitial(op->args), lsecond(op->args), level);
+					vx_emit_collate(out, op->inputcollid, linitial(op->args), name);
 					appendStringInfoChar(out, '}');
 					return;
 				}
-				df_emit_list(b, out, op->args, level);
+				vx_emit_list(b, out, op->args, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -1858,12 +1858,12 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				if (be->boolop == NOT_EXPR)
 				{
 					appendStringInfoString(out, "{\"not\":");
-					df_emit(b, out, linitial(be->args), level);
+					vx_emit(b, out, linitial(be->args), level);
 				}
 				else
 				{
 					appendStringInfoString(out, be->boolop == AND_EXPR ? "{\"and\":" : "{\"or\":");
-					df_emit_list(b, out, be->args, level);
+					vx_emit_list(b, out, be->args, level);
 				}
 				appendStringInfoChar(out, '}');
 				return;
@@ -1872,8 +1872,8 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_CaseExpr:
 			{
 				/* E1: {"case": [{"when": c, "then": r}, ...], "else": e} */
-				CaseExpr   *ce = df_case_searched((CaseExpr *) node);	/* CN1 */
-				int			scale = df_scale_of(df_level_ctx(b, level), node);
+				CaseExpr   *ce = vx_case_searched((CaseExpr *) node);	/* CN1 */
+				int			scale = vx_scale_of(vx_level_ctx(b, level), node);
 				Node	   *saved = b->case_arg;
 				ListCell   *lc;
 
@@ -1886,14 +1886,14 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
 					appendStringInfoString(out, "{\"when\":");
-					df_emit(b, out, (Node *) w->expr, level);
+					vx_emit(b, out, (Node *) w->expr, level);
 					appendStringInfoString(out, ",\"then\":");
-					df_emit_result(b, out, (Node *) w->result, ce->casetype, scale, level);
+					vx_emit_result(b, out, (Node *) w->result, ce->casetype, scale, level);
 					appendStringInfoChar(out, '}');
 				}
 				b->case_arg = saved;
 				appendStringInfoString(out, "],\"else\":");
-				df_emit_result(b, out, (Node *) ce->defresult, ce->casetype, scale, level);
+				vx_emit_result(b, out, (Node *) ce->defresult, ce->casetype, scale, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -1902,10 +1902,10 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			/* the value of a simple CASE (CASE x WHEN ...) */
 			if (b->case_arg == NULL)
 			{
-				df_fail(b, "a CASE value outside a CASE");
+				vx_fail(b, "a CASE value outside a CASE");
 				return;
 			}
-			df_emit(b, out, b->case_arg, level);
+			vx_emit(b, out, b->case_arg, level);
 			return;
 
 		case T_CoalesceExpr:
@@ -1916,7 +1916,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				 * are NULL, as in PostgreSQL.
 				 */
 				CoalesceExpr *co = (CoalesceExpr *) node;
-				int			scale = df_scale_of(df_level_ctx(b, level), node);
+				int			scale = vx_scale_of(vx_level_ctx(b, level), node);
 				int			n = list_length(co->args);
 				ListCell   *lc;
 
@@ -1928,13 +1928,13 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
 					appendStringInfoString(out, "{\"when\":{\"isnotnull\":");
-					df_emit(b, out, lfirst(lc), level);
+					vx_emit(b, out, lfirst(lc), level);
 					appendStringInfoString(out, "},\"then\":");
-					df_emit_result(b, out, lfirst(lc), co->coalescetype, scale, level);
+					vx_emit_result(b, out, lfirst(lc), co->coalescetype, scale, level);
 					appendStringInfoChar(out, '}');
 				}
 				appendStringInfoString(out, "],\"else\":");
-				df_emit_result(b, out, llast(co->args), co->coalescetype, scale, level);
+				vx_emit_result(b, out, llast(co->args), co->coalescetype, scale, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -1945,19 +1945,19 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				NullIfExpr *ni = (NullIfExpr *) node;
 				OpExpr	   *eq = makeNode(OpExpr);
 				Oid			type = exprType(linitial(ni->args));
-				int			scale = df_scale_of(df_level_ctx(b, level), linitial(ni->args));
+				int			scale = vx_scale_of(vx_level_ctx(b, level), linitial(ni->args));
 
 				*eq = *(OpExpr *) ni;
 				eq->xpr.type = T_OpExpr;
 				eq->opresulttype = BOOLOID;
 				appendStringInfoString(out, "{\"case\":[{\"when\":");
-				df_emit(b, out, (Node *) eq, level);
+				vx_emit(b, out, (Node *) eq, level);
 				appendStringInfoString(out, ",\"then\":");
-				df_emit_result(b, out,
+				vx_emit_result(b, out,
 							   (Node *) makeNullConst(type, -1, ni->inputcollid),
 							   type, scale, level);
 				appendStringInfoString(out, "}],\"else\":");
-				df_emit_result(b, out, linitial(ni->args), type, scale, level);
+				vx_emit_result(b, out, linitial(ni->args), type, scale, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -1968,7 +1968,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				DistinctExpr *de = (DistinctExpr *) node;
 
 				appendStringInfoString(out, "{\"distinct\":");
-				df_emit_operands(b, out, linitial(de->args), lsecond(de->args), level);
+				vx_emit_operands(b, out, linitial(de->args), lsecond(de->args), level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -1981,7 +1981,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				Const	   *arr = lsecond(sa->args);
 				ArrayType  *a = DatumGetArrayTypeP(arr->constvalue);
 				Oid			elemtype = ARR_ELEMTYPE(a);
-				Plan	   *ctx = df_level_ctx(b, level);
+				Plan	   *ctx = vx_level_ctx(b, level);
 				Datum	   *elems;
 				bool	   *nulls;
 				int			nelems,
@@ -1995,20 +1995,20 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				deconstruct_array(a, elemtype, elmlen, elmbyval, elmalign,
 								  &elems, &nulls, &nelems);
 				/* numeric: the column and every element at the largest scale */
-				scale = df_scale_of(ctx, left);
+				scale = vx_scale_of(ctx, left);
 				for (i = 0; i < nelems && elemtype == NUMERICOID; i++)
 				{
 					int			p,
 								s;
 
-					if (!nulls[i] && df_numeric_const_ps(elems[i], &p, &s))
+					if (!nulls[i] && vx_numeric_const_ps(elems[i], &p, &s))
 						scale = Max(scale, s);
 				}
 				appendStringInfoString(out, "{\"inlist\":");
 				if (elemtype == NUMERICOID)
-					df_emit_numeric_at(b, out, left, scale, level, ctx);
+					vx_emit_numeric_at(b, out, left, scale, level, ctx);
 				else
-					df_emit_compared(b, out, left, level);
+					vx_emit_compared(b, out, left, level);
 				appendStringInfoString(out, ",\"values\":[");
 				for (i = 0; i < nelems; i++)
 				{
@@ -2018,9 +2018,9 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					if (i > 0)
 						appendStringInfoChar(out, ',');
 					if (elemtype == NUMERICOID)
-						df_emit_numeric_const(b, out, c, scale);
+						vx_emit_numeric_const(b, out, c, scale);
 					else
-						df_emit_compared(b, out, (Node *) c, level);
+						vx_emit_compared(b, out, (Node *) c, level);
 				}
 				appendStringInfo(out, "],\"negated\":%s}", sa->useOr ? "false" : "true");
 				return;
@@ -2032,7 +2032,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 
 				appendStringInfoString(out, nt->nulltesttype == IS_NULL ?
 									   "{\"isnull\":" : "{\"isnotnull\":");
-				df_emit(b, out, (Node *) nt->arg, level);
+				vx_emit(b, out, (Node *) nt->arg, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
@@ -2040,78 +2040,78 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) node;
-				const DfStringFunc *f = df_string_func(fe->funcid);
-				const char *tag = df_type_tag(fe->funcresulttype);
+				const VxStringFunc *f = vx_string_func(fe->funcid);
+				const char *tag = vx_type_tag(fe->funcresulttype);
 
-				if (df_bpchar_func(fe->funcid) != NULL)
+				if (vx_bpchar_func(fe->funcid) != NULL)
 				{
 					/* B1: character to text drops trailing blanks; lengths */
-					const char *fn = df_bpchar_func(fe->funcid);
+					const char *fn = vx_bpchar_func(fe->funcid);
 
 					if (strcmp(fn, "bpkey") == 0)
 						appendStringInfoString(out, "{\"bpkey\":");
 					else
 						appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"int4\",\"args\":[%s",
 										 fn, strcmp(fn, "char_length") == 0 ? "{\"bpkey\":" : "");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfoString(out, strcmp(fn, "bpkey") == 0 ? "}" :
 										   strcmp(fn, "char_length") == 0 ? "}]}" : "]}");
 					return;
 				}
-				if (df_round_scale(fe) >= 0)
+				if (vx_round_scale(fe) >= 0)
 				{
 					/* RD1: numeric_round (df_core::pgnum::pg_round) */
-					Plan	   *ctx = df_level_ctx(b, level);
+					Plan	   *ctx = vx_level_ctx(b, level);
 
 					appendStringInfoString(out, "{\"numround\":");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfo(out, ",\"from\":%d,\"type\":\"%s\"}",
-									 df_scale_of(ctx, linitial(fe->args)),
-									 df_tag(NUMERICOID, df_round_scale(fe)));
+									 vx_scale_of(ctx, linitial(fe->args)),
+									 vx_tag(NUMERICOID, vx_round_scale(fe)));
 					return;
 				}
 				if (fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS)
 				{
 					/* numeric_abs, at its argument's scale */
 					appendStringInfoString(out, "{\"numabs\":");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfoChar(out, '}');
 					return;
 				}
-				if (df_extract_field(fe) != NULL)
+				if (vx_extract_field(fe) != NULL)
 				{
 					/* DT2, ET1: df_core::pgdate */
 					appendStringInfoString(out, "{\"extract\":");
-					df_emit(b, out, lsecond(fe->args), level);
-					appendStringInfo(out, ",\"field\":\"%s\"%s}", df_extract_field(fe),
+					vx_emit(b, out, lsecond(fe->args), level);
+					appendStringInfo(out, ",\"field\":\"%s\"%s}", vx_extract_field(fe),
 									 fe->funcid == F_EXTRACT_TEXT_TIMESTAMP ? ",\"timestamp\":true" : "");
 					return;
 				}
-				if (df_cast_kind(fe->funcid) != NULL && strcmp(df_cast_kind(fe->funcid), "widen") == 0)
+				if (vx_cast_kind(fe->funcid) != NULL && strcmp(vx_cast_kind(fe->funcid), "widen") == 0)
 				{
 					/* exact, or rounding as C does (E2) */
 					appendStringInfoString(out, "{\"cast\":");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfo(out, ",\"type\":\"%s\"}", tag);
 					return;
 				}
-				if (df_cast_kind(fe->funcid) != NULL)
+				if (vx_cast_kind(fe->funcid) != NULL)
 				{
 					/* PostgreSQL's rounding and errors (E2): df_core::pgcast */
-					Plan	   *ctx = df_level_ctx(b, level);
+					Plan	   *ctx = vx_level_ctx(b, level);
 					Node	   *arg = linitial(fe->args);
-					int			rs = fe->funcresulttype == NUMERICOID ? df_scale_of(ctx, node) : 0;
+					int			rs = fe->funcresulttype == NUMERICOID ? vx_scale_of(ctx, node) : 0;
 					int			p = 0,
 								s;
 
 					if (fe->funcresulttype == NUMERICOID)
-						(void) df_numeric_ps(ctx, node, &p, &s);
+						(void) vx_numeric_ps(ctx, node, &p, &s);
 					appendStringInfoString(out, "{\"pgcast\":");
-					df_emit(b, out, arg, level);
+					vx_emit(b, out, arg, level);
 					appendStringInfo(out, ",\"kind\":\"%s\",\"from\":\"%s\",\"type\":\"%s\",\"precision\":%d}",
-									 df_cast_kind(fe->funcid),
-									 df_tag(exprType(arg), df_scale_of(ctx, arg)),
-									 df_tag(fe->funcresulttype, rs), p);
+									 vx_cast_kind(fe->funcid),
+									 vx_tag(exprType(arg), vx_scale_of(ctx, arg)),
+									 vx_tag(fe->funcresulttype, rs), p);
 					return;
 				}
 				if (fe->funcid == F_NUMERIC_INT2 || fe->funcid == F_NUMERIC_INT4 ||
@@ -2119,7 +2119,7 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 				{
 					/* an integer made numeric, exactly (N3) */
 					appendStringInfoString(out, "{\"cast\":");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfoString(out, ",\"type\":\"numeric\"}");
 					return;
 				}
@@ -2131,111 +2131,111 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 					char	   *replacement;
 					ListCell   *lc;
 
-					if (df_regexp_replace_problem(fe, &segments, &replacement) != NULL)
+					if (vx_regexp_replace_problem(fe, &segments, &replacement) != NULL)
 					{
-						df_fail(b, "a regular expression");
+						vx_fail(b, "a regular expression");
 						return;
 					}
 					appendStringInfoString(out, "{\"regexp_replace\":");
-					df_emit(b, out, linitial(fe->args), level);
+					vx_emit(b, out, linitial(fe->args), level);
 					appendStringInfoString(out, ",\"segments\":[");
 					foreach(lc, segments)
 					{
-						DfRegexSeg *seg = lfirst(lc);
+						VxRegexSeg *seg = lfirst(lc);
 
 						appendStringInfo(out, "%s{\"re\":", foreach_current_index(lc) > 0 ? "," : "");
-						df_emit_json_string(out, seg->re.data, seg->re.len);
+						vx_emit_json_string(out, seg->re.data, seg->re.len);
 						appendStringInfo(out, ",\"capture\":%s}", seg->capture ? "true" : "false");
 					}
 					appendStringInfoString(out, "],\"replacement\":");
-					df_emit_json_string(out, replacement, strlen(replacement));
+					vx_emit_json_string(out, replacement, strlen(replacement));
 					appendStringInfoChar(out, '}');
 					return;
 				}
 				if (f == NULL || tag == NULL)
 				{
-					df_fail(b, "a function call");
+					vx_fail(b, "a function call");
 					return;
 				}
-				if (f->rule == DF_COLL_CTYPE_C && !df_ctype_is_c(fe->inputcollid))
+				if (f->rule == VX_COLL_CTYPE_C && !vx_ctype_is_c(fe->inputcollid))
 				{
 					/* CM1: as the node's LC_CTYPE maps each character */
-					df_case_maps_ensure();
+					vx_case_maps_ensure();
 					appendStringInfo(out, "{\"call\":\"%s_locale\",\"type\":\"%s\",\"args\":",
 									 f->name, tag);
 				}
 				else
 					appendStringInfo(out, "{\"call\":\"%s\",\"type\":\"%s\",\"args\":", f->name, tag);
-				df_emit_list(b, out, fe->args, level);
+				vx_emit_list(b, out, fe->args, level);
 				appendStringInfoChar(out, '}');
 				return;
 			}
 
 		case T_RelabelType:
 			/* varchar read as text, or COLLATE (checked by the planner hook) */
-			df_emit(b, out, (Node *) ((RelabelType *) node)->arg, level);
+			vx_emit(b, out, (Node *) ((RelabelType *) node)->arg, level);
 			return;
 
 		case T_Aggref:
-			if (level != DF_LEVEL_AGG)
+			if (level != VX_LEVEL_AGG)
 			{
-				df_fail(b, "an aggregate outside the aggregate node");
+				vx_fail(b, "an aggregate outside the aggregate node");
 				return;
 			}
-			if (df_stddev_agg((Aggref *) node, NULL, NULL))
+			if (vx_stddev_agg((Aggref *) node, NULL, NULL))
 			{
-				df_emit_stddev(b, out, (Aggref *) node, false);
+				vx_emit_stddev(b, out, (Aggref *) node, false);
 				return;
 			}
-			if (df_avg_parts((Aggref *) node, NULL, NULL))
+			if (vx_avg_parts((Aggref *) node, NULL, NULL))
 			{
 				/*
 				 * AVG1: avg returning numeric, inside an expression or below
 				 * the top: numeric_avg of its sum and count (df_core pg_avg),
-				 * at df_avg_scale.  A whole output column is the C side's
-				 * (df_emit_outputs).
+				 * at vx_avg_scale.  A whole output column is the C side's
+				 * (vx_emit_outputs).
 				 */
 				Aggref	   *agg = (Aggref *) node;
 				const char *sfn = NULL,
 						   *cfn = NULL;
-				int			from = df_agg_state(agg) == DF_AGG_AVG_INT ? 0 :
-					df_scale_of((Plan *) b->agg,
+				int			from = vx_agg_state(agg) == VX_AGG_AVG_INT ? 0 :
+					vx_scale_of((Plan *) b->agg,
 								(Node *) linitial_node(TargetEntry, agg->args)->expr);
 
-				(void) df_avg_parts(agg, &sfn, &cfn);
+				(void) vx_avg_parts(agg, &sfn, &cfn);
 				appendStringInfoString(out, "{\"avg_numeric\":[");
-				df_emit_call_ref(b, out, agg, sfn);
+				vx_emit_call_ref(b, out, agg, sfn);
 				appendStringInfoChar(out, ',');
-				df_emit_call_ref(b, out, agg, cfn);
+				vx_emit_call_ref(b, out, agg, cfn);
 				appendStringInfo(out, "],\"scale\":%d,\"type\":\"%s\"}", from,
-								 df_tag(NUMERICOID, df_avg_scale(from)));
+								 vx_tag(NUMERICOID, vx_avg_scale(from)));
 				return;
 			}
-			if (df_named_of(b, b->agg) != NULL)
+			if (vx_named_of(b, b->agg) != NULL)
 			{
-				/* A1: a call of an Agg below the top (df_emit_node) */
-				df_emit_named_call(b, out, (Aggref *) node, NULL);
+				/* A1: a call of an Agg below the top (vx_emit_node) */
+				vx_emit_named_call(b, out, (Aggref *) node, NULL);
 				return;
 			}
-			appendStringInfo(out, "{\"agg\":%d}", df_agg_ref(b, (Aggref *) node, NULL));
+			appendStringInfo(out, "{\"agg\":%d}", vx_agg_ref(b, (Aggref *) node, NULL));
 			return;
 
 		case T_WindowFunc:
 			{
-				/* WIN1: a column of the WindowAgg's node (df_emit_plan_node) */
-				int			k = level == DF_LEVEL_SCAN ? df_window_index(b, node) : -1;
+				/* WIN1: a column of the WindowAgg's node (vx_emit_plan_node) */
+				int			k = level == VX_LEVEL_SCAN ? vx_window_index(b, node) : -1;
 
 				if (k < 0)
-					df_fail(b, "a window function");
-				else if (df_window_avg((WindowFunc *) node))
-					df_emit_window_avg(b, out, (WindowFunc *) node, k, false);
+					vx_fail(b, "a window function");
+				else if (vx_window_avg((WindowFunc *) node))
+					vx_emit_window_avg(b, out, (WindowFunc *) node, k, false);
 				else
 					appendStringInfo(out, "{\"name\":\"q%d_w%d\"}", b->ctx->plan_node_id, k);
 				return;
 			}
 
 		default:
-			df_fail(b, "an expression");
+			vx_fail(b, "an expression");
 			return;
 	}
 }
@@ -2243,32 +2243,32 @@ df_emit(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 /*
  * WIN2: an avg over a frame: numeric_avg (or, 'dscale', its display scale)
  * of window column q<id>_w<k>, the frame's sum, and q<id>_w<k>_n, its
- * count (df_emit_plan_node)
+ * count (vx_emit_plan_node)
  */
 static void
-df_emit_window_avg(DfBuilder *b, StringInfo out, WindowFunc *wf, int k, bool dscale)
+vx_emit_window_avg(VxBuilder *b, StringInfo out, WindowFunc *wf, int k, bool dscale)
 {
 	int			id = b->ctx->plan_node_id;
-	int			from = df_agg_state(df_window_aggref(wf)) == DF_AGG_AVG_INT ? 0 :
-		df_scale_of(b->ctx, (Node *) linitial(wf->args));
+	int			from = vx_agg_state(vx_window_aggref(wf)) == VX_AGG_AVG_INT ? 0 :
+		vx_scale_of(b->ctx, (Node *) linitial(wf->args));
 
 	appendStringInfo(out, "{\"%s\":[{\"name\":\"q%d_w%d\"},{\"name\":\"q%d_w%d_n\"}],"
 					 "\"scale\":%d", dscale ? "avg_numeric_scale" : "avg_numeric",
 					 id, k, id, k, from);
 	if (!dscale)
-		appendStringInfo(out, ",\"type\":\"%s\"", df_tag(NUMERICOID, df_avg_scale(from)));
+		appendStringInfo(out, ",\"type\":\"%s\"", vx_tag(NUMERICOID, vx_avg_scale(from)));
 	appendStringInfoChar(out, '}');
 }
 
 /*
- * A side of an exact comparison (df_numcmp_term): a quotient as its
+ * A side of an exact comparison (vx_numcmp_term): a quotient as its
  * operands and their display scales, abs of one as abs of its operands,
  * or a value at its scale.
  */
 static void
-df_emit_numcmp_side(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
+vx_emit_numcmp_side(VxBuilder *b, StringInfo out, Node *node, VxLevel level)
 {
-	Plan	   *ctx = df_level_ctx(b, level);
+	Plan	   *ctx = vx_level_ctx(b, level);
 	Plan	   *saved = b->ctx;
 	bool		abs = IsA(node, FuncExpr);
 	Node	   *q = abs ? linitial(((FuncExpr *) node)->args) : node;
@@ -2287,34 +2287,34 @@ df_emit_numcmp_side(DfBuilder *b, StringInfo out, Node *node, DfLevel level)
 			if (i > 0)
 				appendStringInfoChar(out, ',');
 			appendStringInfoString(out, abs ? "{\"numabs\":" : "");
-			df_emit(b, out, e, level);
+			vx_emit(b, out, e, level);
 			b->ctx = saved;
 			appendStringInfoString(out, abs ? "}," : ",");
-			df_emit_dscale(b, out, e, level);
+			vx_emit_dscale(b, out, e, level);
 			b->ctx = saved;
 		}
-		appendStringInfo(out, "],\"scales\":[%d,%d]}", df_scale_of(ctx, x), df_scale_of(ctx, y));
+		appendStringInfo(out, "],\"scales\":[%d,%d]}", vx_scale_of(ctx, x), vx_scale_of(ctx, y));
 		return;
 	}
 	appendStringInfoString(out, "{\"value\":");
-	df_emit(b, out, node, level);
+	vx_emit(b, out, node, level);
 	b->ctx = saved;
-	appendStringInfo(out, ",\"scale\":%d}", df_scale_of(ctx, node));
+	appendStringInfo(out, ",\"scale\":%d}", vx_scale_of(ctx, node));
 }
 
 /*
- * 'l' op 'r' exactly (df_numcmp_needed): a CASE's comparison is its
+ * 'l' op 'r' exactly (vx_numcmp_needed): a CASE's comparison is its
  * branch's, NULL where the branch is; the rest PgNumCmp's.
  */
 static void
-df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, DfLevel level)
+vx_emit_numcmp(VxBuilder *b, StringInfo out, const char *op, Node *l, Node *r, VxLevel level)
 {
 	Plan	   *saved = b->ctx;
 	bool		left = IsA(l, CaseExpr);
 
 	if (left || IsA(r, CaseExpr))
 	{
-		CaseExpr   *ce = df_case_searched((CaseExpr *) (left ? l : r));
+		CaseExpr   *ce = vx_case_searched((CaseExpr *) (left ? l : r));
 		int			i;
 
 		appendStringInfoString(out, "{\"case\":[");
@@ -2327,7 +2327,7 @@ df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, D
 				CaseWhen   *w = list_nth_node(CaseWhen, ce->args, i);
 
 				appendStringInfoString(out, i > 0 ? ",{\"when\":" : "{\"when\":");
-				df_emit(b, out, (Node *) w->expr, level);
+				vx_emit(b, out, (Node *) w->expr, level);
 				b->ctx = saved;
 				appendStringInfoString(out, ",\"then\":");
 				res = (Node *) w->result;
@@ -2340,9 +2340,9 @@ df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, D
 			if (IsA(res, Const) && ((Const *) res)->constisnull)
 				appendStringInfoString(out, "{\"lit\":{\"type\":\"bool\",\"null\":true}}");
 			else if (left)
-				df_emit_numcmp(b, out, op, res, r, level);
+				vx_emit_numcmp(b, out, op, res, r, level);
 			else
-				df_emit_numcmp(b, out, op, l, res, level);
+				vx_emit_numcmp(b, out, op, l, res, level);
 			b->ctx = saved;
 			if (i < list_length(ce->args))
 				appendStringInfoChar(out, '}');
@@ -2357,21 +2357,21 @@ df_emit_numcmp(DfBuilder *b, StringInfo out, const char *op, Node *l, Node *r, D
 		return;
 	}
 	appendStringInfo(out, "{\"numcmp\":\"%s\",\"left\":", op);
-	df_emit_numcmp_side(b, out, l, level);
+	vx_emit_numcmp_side(b, out, l, level);
 	appendStringInfoString(out, ",\"right\":");
-	df_emit_numcmp_side(b, out, r, level);
+	vx_emit_numcmp_side(b, out, r, level);
 	appendStringInfoChar(out, '}');
 }
 
 /* The index of window function 'node' among b->ctx's (a WindowAgg), or -1. */
 static int
-df_window_index(DfBuilder *b, Node *node)
+vx_window_index(VxBuilder *b, Node *node)
 {
 	ListCell   *lc;
 
 	if (b->ctx == NULL || !IsA(b->ctx, WindowAgg))
 		return -1;
-	foreach(lc, df_window_funcs((WindowAgg *) b->ctx))
+	foreach(lc, vx_window_funcs((WindowAgg *) b->ctx))
 		if (equal(lfirst(lc), node))
 			return foreach_current_index(lc);
 	return -1;
@@ -2379,27 +2379,27 @@ df_window_index(DfBuilder *b, Node *node)
 
 /* A join key, cast to 'type' if it has another (numeric: to 'scale'). */
 static void
-df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
+vx_emit_key(VxBuilder *b, StringInfo out, Node *key, Oid type, int scale)
 {
-	const char *tag = df_type_tag(type);
+	const char *tag = vx_type_tag(type);
 
 	if (tag == NULL)
 	{
-		df_fail(b, "a join key");
+		vx_fail(b, "a join key");
 		return;
 	}
 	if (type == NUMERICOID)
 	{
-		df_emit_numeric_at(b, out, key, scale, DF_LEVEL_SCAN, b->ctx);
+		vx_emit_numeric_at(b, out, key, scale, VX_LEVEL_SCAN, b->ctx);
 		return;
 	}
 	if (exprType(key) == type)
 	{
-		df_emit_compared(b, out, key, DF_LEVEL_SCAN);
+		vx_emit_compared(b, out, key, VX_LEVEL_SCAN);
 		return;
 	}
 	appendStringInfoString(out, "{\"cast\":");
-	df_emit(b, out, key, DF_LEVEL_SCAN);
+	vx_emit(b, out, key, VX_LEVEL_SCAN);
 	appendStringInfo(out, ",\"type\":\"%s\"}", tag);
 }
 
@@ -2410,24 +2410,24 @@ df_emit_key(DfBuilder *b, StringInfo out, Node *key, Oid type, int scale)
  */
 /*
  * '"group": [...]' of Agg 'agg': its grouping columns, its own and its
- * chain's (df_agg_groups); with grouping sets, '"sets": [[k, ...], ...]'
+ * chain's (vx_agg_groups); with grouping sets, '"sets": [[k, ...], ...]'
  * after, each set's columns by their place in "group", in the order of
  * their GROUPINGSET_ID() (GS1).
  */
 static void
-df_emit_groups(DfBuilder *b, StringInfo out, Agg *agg)
+vx_emit_groups(VxBuilder *b, StringInfo out, Agg *agg)
 {
-	DfAggGroups g;
+	VxAggGroups g;
 	int			i,
 				k;
 
-	df_agg_groups(agg, &g);
+	vx_agg_groups(agg, &g);
 	appendStringInfoString(out, "\"group\":[");
 	for (k = 0; k < g.ncols; k++)
 	{
 		if (k > 0)
 			appendStringInfoChar(out, ',');
-		df_emit_grouped(b, out, outerPlan(agg), g.cols[k]);
+		vx_emit_grouped(b, out, outerPlan(agg), g.cols[k]);
 	}
 	appendStringInfoChar(out, ']');
 	if (g.nsets == 0)
@@ -2451,10 +2451,10 @@ df_emit_groups(DfBuilder *b, StringInfo out, Agg *agg)
 
 /*
  * WIN1: column 'col' of WindowAgg child 'child' as a key it partitions or
- * orders by, compared as PostgreSQL compares it (df_emit_compared).
+ * orders by, compared as PostgreSQL compares it (vx_emit_compared).
  */
 static void
-df_emit_window_key(DfBuilder *b, StringInfo out, Plan *child, AttrNumber col)
+vx_emit_window_key(VxBuilder *b, StringInfo out, Plan *child, AttrNumber col)
 {
 	TargetEntry *tle = get_tle_by_resno(child->targetlist, col);
 	Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
@@ -2463,13 +2463,13 @@ df_emit_window_key(DfBuilder *b, StringInfo out, Plan *child, AttrNumber col)
 
 	if (key != NULL)
 		appendStringInfo(out, "{\"%s\":", key);
-	df_emit_output_of(b, out, child, col);
+	vx_emit_output_of(b, out, child, col);
 	if (key != NULL)
 		appendStringInfoChar(out, '}');
 }
 
 static void
-df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
+vx_emit_plan_node(VxBuilder *b, StringInfo out, Plan *plan)
 {
 	if (b->failed)
 		return;
@@ -2484,61 +2484,61 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				ListCell   *lc;
 
 				if (IsA(plan, SeqScan))
-					(void) df_collect_correlated((Node *) plan->qual, &sps);
+					(void) vx_collect_correlated((Node *) plan->qual, &sps);
 				if (sps != NIL)
 				{
 					/*
 					 * SC1: its rows joined to each correlated scalar
 					 * subquery of its filter, grouped by its keys: those
 					 * with no group get NULLs, its value of no rows
-					 * (df_subplan_correlated).  The groups are the join's
+					 * (vx_subplan_correlated).  The groups are the join's
 					 * build side, fed first, their columns read by name.
 					 */
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
 					for (int i = list_length(sps) - 1; i >= 0; i--)
 					{
-						DfCorrelated *corr = df_correlated_of(b, list_nth(sps, i));
+						VxCorrelated *corr = vx_correlated_of(b, list_nth(sps, i));
 
 						if (corr == NULL)
 						{
-							df_fail(b, "a correlated subquery");
+							vx_fail(b, "a correlated subquery");
 							return;
 						}
 						appendStringInfoString(out, "{\"join\":{\"type\":\"right\",\"left\":");
-						df_emit_node(b, out, (Plan *) corr->agg);
+						vx_emit_node(b, out, (Plan *) corr->agg);
 						appendStringInfoString(out, ",\"right\":");
 					}
-					j = df_add_input(b, plan);
+					j = vx_add_input(b, plan);
 					appendStringInfo(out, "{\"input\":%d}", j);
 					foreach(lc, sps)
 					{
-						DfCorrelated *corr = df_correlated_of(b, lfirst(lc));
+						VxCorrelated *corr = vx_correlated_of(b, lfirst(lc));
 						ListCell   *lo,
 								   *li;
 
 						appendStringInfoString(out, ",\"on\":[");
 						forboth(lo, corr->outer, li, corr->inner)
 						{
-							Oid			type = df_join_key_type(exprType(lfirst(li)),
+							Oid			type = vx_join_key_type(exprType(lfirst(li)),
 																exprType(lfirst(lo)));
 
 							appendStringInfoString(out, foreach_current_index(lo) > 0 ? ",[" : "[");
 							b->ctx = (Plan *) corr->top;
-							df_emit_key(b, out, lfirst(li), type, 0);
+							vx_emit_key(b, out, lfirst(li), type, 0);
 							appendStringInfoChar(out, ',');
 							b->ctx = plan;
-							df_emit_key(b, out, lfirst(lo), type, 0);
+							vx_emit_key(b, out, lfirst(lo), type, 0);
 							appendStringInfoChar(out, ']');
 						}
 						appendStringInfoString(out, "],\"filter\":null}}");
 					}
 					appendStringInfoString(out, ",\"pred\":");
 					b->ctx = plan;
-					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 					appendStringInfoString(out, "}}");
 					return;
 				}
-				j = df_add_input(b, plan);
+				j = vx_add_input(b, plan);
 				if (plan->qual == NIL)
 				{
 					appendStringInfo(out, "{\"input\":%d}", j);
@@ -2546,19 +2546,19 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				}
 				appendStringInfo(out, "{\"filter\":{\"input\":{\"input\":%d},\"pred\":", j);
 				b->ctx = plan;
-				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 				appendStringInfoString(out, "}}");
 				return;
 			}
 
 		case T_Hash:
 		case T_Material:
-			df_emit_node(b, out, outerPlan(plan));
+			vx_emit_node(b, out, outerPlan(plan));
 			return;
 
 		case T_Sequence:
 			/* its last input's rows; PostgreSQL runs the others first */
-			df_emit_node(b, out, llast(((Sequence *) plan)->subplans));
+			vx_emit_node(b, out, llast(((Sequence *) plan)->subplans));
 			return;
 
 		case T_NestLoop:
@@ -2571,7 +2571,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				 */
 				Join	   *join = (Join *) plan;
 				const char *type;
-				bool		swapped = df_nestloop_swapped(plan);	/* NL2 */
+				bool		swapped = vx_nestloop_swapped(plan);	/* NL2 */
 
 				switch (join->jointype)
 				{
@@ -2588,33 +2588,33 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						type = "rightanti";
 						break;
 					default:
-						df_fail(b, "this kind of Nested Loop");
+						vx_fail(b, "this kind of Nested Loop");
 						return;
 				}
 				if (plan->qual != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
 				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",\"left\":", type);
-				df_emit_node(b, out, swapped ? outerPlan(plan) : innerPlan(plan));
+				vx_emit_node(b, out, swapped ? outerPlan(plan) : innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
-				df_emit_node(b, out, swapped ? innerPlan(plan) : outerPlan(plan));
+				vx_emit_node(b, out, swapped ? innerPlan(plan) : outerPlan(plan));
 				appendStringInfoString(out, ",\"on\":[],\"filter\":");
 				b->ctx = plan;
 				b->join_sides = true;
-				df_emit_qual(b, out, join->joinqual, DF_LEVEL_SCAN);
+				vx_emit_qual(b, out, join->joinqual, VX_LEVEL_SCAN);
 				b->join_sides = false;
 				appendStringInfoString(out, "}}");
 				if (plan->qual != NIL)
 				{
 					appendStringInfoString(out, ",\"pred\":");
 					b->ctx = plan;
-					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 					appendStringInfoString(out, "}}");
 				}
 				return;
 			}
 
 		case T_Result:
-			if (df_empty_result(plan))
+			if (vx_empty_result(plan))
 			{
 				/* OF1: no rows */
 				appendStringInfoString(out, "{\"empty\":{}}");
@@ -2623,30 +2623,30 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			if (((Result *) plan)->resconstantqual != NULL)
 			{
 				/* OF1: its one-time filter, known on this segment */
-				int			v = df_one_time_value(((Result *) plan)->resconstantqual, true);
+				int			v = vx_one_time_value(((Result *) plan)->resconstantqual, true);
 
 				if (v < 0)
 				{
-					df_fail(b, "a one-time filter");
+					vx_fail(b, "a one-time filter");
 					return;
 				}
 				appendStringInfoString(out, "{\"filter\":{\"input\":");
 			}
 			/* R1: its child's rows, its filter over them */
 			if (plan->qual == NIL)
-				df_emit_node(b, out, outerPlan(plan));
+				vx_emit_node(b, out, outerPlan(plan));
 			else
 			{
 				appendStringInfoString(out, "{\"filter\":{\"input\":");
-				df_emit_node(b, out, outerPlan(plan));
+				vx_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"pred\":");
 				b->ctx = plan;
-				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 				appendStringInfoString(out, "}}");
 			}
 			if (((Result *) plan)->resconstantqual != NULL)
 				appendStringInfo(out, ",\"pred\":{\"lit\":{\"type\":\"bool\",\"value\":%s}}}}",
-								 df_one_time_value(((Result *) plan)->resconstantqual, true) == 1 ?
+								 vx_one_time_value(((Result *) plan)->resconstantqual, true) == 1 ?
 								 "true" : "false");
 			return;
 
@@ -2654,46 +2654,46 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			/* SQ1: its plan's rows, its filter over them */
 			if (plan->qual == NIL)
 			{
-				df_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
+				vx_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
 				return;
 			}
 			appendStringInfoString(out, "{\"filter\":{\"input\":");
-			df_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
+			vx_emit_node(b, out, ((SubqueryScan *) plan)->subplan);
 			appendStringInfoString(out, ",\"pred\":");
 			b->ctx = plan;
-			df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+			vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 			appendStringInfoString(out, "}}");
 			return;
 
 		case T_Sort:
 			/* below a GroupAggregate run hashed (D2) */
-			df_emit_node(b, out, outerPlan(plan));
+			vx_emit_node(b, out, outerPlan(plan));
 			return;
 
 		case T_Agg:
 			{
 				/*
-				 * A1, D2: an Agg below a join or another Agg (df_check_slice),
+				 * A1, D2: an Agg below a join or another Agg (vx_check_slice),
 				 * its groups named q<plan_node_id>_g<i> and its calls
 				 * q<plan_node_id>_a<k>.
 				 */
 				Agg		   *agg = (Agg *) plan;
-				DfNamedAgg *na = palloc0(sizeof(DfNamedAgg));
+				VxNamedAgg *na = palloc0(sizeof(VxNamedAgg));
 				List	   *calls = NIL;
-				DfUngrouped ungrouped;
+				VxUngrouped ungrouped;
 				Agg		   *saved = b->agg;
 				bool		named = b->agg_named;
 				ListCell   *lc;
 
 				na->agg = agg;
-				df_collect_aggrefs((Node *) plan->targetlist, &calls);
-				df_collect_aggrefs((Node *) plan->qual, &calls);
+				vx_collect_aggrefs((Node *) plan->targetlist, &calls);
+				vx_collect_aggrefs((Node *) plan->qual, &calls);
 				foreach(lc, calls)
 				{
 					const char *sfn = NULL,
 							   *cfn = NULL;
 
-					if (df_stddev_agg(lfirst(lc), NULL, NULL))
+					if (vx_stddev_agg(lfirst(lc), NULL, NULL))
 					{
 						/* STD1: its count, sum and sum of squares; STD2: merged */
 						bool		combine = ((Aggref *) lfirst(lc))->aggsplit == AGGSPLIT_FINAL_DESERIAL;
@@ -2708,7 +2708,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 												 (void *) (combine ? "merge_sumsq" : "sum_sq"));
 						}
 					}
-					else if (df_avg_parts(lfirst(lc), &sfn, &cfn))
+					else if (vx_avg_parts(lfirst(lc), &sfn, &cfn))
 					{
 						/* AVG1: its sum and count */
 						if (!list_member(na->aggrefs, lfirst(lc)))
@@ -2731,7 +2731,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 
 					forboth(la, na->aggrefs, lf, na->aggfns)
 						if (lfirst(lf) == NULL &&
-							df_agg_state_at((Plan *) agg, lfirst(la)) == DF_AGG_SUM_NUMERIC_MIXED)
+							vx_agg_state_at((Plan *) agg, lfirst(la)) == VX_AGG_SUM_NUMERIC_MIXED)
 							mixed = lappend(mixed, lfirst(la));
 					foreach(la, mixed)
 					{
@@ -2741,25 +2741,25 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				}
 				/* DN1: the display scales of its keys of scales of their own */
 				{
-					DfAggGroups g;
+					VxAggGroups g;
 					int			k;
 
-					df_agg_groups(agg, &g);
+					vx_agg_groups(agg, &g);
 					for (k = 0; k < g.ncols; k++)
-						if (df_key_scale_needed(agg, g.cols[k]))
+						if (vx_key_scale_needed(agg, g.cols[k]))
 						{
-							na->aggrefs = lappend(na->aggrefs, df_key_scale_call(g.cols[k]));
+							na->aggrefs = lappend(na->aggrefs, vx_key_scale_call(g.cols[k]));
 							na->aggfns = lappend(na->aggfns, "key_scale");
 						}
 				}
 				/* RI1: the columns it does not group by, as any() */
 				ungrouped.agg = agg;
 				ungrouped.vars = NIL;
-				df_collect_ungrouped((Node *) plan->targetlist, &ungrouped);
-				df_collect_ungrouped((Node *) plan->qual, &ungrouped);
+				vx_collect_ungrouped((Node *) plan->targetlist, &ungrouped);
+				vx_collect_ungrouped((Node *) plan->qual, &ungrouped);
 				foreach(lc, ungrouped.vars)
 				{
-					Aggref	   *call = df_any_call(lfirst(lc));
+					Aggref	   *call = vx_any_call(lfirst(lc));
 
 					if (!list_member(na->aggrefs, call))
 					{
@@ -2768,16 +2768,16 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					}
 				}
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
-				df_emit_node(b, out, outerPlan(plan));
+				vx_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",");
-				df_emit_groups(b, out, agg);
+				vx_emit_groups(b, out, agg);
 				appendStringInfoString(out, ",\"aggs\":[");
-				df_emit_agg_calls(b, out, agg, na->aggrefs, na->aggfns);
+				vx_emit_agg_calls(b, out, agg, na->aggrefs, na->aggfns);
 				b->named = lappend(b->named, na);
 				appendStringInfoString(out, "],\"having\":");
 				b->agg = agg;
 				b->agg_named = false;
-				df_emit_qual(b, out, plan->qual, DF_LEVEL_AGG);
+				vx_emit_qual(b, out, plan->qual, VX_LEVEL_AGG);
 				b->agg = saved;
 				b->agg_named = named;
 				appendStringInfo(out, ",\"name\":\"q%d\"}}", plan->plan_node_id);
@@ -2794,12 +2794,12 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				char	   *detail = psprintf("%s\n", msg);
 
 				appendStringInfoString(out, "{\"filter\":{\"input\":");
-				df_emit_node(b, out, outerPlan(plan));
+				vx_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"pred\":{\"assert\":");
 				b->ctx = plan;
-				df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+				vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 				appendStringInfoString(out, ",\"detail\":");
-				df_emit_json_string(out, detail, strlen(detail));
+				vx_emit_json_string(out, detail, strlen(detail));
 				appendStringInfoString(out, "}}}");
 				return;
 			}
@@ -2815,13 +2815,13 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				int			k;
 
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
-				df_emit_node(b, out, child);
+				vx_emit_node(b, out, child);
 				appendStringInfoString(out, ",\"group\":[");
 				for (k = 0; k < uq->numCols; k++)
 				{
 					if (k > 0)
 						appendStringInfoChar(out, ',');
-					df_emit_output_of(b, out, child, uq->uniqColIdx[k]);
+					vx_emit_output_of(b, out, child, uq->uniqColIdx[k]);
 				}
 				appendStringInfo(out, "],\"aggs\":[],\"having\":null,\"name\":\"q%d\"}}",
 								 plan->plan_node_id);
@@ -2841,13 +2841,13 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				int			k;
 
 				appendStringInfoString(out, "{\"aggregate\":{\"input\":");
-				df_emit_node(b, out, child);
+				vx_emit_node(b, out, child);
 				appendStringInfoString(out, ",\"group\":[");
 				for (k = 0; k < so->numCols; k++)
 				{
 					if (k > 0)
 						appendStringInfoChar(out, ',');
-					df_emit_output_of(b, out, child, so->dupColIdx[k]);
+					vx_emit_output_of(b, out, child, so->dupColIdx[k]);
 				}
 				appendStringInfoString(out, "],\"aggs\":[");
 				for (k = 0; k < 2; k++)
@@ -2855,7 +2855,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					appendStringInfoString(out, k > 0 ? "," : "");
 					appendStringInfoString(out, "{\"fn\":\"count\",\"arg\":{\"case\":[{\"when\":"
 										   "{\"op\":\"=\",\"type\":\"bool\",\"args\":[");
-					df_emit_output_of(b, out, child, so->flagColIdx);
+					vx_emit_output_of(b, out, child, so->flagColIdx);
 					appendStringInfo(out, ",{\"lit\":{\"type\":\"int4\",\"value\":%d}}]},"
 									 "\"then\":{\"lit\":{\"type\":\"int4\",\"value\":1}}}],"
 									 "\"else\":{\"lit\":{\"type\":\"int4\",\"null\":true}}}}", k);
@@ -2881,14 +2881,14 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				ListCell   *lt;
 
 				appendStringInfoString(out, "{\"union\":{\"inputs\":[");
-				foreach(lc, df_append_plans(plan))
+				foreach(lc, vx_append_plans(plan))
 				{
 					if (foreach_current_index(lc) > 0)
 						appendStringInfoChar(out, ',');
-					df_emit_node(b, out, lfirst(lc));
+					vx_emit_node(b, out, lfirst(lc));
 				}
 				appendStringInfoString(out, "],\"columns\":[");
-				foreach(lc, df_append_plans(plan))
+				foreach(lc, vx_append_plans(plan))
 				{
 					Plan	   *child = lfirst(lc);
 					bool		first = true;
@@ -2903,7 +2903,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 
 						if (ctle == NULL)
 						{
-							df_fail(b, "an input column of an Append");
+							vx_fail(b, "an input column of an Append");
 							return;
 						}
 						appendStringInfoString(out, first ? "{\"expr\":" : ",{\"expr\":");
@@ -2915,26 +2915,26 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						 * the column's scale
 						 */
 						if (exprType((Node *) tle->expr) == NUMERICOID &&
-							df_scale_of(child, (Node *) ctle->expr) !=
-							df_scale_of(plan, (Node *) tle->expr))
+							vx_scale_of(child, (Node *) ctle->expr) !=
+							vx_scale_of(plan, (Node *) tle->expr))
 						{
-							int			to = df_scale_of(plan, (Node *) tle->expr);
+							int			to = vx_scale_of(plan, (Node *) tle->expr);
 
 							appendStringInfoString(out, "{\"rescale\":");
-							df_emit_output_of(b, out, child, tle->resno);
+							vx_emit_output_of(b, out, child, tle->resno);
 							appendStringInfo(out, ",\"by\":%d,\"type\":\"%s\"}",
-											 to - df_scale_of(child, (Node *) ctle->expr),
-											 df_tag(NUMERICOID, to));
+											 to - vx_scale_of(child, (Node *) ctle->expr),
+											 vx_tag(NUMERICOID, to));
 						}
 						else
-							df_emit_output_of(b, out, child, tle->resno);
+							vx_emit_output_of(b, out, child, tle->resno);
 						if (exprType((Node *) tle->expr) == NUMERICOID &&
-							(df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
-							 df_numeric_varying(plan, (Node *) tle->expr)))
+							(vx_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
+							 vx_numeric_varying(plan, (Node *) tle->expr)))
 						{
 							/* DN1, AV2: its display scale, as those above read it */
 							appendStringInfoString(out, ",\"dscale\":");
-							df_emit_dscale_output_of(b, out, child, tle->resno);
+							vx_emit_dscale_output_of(b, out, child, tle->resno);
 						}
 						appendStringInfoChar(out, '}');
 					}
@@ -2948,26 +2948,26 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 			{
 				/*
 				 * WIN1: its child's rows with a column q<plan_node_id>_w<k>
-				 * for each window function (df_window_funcs), the top
+				 * for each window function (vx_window_funcs), the top
 				 * one's filter and run condition over them
 				 */
 				WindowAgg  *wa = (WindowAgg *) plan;
 				Plan	   *child = outerPlan(plan);
 				List	   *filter = list_concat(list_copy(plan->qual),
-												 df_window_run_condition(wa));
+												 vx_window_run_condition(wa));
 				ListCell   *lc;
 				int			i;
 
 				if (filter != NIL)
 					appendStringInfoString(out, "{\"filter\":{\"input\":");
 				appendStringInfoString(out, "{\"window\":{\"input\":");
-				df_emit_node(b, out, child);
+				vx_emit_node(b, out, child);
 				appendStringInfoString(out, ",\"partition\":[");
 				for (i = 0; i < wa->partNumCols; i++)
 				{
 					if (i > 0)
 						appendStringInfoChar(out, ',');
-					df_emit_window_key(b, out, child, wa->partColIdx[i]);
+					vx_emit_window_key(b, out, child, wa->partColIdx[i]);
 				}
 				appendStringInfoString(out, "],\"order\":[");
 				for (i = 0; i < wa->ordNumCols; i++)
@@ -2979,19 +2979,19 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 								desc;
 
 					if (tle == NULL ||
-						!df_window_order(child, wa->ordColIdx[i], &sortop, &nulls_first, &coll) ||
-						!df_sort_direction(sortop, exprType((Node *) tle->expr), &desc))
+						!vx_window_order(child, wa->ordColIdx[i], &sortop, &nulls_first, &coll) ||
+						!vx_sort_direction(sortop, exprType((Node *) tle->expr), &desc))
 					{
-						df_fail(b, "a window order key");
+						vx_fail(b, "a window order key");
 						return;
 					}
 					appendStringInfoString(out, i > 0 ? ",{\"expr\":" : "{\"expr\":");
-					df_emit_window_key(b, out, child, wa->ordColIdx[i]);
+					vx_emit_window_key(b, out, child, wa->ordColIdx[i]);
 					appendStringInfo(out, ",\"desc\":%s,\"nulls_first\":%s}",
 									 desc ? "true" : "false", nulls_first ? "true" : "false");
 				}
-				appendStringInfo(out, "],\"frame\":\"%s\",\"funcs\":[", df_window_frame(wa));
-				foreach(lc, df_window_funcs(wa))
+				appendStringInfo(out, "],\"frame\":\"%s\",\"funcs\":[", vx_window_frame(wa));
+				foreach(lc, vx_window_funcs(wa))
 				{
 					WindowFunc *wf = lfirst_node(WindowFunc, lc);
 
@@ -3002,23 +3002,23 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					 * the child as through the WindowAgg, which is all the
 					 * Agg it is given serves for
 					 */
-					if (df_window_avg(wf))
+					if (vx_window_avg(wf))
 					{
 						/* WIN2: an avg's sum and count, as an Agg's (AVG1) */
-						Aggref	   *agg = df_window_aggref(wf);
+						Aggref	   *agg = vx_window_aggref(wf);
 
 						appendStringInfoString(out, "{\"fn\":\"avg_parts\",\"sum\":");
-						df_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
-										  list_make1(df_agg_state(agg) == DF_AGG_AVG_NUMERIC ?
+						vx_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
+										  list_make1(vx_agg_state(agg) == VX_AGG_AVG_NUMERIC ?
 													 "sum_decimal" : "sum_numeric"));
 						appendStringInfoString(out, ",\"count\":");
-						df_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
+						vx_emit_agg_calls(b, out, (Agg *) plan, list_make1(agg),
 										  list_make1("count"));
 						appendStringInfoChar(out, '}');
 					}
 					else if (wf->winagg)
-						df_emit_agg_calls(b, out, (Agg *) plan,
-										  list_make1(df_window_aggref(wf)), NULL);
+						vx_emit_agg_calls(b, out, (Agg *) plan,
+										  list_make1(vx_window_aggref(wf)), NULL);
 					else
 						appendStringInfo(out, "{\"fn\":\"%s\"}", get_func_name(wf->winfnoid));
 				}
@@ -3027,7 +3027,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 				{
 					appendStringInfoString(out, ",\"pred\":");
 					b->ctx = plan;
-					df_emit_qual(b, out, filter, DF_LEVEL_SCAN);
+					vx_emit_qual(b, out, filter, VX_LEVEL_SCAN);
 					appendStringInfoString(out, "}}");
 				}
 				return;
@@ -3079,7 +3079,7 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 						type = "leftanti";
 						break;
 					default:
-						df_fail(b, "this kind of join");
+						vx_fail(b, "this kind of join");
 						return;
 				}
 				if (plan->qual != NIL)
@@ -3097,36 +3097,36 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					OpExpr	   *op = linitial_node(OpExpr, clauses);
 					Node	   *outer = linitial(op->args);
 					Node	   *inner = lsecond(op->args);
-					Oid			ktype = df_join_key_type(exprType(inner), exprType(outer));
+					Oid			ktype = vx_join_key_type(exprType(inner), exprType(outer));
 					int			scale = ktype != NUMERICOID ? 0 :
-						Max(df_scale_of(plan, inner), df_scale_of(plan, outer));
+						Max(vx_scale_of(plan, inner), vx_scale_of(plan, outer));
 
 					appendStringInfoString(out, "{\"join\":{\"type\":\"leftanti\",\"null_aware\":true,\"left\":");
-					df_emit_node(b, out, outerPlan(plan));
+					vx_emit_node(b, out, outerPlan(plan));
 					appendStringInfoString(out, ",\"right\":");
-					df_emit_node(b, out, innerPlan(plan));
+					vx_emit_node(b, out, innerPlan(plan));
 					appendStringInfoString(out, ",\"on\":[[");
 					b->ctx = plan;
 					b->join_sides = true;
-					df_emit_key(b, out, outer, ktype, scale);
+					vx_emit_key(b, out, outer, ktype, scale);
 					appendStringInfoChar(out, ',');
-					df_emit_key(b, out, inner, ktype, scale);
+					vx_emit_key(b, out, inner, ktype, scale);
 					b->join_sides = false;
 					appendStringInfoString(out, "]],\"filter\":null}}");
 					if (plan->qual != NIL)
 					{
 						appendStringInfoString(out, ",\"pred\":");
 						b->ctx = plan;
-						df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+						vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 						appendStringInfoString(out, "}}");
 					}
 					return;
 				}
 				appendStringInfo(out, "{\"join\":{\"type\":\"%s\",%s\"left\":", type,
 								 null_equal ? "\"null_equal\":true," : "");
-				df_emit_node(b, out, innerPlan(plan));
+				vx_emit_node(b, out, innerPlan(plan));
 				appendStringInfoString(out, ",\"right\":");
-				df_emit_node(b, out, outerPlan(plan));
+				vx_emit_node(b, out, outerPlan(plan));
 				appendStringInfoString(out, ",\"on\":[");
 				b->ctx = plan;
 				b->join_sides = true;
@@ -3135,60 +3135,60 @@ df_emit_plan_node(DfBuilder *b, StringInfo out, Plan *plan)
 					OpExpr	   *op = lfirst_node(OpExpr, lc);
 					Node	   *inner = lsecond(op->args);
 					Node	   *outer = linitial(op->args);
-					Oid			type = df_join_key_type(exprType(inner), exprType(outer));
+					Oid			type = vx_join_key_type(exprType(inner), exprType(outer));
 					int			scale = type != NUMERICOID ? 0 :
-						Max(df_scale_of(b->ctx, inner), df_scale_of(b->ctx, outer));
+						Max(vx_scale_of(b->ctx, inner), vx_scale_of(b->ctx, outer));
 
 					/* Keys of two types are compared in the wider one. */
 					appendStringInfoString(out, first ? "[" : ",[");
 					first = false;
-					df_emit_key(b, out, inner, type, scale);
+					vx_emit_key(b, out, inner, type, scale);
 					appendStringInfoChar(out, ',');
-					df_emit_key(b, out, outer, type, scale);
+					vx_emit_key(b, out, outer, type, scale);
 					appendStringInfoChar(out, ']');
 				}
 				appendStringInfoString(out, "],\"filter\":");
 				b->ctx = plan;
-				df_emit_qual(b, out, ((Join *) plan)->joinqual, DF_LEVEL_SCAN);
+				vx_emit_qual(b, out, ((Join *) plan)->joinqual, VX_LEVEL_SCAN);
 				b->join_sides = false;
 				appendStringInfoString(out, "}}");
 				if (plan->qual != NIL)
 				{
 					appendStringInfoString(out, ",\"pred\":");
 					b->ctx = plan;
-					df_emit_qual(b, out, plan->qual, DF_LEVEL_SCAN);
+					vx_emit_qual(b, out, plan->qual, VX_LEVEL_SCAN);
 					appendStringInfoString(out, "}}");
 				}
 				return;
 			}
 
 		default:
-			df_fail(b, "this plan node");
+			vx_fail(b, "this plan node");
 			return;
 	}
 }
 
 /* Is there a RowIdExpr in 'node'? */
 static bool
-df_has_rowid_walker(Node *node, void *context)
+vx_has_rowid_walker(Node *node, void *context)
 {
 	if (node == NULL)
 		return false;
 	if (IsA(node, RowIdExpr))
 		return true;
-	return expression_tree_walker(node, df_has_rowid_walker, context);
+	return expression_tree_walker(node, vx_has_rowid_walker, context);
 }
 
 /*
  * RI1: does plan node 'plan' number its rows (a RowIdExpr in its
- * targetlist, of a scan or join: df_check_slice)?  Its rows get a column
+ * targetlist, of a scan or join: vx_check_slice)?  Its rows get a column
  * rowid<plan_node_id>.
  */
 static bool
-df_numbers_rows(Plan *plan)
+vx_numbers_rows(Plan *plan)
 {
 	return (IsA(plan, SeqScan) || IsA(plan, HashJoin)) &&
-		df_has_rowid_walker((Node *) plan->targetlist, NULL);
+		vx_has_rowid_walker((Node *) plan->targetlist, NULL);
 }
 
 /*
@@ -3196,7 +3196,7 @@ df_numbers_rows(Plan *plan)
  * execExpr.c has it: unique to the segment (and parallel worker).
  */
 static int64
-df_rowid_base(void)
+vx_rowid_base(void)
 {
 	if (TotalParallelWorkerNumberOfSlice > 0)
 	{
@@ -3215,17 +3215,17 @@ df_rowid_base(void)
  * spec, its rows numbered if it has a RowIdExpr (RI1).
  */
 static void
-df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
+vx_emit_node(VxBuilder *b, StringInfo out, Plan *plan)
 {
-	if (b->failed || !df_numbers_rows(plan))
+	if (b->failed || !vx_numbers_rows(plan))
 	{
-		df_emit_plan_node(b, out, plan);
+		vx_emit_plan_node(b, out, plan);
 		return;
 	}
 	appendStringInfoString(out, "{\"rowid\":{\"input\":");
-	df_emit_plan_node(b, out, plan);
+	vx_emit_plan_node(b, out, plan);
 	appendStringInfo(out, ",\"name\":\"rowid%d\",\"base\":" INT64_FORMAT "}}",
-					 plan->plan_node_id, df_rowid_base());
+					 plan->plan_node_id, vx_rowid_base());
 }
 
 /*
@@ -3234,7 +3234,7 @@ df_emit_node(DfBuilder *b, StringInfo out, Plan *plan)
  * of its node.  Arguments are expressions of the Agg over its child.
  */
 static void
-df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, List *aggfns)
+vx_emit_agg_calls(VxBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, List *aggfns)
 {
 	ListCell   *lc;
 
@@ -3249,15 +3249,15 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			appendStringInfoChar(aggs, ',');
 		if (fn != NULL && strcmp(fn, "any") == 0)
 		{
-			/* RI1: a column the groups determine (df_emit_ungrouped) */
+			/* RI1: a column the groups determine (vx_emit_ungrouped) */
 			b->ctx = (Plan *) aggnode;
 			appendStringInfoString(aggs, "{\"fn\":\"any\",\"arg\":");
-			df_emit(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr, DF_LEVEL_SCAN);
+			vx_emit(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr, VX_LEVEL_SCAN);
 			appendStringInfoChar(aggs, '}');
 			continue;
 		}
-		if (combine && df_agg_state(agg) != DF_AGG_AVG_FLOAT &&
-			df_agg_state(agg) != DF_AGG_PLAIN)
+		if (combine && vx_agg_state(agg) != VX_AGG_AVG_FLOAT &&
+			vx_agg_state(agg) != VX_AGG_PLAIN)
 		{
 			/* sum(int8), avg(int): the stream's numeric sum and count columns */
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
@@ -3270,30 +3270,30 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			int			pos;
 
 			/* the Motion's state column, through any joins between (CS2) */
-			if (!IsA(arg, Var) || df_partial_path(&pctx, arg, &motion, &resno) == NULL ||
+			if (!IsA(arg, Var) || vx_partial_path(&pctx, arg, &motion, &resno) == NULL ||
 				motion == NULL)
 			{
-				df_fail(b, "a combining aggregate");
+				vx_fail(b, "a combining aggregate");
 				return;
 			}
 			child = (Plan *) motion;
-			pos = df_motion_stream_column(motion, resno);
-			if (df_agg_state(agg) == DF_AGG_STDDEV)
+			pos = vx_motion_stream_column(motion, resno);
+			if (vx_agg_state(agg) == VX_AGG_STDDEV)
 			{
 				/* STD2: the stream's sum, count and sum of squares, added up */
 				bool		sq = fn != NULL && strcmp(fn, "merge_sumsq") == 0;
 
 				appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":", count ? "sum" : "sum_decimal");
-				df_emit_column(b, aggs, df_input_of(b, child), pos + (count ? 2 : sq ? 3 : 1),
+				vx_emit_column(b, aggs, vx_input_of(b, child), pos + (count ? 2 : sq ? 3 : 1),
 							   count ? INT8OID : NUMERICOID, 0);
 				appendStringInfoChar(aggs, '}');
 				continue;
 			}
 			appendStringInfo(aggs, "{\"fn\":\"%s\",\"arg\":",
 							 count ? "sum" : mixed ? "max" : "sum_decimal");
-			df_emit_column(b, aggs, df_input_of(b, child), pos + (count || mixed ? 2 : 1),
+			vx_emit_column(b, aggs, vx_input_of(b, child), pos + (count || mixed ? 2 : 1),
 						   count ? INT8OID : mixed ? INT4OID : NUMERICOID,
-						   count || mixed ? 0 : df_scale_of((Plan *) aggnode, arg));
+						   count || mixed ? 0 : vx_scale_of((Plan *) aggnode, arg));
 			appendStringInfoChar(aggs, '}');
 			continue;
 		}
@@ -3308,7 +3308,7 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			{
 				b->ctx = (Plan *) aggnode;
 				appendStringInfoString(aggs, k > 0 ? ",{\"cast\":" : "{\"cast\":");
-				df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+				vx_emit(b, aggs, arg, VX_LEVEL_SCAN);
 				appendStringInfoString(aggs, ",\"type\":\"int8\"}");
 			}
 			appendStringInfoString(aggs, "]}}");
@@ -3316,11 +3316,11 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		}
 		if (fn != NULL && strcmp(fn, "key_scale") == 0)
 		{
-			/* DN1: a grouping key's display scale (df_key_scale_call) */
+			/* DN1: a grouping key's display scale (vx_key_scale_call) */
 			b->ctx = (Plan *) aggnode;
 			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":");
-			df_emit_dscale(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr,
-						   DF_LEVEL_SCAN);
+			vx_emit_dscale(b, aggs, (Node *) linitial_node(TargetEntry, agg->args)->expr,
+						   VX_LEVEL_SCAN);
 			appendStringInfoChar(aggs, '}');
 			continue;
 		}
@@ -3334,16 +3334,16 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 
 			b->ctx = (Plan *) aggnode;
 			appendStringInfoString(aggs, "{\"fn\":\"max\",\"arg\":{\"case\":[{\"when\":{\"isnull\":");
-			df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+			vx_emit(b, aggs, arg, VX_LEVEL_SCAN);
 			appendStringInfoString(aggs, "},\"then\":{\"lit\":{\"type\":\"int4\",\"null\":true}}}],\"else\":");
 			b->ctx = (Plan *) aggnode;
-			df_emit_dscale(b, aggs, arg, DF_LEVEL_SCAN);
+			vx_emit_dscale(b, aggs, arg, VX_LEVEL_SCAN);
 			appendStringInfoString(aggs, "}}");
 			continue;
 		}
-		if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_INT8)
+		if (!combine && fn == NULL && vx_agg_state(agg) == VX_AGG_SUM_INT8)
 			fn = "sum_numeric";	/* exact, and numeric as PostgreSQL's */
-		if (!combine && fn == NULL && df_agg_state(agg) == DF_AGG_SUM_NUMERIC)
+		if (!combine && fn == NULL && vx_agg_state(agg) == VX_AGG_SUM_NUMERIC)
 			fn = "sum_decimal";	/* exact, NaN if any is */
 		if (combine && strcmp(name, "avg") == 0)
 		{
@@ -3351,18 +3351,18 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 			int			pos;
 
-			Plan	   *child = df_below_sort(outerPlan(aggnode));
+			Plan	   *child = vx_below_sort(outerPlan(aggnode));
 
 			if (!IsA(child, Motion) || !IsA(arg, Var))
 			{
-				df_fail(b, "a combining avg");
+				vx_fail(b, "a combining avg");
 				return;
 			}
-			pos = df_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
+			pos = vx_motion_stream_column((Motion *) child, ((Var *) arg)->varattno);
 			appendStringInfoString(aggs, "{\"fn\":\"avg_merge\",\"arg\":");
-			df_emit_column(b, aggs, df_input_of(b, child), pos + 1, FLOAT8OID, 0);
+			vx_emit_column(b, aggs, vx_input_of(b, child), pos + 1, FLOAT8OID, 0);
 			appendStringInfoString(aggs, ",\"arg2\":");
-			df_emit_column(b, aggs, df_input_of(b, child), pos + 2, INT8OID, 0);
+			vx_emit_column(b, aggs, vx_input_of(b, child), pos + 2, INT8OID, 0);
 			appendStringInfoChar(aggs, '}');
 			continue;
 		}
@@ -3379,12 +3379,12 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 		{
 			/* arguments are expressions of the aggregate over its child */
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-			bool		bp = agg->aggdistinct != NIL && !combine && df_bpchar_unpadded((Plan *) aggnode, arg);
+			bool		bp = agg->aggdistinct != NIL && !combine && vx_bpchar_unpadded((Plan *) aggnode, arg);
 
 			b->ctx = (Plan *) aggnode;
 			if (bp)
 				appendStringInfoString(aggs, "{\"bpchar\":");	/* told apart without blanks */
-			df_emit(b, aggs, arg, DF_LEVEL_SCAN);
+			vx_emit(b, aggs, arg, VX_LEVEL_SCAN);
 			if (bp)
 				appendStringInfoChar(aggs, '}');
 		}
@@ -3398,7 +3398,7 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
 			strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
 			appendStringInfoString(aggs, ",\"distinct\":true");
 		if (agg->args != NIL)
-			df_emit_collate(aggs, agg->inputcollid,
+			vx_emit_collate(aggs, agg->inputcollid,
 							(Node *) linitial_node(TargetEntry, agg->args)->expr, name);
 		appendStringInfoChar(aggs, '}');
 	}
@@ -3410,13 +3410,13 @@ df_emit_agg_calls(DfBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs, Li
  * too (PS1).
  */
 static int
-df_partial_ncols(DfBuilder *b, Plan *ctx, Node *expr)
+vx_partial_ncols(VxBuilder *b, Plan *ctx, Node *expr)
 {
-	DfAggState	state = df_partial_state(ctx, expr);
+	VxAggState	state = vx_partial_state(ctx, expr);
 
-	if (b->tuples && (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_SUM_INT8))
+	if (b->tuples && (state == VX_AGG_SUM_NUMERIC || state == VX_AGG_SUM_INT8))
 		return 2;
-	return df_agg_state_ncols(state);
+	return vx_agg_state_ncols(state);
 }
 
 /*
@@ -3430,19 +3430,19 @@ df_partial_ncols(DfBuilder *b, Plan *ctx, Node *expr)
  * passes as a value, at its scale).
  */
 static bool
-df_output_dyn(DfBuilder *b, Plan *ctx, Node *expr)
+vx_output_dyn(VxBuilder *b, Plan *ctx, Node *expr)
 {
 	int			p,
 				s;
 
-	return exprType(expr) == NUMERICOID && !df_is_mixed_sum(ctx, expr) &&
-		(df_numeric_dyn(ctx, expr, &p, &s) ||
-		 (b->tuples && df_output_varying(ctx, expr)));
+	return exprType(expr) == NUMERICOID && !vx_is_mixed_sum(ctx, expr) &&
+		(vx_numeric_dyn(ctx, expr, &p, &s) ||
+		 (b->tuples && vx_output_varying(ctx, expr)));
 }
 
 static void
-df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
-				DfSliceSpec *spec, Plan *ctx)
+vx_emit_outputs(VxBuilder *b, StringInfo out, List *values, VxLevel level,
+				VxSliceSpec *spec, Plan *ctx)
 {
 	ListCell   *lc;
 	int			i = 0;
@@ -3452,14 +3452,14 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 	{
 		Node	   *expr = (Node *) lfirst(lc);
 
-		if (level == DF_LEVEL_AGG && df_partial_state(ctx, expr) != DF_AGG_PLAIN)
-			spec->nout += df_partial_ncols(b, ctx, expr);
-		else if (level == DF_LEVEL_AGG && IsA(expr, Aggref) &&
-				 (df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT ||
-				  df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
-				  df_is_mixed_sum(ctx, expr)))
+		if (level == VX_LEVEL_AGG && vx_partial_state(ctx, expr) != VX_AGG_PLAIN)
+			spec->nout += vx_partial_ncols(b, ctx, expr);
+		else if (level == VX_LEVEL_AGG && IsA(expr, Aggref) &&
+				 (vx_agg_state((Aggref *) expr) == VX_AGG_AVG_INT ||
+				  vx_agg_state((Aggref *) expr) == VX_AGG_AVG_NUMERIC ||
+				  vx_is_mixed_sum(ctx, expr)))
 			spec->nout += 2;	/* numeric sum and count, or display scale */
-		else if (df_output_dyn(b, ctx, expr))
+		else if (vx_output_dyn(b, ctx, expr))
 			spec->nout += 2;	/* DN1: the value and its display scale */
 		else
 			spec->nout++;
@@ -3473,21 +3473,21 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 	{
 		Expr	   *value = (Expr *) lfirst(lc);
 		Oid			type = exprType((Node *) value);
-		const char *tag = df_type_tag(type);
-		DfAggState	state = level == DF_LEVEL_AGG ?
-			df_partial_state(ctx, (Node *) value) : DF_AGG_PLAIN;
+		const char *tag = vx_type_tag(type);
+		VxAggState	state = level == VX_LEVEL_AGG ?
+			vx_partial_state(ctx, (Node *) value) : VX_AGG_PLAIN;
 
 		b->out_col[foreach_current_index(lc)] = i;
-		if (state != DF_AGG_PLAIN)
+		if (state != VX_AGG_PLAIN)
 		{
 			/* DataFusion's state: sum (float8 or numeric), then count (M7d, N1, N2) */
 			Aggref	   *agg = (Aggref *) value;
-			bool		fsum = state == DF_AGG_AVG_FLOAT;
-			bool		dsum = state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
-				state == DF_AGG_SUM_NUMERIC_MIXED;
-			int			scale = df_scale_of(ctx, (Node *) agg);
+			bool		fsum = state == VX_AGG_AVG_FLOAT;
+			bool		dsum = state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC ||
+				state == VX_AGG_SUM_NUMERIC_MIXED;
+			int			scale = vx_scale_of(ctx, (Node *) agg);
 
-			if (state == DF_AGG_STDDEV)
+			if (state == VX_AGG_STDDEV)
 			{
 				/* STD2: exact sum, count, exact sum of squares */
 				spec->out_types[i++] = NUMERICOID;
@@ -3497,43 +3497,43 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 								 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"},"
 								 "{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
 								 i > 3 ? "," : "",
-								 df_agg_ref(b, agg, "sum_numeric"), df_tag(NUMERICOID, 0),
-								 df_agg_ref(b, agg, "count"),
-								 df_agg_ref(b, agg, "sum_sq"), df_tag(NUMERICOID, 0));
+								 vx_agg_ref(b, agg, "sum_numeric"), vx_tag(NUMERICOID, 0),
+								 vx_agg_ref(b, agg, "count"),
+								 vx_agg_ref(b, agg, "sum_sq"), vx_tag(NUMERICOID, 0));
 				continue;
 			}
 			/* PS1: what the C side makes of it for tuples */
-			if (b->tuples && (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC))
-				spec->out_kinds[i] = DF_OUT_STATE_NUMERIC;
-			else if (b->tuples && state == DF_AGG_SUM_INT8)
-				spec->out_kinds[i] = DF_OUT_STATE_INT8;
-			else if (b->tuples && state == DF_AGG_AVG_INT)
+			if (b->tuples && (state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC))
+				spec->out_kinds[i] = VX_OUT_STATE_NUMERIC;
+			else if (b->tuples && state == VX_AGG_SUM_INT8)
+				spec->out_kinds[i] = VX_OUT_STATE_INT8;
+			else if (b->tuples && state == VX_AGG_AVG_INT)
 				spec->out_kinds[i] = linitial_oid(agg->aggargtypes) == INT8OID ?
-					DF_OUT_STATE_INT8 : DF_OUT_STATE_INT_ARRAY;
+					VX_OUT_STATE_INT8 : VX_OUT_STATE_INT_ARRAY;
 			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = fsum ? FLOAT8OID : NUMERICOID;
 			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"}",
 							 i > 1 ? "," : "",
-							 df_agg_ref(b, agg, fsum ? "sum" : dsum ? "sum_decimal" : "sum_numeric"),
-							 fsum ? "float8" : df_tag(NUMERICOID, scale));
-			if (state == DF_AGG_SUM_NUMERIC_MIXED)
+							 vx_agg_ref(b, agg, fsum ? "sum" : dsum ? "sum_decimal" : "sum_numeric"),
+							 fsum ? "float8" : vx_tag(NUMERICOID, scale));
+			if (state == VX_AGG_SUM_NUMERIC_MIXED)
 			{
 				/* MS1: the largest display scale added up */
 				spec->out_types[i++] = INT4OID;
 				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int4\"}",
-								 df_agg_ref(b, agg, "mixed_scale"));
+								 vx_agg_ref(b, agg, "mixed_scale"));
 			}
-			else if (df_partial_ncols(b, ctx, (Node *) value) == 2)
+			else if (vx_partial_ncols(b, ctx, (Node *) value) == 2)
 			{
-				if (spec->out_kinds[i - 1] != DF_OUT_PLAIN)
-					spec->out_kinds[i] = DF_OUT_PART;
+				if (spec->out_kinds[i - 1] != VX_OUT_PLAIN)
+					spec->out_kinds[i] = VX_OUT_PART;
 				spec->out_types[i++] = INT8OID;
 				appendStringInfo(out, ",{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
-								 df_agg_ref(b, agg, "count"));
+								 vx_agg_ref(b, agg, "count"));
 			}
 			continue;
 		}
-		if (level == DF_LEVEL_AGG && df_is_mixed_sum(ctx, (Node *) value))
+		if (level == VX_LEVEL_AGG && vx_is_mixed_sum(ctx, (Node *) value))
 		{
 			/*
 			 * MS1: the sum at the largest scale of its argument, and the
@@ -3541,106 +3541,106 @@ df_emit_outputs(DfBuilder *b, StringInfo out, List *values, DfLevel level,
 			 * gives the result as PostgreSQL's sum does
 			 */
 			Aggref	   *agg = (Aggref *) value;
-			int			scale = df_scale_of(ctx, (Node *) agg);
+			int			scale = vx_scale_of(ctx, (Node *) agg);
 
-			spec->out_kinds[i] = DF_OUT_NUMERIC_MIXED;
+			spec->out_kinds[i] = VX_OUT_NUMERIC_MIXED;
 			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = NUMERICOID;
-			spec->out_kinds[i] = DF_OUT_PART;
+			spec->out_kinds[i] = VX_OUT_PART;
 			spec->out_types[i++] = INT4OID;
 			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"},"
 							 "{\"expr\":{\"agg\":%d},\"type\":\"int4\"}",
 							 i > 2 ? "," : "",
-							 df_agg_ref(b, agg, "sum_decimal"), df_tag(NUMERICOID, scale),
-							 df_agg_ref(b, agg, "mixed_scale"));
+							 vx_agg_ref(b, agg, "sum_decimal"), vx_tag(NUMERICOID, scale),
+							 vx_agg_ref(b, agg, "mixed_scale"));
 			continue;
 		}
-		if (level == DF_LEVEL_AGG && IsA(value, Aggref) &&
-			(df_agg_state((Aggref *) value) == DF_AGG_AVG_INT ||
-			 df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC) &&
+		if (level == VX_LEVEL_AGG && IsA(value, Aggref) &&
+			(vx_agg_state((Aggref *) value) == VX_AGG_AVG_INT ||
+			 vx_agg_state((Aggref *) value) == VX_AGG_AVG_NUMERIC) &&
 			!bms_is_member(foreach_current_index(lc), b->sort_values))
 		{
 			/* avg = numeric sum / count, divided on the C side (N1, N2) */
 			Aggref	   *agg = (Aggref *) value;
 			bool		combine = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL;
-			bool		dsum = df_agg_state(agg) == DF_AGG_AVG_NUMERIC;
+			bool		dsum = vx_agg_state(agg) == VX_AGG_AVG_NUMERIC;
 			Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-			int			scale = df_scale_of(ctx, arg);	/* arguments refer to the Agg's child */
+			int			scale = vx_scale_of(ctx, arg);	/* arguments refer to the Agg's child */
 
-			spec->out_kinds[i] = DF_OUT_NUMERIC_AVG;
+			spec->out_kinds[i] = VX_OUT_NUMERIC_AVG;
 			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = NUMERICOID;
-			spec->out_kinds[i] = DF_OUT_PART;
+			spec->out_kinds[i] = VX_OUT_PART;
 			spec->out_types[i++] = INT8OID;
 			appendStringInfo(out, "%s{\"expr\":{\"agg\":%d},\"type\":\"%s\"},"
 							 "{\"expr\":{\"agg\":%d},\"type\":\"int8\"}",
 							 i > 2 ? "," : "",
-							 df_agg_ref(b, agg, combine ? "merge_sum" : dsum ? "sum_decimal" : "sum_numeric"),
-							 df_tag(NUMERICOID, scale),
-							 df_agg_ref(b, agg, combine ? "merge_count" : "count"));
+							 vx_agg_ref(b, agg, combine ? "merge_sum" : dsum ? "sum_decimal" : "sum_numeric"),
+							 vx_tag(NUMERICOID, scale),
+							 vx_agg_ref(b, agg, combine ? "merge_count" : "count"));
 			continue;
 		}
 		if (tag == NULL)
 		{
-			df_fail(b, "an output column");
+			vx_fail(b, "an output column");
 			return;
 		}
-		if (df_output_dyn(b, ctx, (Node *) value) ||
-			(level == DF_LEVEL_AGG && IsA(value, Aggref) &&
-			 (df_agg_state((Aggref *) value) == DF_AGG_AVG_INT ||
-			  df_agg_state((Aggref *) value) == DF_AGG_AVG_NUMERIC)))
+		if (vx_output_dyn(b, ctx, (Node *) value) ||
+			(level == VX_LEVEL_AGG && IsA(value, Aggref) &&
+			 (vx_agg_state((Aggref *) value) == VX_AGG_AVG_INT ||
+			  vx_agg_state((Aggref *) value) == VX_AGG_AVG_NUMERIC)))
 		{
 			/*
 			 * DN1: the value at the largest scale it may have, and its own
 			 * display scale, which the C side gives it (as MS1's sum); AV2:
 			 * so is an avg the slice sorts by, which DataFusion divides
 			 */
-			int			scale = df_scale_of(ctx, (Node *) value);
+			int			scale = vx_scale_of(ctx, (Node *) value);
 
-			spec->out_kinds[i] = DF_OUT_NUMERIC_MIXED;
+			spec->out_kinds[i] = VX_OUT_NUMERIC_MIXED;
 			spec->out_scales[i] = (int16) scale;
 			spec->out_types[i++] = NUMERICOID;
-			spec->out_kinds[i] = DF_OUT_PART;
+			spec->out_kinds[i] = VX_OUT_PART;
 			spec->out_types[i++] = INT4OID;
 			appendStringInfoString(out, i > 2 ? ",{\"expr\":" : "{\"expr\":");
-			df_emit(b, out, (Node *) value, level);
-			appendStringInfo(out, ",\"type\":\"%s\"},{\"expr\":", df_tag(NUMERICOID, scale));
-			if (level == DF_LEVEL_SCAN)
+			vx_emit(b, out, (Node *) value, level);
+			appendStringInfo(out, ",\"type\":\"%s\"},{\"expr\":", vx_tag(NUMERICOID, scale));
+			if (level == VX_LEVEL_SCAN)
 				b->ctx = ctx;
-			df_emit_dscale(b, out, (Node *) value, level);
+			vx_emit_dscale(b, out, (Node *) value, level);
 			appendStringInfoString(out, ",\"type\":\"int4\"}");
 			continue;
 		}
 		if (type == NUMERICOID)
 		{
-			spec->out_scales[i] = (int16) df_scale_of(ctx, (Node *) value);
-			tag = df_tag(type, spec->out_scales[i]);
+			spec->out_scales[i] = (int16) vx_scale_of(ctx, (Node *) value);
+			tag = vx_tag(type, spec->out_scales[i]);
 		}
 		spec->out_types[i++] = type;
 		if (i > 1)
 			appendStringInfoChar(out, ',');
 		appendStringInfoString(out, "{\"expr\":");
-		df_emit(b, out, (Node *) value, level);
+		vx_emit(b, out, (Node *) value, level);
 		appendStringInfo(out, ",\"type\":\"%s\"}", tag);
 	}
 	appendStringInfoChar(out, ']');
 	/* the arrays above were sized by the first loop */
 	if (!b->failed && i != spec->nout)
-		elog(ERROR, "datafusion: %d output columns where %d were counted", i, spec->nout);
+		elog(ERROR, "vec_executor: %d output columns where %d were counted", i, spec->nout);
 }
 
 /*
- * Rows per batch: about DF_BATCH_BYTES of the widest row the planner
- * expects anywhere in the slice, at most DF_BATCH_MAX_ROWS.  DataFusion's
+ * Rows per batch: about VX_BATCH_BYTES of the widest row the planner
+ * expects anywhere in the slice, at most VX_BATCH_MAX_ROWS.  DataFusion's
  * operators allocate in proportion to a batch's bytes, and a partition's
  * share of the memory budget is sized for batches of about this size.
  */
-#define DF_BATCH_BYTES		(256 * 1024)
-#define DF_BATCH_MIN_ROWS	16
-#define DF_BATCH_MAX_ROWS	8192
+#define VX_BATCH_BYTES		(256 * 1024)
+#define VX_BATCH_MIN_ROWS	16
+#define VX_BATCH_MAX_ROWS	8192
 
 static int
-df_slice_width(Plan *plan)
+vx_slice_width(Plan *plan)
 {
 	int			width;
 
@@ -3649,27 +3649,27 @@ df_slice_width(Plan *plan)
 	width = plan->plan_width;
 	if (IsA(plan, Motion))
 		return width;			/* another slice below */
-	if (df_append_plans(plan) != NIL)
+	if (vx_append_plans(plan) != NIL)
 	{
 		ListCell   *lc;
 
-		foreach(lc, df_append_plans(plan))
-			width = Max(width, df_slice_width(lfirst(lc)));
+		foreach(lc, vx_append_plans(plan))
+			width = Max(width, vx_slice_width(lfirst(lc)));
 		return width;
 	}
-	return Max(width, Max(df_slice_width(outerPlan(plan)), df_slice_width(innerPlan(plan))));
+	return Max(width, Max(vx_slice_width(outerPlan(plan)), vx_slice_width(innerPlan(plan))));
 }
 
 /* P1: building the expression PostgreSQL finishes an output column with */
-typedef struct DfTailContext
+typedef struct VxTailContext
 {
-	const DfTails *tails;
+	const VxTails *tails;
 	List	  **values;
-} DfTailContext;
+} VxTailContext;
 
 /* 'node' with each leaf DataFusion computes replaced by a Var of its value */
 static Node *
-df_tail_mutator(Node *node, DfTailContext *c)
+vx_tail_mutator(Node *node, VxTailContext *c)
 {
 	if (node == NULL)
 		return NULL;
@@ -3681,18 +3681,18 @@ df_tail_mutator(Node *node, DfTailContext *c)
 		return (Node *) makeVar(OUTER_VAR, v + 1, exprType(node), exprTypmod(node),
 								exprCollation(node), 0);
 	}
-	return expression_tree_mutator(node, df_tail_mutator, c);
+	return expression_tree_mutator(node, vx_tail_mutator, c);
 }
 
 /*
  * The values DataFusion computes for the targetlist of 'body', and how each
  * of its columns is made of them (spec->col_value, col_tail).
  */
-static List *df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec);
+static List *vx_output_values(Plan *body, const VxTails *tails, VxSliceSpec *spec);
 
 /* The values (spec->col_value) the slice's Sort 'sort' orders by. */
 static Bitmapset *
-df_sort_values(Sort *sort, DfSliceSpec *spec)
+vx_sort_values(Sort *sort, VxSliceSpec *spec)
 {
 	Bitmapset  *values = NULL;
 	int			i;
@@ -3707,11 +3707,11 @@ df_sort_values(Sort *sort, DfSliceSpec *spec)
 }
 
 static List *
-df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec)
+vx_output_values(Plan *body, const VxTails *tails, VxSliceSpec *spec)
 {
 	List	   *values = NIL;
 	ListCell   *lc;
-	DfTailContext c = {tails, &values};
+	VxTailContext c = {tails, &values};
 
 	spec->ncols = list_length(body->targetlist);
 	spec->col_value = palloc(sizeof(int) * Max(spec->ncols, 1));
@@ -3726,7 +3726,7 @@ df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec)
 			if (spec->col_tail == NULL)
 				spec->col_tail = palloc0(sizeof(Expr *) * spec->ncols);
 			spec->col_value[k] = -1;
-			spec->col_tail[k] = (Expr *) df_tail_mutator((Node *) tle->expr, &c);
+			spec->col_tail[k] = (Expr *) vx_tail_mutator((Node *) tle->expr, &c);
 		}
 		else
 		{
@@ -3746,8 +3746,8 @@ df_output_values(Plan *body, const DfTails *tails, DfSliceSpec *spec)
  * ,"sort":[{"col": c, "desc": b, "nulls_first": b}, ...],"limit":{...}
  */
 static void
-df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
-				   Plan *body, DfSliceSpec *spec)
+vx_emit_sort_limit(VxBuilder *b, StringInfo out, Sort *sort, Limit *limit,
+				   Plan *body, VxSliceSpec *spec)
 {
 	int			i;
 
@@ -3762,26 +3762,26 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 			int			c;
 
 			if (tle == NULL || k > list_length(body->targetlist) ||
-				!df_sort_direction(sort->sortOperators[i], exprType((Node *) tle->expr), &desc))
+				!vx_sort_direction(sort->sortOperators[i], exprType((Node *) tle->expr), &desc))
 			{
-				df_fail(b, "a sort key");
+				vx_fail(b, "a sort key");
 				return;
 			}
 			if (spec->col_value[k - 1] < 0)
 			{
-				df_fail(b, "a sort key PostgreSQL computes");
+				vx_fail(b, "a sort key PostgreSQL computes");
 				return;
 			}
 			c = b->out_col[spec->col_value[k - 1]];
-			if ((spec->out_kinds[c] != DF_OUT_PLAIN &&
-				 spec->out_kinds[c] != DF_OUT_NUMERIC_MIXED) ||
+			if ((spec->out_kinds[c] != VX_OUT_PLAIN &&
+				 spec->out_kinds[c] != VX_OUT_NUMERIC_MIXED) ||
 				spec->out_types[c] != exprType((Node *) tle->expr))
 			{
 				/*
 				 * e.g. avg returning numeric, divided after DataFusion; a
 				 * value of display scales of its own sorts as a value (DN1)
 				 */
-				df_fail(b, "a sort key computed outside DataFusion");
+				vx_fail(b, "a sort key computed outside DataFusion");
 				return;
 			}
 			appendStringInfo(out, "%s{\"col\":%d,\"desc\":%s,\"nulls_first\":%s}",
@@ -3795,10 +3795,10 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
 		int64		count,
 					offset;
 
-		if (!df_limit_value(limit->limitCount, &count) ||
-			!df_limit_value(limit->limitOffset, &offset))
+		if (!vx_limit_value(limit->limitCount, &count) ||
+			!vx_limit_value(limit->limitOffset, &offset))
 		{
-			df_fail(b, "a LIMIT or OFFSET");
+			vx_fail(b, "a LIMIT or OFFSET");
 			return;
 		}
 		appendStringInfo(out, ",\"limit\":{\"skip\":" INT64_FORMAT, Max(offset, 0));
@@ -3814,7 +3814,7 @@ df_emit_sort_limit(DfBuilder *b, StringInfo out, Sort *sort, Limit *limit,
  * Limit applies after it).
  */
 static void
-df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSliceSpec *spec)
+vx_emit_resort_by(VxBuilder *b, StringInfo out, Plan *input, Plan *body, VxSliceSpec *spec)
 {
 	int			ncols;
 	AttrNumber *cols;
@@ -3843,7 +3843,7 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 		nulls = ((Motion *) input)->nullsFirst;
 	}
 	appendStringInfoString(out, ",\"sort\":[");
-	/* up to the key that completes the groups, as df_check_group_order */
+	/* up to the key that completes the groups, as vx_check_group_order */
 	for (i = 0; i < ncols && bms_num_members(groups) < ngroups; i++)
 	{
 		TargetEntry *tle = NULL;
@@ -3863,9 +3863,9 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
 			;
 		groups = bms_add_member(groups, k);
 		if (tle == NULL || k == ngroups || spec->col_value[tle->resno - 1] < 0 ||
-			!df_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
+			!vx_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
 		{
-			df_fail(b, "a sort key of the GroupAggregate");
+			vx_fail(b, "a sort key of the GroupAggregate");
 			return;
 		}
 		c = b->out_col[spec->col_value[tle->resno - 1]];
@@ -3888,7 +3888,7 @@ df_emit_resort_by(DfBuilder *b, StringInfo out, Plan *input, Plan *body, DfSlice
  * run hashed, as the spec's "sort" by output columns.
  */
 static void
-df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSliceSpec *spec)
+vx_emit_resort(VxBuilder *b, StringInfo out, Motion *motion, Plan *body, VxSliceSpec *spec)
 {
 	int			i;
 
@@ -3902,9 +3902,9 @@ df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSlice
 		int			c;
 
 		if (tle == NULL || spec->col_value[k - 1] < 0 ||
-			!df_sort_direction(motion->sortOperators[i], exprType((Node *) tle->expr), &desc))
+			!vx_sort_direction(motion->sortOperators[i], exprType((Node *) tle->expr), &desc))
 		{
-			df_fail(b, "a sort key of the Motion");
+			vx_fail(b, "a sort key of the Motion");
 			return;
 		}
 		c = b->out_col[spec->col_value[k - 1]];
@@ -3921,7 +3921,7 @@ df_emit_resort(DfBuilder *b, StringInfo out, Motion *motion, Plan *body, DfSlice
  * "sort" by its keys, columns of the plan (a Limit applies after it).
  */
 static void
-df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
+vx_emit_window_order(VxBuilder *b, StringInfo out, Plan *input)
 {
 	int			ncols;
 	AttrNumber *cols;
@@ -3929,7 +3929,7 @@ df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
 	bool	   *nulls;
 	int			i;
 
-	input = df_window_order_input(input);
+	input = vx_window_order_input(input);
 	if (IsA(input, Sort))
 	{
 		ncols = ((Sort *) input)->numCols;
@@ -3950,13 +3950,13 @@ df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
 		TargetEntry *tle = get_tle_by_resno(input->targetlist, cols[i]);
 		bool		desc;
 
-		if (tle == NULL || !df_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
+		if (tle == NULL || !vx_sort_direction(ops[i], exprType((Node *) tle->expr), &desc))
 		{
-			df_fail(b, "a sort key of the WindowAgg");
+			vx_fail(b, "a sort key of the WindowAgg");
 			return;
 		}
 		appendStringInfoString(out, i > 0 ? ",{\"expr\":" : "{\"expr\":");
-		df_emit_window_key(b, out, input, cols[i]);
+		vx_emit_window_key(b, out, input, cols[i]);
 		appendStringInfo(out, ",\"desc\":%s,\"nulls_first\":%s}",
 						 desc ? "true" : "false", nulls[i] ? "true" : "false");
 	}
@@ -3965,7 +3965,7 @@ df_emit_window_order(DfBuilder *b, StringInfo out, Plan *input)
 
 /* 'plan', or the last input of the Sequences it is, whose rows they pass on */
 static Plan *
-df_sequence_body(Plan *plan)
+vx_sequence_body(Plan *plan)
 {
 	while (plan != NULL && IsA(plan, Sequence))
 		plan = llast(((Sequence *) plan)->subplans);
@@ -3985,7 +3985,7 @@ df_sequence_body(Plan *plan)
  * group produced twice would count twice.
  */
 static bool
-df_agg_partial(Agg *agg, Plan *top)
+vx_agg_partial(Agg *agg, Plan *top)
 {
 	List	   *calls = NIL;
 	ListCell   *lc;
@@ -3994,17 +3994,17 @@ df_agg_partial(Agg *agg, Plan *top)
 	if (agg->aggsplit != AGGSPLIT_INITIAL_SERIAL || agg->groupingSets != NIL ||
 		agg->plan.qual != NIL)
 		return false;
-	df_collect_aggrefs((Node *) agg->plan.targetlist, &calls);
+	vx_collect_aggrefs((Node *) agg->plan.targetlist, &calls);
 	foreach(lc, calls)
 		if (((Aggref *) lfirst(lc))->aggdistinct != NIL)
 			return false;
-	above = df_motion_consumer_agg(top);
+	above = vx_motion_consumer_agg(top);
 	if (above == NULL || above->aggsplit != AGGSPLIT_FINAL_DESERIAL ||
 		above->numCols != agg->numCols || above->groupingSets != NIL)
 		return false;
 	calls = NIL;
-	df_collect_aggrefs((Node *) above->plan.targetlist, &calls);
-	df_collect_aggrefs((Node *) above->plan.qual, &calls);
+	vx_collect_aggrefs((Node *) above->plan.targetlist, &calls);
+	vx_collect_aggrefs((Node *) above->plan.qual, &calls);
 	foreach(lc, calls)
 		if (((Aggref *) lfirst(lc))->aggsplit != AGGSPLIT_FINAL_DESERIAL)
 			return false;
@@ -4016,10 +4016,10 @@ df_agg_partial(Agg *agg, Plan *top)
  * false, with a reason, if something cannot be expressed.
  */
 bool
-df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *spec,
+vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *spec,
 				   char *reason, size_t reasonlen)
 {
-	DfBuilder	b;
+	VxBuilder	b;
 	StringInfoData node,
 				group,
 				having,
@@ -4037,16 +4037,16 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	 * S1: a Limit and a Sort at the top, over the rows of the rest; a
 	 * Sequence passes its last input's rows on.
 	 */
-	root = df_sequence_body(root);
+	root = vx_sequence_body(root);
 	if (IsA(root, Limit))
 	{
 		limit = (Limit *) root;
-		root = df_sequence_body(outerPlan(root));
+		root = vx_sequence_body(outerPlan(root));
 	}
 	if (root != NULL && IsA(root, Sort))
 	{
 		sort = (Sort *) root;
-		root = df_sequence_body(outerPlan(root));
+		root = vx_sequence_body(outerPlan(root));
 	}
 	else if (root != NULL && IsA(root, Result) && outerPlan(root) != NULL &&
 			 IsA(outerPlan(root), Sort))
@@ -4063,7 +4063,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		sort->sortColIdx = palloc(sizeof(AttrNumber) * Max(below->numCols, 1));
 		for (i = 0; i < below->numCols; i++)
 		{
-			sort->sortColIdx[i] = df_output_of(root, below->sortColIdx[i]);
+			sort->sortColIdx[i] = vx_output_of(root, below->sortColIdx[i]);
 			if (sort->sortColIdx[i] == 0)
 			{
 				snprintf(reason, reasonlen, "a sort key the Result does not pass on");
@@ -4071,8 +4071,8 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			}
 		}
 	}
-	if (root == NULL || (limit && !df_passes_through((Plan *) limit)) ||
-		(sort && !df_passes_through((Plan *) sort)))
+	if (root == NULL || (limit && !vx_passes_through((Plan *) limit)) ||
+		(sort && !vx_passes_through((Plan *) sort)))
 	{
 		snprintf(reason, reasonlen, "cannot translate a Limit or Sort");
 		return false;
@@ -4091,38 +4091,38 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 	if (IsA(root, Agg))
 	{
 		b.agg = (Agg *) root;
-		df_emit_node(&b, &node, outerPlan(root));
-		df_emit_groups(&b, &group, b.agg);
-		df_emit_qual(&b, &having, root->qual, DF_LEVEL_AGG);
-		values = df_output_values(root, tails, spec);
-		b.sort_values = df_sort_values(sort, spec);
-		df_emit_outputs(&b, &outputs, values, DF_LEVEL_AGG, spec, root);
+		vx_emit_node(&b, &node, outerPlan(root));
+		vx_emit_groups(&b, &group, b.agg);
+		vx_emit_qual(&b, &having, root->qual, VX_LEVEL_AGG);
+		values = vx_output_values(root, tails, spec);
+		b.sort_values = vx_sort_values(sort, spec);
+		vx_emit_outputs(&b, &outputs, values, VX_LEVEL_AGG, spec, root);
 	}
 	else
 	{
-		df_emit_node(&b, &node, root);
+		vx_emit_node(&b, &node, root);
 		b.ctx = root;
-		values = df_output_values(root, tails, spec);
-		df_emit_outputs(&b, &outputs, values, DF_LEVEL_SCAN, spec, root);
+		values = vx_output_values(root, tails, spec);
+		vx_emit_outputs(&b, &outputs, values, VX_LEVEL_SCAN, spec, root);
 	}
 	initStringInfo(&sortlimit);
 	if (!b.failed && tails != NULL && tails->window_order != NULL)
 	{
 		if (sort != NULL)
-			df_fail(&b, "a Sort above a WindowAgg whose order is read");
+			vx_fail(&b, "a Sort above a WindowAgg whose order is read");
 		else
-			df_emit_window_order(&b, &sortlimit, tails->window_order);
+			vx_emit_window_order(&b, &sortlimit, tails->window_order);
 	}
 	if (!b.failed)
-		df_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
+		vx_emit_sort_limit(&b, &sortlimit, sort, limit, root, spec);
 	if (!b.failed && tails != NULL && (tails->resort != NULL || tails->resort_by != NULL))
 	{
 		if (sort != NULL || (limit != NULL && tails->resort_by == NULL))
-			df_fail(&b, "a Sort below a sorted Motion's GroupAggregate");
+			vx_fail(&b, "a Sort below a sorted Motion's GroupAggregate");
 		else if (tails->resort_by != NULL)
-			df_emit_resort_by(&b, &sortlimit, tails->resort_by, root, spec);
+			vx_emit_resort_by(&b, &sortlimit, tails->resort_by, root, spec);
 		else
-			df_emit_resort(&b, &sortlimit, tails->resort, root, spec);
+			vx_emit_resort(&b, &sortlimit, tails->resort, root, spec);
 	}
 	if (b.failed)
 		return false;
@@ -4135,7 +4135,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		StringInfoData aggs;
 
 		initStringInfo(&aggs);
-		df_emit_agg_calls(&b, &aggs, b.agg, b.aggrefs, b.aggfns);
+		vx_emit_agg_calls(&b, &aggs, b.agg, b.aggrefs, b.aggfns);
 		if (b.failed)
 			return false;
 
@@ -4145,7 +4145,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 		i = 0;
 		foreach(lc, b.inputs)
 		{
-			DfInputDesc *in = lfirst(lc);
+			VxInputDesc *in = lfirst(lc);
 			ListCell   *lt,
 					   *ls;
 			int			k = 0;
@@ -4153,7 +4153,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			appendStringInfoString(&json, i++ > 0 ? ",{\"columns\":[" : "{\"columns\":[");
 			forboth(lt, in->types, ls, in->scales)
 				appendStringInfo(&json, "%s{\"type\":\"%s\"}", k++ > 0 ? "," : "",
-								 df_tag(lfirst_oid(lt), lfirst_int(ls)));
+								 vx_tag(lfirst_oid(lt), lfirst_int(ls)));
 			appendStringInfoChar(&json, ']');
 			if (in->set)
 				appendStringInfoString(&json, ",\"set\":true");
@@ -4161,14 +4161,14 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			if (!IsA(in->leaf, Motion))
 			{
 				for (k = 0; k < list_length(in->attnos); k++)
-					if (df_input_digits(in, k) > 0)
+					if (vx_input_digits(in, k) > 0)
 						break;
 				if (k < list_length(in->attnos))
 				{
 					appendStringInfoString(&json, ",\"digits\":[");
 					for (k = 0; k < list_length(in->attnos); k++)
 						appendStringInfo(&json, "%s%d", k > 0 ? "," : "",
-										 df_input_digits(in, k));
+										 vx_input_digits(in, k));
 					appendStringInfoChar(&json, ']');
 				}
 			}
@@ -4188,7 +4188,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 				 */
 				k = 0;
 				foreach(lt, in->attnos)
-					if (df_motion_stream_pad(df_numeric_stmt, (Motion *) in->leaf,
+					if (vx_motion_stream_pad(vx_numeric_stmt, (Motion *) in->leaf,
 											 lfirst_int(lt) - 1) > 0)
 						break;
 				if (lt != NULL)
@@ -4196,7 +4196,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 					appendStringInfoString(&json, ",\"motion_pad\":[");
 					foreach(lt, in->attnos)
 						appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "",
-										 df_motion_stream_pad(df_numeric_stmt, (Motion *) in->leaf,
+										 vx_motion_stream_pad(vx_numeric_stmt, (Motion *) in->leaf,
 															  lfirst_int(lt) - 1));
 					appendStringInfoChar(&json, ']');
 				}
@@ -4206,7 +4206,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 				 * narrowed by, -1 for the others
 				 */
 				foreach(lt, in->attnos)
-					if (df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf,
+					if (vx_motion_stream_digits(vx_numeric_stmt, (Motion *) in->leaf,
 												lfirst_int(lt) - 1) > 0)
 						break;
 				if (lt != NULL)
@@ -4215,7 +4215,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 					appendStringInfoString(&json, ",\"motion_narrow\":[");
 					foreach(lt, in->attnos)
 						appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "",
-										 df_motion_stream_digits(df_numeric_stmt, (Motion *) in->leaf,
+										 vx_motion_stream_digits(vx_numeric_stmt, (Motion *) in->leaf,
 																 lfirst_int(lt) - 1));
 					appendStringInfoChar(&json, ']');
 				}
@@ -4232,27 +4232,27 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			appendStringInfo(&a, "{\"aggregate\":{\"input\":%s,%s,"
 							 "\"aggs\":[%s],\"having\":%s%s}}",
 							 node.data, group.data, aggs.data, having.data,
-							 limit == NULL && sort == NULL && df_agg_partial(b.agg, top) ?
+							 limit == NULL && sort == NULL && vx_agg_partial(b.agg, top) ?
 							 ",\"partial\":true" : "");
 			node = a;
 		}
-		spec->batch_rows = Min(DF_BATCH_MAX_ROWS,
-							   Max(DF_BATCH_MIN_ROWS, DF_BATCH_BYTES / Max(df_slice_width(root), 1)));
+		spec->batch_rows = Min(VX_BATCH_MAX_ROWS,
+							   Max(VX_BATCH_MIN_ROWS, VX_BATCH_BYTES / Max(vx_slice_width(root), 1)));
 		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d%s,"
 						 "\"skip_partial_ratio\":%.17g}",
 						 node.data, outputs.data, sortlimit.data, spec->batch_rows,
-						 df_key_filters ? "" : ",\"key_filters\":false",
-						 df_partial_agg_skip_ratio);
+						 vx_key_filters ? "" : ",\"key_filters\":false",
+						 vx_partial_agg_skip_ratio);
 	}
 
 	spec->json = json.data;
 	spec->ninputs = list_length(b.inputs);
-	spec->inputs = palloc0(sizeof(DfSliceInput) * spec->ninputs);
+	spec->inputs = palloc0(sizeof(VxSliceInput) * spec->ninputs);
 	i = 0;
 	foreach(lc, b.inputs)
 	{
-		DfInputDesc *in = lfirst(lc);
-		DfSliceInput *si = &spec->inputs[i++];
+		VxInputDesc *in = lfirst(lc);
+		VxSliceInput *si = &spec->inputs[i++];
 		ListCell   *la,
 				   *lt;
 		int			k = 0;
@@ -4269,7 +4269,7 @@ df_translate_slice(Plan *root, const DfTails *tails, bool tuples, DfSliceSpec *s
 			si->attnos[k] = (AttrNumber) lfirst_int(la);
 			si->types[k] = lfirst_oid(lt);
 			si->scales[k] = (int16) list_nth_int(in->scales, k);
-			si->digits[k] = (int16) df_input_digits(in, k);
+			si->digits[k] = (int16) vx_input_digits(in, k);
 			k++;
 		}
 	}

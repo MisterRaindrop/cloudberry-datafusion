@@ -17,14 +17,14 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_debug.c
+ * vx_debug.c
  *	  SQL-callable test functions for the runtime milestone (M1).
  *
  * They run CPU-bound work on the runtime, panic inside a worker, and
  * report on the runtime's threads, so the regression tests can check
  * cancellation, panic handling and signal masks from SQL.
  *
- * src/df_debug.c
+ * src/vx_debug.c
  *
  *-------------------------------------------------------------------------
  */
@@ -44,25 +44,25 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
 /* Thread name the runtime gives its threads (df_core::runtime::THREAD_NAME). */
-#define DF_THREAD_NAME "df-worker"
+#define VX_THREAD_NAME "df-worker"
 
-PG_FUNCTION_INFO_V1(datafusion_debug_spin);
-PG_FUNCTION_INFO_V1(datafusion_debug_worker_panic);
-PG_FUNCTION_INFO_V1(datafusion_debug_active_tasks);
-PG_FUNCTION_INFO_V1(datafusion_debug_runtime_threads);
-PG_FUNCTION_INFO_V1(datafusion_debug_last_run);
-PG_FUNCTION_INFO_V1(datafusion_debug_vmem);
-PG_FUNCTION_INFO_V1(datafusion_debug_vmem_lease);
-PG_FUNCTION_INFO_V1(datafusion_debug_pax_direct_scans);
-PG_FUNCTION_INFO_V1(datafusion_debug_last_pax);
-PG_FUNCTION_INFO_V1(datafusion_debug_pax_cache);
-PG_FUNCTION_INFO_V1(datafusion_debug_cdbhash_check);
+PG_FUNCTION_INFO_V1(vec_debug_spin);
+PG_FUNCTION_INFO_V1(vec_debug_worker_panic);
+PG_FUNCTION_INFO_V1(vec_debug_active_tasks);
+PG_FUNCTION_INFO_V1(vec_debug_runtime_threads);
+PG_FUNCTION_INFO_V1(vec_debug_last_run);
+PG_FUNCTION_INFO_V1(vec_debug_vmem);
+PG_FUNCTION_INFO_V1(vec_debug_vmem_lease);
+PG_FUNCTION_INFO_V1(vec_debug_pax_direct_scans);
+PG_FUNCTION_INFO_V1(vec_debug_last_pax);
+PG_FUNCTION_INFO_V1(vec_debug_pax_cache);
+PG_FUNCTION_INFO_V1(vec_debug_cdbhash_check);
 
 static Datum
-df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
+vx_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
 {
 	TupleDesc	tupdesc;
 	Datum		values[8];
@@ -79,36 +79,36 @@ df_int8_record(FunctionCallInfo fcinfo, int n, const int64 *v)
 }
 
 /*
- * datafusion_debug_last_run(OUT partitions int8, OUT memory_limit_kb int8,
+ * vec_debug_last_run(OUT partitions int8, OUT memory_limit_kb int8,
  *                           OUT memory_peak_kb int8, OUT spilled_kb int8,
  *                           OUT spills int8)
  */
 Datum
-datafusion_debug_last_run(PG_FUNCTION_ARGS)
+vec_debug_last_run(PG_FUNCTION_ARGS)
 {
 	int64		v[5];
 
-	v[0] = (int64) df_last_run.partitions;
-	v[1] = (int64) (df_last_run.memory_limit / 1024);
-	v[2] = (int64) ((df_last_run.memory_peak + 1023) / 1024);
-	v[3] = (int64) ((df_last_run.spilled_bytes + 1023) / 1024);
-	v[4] = (int64) df_last_run.spill_count;
-	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
+	v[0] = (int64) vx_last_run.partitions;
+	v[1] = (int64) (vx_last_run.memory_limit / 1024);
+	v[2] = (int64) ((vx_last_run.memory_peak + 1023) / 1024);
+	v[3] = (int64) ((vx_last_run.spilled_bytes + 1023) / 1024);
+	v[4] = (int64) vx_last_run.spill_count;
+	PG_RETURN_DATUM(vx_int8_record(fcinfo, 5, v));
 }
 
-/* datafusion_debug_vmem(OUT heap_bytes int8, OUT leased_bytes int8) */
+/* vec_debug_vmem(OUT heap_bytes int8, OUT leased_bytes int8) */
 Datum
-datafusion_debug_vmem(PG_FUNCTION_ARGS)
+vec_debug_vmem(PG_FUNCTION_ARGS)
 {
 	int64		v[2];
 
-	v[0] = df_engine_load()->heap_bytes();
-	v[1] = df_vmem_leased_bytes();
-	PG_RETURN_DATUM(df_int8_record(fcinfo, 2, v));
+	v[0] = vx_engine_load()->heap_bytes();
+	v[1] = vx_vmem_leased_bytes();
+	PG_RETURN_DATUM(vx_int8_record(fcinfo, 2, v));
 }
 
 static text *
-df_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
+vx_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
 {
 	VecError	err;
 	VecTask	   *task = NULL;
@@ -119,48 +119,48 @@ df_run_spin(float8 seconds, int32 ntasks, bool panic_in_worker)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("ntasks must be at least 1")));
 
-	df_runtime_ensure();
+	vx_runtime_ensure();
 
-	DF_ERROR_INIT(err);
-	status = df_engine_debug()->spin_start(seconds, (uint32_t) ntasks,
+	VX_ERROR_INIT(err);
+	status = vx_engine_debug()->spin_start(seconds, (uint32_t) ntasks,
 										   panic_in_worker, &task, &err);
 	if (status != VEC_OK)
-		df_raise(status, err.message);
+		vx_raise(status, err.message);
 
-	DF_ERROR_INIT(err);
-	status = df_task_wait_interruptible(task, &err);
+	VX_ERROR_INIT(err);
+	status = vx_task_wait_interruptible(task, &err);
 	if (status == VEC_OK)
 		return cstring_to_text(err.message);
 	if (status == VEC_CANCELLED)
 		elog(ERROR, "DataFusion tasks were cancelled");
-	df_raise(status, err.message);
+	vx_raise(status, err.message);
 }
 
-/* datafusion_debug_spin(seconds float8, ntasks int) returns text */
+/* vec_debug_spin(seconds float8, ntasks int) returns text */
 Datum
-datafusion_debug_spin(PG_FUNCTION_ARGS)
+vec_debug_spin(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(df_run_spin(PG_GETARG_FLOAT8(0), PG_GETARG_INT32(1), false));
+	PG_RETURN_TEXT_P(vx_run_spin(PG_GETARG_FLOAT8(0), PG_GETARG_INT32(1), false));
 }
 
-/* datafusion_debug_worker_panic() returns text */
+/* vec_debug_worker_panic() returns text */
 Datum
-datafusion_debug_worker_panic(PG_FUNCTION_ARGS)
+vec_debug_worker_panic(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_TEXT_P(df_run_spin(10.0, 2, true));
+	PG_RETURN_TEXT_P(vx_run_spin(10.0, 2, true));
 }
 
-/* datafusion_debug_active_tasks() returns bigint */
+/* vec_debug_active_tasks() returns bigint */
 Datum
-datafusion_debug_active_tasks(PG_FUNCTION_ARGS)
+vec_debug_active_tasks(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64((int64) df_engine_debug()->active_tasks());
+	PG_RETURN_INT64((int64) vx_engine_debug()->active_tasks());
 }
 
 #ifdef __linux__
 /* Read the first line of a small /proc file into buf; false if unreadable. */
 static bool
-df_read_proc_line(const char *path, const char *prefix, char *buf, size_t buflen)
+vx_read_proc_line(const char *path, const char *prefix, char *buf, size_t buflen)
 {
 	FILE	   *f;
 	bool		found = false;
@@ -183,13 +183,13 @@ df_read_proc_line(const char *path, const char *prefix, char *buf, size_t buflen
 #endif
 
 /*
- * datafusion_debug_runtime_threads(OUT threads int, OUT signals_blocked bool)
+ * vec_debug_runtime_threads(OUT threads int, OUT signals_blocked bool)
  *
  * Counts this backend's runtime threads and checks that each blocks the
  * signals PostgreSQL relies on.  Linux only (reads /proc/self/task).
  */
 Datum
-datafusion_debug_runtime_threads(PG_FUNCTION_ARGS)
+vec_debug_runtime_threads(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
 	Datum		values[2];
@@ -223,12 +223,12 @@ datafusion_debug_runtime_threads(PG_FUNCTION_ARGS)
 				continue;
 
 			snprintf(path, sizeof(path), "/proc/self/task/%s/comm", de->d_name);
-			if (!df_read_proc_line(path, NULL, line, sizeof(line)) ||
-				strcmp(line, DF_THREAD_NAME) != 0)
+			if (!vx_read_proc_line(path, NULL, line, sizeof(line)) ||
+				strcmp(line, VX_THREAD_NAME) != 0)
 				continue;
 
 			snprintf(path, sizeof(path), "/proc/self/task/%s/status", de->d_name);
-			if (!df_read_proc_line(path, "SigBlk:", line, sizeof(line)))
+			if (!vx_read_proc_line(path, "SigBlk:", line, sizeof(line)))
 				continue;
 
 			threads++;
@@ -241,7 +241,7 @@ datafusion_debug_runtime_threads(PG_FUNCTION_ARGS)
 #else
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("datafusion_debug_runtime_threads() needs /proc (Linux)")));
+			 errmsg("vec_debug_runtime_threads() needs /proc (Linux)")));
 #endif
 
 	values[0] = Int32GetDatum(threads);
@@ -251,14 +251,14 @@ datafusion_debug_runtime_threads(PG_FUNCTION_ARGS)
 }
 
 /*
- * datafusion_debug_vmem_lease(headroom int8) returns int8
+ * vec_debug_vmem_lease(headroom int8) returns int8
  *
  * Run the lease step a query runs between waits, with the given headroom,
  * and return the bytes leased.  Lets tests reach the vmem tracker's limits,
  * which Cloudberry enforces on QEs only.
  */
 Datum
-datafusion_debug_vmem_lease(PG_FUNCTION_ARGS)
+vec_debug_vmem_lease(PG_FUNCTION_ARGS)
 {
 	int64		headroom = PG_GETARG_INT64(0);
 	int64		leased;
@@ -267,32 +267,32 @@ datafusion_debug_vmem_lease(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("headroom must not be negative")));
-	df_vmem_sync(headroom);
-	leased = df_vmem_leased_bytes();
-	df_vmem_trim();
+	vx_vmem_sync(headroom);
+	leased = vx_vmem_leased_bytes();
+	vx_vmem_trim();
 	PG_RETURN_INT64(leased);
 }
 
-/* datafusion_debug_pax_direct_scans() returns bigint */
+/* vec_debug_pax_direct_scans() returns bigint */
 Datum
-datafusion_debug_pax_direct_scans(PG_FUNCTION_ARGS)
+vec_debug_pax_direct_scans(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64((int64) df_pax_direct_scans);
+	PG_RETURN_INT64((int64) vx_pax_direct_scans);
 }
 
 /*
- * datafusion_debug_last_pax(OUT files int8, OUT files_skipped int8,
+ * vec_debug_last_pax(OUT files int8, OUT files_skipped int8,
  *                           OUT groups int8, OUT groups_skipped int8,
  *                           OUT decode_peak_kb int8)
  * The min/max skipping and the decoding memory of the latest completed run,
  * if it read PAX directly; NULLs otherwise.
  */
 Datum
-datafusion_debug_last_pax(PG_FUNCTION_ARGS)
+vec_debug_last_pax(PG_FUNCTION_ARGS)
 {
 	int64		v[5];
 
-	if (!df_last_run_pax)
+	if (!vx_last_run_pax)
 	{
 		TupleDesc	tupdesc;
 		Datum		values[5] = {0};
@@ -303,26 +303,26 @@ datafusion_debug_last_pax(PG_FUNCTION_ARGS)
 		tupdesc = BlessTupleDesc(tupdesc);
 		PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 	}
-	v[0] = df_last_pax_scan.files;
-	v[1] = df_last_pax_scan.files_skipped;
-	v[2] = df_last_pax_scan.groups;
-	v[3] = df_last_pax_scan.groups_skipped;
-	v[4] = (int64) ((df_last_run.pax_decode_peak + 1023) / 1024);
-	PG_RETURN_DATUM(df_int8_record(fcinfo, 5, v));
+	v[0] = vx_last_pax_scan.files;
+	v[1] = vx_last_pax_scan.files_skipped;
+	v[2] = vx_last_pax_scan.groups;
+	v[3] = vx_last_pax_scan.groups_skipped;
+	v[4] = (int64) ((vx_last_run.pax_decode_peak + 1023) / 1024);
+	PG_RETURN_DATUM(vx_int8_record(fcinfo, 5, v));
 }
 
 /*
- * datafusion_debug_pax_cache(OUT hits int8, OUT fills int8, OUT bad int8,
+ * vec_debug_pax_cache(OUT hits int8, OUT fills int8, OUT bad int8,
  *                            OUT evicted int8, OUT refused int8,
  *                            OUT unusable int8)
  * What the direct PAX reader's decoded-column cache did in this backend
- * (datafusion.pax_decode_cache); NULLs if the reader is not loaded.
+ * (vec.pax_decode_cache); NULLs if the reader is not loaded.
  */
 Datum
-datafusion_debug_pax_cache(PG_FUNCTION_ARGS)
+vec_debug_pax_cache(PG_FUNCTION_ARGS)
 {
-	const DfPaxReader *reader = df_pax_reader_loaded();
-	DfPaxCacheStats s;
+	const VxPaxReader *reader = vx_pax_reader_loaded();
+	VxPaxCacheStats s;
 	int64		v[6];
 
 	if (reader == NULL)
@@ -343,11 +343,11 @@ datafusion_debug_pax_cache(PG_FUNCTION_ARGS)
 	v[3] = s.evicted;
 	v[4] = s.refused;
 	v[5] = s.unusable;
-	PG_RETURN_DATUM(df_int8_record(fcinfo, 6, v));
+	PG_RETURN_DATUM(vx_int8_record(fcinfo, 6, v));
 }
 
 /* ---------------------------------------------------------------------
- * datafusion_debug_cdbhash_check(nrows int4, segments int4, workers int4)
+ * vec_debug_cdbhash_check(nrows int4, segments int4, workers int4)
  * returns bigint
  *
  * Route 'nrows' rows of random keys, with the special values mixed in, by
@@ -357,20 +357,20 @@ datafusion_debug_pax_cache(PG_FUNCTION_ARGS)
  * route includes the worker, as nodeMotion.c computes it in parallel mode.
  * ---------------------------------------------------------------------
  */
-typedef struct DfKeyType
+typedef struct VxKeyType
 {
 	int32		kind;			/* as the engine's cdbhash_routes numbers it */
 	Oid			hashfunc;
 	int			width;			/* 0: a string */
-} DfKeyType;
+} VxKeyType;
 
-static const DfKeyType df_key_types[] = {
+static const VxKeyType vx_key_types[] = {
 	{0, F_HASHCHAR, 1}, {1, F_HASHINT2, 2}, {2, F_HASHINT4, 4},
 	{3, F_HASHINT8, 8}, {4, F_HASHFLOAT4, 4}, {5, F_HASHFLOAT8, 8},
 	{6, F_HASHTEXT, 0}, {7, F_HASHBPCHAR, 0},
 	/* numeric of scale kind - 8 */
-	{8, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {10, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
-	{13, F_HASH_NUMERIC, DF_NUMERIC_BYTES}, {23, F_HASH_NUMERIC, DF_NUMERIC_BYTES},
+	{8, F_HASH_NUMERIC, VX_NUMERIC_BYTES}, {10, F_HASH_NUMERIC, VX_NUMERIC_BYTES},
+	{13, F_HASH_NUMERIC, VX_NUMERIC_BYTES}, {23, F_HASH_NUMERIC, VX_NUMERIC_BYTES},
 	/* tid, as block << 16 | offset */
 	{85, F_HASHTID, 8},
 };
@@ -380,7 +380,7 @@ static const DfKeyType df_key_types[] = {
  * now and then a long one, mixing ASCII with 2-, 3- and 4-byte characters.
  */
 static void
-df_random_string(pg_prng_state *rng, StringInfo buf)
+vx_random_string(pg_prng_state *rng, StringInfo buf)
 {
 	static const char *const pieces[] = {"\xc3\xa9", "\xe4\xb8\xad", "\xf0\x9f\x98\x80"};
 	int			len = pg_prng_uint64(rng) % 16 == 0 ? 100 + pg_prng_uint64(rng) % 300 :
@@ -400,7 +400,7 @@ df_random_string(pg_prng_state *rng, StringInfo buf)
 
 /* A random value of key type 'kind', a special value one time in four. */
 static void
-df_random_key(pg_prng_state *rng, int32 kind, void *dst)
+vx_random_key(pg_prng_state *rng, int32 kind, void *dst)
 {
 	static const double fspecial[] = {0.0, -0.0, NAN, -NAN, INFINITY, -INFINITY, 1.5, -1e300};
 	static const int64 ispecial[] = {0, -1, 1, PG_INT64_MIN, PG_INT64_MAX,
@@ -441,8 +441,8 @@ df_random_key(pg_prng_state *rng, int32 kind, void *dst)
 		default:
 			{
 				/* numeric: up to 38 digits, zero digits around the point */
-				static const int128 nspecial[] = {0, DF_NUMERIC_NAN, DF_NUMERIC_PINF,
-				DF_NUMERIC_NINF, 1, -10000, 100000000, 1};
+				static const int128 nspecial[] = {0, VX_NUMERIC_NAN, VX_NUMERIC_PINF,
+				VX_NUMERIC_NINF, 1, -10000, 100000000, 1};
 				int128		v = 0;
 				int			ndig = pg_prng_uint64(rng) % 39;
 				int			i;
@@ -458,14 +458,14 @@ df_random_key(pg_prng_state *rng, int32 kind, void *dst)
 				}
 				if (!special && (r & 1))
 					v = -v;
-				df_numeric_store(v, dst);
+				vx_numeric_store(v, dst);
 			}
 			break;
 	}
 }
 
 static Datum
-df_key_datum(int32 kind, const void *v)
+vx_key_datum(int32 kind, const void *v)
 {
 	switch (kind)
 	{
@@ -490,13 +490,13 @@ df_key_datum(int32 kind, const void *v)
 				return ItemPointerGetDatum(ip);
 			}
 		default:
-			return df_numeric_datum((const uint8 *) v, kind - 8);
+			return vx_numeric_datum((const uint8 *) v, kind - 8);
 	}
 }
 
 /* Mismatching rows for one combination of key types. */
 static int64
-df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
+vx_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 					  int nrows, int segments, int workers)
 {
 	char	   *values[3];
@@ -516,7 +516,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 
 	for (k = 0; k < nkeys; k++)
 	{
-		const DfKeyType *t = &df_key_types[types[k]];
+		const VxKeyType *t = &vx_key_types[types[k]];
 
 		kinds[k] = t->kind;
 		funcs[k] = t->hashfunc;
@@ -532,7 +532,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 			for (r = 0; r < nrows; r++)
 			{
 				nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
-				df_random_string(rng, &buf);
+				vx_random_string(rng, &buf);
 				if (t->kind == 7)
 				{
 					/* character: blank padding, which hashbpchar leaves out */
@@ -551,17 +551,17 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 			for (r = 0; r < nrows; r++)
 			{
 				nulls[k][r] = pg_prng_uint64(rng) % 10 == 0;
-				df_random_key(rng, t->kind, values[k] + r * t->width);
+				vx_random_key(rng, t->kind, values[k] + r * t->width);
 			}
 		}
 	}
 
 	/* the keys as the engine takes them: Arrow arrays (vec_engine.h) */
-	df_arrow_struct_array(&keys, nkeys);
+	vx_arrow_struct_array(&keys, nkeys);
 	keys.length = nrows;
 	for (k = 0; k < nkeys; k++)
 	{
-		const DfKeyType *t = &df_key_types[types[k]];
+		const VxKeyType *t = &vx_key_types[types[k]];
 		uint8	   *valid = palloc0((nrows + 7) / 8);
 		const void *v = values[k];
 		int64		nnull = 0;
@@ -586,16 +586,16 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 		formats[k] = t->kind == 0 ? "b" : t->kind == 1 ? "s" : t->kind == 2 ? "i" :
 			t->kind == 3 || t->kind == 85 ? "l" : t->kind == 4 ? "f" :
 			t->kind == 5 ? "g" : t->kind <= 7 ? "u" :
-			df_arrow_format(NUMERICOID, t->kind - 8);
-		df_arrow_set_column(keys.children[k], nrows, nnull, valid, v, offsets[k]);
+			vx_arrow_format(NUMERICOID, t->kind - 8);
+		vx_arrow_set_column(keys.children[k], nrows, nnull, valid, v, offsets[k]);
 	}
-	df_arrow_struct_schema(&schema, nkeys, formats);
+	vx_arrow_struct_schema(&schema, nkeys, formats);
 	h = makeCdbHash(segments, nkeys, funcs);
 	hw = makeCdbHash(segments * Max(workers, 1), nkeys, funcs);
 
-	if (df_engine_debug()->cdbhash_routes(kinds, &schema, &keys, segments, workers,
+	if (vx_engine_debug()->cdbhash_routes(kinds, &schema, &keys, segments, workers,
 										  routes) != VEC_OK)
-		elog(ERROR, "datafusion: the engine's cdbhash_routes failed");
+		elog(ERROR, "vec_executor: the engine's cdbhash_routes failed");
 
 	for (r = 0; r < nrows; r++)
 	{
@@ -612,7 +612,7 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 				d = PointerGetDatum(cstring_to_text_with_len(values[k] + offsets[k][r],
 															 offsets[k][r + 1] - offsets[k][r]));
 			else
-				d = df_key_datum(kinds[k], values[k] + r * df_key_types[types[k]].width);
+				d = vx_key_datum(kinds[k], values[k] + r * vx_key_types[types[k]].width);
 
 			cdbhash(h, k + 1, d, nulls[k][r] != 0);
 			cdbhash(hw, k + 1, d, nulls[k][r] != 0);
@@ -626,10 +626,10 @@ df_cdbhash_check_keys(pg_prng_state *rng, const int *types, int nkeys,
 }
 
 Datum
-datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
+vec_debug_cdbhash_check(PG_FUNCTION_ARGS)
 {
 	static const int combos[][4] = {
-		/* nkeys, key types (indexes into df_key_types) */
+		/* nkeys, key types (indexes into vx_key_types) */
 		{1, 0}, {1, 1}, {1, 2}, {1, 3}, {1, 4}, {1, 5}, {1, 6}, {1, 7},
 		{2, 2, 5}, {3, 3, 1, 0}, {2, 6, 2}, {3, 6, 6, 3}, {2, 7, 2},
 		{1, 8}, {1, 9}, {1, 10}, {1, 11}, {2, 9, 7},
@@ -649,7 +649,7 @@ datafusion_debug_cdbhash_check(PG_FUNCTION_ARGS)
 				 errmsg("nrows, segments and workers must be positive")));
 	pg_prng_seed(&rng, 20261005);
 	for (i = 0; i < lengthof(combos); i++)
-		bad += df_cdbhash_check_keys(&rng, &combos[i][1], combos[i][0],
+		bad += vx_cdbhash_check_keys(&rng, &combos[i][1], combos[i][0],
 									 nrows, segments, workers);
 	PG_RETURN_INT64(bad);
 }

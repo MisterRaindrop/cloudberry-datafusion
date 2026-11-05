@@ -23,7 +23,7 @@
 //! directions go through bounded channels, so a slow consumer slows the
 //! producer instead of piling up memory.
 //!
-//! The plan arrives as JSON built by the C side (src/df_translate.c),
+//! The plan arrives as JSON built by the C side (src/vx_translate.c),
 //! the plan IR that docs/ir.md specifies: a tree of nodes over one or more
 //! inputs, with PostgreSQL's semantics for every expression.
 
@@ -107,7 +107,7 @@ pub const PLAN_BATCH_ROWS: usize = 4096;
 
 /// SK1: groups per row in a partial aggregation's first rows above which it
 /// stops aggregating (`skip_partial_aggregation_probe_ratio_threshold`),
-/// unless the spec gives `skip_partial_ratio` (datafusion.partial_agg_skip_ratio).
+/// unless the spec gives `skip_partial_ratio` (vec.partial_agg_skip_ratio).
 pub const SKIP_PARTIAL_RATIO: f64 = 0.2;
 
 /// Batches buffered in each direction.
@@ -1245,7 +1245,7 @@ pub type PaxRowsFn = unsafe extern "C" fn(
     err: *mut c_char,
     errlen: usize,
 ) -> i32;
-/// LT1: the fetch column of the rows' locators (DATAFUSION_PAX_LOCATOR).
+/// LT1: the fetch column of the rows' locators (PAX_DIRECT_LOCATOR).
 pub const PAX_LOCATOR: i32 = -1;
 
 /// A PAX scan listed on the main thread.  Partitions take blocks from it
@@ -1547,7 +1547,7 @@ unsafe fn str_rows(
 /// (C4c), and the wake-up of partitions waiting for work or for a read to
 /// end.  Each read holds its decoded group: with one read per partition a
 /// QE held 330 MB on TPC-H's lineitem at scale factor 10 (10 partitions).
-/// `max_readers` (datafusion.pax_max_decoders) trades that for time, the
+/// `max_readers` (vec.pax_max_decoders) trades that for time, the
 /// other partitions taking the rows decoded meanwhile: 4 reads took 270-300
 /// MB and 1.6 times as long, 2 took 190-225 MB and 2.5 times as long.
 #[derive(Debug)]
@@ -3576,7 +3576,7 @@ impl Query {
         // add: in TPC-H Q18 the partial step turned 200M rows into 50M groups
         // a segment and the final step found 0.08% of them twice.  Not when
         // the states go through a Motion, where rows cost more.  The ratio
-        // is datafusion.partial_agg_skip_ratio.
+        // is vec.partial_agg_skip_ratio.
         if !partial {
             execution.skip_partial_aggregation_probe_ratio_threshold = spec
                 .get("skip_partial_ratio")

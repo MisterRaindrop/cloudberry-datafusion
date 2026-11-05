@@ -17,7 +17,7 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_plan_check.c
+ * vx_plan_check.c
  *	  Decide which slices of a plan DataFusion can run.
  *
  * A slice qualifies when every plan node and expression in it is on a
@@ -36,7 +36,7 @@
  * aggregate may then be the combining stage (Finalize Aggregate) of count,
  * sum, min and max, whose transition states are plain values.
  *
- * src/df_plan_check.c
+ * src/vx_plan_check.c
  *
  *-------------------------------------------------------------------------
  */
@@ -80,9 +80,9 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
-int			df_join_estimates = DF_JOIN_ESTIMATES_SPILL;
+int			vx_join_estimates = VX_JOIN_ESTIMATES_SPILL;
 
 /*
  * From utils/pg_locale.h, which needs ICU's headers when the server was
@@ -91,10 +91,10 @@ int			df_join_estimates = DF_JOIN_ESTIMATES_SPILL;
 extern bool lc_collate_is_c(Oid collation);
 extern bool lc_ctype_is_c(Oid collation);
 
-static bool df_subplan_value(Node *node, Plan **top, Node **value);
-static bool df_rows_from_motion(Plan *plan);
+static bool vx_subplan_value(Node *node, Plan **top, Node **value);
+static bool vx_rows_from_motion(Plan *plan);
 
-typedef struct DfCheckContext
+typedef struct VxCheckContext
 {
 	PlannedStmt *stmt;
 	bool		allow_aggref;	/* inside an Agg node's targetlist or qual */
@@ -103,7 +103,7 @@ typedef struct DfCheckContext
 	bool		join_input;		/* checking an input of a join */
 	bool		window_input;	/* checking the child of a WindowAgg (WIN1) */
 	bool		union_input;	/* checking an input of an Append whose other
-								 * inputs compute (df_plan_computes) */
+								 * inputs compute (vx_plan_computes) */
 	WindowAgg  *window;			/* the WindowAgg whose expressions are
 								 * checked, which computes their window
 								 * functions (WIN1) */
@@ -117,7 +117,7 @@ typedef struct DfCheckContext
 								 * where a RowIdExpr may be (RI1) */
 	bool		correlated_ok;	/* checking a Seq Scan's filter, where a
 								 * correlated scalar subquery may be (SC1) */
-	Bitmapset  *batches;		/* Motions carrying batches (df_batch_motions) */
+	Bitmapset  *batches;		/* Motions carrying batches (vx_batch_motions) */
 	bool		batch_sender;	/* checking the child of a batch-sending Motion */
 	bool		partial_states; /* this Agg may output DataFusion avg states */
 	bool		pg_states;		/* this partial Agg's states leave the slice
@@ -148,31 +148,31 @@ typedef struct DfCheckContext
 	bool		node_order_free;	/* that, for the node being checked */
 	Plan	   *skipped_sort;	/* the Sort below such a sorted Agg, which
 								 * DataFusion leaves out (D2) */
-	DfTails		tails;			/* the columns it finishes */
+	VxTails		tails;			/* the columns it finishes */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
-} DfCheckContext;
+} VxCheckContext;
 
-static void df_reject(DfCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
-static bool df_check_expr(Node *node, DfCheckContext *cxt);
-static bool df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg);
-static bool df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups);
-static bool df_name_in(const char *name, const char *const *list);
-static bool df_state_var(Plan *ctx, Var *var, Bitmapset *batches);
-static bool df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches);
-static bool df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches);
-static bool df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
-static void df_check_numcmp_term(Node *node, DfCheckContext *cxt);
-static void df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+static void vx_reject(VxCheckContext *cxt, const char *fmt,...) pg_attribute_printf(2, 3);
+static bool vx_check_expr(Node *node, VxCheckContext *cxt);
+static bool vx_check_group_order(VxCheckContext *cxt, Motion *motion, Agg *agg);
+static bool vx_check_grouping_sets(VxCheckContext *cxt, Agg *agg, VxAggGroups *groups);
+static bool vx_name_in(const char *name, const char *const *list);
+static bool vx_state_var(Plan *ctx, Var *var, Bitmapset *batches);
+static bool vx_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches);
+static bool vx_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches);
+static bool vx_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches);
+static void vx_check_numcmp_term(Node *node, VxCheckContext *cxt);
+static void vx_check_plan(Plan *plan, VxCheckContext *cxt, Bitmapset *needed,
 						  bool root_is_sender);
-static bool df_engine_has(DfCheckContext *cxt, uint64 feature);
-static void df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+static bool vx_engine_has(VxCheckContext *cxt, uint64 feature);
+static void vx_check_plan_node(Plan *plan, VxCheckContext *cxt, Bitmapset *needed,
 							   bool root_is_sender);
 
 /* Add the parameters the init plans of 'plan' and below it set. */
 static void
-df_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
+vx_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
 {
 	ListCell   *lc;
 
@@ -186,13 +186,13 @@ df_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
 		foreach(lp, sp->setParam)
 			*params = bms_add_member(*params, lfirst_int(lp));
 	}
-	df_collect_init_params(stmt, outerPlan(plan), params);
-	df_collect_init_params(stmt, innerPlan(plan), params);
+	vx_collect_init_params(stmt, outerPlan(plan), params);
+	vx_collect_init_params(stmt, innerPlan(plan), params);
 	if (IsA(plan, SubqueryScan))
-		df_collect_init_params(stmt, ((SubqueryScan *) plan)->subplan, params);
-	if (df_append_plans(plan) != NIL)
-		foreach(lc, df_append_plans(plan))
-			df_collect_init_params(stmt, lfirst(lc), params);
+		vx_collect_init_params(stmt, ((SubqueryScan *) plan)->subplan, params);
+	if (vx_append_plans(plan) != NIL)
+		foreach(lc, vx_append_plans(plan))
+			vx_collect_init_params(stmt, lfirst(lc), params);
 }
 
 /*
@@ -201,15 +201,15 @@ df_collect_init_params(PlannedStmt *stmt, Plan *plan, Bitmapset **params)
  * before dispatching (preprocess_initplans) and the segments receive them.
  */
 static Bitmapset *
-df_init_params(DfCheckContext *cxt)
+vx_init_params(VxCheckContext *cxt)
 {
 	ListCell   *lc;
 
 	if (!cxt->init_params_found)
 	{
-		df_collect_init_params(cxt->stmt, cxt->stmt->planTree, &cxt->init_params);
+		vx_collect_init_params(cxt->stmt, cxt->stmt->planTree, &cxt->init_params);
 		foreach(lc, cxt->stmt->subplans)
-			df_collect_init_params(cxt->stmt, lfirst(lc), &cxt->init_params);
+			vx_collect_init_params(cxt->stmt, lfirst(lc), &cxt->init_params);
 		cxt->init_params_found = true;
 	}
 	return cxt->init_params;
@@ -217,7 +217,7 @@ df_init_params(DfCheckContext *cxt)
 
 /* The init plan of 'plan' or below it that sets parameter 'paramid'. */
 static SubPlan *
-df_find_init_plan(Plan *plan, int paramid)
+vx_find_init_plan(Plan *plan, int paramid)
 {
 	ListCell   *lc;
 	SubPlan    *sp;
@@ -227,14 +227,14 @@ df_find_init_plan(Plan *plan, int paramid)
 	foreach(lc, plan->initPlan)
 		if (list_member_int(lfirst_node(SubPlan, lc)->setParam, paramid))
 			return lfirst_node(SubPlan, lc);
-	if ((sp = df_find_init_plan(outerPlan(plan), paramid)) != NULL ||
-		(sp = df_find_init_plan(innerPlan(plan), paramid)) != NULL)
+	if ((sp = vx_find_init_plan(outerPlan(plan), paramid)) != NULL ||
+		(sp = vx_find_init_plan(innerPlan(plan), paramid)) != NULL)
 		return sp;
 	if (IsA(plan, SubqueryScan) &&
-		(sp = df_find_init_plan(((SubqueryScan *) plan)->subplan, paramid)) != NULL)
+		(sp = vx_find_init_plan(((SubqueryScan *) plan)->subplan, paramid)) != NULL)
 		return sp;
-	foreach(lc, df_append_plans(plan))
-		if ((sp = df_find_init_plan(lfirst(lc), paramid)) != NULL)
+	foreach(lc, vx_append_plans(plan))
+		if ((sp = vx_find_init_plan(lfirst(lc), paramid)) != NULL)
 			return sp;
 	return NULL;
 }
@@ -242,26 +242,26 @@ df_find_init_plan(Plan *plan, int paramid)
 /*
  * IP3: the plan and the expression of the value of init plan parameter
  * 'node', in the statement whose numeric values are being followed
- * (df_numeric_stmt): the column of its init plan's top node that sets it.
+ * (vx_numeric_stmt): the column of its init plan's top node that sets it.
  */
 static bool
-df_init_param_value(Node *node, Plan **top, Node **value)
+vx_init_param_value(Node *node, Plan **top, Node **value)
 {
 	Param	   *param = (Param *) node;
 	SubPlan    *sp = NULL;
 	ListCell   *lc;
 	int			k;
 
-	if (!IsA(node, Param) || param->paramkind != PARAM_EXEC || df_numeric_stmt == NULL)
+	if (!IsA(node, Param) || param->paramkind != PARAM_EXEC || vx_numeric_stmt == NULL)
 		return false;
-	sp = df_find_init_plan(df_numeric_stmt->planTree, param->paramid);
-	foreach(lc, df_numeric_stmt->subplans)
+	sp = vx_find_init_plan(vx_numeric_stmt->planTree, param->paramid);
+	foreach(lc, vx_numeric_stmt->subplans)
 		if (sp == NULL)
-			sp = df_find_init_plan(lfirst(lc), param->paramid);
-	if (sp == NULL || sp->plan_id < 1 || sp->plan_id > list_length(df_numeric_stmt->subplans) ||
+			sp = vx_find_init_plan(lfirst(lc), param->paramid);
+	if (sp == NULL || sp->plan_id < 1 || sp->plan_id > list_length(vx_numeric_stmt->subplans) ||
 		sp->subLinkType != EXPR_SUBLINK)
 		return false;
-	*top = list_nth(df_numeric_stmt->subplans, sp->plan_id - 1);
+	*top = list_nth(vx_numeric_stmt->subplans, sp->plan_id - 1);
 	for (k = 0; list_nth_int(sp->setParam, k) != param->paramid; k++)
 		;
 	foreach(lc, (*top)->targetlist)
@@ -284,7 +284,7 @@ df_init_param_value(Node *node, Plan **top, Node **value)
  * updatable cursor does for WHERE CURRENT OF?
  */
 static bool
-df_cursor_sysattrs(PlannedStmt *stmt)
+vx_cursor_sysattrs(PlannedStmt *stmt)
 {
 	ListCell   *lc;
 
@@ -306,14 +306,14 @@ df_cursor_sysattrs(PlannedStmt *stmt)
  * whose divisor is a count, below 10^20 (weight 4).
  */
 int
-df_avg_scale(int s)
+vx_avg_scale(int s)
 {
 	return 36 + 4 * ((s + 3) / 4);
 }
 
 /* Record the first reason a slice does not qualify. */
 static void
-df_reject(DfCheckContext *cxt, const char *fmt,...)
+vx_reject(VxCheckContext *cxt, const char *fmt,...)
 {
 	va_list		args;
 
@@ -326,7 +326,7 @@ df_reject(DfCheckContext *cxt, const char *fmt,...)
 }
 
 static bool
-df_type_supported(Oid type)
+vx_type_supported(Oid type)
 {
 	switch (type)
 	{
@@ -350,8 +350,8 @@ df_type_supported(Oid type)
 			/* Arrow's strings are UTF-8. */
 			return GetDatabaseEncoding() == PG_UTF8;
 		case NUMERICOID:
-			/* of a known precision and scale: df_numeric_ps */
-			return df_engine_numeric();
+			/* of a known precision and scale: vx_numeric_ps */
+			return vx_engine_numeric();
 		default:
 			return false;
 	}
@@ -363,7 +363,7 @@ df_type_supported(Oid type)
  * so comparing two values of one type compares the integers.
  */
 static bool
-df_type_is_datetime(Oid type)
+vx_type_is_datetime(Oid type)
 {
 	return type == DATEOID || type == TIMEOID ||
 		type == TIMESTAMPOID || type == TIMESTAMPTZOID;
@@ -381,7 +381,7 @@ df_type_is_datetime(Oid type)
  * constant (< or >= the earliest date).
  */
 bool
-df_date_timestamp_cmp(OpExpr *op, Node **date_arg, const char **cmp, int32 *value)
+vx_date_timestamp_cmp(OpExpr *op, Node **date_arg, const char **cmp, int32 *value)
 {
 	static const char *const names[][2] = {
 		{"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}, {"=", "="}, {"<>", "<>"}
@@ -447,7 +447,7 @@ df_date_timestamp_cmp(OpExpr *op, Node **date_arg, const char **cmp, int32 *valu
  * trailing blanks (df_core::pgstr::bpchar_key), as bpcharcmp does.
  */
 static bool
-df_type_is_string(Oid type)
+vx_type_is_string(Oid type)
 {
 	return type == TEXTOID || type == VARCHAROID || type == BPCHAROID;
 }
@@ -455,11 +455,11 @@ df_type_is_string(Oid type)
 /*
  * CL2: for EXPLAIN on the coordinator, whether the default collation's
  * LC_COLLATE and LC_CTYPE are C on the nodes running the slice being
- * reported: 1 or 0 for the segments (df_explain_slices), -1 for this
+ * reported: 1 or 0 for the segments (vx_explain_slices), -1 for this
  * node's own.
  */
-static int	df_explain_collate_c = -1;
-static int	df_explain_ctype_c = -1;
+static int	vx_explain_collate_c = -1;
+static int	vx_explain_ctype_c = -1;
 
 /*
  * CU1: pairs of strings, each in byte order, whose order differs under a
@@ -469,13 +469,13 @@ static int	df_explain_ctype_c = -1;
  * (glibc's since 2.35, and distributions' own before); these tell.  As
  * code points, terminated by 0.
  */
-typedef struct DfBytewisePair
+typedef struct VxBytewisePair
 {
 	pg_wchar	x[4];
 	pg_wchar	y[4];
-} DfBytewisePair;
+} VxBytewisePair;
 
-static const DfBytewisePair df_bytewise_pairs[] = {
+static const VxBytewisePair vx_bytewise_pairs[] = {
 	{{'B'}, {'a'}},
 	{{'Z'}, {'a'}},
 	{{'a', '-', 'c'}, {'a', 'b'}},
@@ -487,14 +487,14 @@ static const DfBytewisePair df_bytewise_pairs[] = {
 
 /* Is 'locale' a name of C.UTF-8 (C.UTF-8, C.utf8, ...)? */
 static bool
-df_c_utf8_name(const char *locale)
+vx_c_utf8_name(const char *locale)
 {
 	return locale != NULL && (locale[0] == 'C' || locale[0] == 'c') && locale[1] == '.' &&
 		(pg_strcasecmp(locale + 2, "UTF-8") == 0 || pg_strcasecmp(locale + 2, "UTF8") == 0);
 }
 
 static void
-df_utf8_of(const pg_wchar *cps, char *out)
+vx_utf8_of(const pg_wchar *cps, char *out)
 {
 	for (; *cps != 0; cps++)
 		out += pg_utf_mblen(unicode_to_utf8(*cps, (unsigned char *) out));
@@ -503,7 +503,7 @@ df_utf8_of(const pg_wchar *cps, char *out)
 
 /* The provider of this database's default collation (pg_database). */
 static char
-df_database_provider(void)
+vx_database_provider(void)
 {
 	HeapTuple	tup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	char		provider = COLLPROVIDER_DEFAULT;
@@ -520,41 +520,41 @@ df_database_provider(void)
  * CM1: does case mapping under the default collation map each character as
  * towupper and towlower of the node's LC_CTYPE do (str_toupper,
  * str_tolower): a libc provider in a UTF-8 database?  Their maps are given
- * to DataFusion (df_case_maps_ensure).
+ * to DataFusion (vx_case_maps_ensure).
  */
 bool
-df_default_case_maps(void)
+vx_default_case_maps(void)
 {
-	return df_database_provider() == COLLPROVIDER_LIBC && GetDatabaseEncoding() == PG_UTF8;
+	return vx_database_provider() == COLLPROVIDER_LIBC && GetDatabaseEncoding() == PG_UTF8;
 }
 
 /*
  * Does this node compare strings under the database's default collation
  * by their bytes?  Under C or POSIX, or (CU1) under libc's C.UTF-8 where
- * strcoll orders df_bytewise_pairs as their bytes.
+ * strcoll orders vx_bytewise_pairs as their bytes.
  */
 static bool
-df_default_collation_bytewise(void)
+vx_default_collation_bytewise(void)
 {
 	static int	bytewise = -1;
 
 	if (bytewise < 0)
 	{
 		bytewise = lc_collate_is_c(DEFAULT_COLLATION_OID);
-		if (!bytewise && df_database_provider() == COLLPROVIDER_LIBC &&
+		if (!bytewise && vx_database_provider() == COLLPROVIDER_LIBC &&
 			GetDatabaseEncoding() == PG_UTF8 &&
-			df_c_utf8_name(setlocale(LC_COLLATE, NULL)))
+			vx_c_utf8_name(setlocale(LC_COLLATE, NULL)))
 		{
 			int			i;
 
 			bytewise = 1;
-			for (i = 0; i < lengthof(df_bytewise_pairs); i++)
+			for (i = 0; i < lengthof(vx_bytewise_pairs); i++)
 			{
 				char		x[17],
 							y[17];
 
-				df_utf8_of(df_bytewise_pairs[i].x, x);
-				df_utf8_of(df_bytewise_pairs[i].y, y);
+				vx_utf8_of(vx_bytewise_pairs[i].x, x);
+				vx_utf8_of(vx_bytewise_pairs[i].y, y);
 				if (strcoll(x, y) >= 0 || strcoll(y, x) <= 0)
 					bytewise = 0;
 			}
@@ -569,26 +569,26 @@ df_default_collation_bytewise(void)
  * unless the coordinator found it so on every node (CL1).
  */
 static bool
-df_collate_is_c(Oid collation)
+vx_collate_is_c(Oid collation)
 {
 	if (collation == DEFAULT_COLLATION_OID)
 	{
-		if (df_explain_collate_c >= 0)
-			return df_explain_collate_c == 1;
-		return df_cluster_collation_c || df_default_collation_bytewise();
+		if (vx_explain_collate_c >= 0)
+			return vx_explain_collate_c == 1;
+		return vx_cluster_collation_c || vx_default_collation_bytewise();
 	}
 	return lc_collate_is_c(collation);
 }
 
 /* The provider of 'collation': libc, ICU, or for the default, the database's. */
 static char
-df_collation_provider(Oid collation)
+vx_collation_provider(Oid collation)
 {
 	HeapTuple	tup;
 	char		provider;
 
 	if (collation == DEFAULT_COLLATION_OID)
-		return df_database_provider();
+		return vx_database_provider();
 	tup = SearchSysCache1(COLLOID, ObjectIdGetDatum(collation));
 	if (!HeapTupleIsValid(tup))
 		return COLLPROVIDER_DEFAULT;
@@ -605,14 +605,14 @@ df_collation_provider(Oid collation)
  * (df_core::pgcoll).
  */
 const char *
-df_collation_locale(Oid collation)
+vx_collation_locale(Oid collation)
 {
 	HeapTuple	tup;
 	Datum		d;
 	bool		isnull;
 	char	   *locale;
 
-	if (df_collate_is_c(collation))
+	if (vx_collate_is_c(collation))
 		return NULL;
 	if (collation == DEFAULT_COLLATION_OID)
 		return pstrdup(setlocale(LC_COLLATE, NULL));
@@ -628,10 +628,10 @@ df_collation_locale(Oid collation)
 }
 
 bool
-df_ctype_is_c(Oid collation)
+vx_ctype_is_c(Oid collation)
 {
-	if (collation == DEFAULT_COLLATION_OID && df_explain_ctype_c >= 0)
-		return df_explain_ctype_c == 1;
+	if (collation == DEFAULT_COLLATION_OID && vx_explain_ctype_c >= 0)
+		return vx_explain_ctype_c == 1;
 	return lc_ctype_is_c(collation);
 }
 
@@ -640,75 +640,75 @@ df_ctype_is_c(Oid collation)
  * PostgreSQL, or NULL.  Whether the database's default collation is C is
  * each node's own: the coordinator and the segments can differ (e.g. C and
  * C.UTF-8), so such a verdict is marked as depending on the node, unless
- * the coordinator found it C on every node (df_sync_cluster_collation).
+ * the coordinator found it C on every node (vx_sync_cluster_collation).
  */
 static const char *
-df_string_compare_problem(DfCheckContext *cxt, const char *name, Oid collation)
+vx_string_compare_problem(VxCheckContext *cxt, const char *name, Oid collation)
 {
 	/* LIKE compares bytes too, and PostgreSQL rejects it otherwise */
 	bool		equality = strcmp(name, "=") == 0 || strcmp(name, "<>") == 0 ||
 		strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0;
 
-	if (!equality && collation == DEFAULT_COLLATION_OID && !df_cluster_collation_c)
+	if (!equality && collation == DEFAULT_COLLATION_OID && !vx_cluster_collation_c)
 		cxt->locale_dependent = true;
 	if (!OidIsValid(collation))
 		return "without a collation";
-	if (equality ? !get_collation_isdeterministic(collation) : !df_collate_is_c(collation))
+	if (equality ? !get_collation_isdeterministic(collation) : !vx_collate_is_c(collation))
 		return equality ? "under a nondeterministic collation" : "under a collation other than C";
 	return NULL;
 }
 
 /*
  * Why ordering strings under 'collation' by operator or min/max 'name'
- * stays on PostgreSQL, or NULL.  Beyond df_string_compare_problem: under a
+ * stays on PostgreSQL, or NULL.  Beyond vx_string_compare_problem: under a
  * deterministic libc collation of a language (CU2), DataFusion compares by
  * strcoll_l with the node's locale, as PostgreSQL there.  Sorts stay as
- * df_string_compare_problem has them.
+ * vx_string_compare_problem has them.
  */
 static const char *
-df_string_order_problem(DfCheckContext *cxt, const char *name, Oid collation)
+vx_string_order_problem(VxCheckContext *cxt, const char *name, Oid collation)
 {
 	if (strcmp(name, "<") != 0 && strcmp(name, "<=") != 0 && strcmp(name, ">") != 0 &&
 		strcmp(name, ">=") != 0 && strcmp(name, "min") != 0 && strcmp(name, "max") != 0)
-		return df_string_compare_problem(cxt, name, collation);
+		return vx_string_compare_problem(cxt, name, collation);
 	if (OidIsValid(collation) && GetDatabaseEncoding() == PG_UTF8 &&
-		df_collation_provider(collation) == COLLPROVIDER_LIBC &&
+		vx_collation_provider(collation) == COLLPROVIDER_LIBC &&
 		get_collation_isdeterministic(collation) &&
-		(df_engine_features() & VEC_F_COLLATE) != 0)
+		(vx_engine_features() & VEC_F_COLLATE) != 0)
 		return NULL;
-	return df_string_compare_problem(cxt, name, collation);
+	return vx_string_compare_problem(cxt, name, collation);
 }
 
-static const DfStringFunc df_string_funcs[] = {
-	{F_LENGTH_TEXT, "char_length", DF_COLL_ANY},
-	{F_CHAR_LENGTH_TEXT, "char_length", DF_COLL_ANY},
-	{F_CHARACTER_LENGTH_TEXT, "char_length", DF_COLL_ANY},
-	{F_OCTET_LENGTH_TEXT, "octet_length", DF_COLL_ANY},
-	{F_SUBSTR_TEXT_INT4_INT4, "substr", DF_COLL_ANY},
-	{F_SUBSTRING_TEXT_INT4_INT4, "substr", DF_COLL_ANY},
-	{F_SUBSTR_TEXT_INT4, "substr", DF_COLL_ANY},
-	{F_SUBSTRING_TEXT_INT4, "substr", DF_COLL_ANY},
-	{F_TEXTCAT, "textcat", DF_COLL_ANY},
-	{F_CONCAT, "concat", DF_COLL_ANY},
-	{F_BTRIM_TEXT_TEXT, "btrim", DF_COLL_ANY},
-	{F_BTRIM_TEXT, "btrim", DF_COLL_ANY},
-	{F_LTRIM_TEXT_TEXT, "ltrim", DF_COLL_ANY},
-	{F_LTRIM_TEXT, "ltrim", DF_COLL_ANY},
-	{F_RTRIM_TEXT_TEXT, "rtrim", DF_COLL_ANY},
-	{F_RTRIM_TEXT, "rtrim", DF_COLL_ANY},
-	{F_LEFT, "left", DF_COLL_ANY},
-	{F_RIGHT, "right", DF_COLL_ANY},
-	{F_REVERSE, "reverse", DF_COLL_ANY},
-	{F_REPEAT, "repeat", DF_COLL_ANY},
-	{F_LPAD_TEXT_INT4_TEXT, "lpad", DF_COLL_ANY},
-	{F_RPAD_TEXT_INT4_TEXT, "rpad", DF_COLL_ANY},
-	{F_STRPOS, "strpos", DF_COLL_DETERMINISTIC},
-	{F_POSITION_TEXT_TEXT, "strpos", DF_COLL_DETERMINISTIC},
-	{F_REPLACE, "replace", DF_COLL_DETERMINISTIC},
-	{F_SPLIT_PART, "split_part", DF_COLL_DETERMINISTIC},
-	{F_STARTS_WITH, "starts_with", DF_COLL_DETERMINISTIC},
-	{F_LOWER_TEXT, "lower", DF_COLL_CTYPE_C},
-	{F_UPPER_TEXT, "upper", DF_COLL_CTYPE_C},
+static const VxStringFunc vx_string_funcs[] = {
+	{F_LENGTH_TEXT, "char_length", VX_COLL_ANY},
+	{F_CHAR_LENGTH_TEXT, "char_length", VX_COLL_ANY},
+	{F_CHARACTER_LENGTH_TEXT, "char_length", VX_COLL_ANY},
+	{F_OCTET_LENGTH_TEXT, "octet_length", VX_COLL_ANY},
+	{F_SUBSTR_TEXT_INT4_INT4, "substr", VX_COLL_ANY},
+	{F_SUBSTRING_TEXT_INT4_INT4, "substr", VX_COLL_ANY},
+	{F_SUBSTR_TEXT_INT4, "substr", VX_COLL_ANY},
+	{F_SUBSTRING_TEXT_INT4, "substr", VX_COLL_ANY},
+	{F_TEXTCAT, "textcat", VX_COLL_ANY},
+	{F_CONCAT, "concat", VX_COLL_ANY},
+	{F_BTRIM_TEXT_TEXT, "btrim", VX_COLL_ANY},
+	{F_BTRIM_TEXT, "btrim", VX_COLL_ANY},
+	{F_LTRIM_TEXT_TEXT, "ltrim", VX_COLL_ANY},
+	{F_LTRIM_TEXT, "ltrim", VX_COLL_ANY},
+	{F_RTRIM_TEXT_TEXT, "rtrim", VX_COLL_ANY},
+	{F_RTRIM_TEXT, "rtrim", VX_COLL_ANY},
+	{F_LEFT, "left", VX_COLL_ANY},
+	{F_RIGHT, "right", VX_COLL_ANY},
+	{F_REVERSE, "reverse", VX_COLL_ANY},
+	{F_REPEAT, "repeat", VX_COLL_ANY},
+	{F_LPAD_TEXT_INT4_TEXT, "lpad", VX_COLL_ANY},
+	{F_RPAD_TEXT_INT4_TEXT, "rpad", VX_COLL_ANY},
+	{F_STRPOS, "strpos", VX_COLL_DETERMINISTIC},
+	{F_POSITION_TEXT_TEXT, "strpos", VX_COLL_DETERMINISTIC},
+	{F_REPLACE, "replace", VX_COLL_DETERMINISTIC},
+	{F_SPLIT_PART, "split_part", VX_COLL_DETERMINISTIC},
+	{F_STARTS_WITH, "starts_with", VX_COLL_DETERMINISTIC},
+	{F_LOWER_TEXT, "lower", VX_COLL_CTYPE_C},
+	{F_UPPER_TEXT, "upper", VX_COLL_CTYPE_C},
 };
 
 /*
@@ -717,7 +717,7 @@ static const DfStringFunc df_string_funcs[] = {
  * ("char_length" of that; "octet_length" of the padded value).
  */
 const char *
-df_bpchar_func(Oid funcid)
+vx_bpchar_func(Oid funcid)
 {
 	switch (funcid)
 	{
@@ -738,7 +738,7 @@ static const struct
 {
 	Oid			funcid;
 	const char *kind;
-}			df_casts[] =
+}			vx_casts[] =
 {
 	/* exact, or rounding as C converts */
 	{F_INT4_INT2, "widen"}, {F_INT8_INT2, "widen"}, {F_INT8_INT4, "widen"},
@@ -757,24 +757,24 @@ static const struct
 };
 
 const char *
-df_cast_kind(Oid funcid)
+vx_cast_kind(Oid funcid)
 {
 	int			i;
 
-	for (i = 0; i < lengthof(df_casts); i++)
-		if (df_casts[i].funcid == funcid)
-			return df_casts[i].kind;
+	for (i = 0; i < lengthof(vx_casts); i++)
+		if (vx_casts[i].funcid == funcid)
+			return vx_casts[i].kind;
 	return NULL;
 }
 
-const DfStringFunc *
-df_string_func(Oid funcid)
+const VxStringFunc *
+vx_string_func(Oid funcid)
 {
 	int			i;
 
-	for (i = 0; i < lengthof(df_string_funcs); i++)
-		if (df_string_funcs[i].funcid == funcid)
-			return &df_string_funcs[i];
+	for (i = 0; i < lengthof(vx_string_funcs); i++)
+		if (vx_string_funcs[i].funcid == funcid)
+			return &vx_string_funcs[i];
 	return NULL;
 }
 
@@ -784,24 +784,24 @@ df_string_func(Oid funcid)
  * node's LC_CTYPE, so such a verdict is marked as depending on the node.
  */
 static const char *
-df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation)
+vx_string_func_problem(VxCheckContext *cxt, const VxStringFunc *f, Oid collation)
 {
 	switch (f->rule)
 	{
-		case DF_COLL_ANY:
+		case VX_COLL_ANY:
 			return NULL;
-		case DF_COLL_DETERMINISTIC:
+		case VX_COLL_DETERMINISTIC:
 			if (!OidIsValid(collation) || !get_collation_isdeterministic(collation))
 				return "under a nondeterministic collation";
 			return NULL;
-		case DF_COLL_CTYPE_C:
+		case VX_COLL_CTYPE_C:
 			if (collation == DEFAULT_COLLATION_OID)
 				cxt->locale_dependent = true;
 			if (!OidIsValid(collation))
 				return "without a collation";
-			if (df_ctype_is_c(collation) ||
-				(collation == DEFAULT_COLLATION_OID && df_default_case_maps() &&
-				 (df_engine_features() & VEC_F_COLLATE) != 0))
+			if (vx_ctype_is_c(collation) ||
+				(collation == DEFAULT_COLLATION_OID && vx_default_case_maps() &&
+				 (vx_engine_features() & VEC_F_COLLATE) != 0))
 				return NULL;	/* ASCII under C, else the locale's maps (CM1) */
 			return "under a collation other than C";
 	}
@@ -816,7 +816,7 @@ df_string_func_problem(DfCheckContext *cxt, const DfStringFunc *f, Oid collation
  * for these fields.
  */
 const char *
-df_extract_field(FuncExpr *fe)
+vx_extract_field(FuncExpr *fe)
 {
 	static const char *const fields[] = {"year", "quarter", "month", "day",
 	"hour", "minute", NULL};
@@ -852,7 +852,7 @@ df_extract_field(FuncExpr *fe)
  * rescaling, casts and sums would take it for a number.
  */
 static bool
-df_numeric_may_be_infinite(Plan *ctx, Node *expr)
+vx_numeric_may_be_infinite(Plan *ctx, Node *expr)
 {
 	ListCell   *lc;
 
@@ -865,8 +865,8 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *top;
 				Node	   *value;
 
-				return !df_subplan_value(expr, &top, &value) ||
-					df_numeric_may_be_infinite(top, value);
+				return !vx_subplan_value(expr, &top, &value) ||
+					vx_numeric_may_be_infinite(top, value);
 			}
 		case T_Param:
 			{
@@ -874,8 +874,8 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *top;
 				Node	   *value;
 
-				return !df_init_param_value(expr, &top, &value) ||
-					df_numeric_may_be_infinite(top, value);
+				return !vx_init_param_value(expr, &top, &value) ||
+					vx_numeric_may_be_infinite(top, value);
 			}
 		case T_Var:
 			{
@@ -883,14 +883,14 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				Plan	   *child;
 				TargetEntry *tle;
 
-				if (df_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
+				if (vx_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
 				{
 					/* UA1: any input's */
-					foreach(lc, df_append_plans(ctx))
+					foreach(lc, vx_append_plans(ctx))
 					{
 						child = lfirst(lc);
 						tle = get_tle_by_resno(child->targetlist, var->varattno);
-						if (tle == NULL || df_numeric_may_be_infinite(child, (Node *) tle->expr))
+						if (tle == NULL || vx_numeric_may_be_infinite(child, (Node *) tle->expr))
 							return true;
 					}
 					return false;
@@ -902,29 +902,29 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 				else
 					return false;
 				tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-				return tle != NULL && df_numeric_may_be_infinite(child, (Node *) tle->expr);
+				return tle != NULL && vx_numeric_may_be_infinite(child, (Node *) tle->expr);
 			}
 		case T_FuncExpr:
 			{
-				const char *f = df_extract_field((FuncExpr *) expr);
+				const char *f = vx_extract_field((FuncExpr *) expr);
 
 				return f != NULL && strcmp(f, "year") == 0;
 			}
 		case T_CaseExpr:
 			foreach(lc, ((CaseExpr *) expr)->args)
-				if (df_numeric_may_be_infinite(ctx, (Node *) lfirst_node(CaseWhen, lc)->result))
+				if (vx_numeric_may_be_infinite(ctx, (Node *) lfirst_node(CaseWhen, lc)->result))
 					return true;
-			return df_numeric_may_be_infinite(ctx, (Node *) ((CaseExpr *) expr)->defresult);
+			return vx_numeric_may_be_infinite(ctx, (Node *) ((CaseExpr *) expr)->defresult);
 		case T_CoalesceExpr:
 			foreach(lc, ((CoalesceExpr *) expr)->args)
-				if (df_numeric_may_be_infinite(ctx, lfirst(lc)))
+				if (vx_numeric_may_be_infinite(ctx, lfirst(lc)))
 					return true;
 			return false;
 		case T_NullIfExpr:
-			return df_numeric_may_be_infinite(ctx, linitial(((NullIfExpr *) expr)->args));
+			return vx_numeric_may_be_infinite(ctx, linitial(((NullIfExpr *) expr)->args));
 		case T_WindowFunc:
 			return ((WindowFunc *) expr)->winagg &&
-				df_numeric_may_be_infinite(ctx, (Node *) df_window_aggref((WindowFunc *) expr));
+				vx_numeric_may_be_infinite(ctx, (Node *) vx_window_aggref((WindowFunc *) expr));
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) expr;
@@ -932,7 +932,7 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
 
 				return name != NULL && list_length(agg->args) == 1 &&
 					(strcmp(name, "min") == 0 || strcmp(name, "max") == 0) &&
-					df_numeric_may_be_infinite(ctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
+					vx_numeric_may_be_infinite(ctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
 			}
 		default:
 			return false;
@@ -944,33 +944,33 @@ df_numeric_may_be_infinite(Plan *ctx, Node *expr)
  * that may be infinite (DT2)?
  */
 static bool
-df_rescales_infinity(Plan *ctx, Node *l, Node *r)
+vx_rescales_infinity(Plan *ctx, Node *l, Node *r)
 {
 	int			lp,
 				ls,
 				rp,
 				rs;
 
-	if (!df_numeric_ps(ctx, l, &lp, &ls) || !df_numeric_ps(ctx, r, &rp, &rs))
+	if (!vx_numeric_ps(ctx, l, &lp, &ls) || !vx_numeric_ps(ctx, r, &rp, &rs))
 		return false;
-	return (ls < rs && df_numeric_may_be_infinite(ctx, l)) ||
-		(rs < ls && df_numeric_may_be_infinite(ctx, r));
+	return (ls < rs && vx_numeric_may_be_infinite(ctx, l)) ||
+		(rs < ls && vx_numeric_may_be_infinite(ctx, r));
 }
 
 /*
  * Is numeric 'expr' of plan node 'ctx' a CASE or COALESCE whose results
  * have scales of their own, not all the same (MS1)?  Each row's value then
  * has the display scale of its branch.  Since DN1, any expression whose
- * values have display scales of their own (df_numeric_dyn).  Sets the
+ * values have display scales of their own (vx_numeric_dyn).  Sets the
  * largest scale and the precision at it.
  */
 bool
-df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale)
+vx_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale)
 {
 	/* DN1: or any expression whose values have display scales of their own */
 	return expr != NULL && exprType(expr) == NUMERICOID &&
-		df_numeric_dyn(ctx, expr, precision, scale) &&
-		!df_numeric_may_be_infinite(ctx, expr);
+		vx_numeric_dyn(ctx, expr, precision, scale) &&
+		!vx_numeric_may_be_infinite(ctx, expr);
 }
 
 /*
@@ -980,7 +980,7 @@ df_numeric_mixed(Plan *ctx, Node *expr, int *precision, int *scale)
  * keeps beside the sum.
  */
 static bool
-df_sum_mixed(Plan *ctx, Aggref *agg)
+vx_sum_mixed(Plan *ctx, Aggref *agg)
 {
 	char	   *name = get_func_name(agg->aggfnoid);
 	Node	   *arg;
@@ -994,15 +994,15 @@ df_sum_mixed(Plan *ctx, Aggref *agg)
 	{
 		/* the partial sum, through the Motion and any Sort between (CS2) */
 		Plan	   *child = ctx;
-		Aggref	   *partial = df_partial_path(&child, arg, NULL, NULL);
+		Aggref	   *partial = vx_partial_path(&child, arg, NULL, NULL);
 
-		return partial != NULL && df_sum_mixed(child, partial);
+		return partial != NULL && vx_sum_mixed(child, partial);
 	}
 	{
 		int			p,
 					s;
 
-		return df_numeric_mixed(ctx, arg, &p, &s);
+		return vx_numeric_mixed(ctx, arg, &p, &s);
 	}
 }
 
@@ -1011,7 +1011,7 @@ df_sum_mixed(Plan *ctx, Aggref *agg)
  * to through the nodes below: the largest of its argument's branches.
  */
 bool
-df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale)
+vx_mixed_sum_scale(Plan *ctx, Node *expr, int *scale)
 {
 	int			p;
 
@@ -1030,25 +1030,25 @@ df_mixed_sum_scale(Plan *ctx, Node *expr, int *scale)
 		ctx = child;
 		expr = (Node *) tle->expr;
 	}
-	if (!IsA(expr, Aggref) || df_agg_state_at(ctx, (Aggref *) expr) != DF_AGG_SUM_NUMERIC_MIXED)
+	if (!IsA(expr, Aggref) || vx_agg_state_at(ctx, (Aggref *) expr) != VX_AGG_SUM_NUMERIC_MIXED)
 		return false;
 	if (((Aggref *) expr)->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 		/* its argument is the partial sum below */
-		return df_mixed_sum_scale(ctx, (Node *) linitial_node(TargetEntry,
+		return vx_mixed_sum_scale(ctx, (Node *) linitial_node(TargetEntry,
 															  ((Aggref *) expr)->args)->expr,
 								  scale);
-	return df_numeric_mixed(ctx, (Node *) linitial_node(TargetEntry, ((Aggref *) expr)->args)->expr,
+	return vx_numeric_mixed(ctx, (Node *) linitial_node(TargetEntry, ((Aggref *) expr)->args)->expr,
 							&p, scale);
 }
 
-/* df_agg_state of 'agg' of Agg node 'ctx', telling apart MS1's sums. */
-DfAggState
-df_agg_state_at(Plan *ctx, Aggref *agg)
+/* vx_agg_state of 'agg' of Agg node 'ctx', telling apart MS1's sums. */
+VxAggState
+vx_agg_state_at(Plan *ctx, Aggref *agg)
 {
-	DfAggState	state = df_agg_state(agg);
+	VxAggState	state = vx_agg_state(agg);
 
-	if (state == DF_AGG_SUM_NUMERIC && df_sum_mixed(ctx, agg))
-		return DF_AGG_SUM_NUMERIC_MIXED;
+	if (state == VX_AGG_SUM_NUMERIC && vx_sum_mixed(ctx, agg))
+		return VX_AGG_SUM_NUMERIC_MIXED;
 	return state;
 }
 
@@ -1059,7 +1059,7 @@ df_agg_state_at(Plan *ctx, Aggref *agg)
  * rounded to that side's scale when the slice starts.
  */
 bool
-df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
+vx_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
 {
 	static const char *const cmps[] = {"<", "<=", ">", ">=", "=", "<>", NULL};
 	Node	   *l,
@@ -1070,7 +1070,7 @@ df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
 				s;
 
 	if (list_length(op->args) != 2 || op->opresulttype != BOOLOID ||
-		(name = get_opname(op->opno)) == NULL || !df_name_in(name, cmps))
+		(name = get_opname(op->opno)) == NULL || !vx_name_in(name, cmps))
 		return false;
 	l = linitial(op->args);
 	r = lsecond(op->args);
@@ -1079,8 +1079,8 @@ df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
 		((Param *) (IsA(l, Param) ? l : r))->paramkind != PARAM_EXEC)
 		return false;
 	x = IsA(l, Param) ? r : l;
-	if (!df_numeric_ps(ctx, x, &p, &s) || p > DF_NUMERIC_MAX_PRECISION ||
-		df_numeric_may_be_infinite(ctx, x))
+	if (!vx_numeric_ps(ctx, x, &p, &s) || p > VX_NUMERIC_MAX_PRECISION ||
+		vx_numeric_may_be_infinite(ctx, x))
 		return false;
 	if (other)
 		*other = x;
@@ -1095,9 +1095,9 @@ df_numeric_param_cmp(Plan *ctx, OpExpr *op, Node **other, bool *param_left)
  * or NULL; *ctx becomes its Agg.
  */
 static Aggref *
-df_partial_below(Plan **ctx, Node *arg)
+vx_partial_below(Plan **ctx, Node *arg)
 {
-	return df_partial_path(ctx, arg, NULL, NULL);
+	return vx_partial_path(ctx, arg, NULL, NULL);
 }
 
 /*
@@ -1111,7 +1111,7 @@ df_partial_below(Plan **ctx, Node *arg)
  * its column, or NULL.
  */
 Aggref *
-df_partial_path(Plan **ctx, Node *arg, Motion **motion, AttrNumber *resno)
+vx_partial_path(Plan **ctx, Node *arg, Motion **motion, AttrNumber *resno)
 {
 	Plan	   *cur = *ctx;
 	Motion	   *crossed = NULL;
@@ -1162,23 +1162,23 @@ df_partial_path(Plan **ctx, Node *arg, Motion **motion, AttrNumber *resno)
 }
 
 /*
- * The statement whose plan df_numeric_ps follows references through: set
+ * The statement whose plan vx_numeric_ps follows references through: set
  * while a slice is checked or translated, for the producer of a Shared
  * Scan, which may be anywhere in the plan.
  */
-PlannedStmt *df_numeric_stmt = NULL;
+PlannedStmt *vx_numeric_stmt = NULL;
 
-typedef struct DfShareFind
+typedef struct VxShareFind
 {
 	plan_tree_base_prefix base; /* for plan_tree_walker */
 	int			share_id;
 	Plan	   *producer;
-} DfShareFind;
+} VxShareFind;
 
 static bool
-df_share_find_walker(Node *node, void *context)
+vx_share_find_walker(Node *node, void *context)
 {
-	DfShareFind *find = (DfShareFind *) context;
+	VxShareFind *find = (VxShareFind *) context;
 
 	if (node == NULL || find->producer != NULL)
 		return find->producer != NULL;
@@ -1188,35 +1188,35 @@ df_share_find_walker(Node *node, void *context)
 		find->producer = (Plan *) node;
 		return true;
 	}
-	return plan_tree_walker(node, df_share_find_walker, context, true);
+	return plan_tree_walker(node, vx_share_find_walker, context, true);
 }
 
 /* The Shared Scan that produces what 'consumer' reads, or NULL. */
 static Plan *
-df_share_producer(ShareInputScan *consumer)
+vx_share_producer(ShareInputScan *consumer)
 {
-	DfShareFind find;
+	VxShareFind find;
 
-	if (df_numeric_stmt == NULL)
+	if (vx_numeric_stmt == NULL)
 		return NULL;
-	exec_init_plan_tree_base(&find.base, df_numeric_stmt);
+	exec_init_plan_tree_base(&find.base, vx_numeric_stmt);
 	find.share_id = consumer->share_id;
 	find.producer = NULL;
-	(void) df_share_find_walker((Node *) df_numeric_stmt->planTree, &find);
+	(void) vx_share_find_walker((Node *) vx_numeric_stmt->planTree, &find);
 	return find.producer;
 }
 
-typedef struct DfConsumerFind
+typedef struct VxConsumerFind
 {
 	plan_tree_base_prefix base; /* for plan_tree_walker */
 	Plan	   *top;
 	Plan	   *consumer;
-} DfConsumerFind;
+} VxConsumerFind;
 
 static bool
-df_consumer_walker(Node *node, void *context)
+vx_consumer_walker(Node *node, void *context)
 {
-	DfConsumerFind *find = (DfConsumerFind *) context;
+	VxConsumerFind *find = (VxConsumerFind *) context;
 
 	if (node == NULL || find->consumer != NULL)
 		return find->consumer != NULL;
@@ -1232,7 +1232,7 @@ df_consumer_walker(Node *node, void *context)
 			return true;
 		}
 	}
-	return plan_tree_walker(node, df_consumer_walker, context, true);
+	return plan_tree_walker(node, vx_consumer_walker, context, true);
 }
 
 /*
@@ -1240,16 +1240,16 @@ df_consumer_walker(Node *node, void *context)
  * Motion (and a Sort), or NULL.
  */
 Agg *
-df_motion_consumer_agg(Plan *top)
+vx_motion_consumer_agg(Plan *top)
 {
-	DfConsumerFind find;
+	VxConsumerFind find;
 
-	if (df_numeric_stmt == NULL)
+	if (vx_numeric_stmt == NULL)
 		return NULL;
-	exec_init_plan_tree_base(&find.base, df_numeric_stmt);
+	exec_init_plan_tree_base(&find.base, vx_numeric_stmt);
 	find.top = top;
 	find.consumer = NULL;
-	(void) df_consumer_walker((Node *) df_numeric_stmt->planTree, &find);
+	(void) vx_consumer_walker((Node *) vx_numeric_stmt->planTree, &find);
 	return (Agg *) find.consumer;
 }
 
@@ -1261,7 +1261,7 @@ df_motion_consumer_agg(Plan *top)
  * as are inputs of such values.
  */
 static bool
-df_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scale, bool *dyn)
+vx_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scale, bool *dyn)
 {
 	ListCell   *lc;
 	bool		found = false;
@@ -1276,7 +1276,7 @@ df_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scal
 					s;
 		bool		cdyn;
 
-		if (tle == NULL || !df_numeric_range(child, (Node *) tle->expr, &p, &s, &cdyn))
+		if (tle == NULL || !vx_numeric_range(child, (Node *) tle->expr, &p, &s, &cdyn))
 			return false;
 		if (cdyn || (found && s != *scale))
 			*dyn = true;
@@ -1285,7 +1285,7 @@ df_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scal
 		found = true;
 	}
 	*precision = digits + *scale;
-	return found && *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+	return found && *precision <= VX_NUMERIC_MAX_EXPR_PRECISION;
 }
 
 /*
@@ -1295,7 +1295,7 @@ df_numeric_append_range(List *plans, AttrNumber attno, int *precision, int *scal
  * a sum may take.
  */
 static bool
-df_pg_partial_readable(Plan *ctx, Aggref *agg)
+vx_pg_partial_readable(Plan *ctx, Aggref *agg)
 {
 	Plan	   *pctx = ctx;
 	Aggref	   *partial;
@@ -1305,14 +1305,14 @@ df_pg_partial_readable(Plan *ctx, Aggref *agg)
 
 	if (list_length(agg->args) != 1)
 		return false;
-	partial = df_partial_below(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
+	partial = vx_partial_below(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr);
 	if (partial == NULL || list_length(partial->args) != 1)
 		return false;
 	arg = (Node *) linitial_node(TargetEntry, partial->args)->expr;
 	if (exprType(arg) != NUMERICOID)
 		return true;
-	return df_numeric_ps(pctx, arg, &p, &s) && p <= DF_NUMERIC_MAX_SUM_PRECISION &&
-		!df_numeric_may_be_infinite(pctx, arg);
+	return vx_numeric_ps(pctx, arg, &p, &s) && p <= VX_NUMERIC_MAX_SUM_PRECISION &&
+		!vx_numeric_may_be_infinite(pctx, arg);
 }
 
 /*
@@ -1322,7 +1322,7 @@ df_pg_partial_readable(Plan *ctx, Aggref *agg)
  * rows no other group has.
  */
 static bool
-df_sums_groups(Plan *ctx, Node *expr)
+vx_sums_groups(Plan *ctx, Node *expr)
 {
 	for (;;)
 	{
@@ -1367,7 +1367,7 @@ df_sums_groups(Plan *ctx, Node *expr)
  * once.
  */
 static bool
-df_case_value_once_ok(CaseExpr *ce)
+vx_case_value_once_ok(CaseExpr *ce)
 {
 	return !contain_volatile_functions((Node *) ce->arg) &&
 		!contain_subplans((Node *) ce->arg);
@@ -1382,7 +1382,7 @@ df_case_value_once_ok(CaseExpr *ce)
  * they are.  Any other CASE as it is.
  */
 static Node *
-df_case_value_mutator(Node *node, Node *arg)
+vx_case_value_mutator(Node *node, Node *arg)
 {
 	if (node == NULL)
 		return NULL;
@@ -1392,20 +1392,20 @@ df_case_value_mutator(Node *node, Node *arg)
 	{
 		CaseExpr   *c = copyObject((CaseExpr *) node);
 
-		c->arg = (Expr *) df_case_value_mutator((Node *) c->arg, arg);
+		c->arg = (Expr *) vx_case_value_mutator((Node *) c->arg, arg);
 		return (Node *) c;
 	}
-	return expression_tree_mutator(node, df_case_value_mutator, arg);
+	return expression_tree_mutator(node, vx_case_value_mutator, arg);
 }
 
 CaseExpr *
-df_case_searched(CaseExpr *ce)
+vx_case_searched(CaseExpr *ce)
 {
 	CaseExpr   *s;
 	ListCell   *lc;
 
 	if (ce->arg == NULL || exprType((Node *) ce->arg) != NUMERICOID ||
-		!df_case_value_once_ok(ce))
+		!vx_case_value_once_ok(ce))
 		return ce;
 	s = makeNode(CaseExpr);
 	*s = *ce;
@@ -1417,7 +1417,7 @@ df_case_searched(CaseExpr *ce)
 		CaseWhen   *n = makeNode(CaseWhen);
 
 		*n = *w;
-		n->expr = (Expr *) df_case_value_mutator((Node *) w->expr, (Node *) ce->arg);
+		n->expr = (Expr *) vx_case_value_mutator((Node *) w->expr, (Node *) ce->arg);
 		s->args = lappend(s->args, n);
 	}
 	return s;
@@ -1425,25 +1425,25 @@ df_case_searched(CaseExpr *ce)
 
 /* a / b rounded down, b > 0 */
 static int
-df_floor_div(int a, int b)
+vx_floor_div(int a, int b)
 {
 	return a >= 0 ? a / b : -((-a + b - 1) / b);
 }
 
-static bool df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale,
+static bool vx_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale,
 								  bool *dyn, int *least);
 
 /*
- * QM1: df_numeric_range, and the least magnitude of its nonzero values,
+ * QM1: vx_numeric_range, and the least magnitude of its nonzero values,
  * at least 10^-least: for a value of display scale d, 10^-d, unless the
  * expression bounds it closer to 1 (an avg, a standard deviation), so
  * that a quotient by it is bound closer.  0 <= least <= scale.
  */
 static bool
-df_numeric_range_f(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn, int *least)
+vx_numeric_range_f(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn, int *least)
 {
 	*least = -1;
-	if (!df_numeric_range_body(ctx, expr, precision, scale, dyn, least))
+	if (!vx_numeric_range_body(ctx, expr, precision, scale, dyn, least))
 		return false;
 	if (*least < 0 || *least > *scale)
 		*least = *scale;
@@ -1451,11 +1451,11 @@ df_numeric_range_f(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn,
 }
 
 bool
-df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
+vx_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
 {
 	int			least;
 
-	return df_numeric_range_f(ctx, expr, precision, scale, dyn, &least);
+	return vx_numeric_range_f(ctx, expr, precision, scale, dyn, &least);
 }
 
 /*
@@ -1467,7 +1467,7 @@ df_numeric_range(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn)
  * as such a sum.  Anything else (an avg's result, arithmetic) has none.
  */
 static bool
-df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn,
+vx_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *dyn,
 					  int *least)
 {
 	*dyn = false;
@@ -1481,8 +1481,8 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				Plan	   *top;
 				Node	   *value;
 
-				return df_subplan_value(expr, &top, &value) &&
-					df_numeric_range_f(top, value, precision, scale, dyn, least);
+				return vx_subplan_value(expr, &top, &value) &&
+					vx_numeric_range_f(top, value, precision, scale, dyn, least);
 			}
 		case T_Param:
 			{
@@ -1490,8 +1490,8 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				Plan	   *top;
 				Node	   *value;
 
-				return df_init_param_value(expr, &top, &value) &&
-					df_numeric_range_f(top, value, precision, scale, dyn, least);
+				return vx_init_param_value(expr, &top, &value) &&
+					vx_numeric_range_f(top, value, precision, scale, dyn, least);
 			}
 		case T_Var:
 			{
@@ -1509,7 +1509,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					Plan	   *sub = ((SubqueryScan *) ctx)->subplan;
 
 					tle = get_tle_by_resno(sub->targetlist, var->varattno);
-					return tle != NULL && df_numeric_range_f(sub, (Node *) tle->expr, precision, scale, dyn, least);
+					return tle != NULL && vx_numeric_range_f(sub, (Node *) tle->expr, precision, scale, dyn, least);
 				}
 				if (IsA(ctx, ShareInputScan))
 				{
@@ -1521,30 +1521,30 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					 * the type modifier).
 					 */
 					Plan	   *producer = outerPlan(ctx) ? ctx :
-						df_share_producer((ShareInputScan *) ctx);
+						vx_share_producer((ShareInputScan *) ctx);
 
 					child = producer ? outerPlan(producer) : NULL;
 					tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-					return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
+					return tle != NULL && vx_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 				}
-				if (var->varno == OUTER_VAR && df_append_plans(ctx) != NIL)
-					return df_numeric_append_range(df_append_plans(ctx), var->varattno,
+				if (var->varno == OUTER_VAR && vx_append_plans(ctx) != NIL)
+					return vx_numeric_append_range(vx_append_plans(ctx), var->varattno,
 												   precision, scale, dyn);
 				if (var->varno == OUTER_VAR && IsA(ctx, Sequence))
 				{
 					/* GPORCA's Sequence returns its last input's rows */
 					child = llast(((Sequence *) ctx)->subplans);
 					tle = get_tle_by_resno(child->targetlist, var->varattno);
-					return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
+					return tle != NULL && vx_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 				}
 				if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 					return var->vartype == NUMERICOID &&
-						df_numeric_typmod(var->vartypmod, precision, scale);
+						vx_numeric_typmod(var->vartypmod, precision, scale);
 				child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
 				if (child == NULL)
 					return false;
 				tle = get_tle_by_resno(child->targetlist, var->varattno);
-				return tle != NULL && df_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
+				return tle != NULL && vx_numeric_range_f(child, (Node *) tle->expr, precision, scale, dyn, least);
 			}
 		case T_Const:
 			if (((Const *) expr)->consttype != NUMERICOID)
@@ -1555,7 +1555,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				*scale = 0;
 				return true;
 			}
-			return df_numeric_const_ps(((Const *) expr)->constvalue, precision, scale);
+			return vx_numeric_const_ps(((Const *) expr)->constvalue, precision, scale);
 		case T_OpExpr:
 			{
 				/* numeric + - * (N3): the result scale and digits of numeric.c */
@@ -1574,8 +1574,8 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					name == NULL || op->opno >= FirstGenbkiObjectId ||
 					exprType(linitial(op->args)) != NUMERICOID ||
 					exprType(lsecond(op->args)) != NUMERICOID ||
-					!df_numeric_range_f(ctx, linitial(op->args), &lp, &ls, &ldyn, &lf) ||
-					!df_numeric_range_f(ctx, lsecond(op->args), &rp, &rs, &rdyn, &rf))
+					!vx_numeric_range_f(ctx, linitial(op->args), &lp, &ls, &ldyn, &lf) ||
+					!vx_numeric_range_f(ctx, lsecond(op->args), &rp, &rs, &rdyn, &rf))
 					return false;
 				*dyn = ldyn || rdyn;
 				if (strcmp(name, "+") == 0 || strcmp(name, "-") == 0)
@@ -1615,7 +1615,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					 * 10^(rp - rs).  pgnum::pg_div scales the operands in
 					 * arbitrary precision where Decimal256 cannot.
 					 */
-					int			qweight = df_floor_div(-lf, 4) - df_floor_div(rp - rs - 1, 4) - 1;
+					int			qweight = vx_floor_div(-lf, 4) - vx_floor_div(rp - rs - 1, 4) - 1;
 
 					*scale = Min(Max(16 - 4 * qweight, Max(ls, rs)), 1000);
 					*precision = (lp - ls) + rf + *scale;
@@ -1624,7 +1624,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				}
 				else
 					return false;	/* %: not done */
-				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+				return *precision <= VX_NUMERIC_MAX_EXPR_PRECISION;
 			}
 		case T_CaseExpr:
 		case T_CoalesceExpr:
@@ -1661,7 +1661,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 
 					if (IsA(e, Const) && ((Const *) e)->constisnull)
 						continue;
-					if (!df_numeric_range_f(ctx, e, &p, &s, &edyn, &f))
+					if (!vx_numeric_range_f(ctx, e, &p, &s, &edyn, &f))
 						return false;
 					*least = Max(*least, f);
 					if (edyn || (found && s != *scale))
@@ -1671,10 +1671,10 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					found = true;
 				}
 				*precision = digits + *scale;
-				return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+				return *precision <= VX_NUMERIC_MAX_EXPR_PRECISION;
 			}
 		case T_NullIfExpr:
-			return df_numeric_range_f(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn,
+			return vx_numeric_range_f(ctx, linitial(((NullIfExpr *) expr)->args), precision, scale, dyn,
 									  least);
 		case T_RelabelType:
 			{
@@ -1687,7 +1687,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				Node	   *arg = (Node *) ((RelabelType *) expr)->arg;
 
 				return exprType(expr) == NUMERICOID && exprType(arg) == NUMERICOID &&
-					df_numeric_ps(ctx, arg, precision, scale);
+					vx_numeric_ps(ctx, arg, precision, scale);
 			}
 		case T_FuncExpr:
 			{
@@ -1695,10 +1695,10 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 
 				/* integers made numeric, scale 0 */
 				*scale = 0;
-				if (df_extract_field(fe) != NULL)
+				if (vx_extract_field(fe) != NULL)
 				{
 					/* DT2: years run from -4714 to 5874897 */
-					*precision = strcmp(df_extract_field(fe), "year") == 0 ? 7 : 2;
+					*precision = strcmp(vx_extract_field(fe), "year") == 0 ? 7 : 2;
 					return true;
 				}
 				switch (fe->funcid)
@@ -1715,7 +1715,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					case F_ABS_NUMERIC:
 					case F_NUMERIC_ABS:
 						/* numeric_abs keeps the digits and display scale */
-						return df_numeric_range_f(ctx, linitial(fe->args), precision, scale, dyn, least);
+						return vx_numeric_range_f(ctx, linitial(fe->args), precision, scale, dyn, least);
 					case F_ROUND_NUMERIC:
 					case F_ROUND_NUMERIC_INT4:
 						{
@@ -1724,17 +1724,17 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 							 * display scale; a digit more where rounding up
 							 * carries
 							 */
-							int			to = df_round_scale(fe);
+							int			to = vx_round_scale(fe);
 							int			ap,
 										as;
 							bool		adyn;
 
 							if (to < 0 ||
-								!df_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn))
+								!vx_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn))
 								return false;
 							*scale = to;
 							*precision = ap - as + 1 + to;
-							return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+							return *precision <= VX_NUMERIC_MAX_EXPR_PRECISION;
 						}
 					case F_NUMERIC_NUMERIC_INT4:
 						{
@@ -1745,8 +1745,8 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 							bool		adyn;
 
 							return IsA(tm, Const) && !((Const *) tm)->constisnull &&
-								df_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn) &&
-								df_numeric_typmod(DatumGetInt32(((Const *) tm)->constvalue),
+								vx_numeric_range(ctx, linitial(fe->args), &ap, &as, &adyn) &&
+								vx_numeric_typmod(DatumGetInt32(((Const *) tm)->constvalue),
 												  precision, scale);
 						}
 					default:
@@ -1764,10 +1764,10 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				 * rows at most once: within the digits of a sum of those.
 				 */
 				if (wf->winagg && name != NULL && strcmp(name, "sum") == 0 &&
-					list_length(wf->args) == 1 && df_sums_groups(ctx, linitial(wf->args)))
-					return df_numeric_range_f(ctx, linitial(wf->args), precision, scale, dyn, least);
+					list_length(wf->args) == 1 && vx_sums_groups(ctx, linitial(wf->args)))
+					return vx_numeric_range_f(ctx, linitial(wf->args), precision, scale, dyn, least);
 				return wf->winagg &&
-					df_numeric_range_f(ctx, (Node *) df_window_aggref(wf), precision, scale, dyn,
+					vx_numeric_range_f(ctx, (Node *) vx_window_aggref(wf), precision, scale, dyn,
 									   least);
 			}
 		case T_Aggref:
@@ -1784,7 +1784,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					list_length(agg->args) != 1)
 					return false;
 				arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
-				if (df_stddev_agg(agg, NULL, &variance))
+				if (vx_stddev_agg(agg, NULL, &variance))
 				{
 					/*
 					 * STD1: a variance of int4 values is at most range^2 / 2
@@ -1798,8 +1798,8 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					 * 10^-20 for n < 2^63, and a standard deviation above
 					 * 10^-10.
 					 */
-					*precision = (variance ? 19 : 10) + DF_STDDEV_MAX_SCALE;
-					*scale = DF_STDDEV_MAX_SCALE;
+					*precision = (variance ? 19 : 10) + VX_STDDEV_MAX_SCALE;
+					*scale = VX_STDDEV_MAX_SCALE;
 					*least = variance ? 20 : 10;
 					*dyn = true;
 					return true;
@@ -1808,7 +1808,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
 					/* the argument is the partial result below, of the same scale */
-					if (!df_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
+					if (!vx_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
 						return false;
 				}
 				else if (exprType(arg) == INT8OID && strcmp(name, "sum") == 0)
@@ -1821,7 +1821,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 						return false;
 					p = 19, s = 0, f = 0;
 				}
-				else if (!df_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
+				else if (!vx_numeric_range_f(ctx, arg, &p, &s, dyn, &f))
 					return false;
 				if (strcmp(name, "min") == 0 || strcmp(name, "max") == 0)
 				{
@@ -1838,7 +1838,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					 * digits; a combining sum's argument, the partial sum,
 					 * has them already.
 					 */
-					*precision = Min(DF_NUMERIC_MAX_PRECISION,
+					*precision = Min(VX_NUMERIC_MAX_PRECISION,
 									 agg->aggsplit == AGGSPLIT_FINAL_DESERIAL ? p : p + 19);
 					*scale = s;
 					return true;
@@ -1849,7 +1849,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 				{
 					/*
 					 * AVG1: within the values' integer digits, at the largest
-					 * scale numeric_avg may give it (df_avg_scale).  Those of
+					 * scale numeric_avg may give it (vx_avg_scale).  Those of
 					 * a combining one are its partial avg's argument's.
 					 */
 					int			digits = p - s;
@@ -1860,20 +1860,20 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 					{
 						Plan	   *pctx = ctx;
-						Aggref	   *partial = df_partial_below(&pctx, arg);
+						Aggref	   *partial = vx_partial_below(&pctx, arg);
 						Node	   *parg = partial ? (Node *) linitial_node(TargetEntry, partial->args)->expr : NULL;
 						int			pp,
 									ps;
 
 						if (parg != NULL && exprType(parg) == NUMERICOID &&
-							df_numeric_ps(pctx, parg, &pp, &ps))
+							vx_numeric_ps(pctx, parg, &pp, &ps))
 							digits = pp - ps;
 						else if (parg != NULL)
 							digits = exprType(parg) == INT2OID ? 5 :
 								exprType(parg) == INT4OID ? 10 :
 								exprType(parg) == INT8OID ? 19 : digits;
 					}
-					*scale = df_avg_scale(s);
+					*scale = vx_avg_scale(s);
 					*precision = digits + *scale;
 					/*
 					 * QM1: a nonzero sum is at least 10^-s, over fewer than
@@ -1881,7 +1881,7 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 					 * 16 digits keep
 					 */
 					*least = s + 19;
-					return *precision <= DF_NUMERIC_MAX_EXPR_PRECISION;
+					return *precision <= VX_NUMERIC_MAX_EXPR_PRECISION;
 				}
 				return false;
 			}
@@ -1891,19 +1891,19 @@ df_numeric_range_body(Plan *ctx, Node *expr, int *precision, int *scale, bool *d
 }
 
 
-/* df_numeric_range of an expression of one scale (not DN1's). */
+/* vx_numeric_range of an expression of one scale (not DN1's). */
 bool
-df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
+vx_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
 {
 	bool		dyn;
 
-	return df_numeric_range(ctx, expr, precision, scale, &dyn) && !dyn;
+	return vx_numeric_range(ctx, expr, precision, scale, &dyn) && !dyn;
 }
 
 /*
  * Is character 'expr' of plan node 'ctx' a column of a table's
  * character(n), found through the references of the nodes above it (as
- * df_numeric_range follows them), so that every value is padded to n and
+ * vx_numeric_range follows them), so that every value is padded to n and
  * equal values look alike as they are?  An Append needs it of all its
  * inputs, with one n.  A type modifier on a reference does not tell:
  * GPORCA gives an Append of character(5) and character(10) the first.
@@ -1911,7 +1911,7 @@ df_numeric_ps(Plan *ctx, Node *expr, int *precision, int *scale)
  * padded.
  */
 int
-df_bpchar_length(Plan *ctx, Node *expr)
+vx_bpchar_length(Plan *ctx, Node *expr)
 {
 	Var		   *var;
 	Plan	   *child;
@@ -1924,29 +1924,29 @@ df_bpchar_length(Plan *ctx, Node *expr)
 	{
 		child = ((SubqueryScan *) ctx)->subplan;
 		tle = get_tle_by_resno(child->targetlist, var->varattno);
-		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+		return tle ? vx_bpchar_length(child, (Node *) tle->expr) : -1;
 	}
 	if (IsA(ctx, ShareInputScan))
 	{
 		Plan	   *producer = outerPlan(ctx) ? ctx :
-			df_share_producer((ShareInputScan *) ctx);
+			vx_share_producer((ShareInputScan *) ctx);
 
 		child = producer ? outerPlan(producer) : NULL;
 		tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+		return tle ? vx_bpchar_length(child, (Node *) tle->expr) : -1;
 	}
-	if (var->varno == OUTER_VAR && df_append_plans(ctx) != NIL)
+	if (var->varno == OUTER_VAR && vx_append_plans(ctx) != NIL)
 	{
 		ListCell   *lc;
 		int			n = -1;
 
-		foreach(lc, df_append_plans(ctx))
+		foreach(lc, vx_append_plans(ctx))
 		{
 			int			cn;
 
 			child = lfirst(lc);
 			tle = get_tle_by_resno(child->targetlist, var->varattno);
-			cn = tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+			cn = tle ? vx_bpchar_length(child, (Node *) tle->expr) : -1;
 			if (cn < 0 || (n >= 0 && cn != n))
 				return -1;
 			n = cn;
@@ -1957,7 +1957,7 @@ df_bpchar_length(Plan *ctx, Node *expr)
 	{
 		child = llast(((Sequence *) ctx)->subplans);
 		tle = get_tle_by_resno(child->targetlist, var->varattno);
-		return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+		return tle ? vx_bpchar_length(child, (Node *) tle->expr) : -1;
 	}
 	if (var->varno != OUTER_VAR && var->varno != INNER_VAR)
 	{
@@ -1978,7 +1978,7 @@ df_bpchar_length(Plan *ctx, Node *expr)
 	}
 	child = var->varno == OUTER_VAR ? outerPlan(ctx) : innerPlan(ctx);
 	tle = child ? get_tle_by_resno(child->targetlist, var->varattno) : NULL;
-	return tle ? df_bpchar_length(child, (Node *) tle->expr) : -1;
+	return tle ? vx_bpchar_length(child, (Node *) tle->expr) : -1;
 }
 
 /*
@@ -1987,11 +1987,11 @@ df_bpchar_length(Plan *ctx, Node *expr)
  * largest, and the precision at it.
  */
 bool
-df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale)
+vx_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale)
 {
 	bool		dyn;
 
-	return df_numeric_range(ctx, expr, precision, scale, &dyn) && dyn;
+	return vx_numeric_range(ctx, expr, precision, scale, &dyn) && dyn;
 }
 
 /*
@@ -2002,14 +2002,14 @@ df_numeric_dyn(Plan *ctx, Node *expr, int *precision, int *scale)
  * stay on PostgreSQL (count, min and max are not affected).
  */
 static const char *
-df_distinct_problem(DfCheckContext *cxt, Aggref *agg)
+vx_distinct_problem(VxCheckContext *cxt, Aggref *agg)
 {
 	Node	   *arg = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 	Oid			type = exprType(arg);
 	char	   *name = get_func_name(agg->aggfnoid);
 
-	if (df_type_is_string(type))
-		return df_string_compare_problem(cxt, "=", agg->inputcollid);
+	if (vx_type_is_string(type))
+		return vx_string_compare_problem(cxt, "=", agg->inputcollid);
 	if ((type == FLOAT4OID || type == FLOAT8OID) &&
 		(strcmp(name, "sum") == 0 || strcmp(name, "avg") == 0))
 		return "of floats";
@@ -2021,7 +2021,7 @@ df_distinct_problem(DfCheckContext *cxt, Aggref *agg)
  * under a Materialize or not, or NULL: DataFusion's hash join leaves it out.
  */
 static Plan *
-df_merge_sort(Plan *side)
+vx_merge_sort(Plan *side)
 {
 	if (side != NULL && IsA(side, Material))
 		side = outerPlan(side);
@@ -2036,7 +2036,7 @@ df_merge_sort(Plan *side)
  * a sample and whether a variance.
  */
 bool
-df_stddev_agg(Aggref *agg, bool *sample, bool *variance)
+vx_stddev_agg(Aggref *agg, bool *sample, bool *variance)
 {
 	char	   *name = get_func_name(agg->aggfnoid);
 	Oid			argtype = list_length(agg->aggargtypes) == 1 ?
@@ -2070,7 +2070,7 @@ df_stddev_agg(Aggref *agg, bool *sample, bool *variance)
 
 /* Add the Aggrefs of 'node' to 'aggs'. */
 bool
-df_collect_aggrefs(Node *node, List **aggs)
+vx_collect_aggrefs(Node *node, List **aggs)
 {
 	if (node == NULL)
 		return false;
@@ -2079,23 +2079,23 @@ df_collect_aggrefs(Node *node, List **aggs)
 		*aggs = lappend(*aggs, node);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_aggrefs, aggs);
+	return expression_tree_walker(node, vx_collect_aggrefs, aggs);
 }
 
 /*
  * CS1: are the transition states of all calls of Agg 'agg' plain values,
- * which a combining stage reads as any column (df_agg_state)?
+ * which a combining stage reads as any column (vx_agg_state)?
  */
 static bool
-df_agg_plain_states(Agg *agg)
+vx_agg_plain_states(Agg *agg)
 {
 	List	   *aggs = NIL;
 	ListCell   *lc;
 
-	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
-	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
+	vx_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	vx_collect_aggrefs((Node *) agg->plan.qual, &aggs);
 	foreach(lc, aggs)
-		if (df_agg_state(lfirst_node(Aggref, lc)) != DF_AGG_PLAIN)
+		if (vx_agg_state(lfirst_node(Aggref, lc)) != VX_AGG_PLAIN)
 			return false;
 	return true;
 }
@@ -2103,11 +2103,11 @@ df_agg_plain_states(Agg *agg)
 /*
  * CS2: can combining aggregate 'agg' of Agg 'ctx' read its partial
  * aggregate's state through what lies between it and their Motion
- * (df_partial_path): DataFusion's state from a batch Motion, or
+ * (vx_partial_path): DataFusion's state from a batch Motion, or
  * PostgreSQL's from tuples that the C side reads (PS1)?
  */
 static bool
-df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches)
+vx_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches)
 {
 	Plan	   *pctx = ctx;
 	Motion	   *motion = NULL;
@@ -2115,12 +2115,12 @@ df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches)
 
 	if (list_length(agg->args) != 1 ||
 		!IsA(linitial_node(TargetEntry, agg->args)->expr, Var) ||
-		df_partial_path(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr,
+		vx_partial_path(&pctx, (Node *) linitial_node(TargetEntry, agg->args)->expr,
 						&motion, &resno) == NULL || motion == NULL)
 		return false;
 	if (bms_is_member(motion->motionID, batches))
 		return true;
-	return df_motion_pg_state(motion, resno) && df_pg_partial_readable(ctx, agg);
+	return vx_motion_pg_state(motion, resno) && vx_pg_partial_readable(ctx, agg);
 }
 
 /*
@@ -2130,32 +2130,32 @@ df_state_through(Plan *ctx, Aggref *agg, Bitmapset *batches)
  * references follow it down to the Motion's columns.
  */
 static bool
-df_state_var(Plan *ctx, Var *var, Bitmapset *batches)
+vx_state_var(Plan *ctx, Var *var, Bitmapset *batches)
 {
 	Plan	   *pctx = ctx;
 	Motion	   *motion = NULL;
 	AttrNumber	resno;
 
-	if (df_partial_path(&pctx, (Node *) var, &motion, &resno) == NULL || motion == NULL)
+	if (vx_partial_path(&pctx, (Node *) var, &motion, &resno) == NULL || motion == NULL)
 		return false;
 	return bms_is_member(motion->motionID, batches) ?
-		df_motion_state_columns(motion, resno) > 0 : df_motion_pg_state(motion, resno);
+		vx_motion_state_columns(motion, resno) > 0 : vx_motion_pg_state(motion, resno);
 }
 
 /* CS2: does every call of combining Agg 'agg' read a plain or such a state? */
 static bool
-df_agg_states_through(Agg *agg, Bitmapset *batches)
+vx_agg_states_through(Agg *agg, Bitmapset *batches)
 {
 	List	   *aggs = NIL;
 	ListCell   *lc;
 
-	df_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
-	df_collect_aggrefs((Node *) agg->plan.qual, &aggs);
+	vx_collect_aggrefs((Node *) agg->plan.targetlist, &aggs);
+	vx_collect_aggrefs((Node *) agg->plan.qual, &aggs);
 	foreach(lc, aggs)
 	{
 		Aggref	   *a = lfirst_node(Aggref, lc);
 
-		if (df_agg_state(a) != DF_AGG_PLAIN && !df_state_through((Plan *) agg, a, batches))
+		if (vx_agg_state(a) != VX_AGG_PLAIN && !vx_state_through((Plan *) agg, a, batches))
 			return false;
 	}
 	return true;
@@ -2167,7 +2167,7 @@ df_agg_states_through(Agg *agg, Bitmapset *batches)
  * same: integers, dates and times, bool), or NULL.
  */
 Node *
-df_semi_key_for(HashJoin *hj, Var *var)
+vx_semi_key_for(HashJoin *hj, Var *var)
 {
 	ListCell   *lc;
 
@@ -2180,7 +2180,7 @@ df_semi_key_for(HashJoin *hj, Var *var)
 
 		if (equal(inner, var) && exprType(outer) == type &&
 			(type == INT2OID || type == INT4OID || type == INT8OID || type == BOOLOID ||
-			 df_type_is_datetime(type)))
+			 vx_type_is_datetime(type)))
 			return outer;
 	}
 	return NULL;
@@ -2192,7 +2192,7 @@ df_semi_key_for(HashJoin *hj, Var *var)
  * not.
  */
 static void
-df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid collation)
+vx_check_equality(VxCheckContext *cxt, const char *what, Node *l, Node *r, Oid collation)
 {
 	Oid			lt = exprType(l);
 	Oid			rt = exprType(r);
@@ -2205,24 +2205,24 @@ df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid c
 	const char *problem;
 
 	/* integers of two widths, or floats, compare in the wider one */
-	if (!df_type_supported(lt) || (lt != rt && !OidIsValid(df_join_key_type(lt, rt))))
-		df_reject(cxt, "%s on %s and %s", what, format_type_be(lt), format_type_be(rt));
+	if (!vx_type_supported(lt) || (lt != rt && !OidIsValid(vx_join_key_type(lt, rt))))
+		vx_reject(cxt, "%s on %s and %s", what, format_type_be(lt), format_type_be(rt));
 	else if (lt == NUMERICOID)
 	{
 		/* DN1: values of display scales of their own compare as values */
-		if (!df_numeric_range(cxt->node, l, &lp, &ls, &dyn) ||
-			!df_numeric_range(cxt->node, r, &rp, &rs, &dyn))
-			df_reject(cxt, "%s on numeric of unknown precision", what);
-		else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
-				 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
-			df_reject(cxt, "%s on numeric beyond %d digits at a common scale",
-					  what, DF_NUMERIC_MAX_EXPR_PRECISION);
-		else if (df_rescales_infinity(cxt->node, l, r))
-			df_reject(cxt, "%s rescaling a numeric that may be infinite", what);
+		if (!vx_numeric_range(cxt->node, l, &lp, &ls, &dyn) ||
+			!vx_numeric_range(cxt->node, r, &rp, &rs, &dyn))
+			vx_reject(cxt, "%s on numeric of unknown precision", what);
+		else if (t = Max(ls, rs), lp - ls + t > VX_NUMERIC_MAX_EXPR_PRECISION ||
+				 rp - rs + t > VX_NUMERIC_MAX_EXPR_PRECISION)
+			vx_reject(cxt, "%s on numeric beyond %d digits at a common scale",
+					  what, VX_NUMERIC_MAX_EXPR_PRECISION);
+		else if (vx_rescales_infinity(cxt->node, l, r))
+			vx_reject(cxt, "%s rescaling a numeric that may be infinite", what);
 	}
-	else if (df_type_is_string(lt) &&
-			 (problem = df_string_compare_problem(cxt, "=", collation)) != NULL)
-		df_reject(cxt, "%s on %s %s", what, format_type_be(lt), problem);
+	else if (vx_type_is_string(lt) &&
+			 (problem = vx_string_compare_problem(cxt, "=", collation)) != NULL)
+		vx_reject(cxt, "%s on %s %s", what, format_type_be(lt), problem);
 }
 
 /*
@@ -2233,7 +2233,7 @@ df_check_equality(DfCheckContext *cxt, const char *what, Node *l, Node *r, Oid c
  * one scale cannot.  A NULL constant fits any scale.
  */
 static bool
-df_numeric_same_scale(Plan *ctx, List *exprs, int scale)
+vx_numeric_same_scale(Plan *ctx, List *exprs, int scale)
 {
 	ListCell   *lc;
 
@@ -2245,7 +2245,7 @@ df_numeric_same_scale(Plan *ctx, List *exprs, int scale)
 
 		if (IsA(e, Const) && ((Const *) e)->constisnull)
 			continue;
-		if (!df_numeric_ps(ctx, e, &p, &s) || (scale >= 0 && s != scale))
+		if (!vx_numeric_ps(ctx, e, &p, &s) || (scale >= 0 && s != scale))
 			return false;
 		scale = s;
 	}
@@ -2254,7 +2254,7 @@ df_numeric_same_scale(Plan *ctx, List *exprs, int scale)
 
 /* Is 'node' a constant LIKE pattern whose last backslash escapes nothing? */
 static bool
-df_like_pattern_ends_in_escape(Node *node)
+vx_like_pattern_ends_in_escape(Node *node)
 {
 	text	   *t;
 	const char *p;
@@ -2279,7 +2279,7 @@ df_like_pattern_ends_in_escape(Node *node)
 }
 
 static bool
-df_name_in(const char *name, const char *const *list)
+vx_name_in(const char *name, const char *const *list)
 {
 	for (; *list; list++)
 		if (strcmp(name, *list) == 0)
@@ -2288,7 +2288,7 @@ df_name_in(const char *name, const char *const *list)
 }
 
 static const char *
-df_plan_name(Plan *plan)
+vx_plan_name(Plan *plan)
 {
 	switch (nodeTag(plan))
 	{
@@ -2372,20 +2372,20 @@ df_plan_name(Plan *plan)
 }
 
 static void
-df_reject_plan(DfCheckContext *cxt, Plan *plan)
+vx_reject_plan(VxCheckContext *cxt, Plan *plan)
 {
-	const char *name = df_plan_name(plan);
+	const char *name = vx_plan_name(plan);
 
 	if (name)
-		df_reject(cxt, "%s is not supported", name);
+		vx_reject(cxt, "%s is not supported", name);
 	else
-		df_reject(cxt, "plan node type %d is not supported", (int) nodeTag(plan));
+		vx_reject(cxt, "plan node type %d is not supported", (int) nodeTag(plan));
 }
 
 static bool
-df_check_expr_list(List *exprs, DfCheckContext *cxt)
+vx_check_expr_list(List *exprs, VxCheckContext *cxt)
 {
-	return df_check_expr((Node *) exprs, cxt);
+	return vx_check_expr((Node *) exprs, cxt);
 }
 
 /*
@@ -2396,22 +2396,22 @@ df_check_expr_list(List *exprs, DfCheckContext *cxt)
  * input, else NULL.
  */
 Plan *
-df_subplan_rows(PlannedStmt *stmt, SubPlan *sp)
+vx_subplan_rows(PlannedStmt *stmt, SubPlan *sp)
 {
 	Plan	   *plan;
 
 	if (stmt == NULL || sp->plan_id < 1 || sp->plan_id > list_length(stmt->subplans))
 		return NULL;
 	plan = list_nth(stmt->subplans, sp->plan_id - 1);
-	return df_rows_from_motion(plan) ? plan : NULL;
+	return vx_rows_from_motion(plan) ? plan : NULL;
 }
 
 /*
  * Do the rows of 'plan' come from a Motion this slice receives, through
- * nodes that only pass them on (df_subplan_rows)?
+ * nodes that only pass them on (vx_subplan_rows)?
  */
 static bool
-df_rows_from_motion(Plan *plan)
+vx_rows_from_motion(Plan *plan)
 {
 	for (Plan *p = plan; p != NULL; p = outerPlan(p))
 	{
@@ -2427,14 +2427,14 @@ df_rows_from_motion(Plan *plan)
 
 /* Does 'node' read one of the PARAM_EXEC parameters 'params'? */
 static bool
-df_reads_params(Node *node, Bitmapset *params)
+vx_reads_params(Node *node, Bitmapset *params)
 {
 	if (node == NULL)
 		return false;
 	if (IsA(node, Param))
 		return ((Param *) node)->paramkind == PARAM_EXEC &&
 			bms_is_member(((Param *) node)->paramid, params);
-	return expression_tree_walker(node, df_reads_params, params);
+	return expression_tree_walker(node, vx_reads_params, params);
 }
 
 /*
@@ -2454,11 +2454,11 @@ df_reads_params(Node *node, Bitmapset *params)
  * keys equal the outer sides: a NULL outer side, which = matches with no
  * row, or keys of no group are the aggregate of no rows, NULL, or 0 for
  * a count.  Sets *corr to that aggregate grouped by the keys, read
- * through a Result over it (DfCorrelated).  Returns the reason it is not
+ * through a Result over it (VxCorrelated).  Returns the reason it is not
  * such a subquery, or NULL.
  */
 const char *
-df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
+vx_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, VxCorrelated **corr)
 {
 	Plan	   *plan;
 	Agg		   *agg;
@@ -2509,7 +2509,7 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
 	filter = (Result *) outerPlan(plan);
 	if (filter == NULL || !IsA(filter, Result) || filter->resconstantqual != NULL ||
 		innerPlan(filter) != NULL || filter->plan.initPlan != NIL ||
-		!df_rows_from_motion(outerPlan(filter)))
+		!vx_rows_from_motion(outerPlan(filter)))
 		return "correlated scalar subquery whose rows do not come from a Motion as they are";
 	foreach(lc, sp->parParam)
 		params = bms_add_member(params, lfirst_int(lc));
@@ -2517,8 +2517,8 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
 	 * PostgreSQL computes the outer sides and the conditions again for each
 	 * outer row, the join once
 	 */
-	if (df_reads_params((Node *) plan->targetlist, params) ||
-		df_reads_params((Node *) filter->plan.targetlist, params) ||
+	if (vx_reads_params((Node *) plan->targetlist, params) ||
+		vx_reads_params((Node *) filter->plan.targetlist, params) ||
 		contain_volatile_functions((Node *) sp->args) ||
 		contain_volatile_functions((Node *) filter->plan.qual) ||
 		contain_subplans((Node *) sp->args) || contain_subplans((Node *) filter->plan.qual))
@@ -2539,7 +2539,7 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
 		 * The planner pushes the other conditions below the Motion
 		 * (distribute_qual_to_rels), leaving none here
 		 */
-		if (!df_reads_params(qual, params))
+		if (!vx_reads_params(qual, params))
 			return "correlated scalar subquery with a condition of its own above its rows";
 		if (!IsA(qual, OpExpr) || list_length(op->args) != 2)
 			return "correlated scalar subquery correlated other than by =";
@@ -2547,14 +2547,14 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
 		r = lsecond(op->args);
 		/* the parameter, perhaps relabeled (varchar as text) */
 		p = IsA(r, RelabelType) ? (Node *) ((RelabelType *) r)->arg : r;
-		if (IsA(p, Param) && !df_reads_params(l, params))
+		if (IsA(p, Param) && !vx_reads_params(l, params))
 			in = l;
 		else
 		{
 			p = IsA(l, RelabelType) ? (Node *) ((RelabelType *) l)->arg : l;
 			in = r;
 			r = l;
-			if (!IsA(p, Param) || df_reads_params(in, params))
+			if (!IsA(p, Param) || vx_reads_params(in, params))
 				return "correlated scalar subquery correlated other than by =";
 		}
 		name = get_opname(op->opno);
@@ -2627,7 +2627,7 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
 									   makeTargetEntry(copyObject(value->expr), nkeys + 1,
 													   NULL, false));
 
-	*corr = palloc0(sizeof(DfCorrelated));
+	*corr = palloc0(sizeof(VxCorrelated));
 	(*corr)->sp = sp;
 	(*corr)->agg = grouped;
 	(*corr)->top = top;
@@ -2661,7 +2661,7 @@ df_subplan_correlated(PlannedStmt *stmt, SubPlan *sp, DfCorrelated **corr)
  * Returns the reason it is not, or NULL.
  */
 const char *
-df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
+vx_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
 {
 	OpExpr	   *op;
 	Node	   *l,
@@ -2693,7 +2693,7 @@ df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
 	/* varchar's values compare as text, relabeled on both sides */
 	if (exprType(lsecond(op->args)) != type ||
 		(((Param *) r)->paramtype != type &&
-		 !(df_type_is_string(type) && df_type_is_string(((Param *) r)->paramtype) &&
+		 !(vx_type_is_string(type) && vx_type_is_string(((Param *) r)->paramtype) &&
 		   type != BPCHAROID && ((Param *) r)->paramtype != BPCHAROID)))
 		return "IN subquery of two types";
 	switch (type)
@@ -2712,7 +2712,7 @@ df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
 		default:
 			return "IN subquery of a type other than integers, dates, floats or strings";
 	}
-	if (df_subplan_rows(stmt, sp) == NULL)
+	if (vx_subplan_rows(stmt, sp) == NULL)
 		return "IN subquery whose rows do not come from a Motion as they are";
 	*arg = l;
 	return NULL;
@@ -2720,13 +2720,13 @@ df_subplan_in_set(PlannedStmt *stmt, SubPlan *sp, Node **arg)
 
 /*
  * SP2: is SubPlan 'sp' the value of an uncorrelated scalar subquery, whose
- * rows come from a Motion as they are (df_subplan_rows)?  PostgreSQL scans
+ * rows come from a Motion as they are (vx_subplan_rows)?  PostgreSQL scans
  * them where the expression is evaluated: no row is NULL, more than one an
  * error.  Sets *top to the subplan's top node and *tle to its column.
  * Returns the reason it is not, or NULL.
  */
 const char *
-df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top, TargetEntry **tle)
+vx_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top, TargetEntry **tle)
 {
 	ListCell   *lc;
 
@@ -2736,9 +2736,9 @@ df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top, TargetEntry **tle)
 	if (sp->args != NIL || sp->parParam != NIL || sp->setParam != NIL ||
 		sp->testexpr != NULL)
 		return "correlated scalar subquery";
-	if (!df_type_supported(sp->firstColType))
+	if (!vx_type_supported(sp->firstColType))
 		return "scalar subquery of an unsupported type";
-	if ((*top = df_subplan_rows(stmt, sp)) == NULL)
+	if ((*top = vx_subplan_rows(stmt, sp)) == NULL)
 		return "scalar subquery whose rows do not come from a Motion as they are";
 	foreach(lc, (*top)->targetlist)
 	{
@@ -2757,23 +2757,23 @@ df_subplan_scalar(PlannedStmt *stmt, SubPlan *sp, Plan **top, TargetEntry **tle)
 
 /*
  * The node and the expression of the value of scalar SubPlan 'node', in
- * the statement whose numeric values are being followed (df_numeric_stmt).
+ * the statement whose numeric values are being followed (vx_numeric_stmt).
  */
 static bool
-df_subplan_value(Node *node, Plan **top, Node **value)
+vx_subplan_value(Node *node, Plan **top, Node **value)
 {
 	TargetEntry *tle;
-	DfCorrelated *corr;
+	VxCorrelated *corr;
 
 	if (!IsA(node, SubPlan))
 		return false;
-	if (df_subplan_scalar(df_numeric_stmt, (SubPlan *) node, top, &tle) == NULL)
+	if (vx_subplan_scalar(vx_numeric_stmt, (SubPlan *) node, top, &tle) == NULL)
 	{
 		*value = (Node *) tle->expr;
 		return true;
 	}
 	/* SC1: the grouped aggregate's, joined */
-	if (df_subplan_correlated(df_numeric_stmt, (SubPlan *) node, &corr) != NULL)
+	if (vx_subplan_correlated(vx_numeric_stmt, (SubPlan *) node, &corr) != NULL)
 		return false;
 	*top = (Plan *) corr->top;
 	*value = corr->value;
@@ -2782,16 +2782,16 @@ df_subplan_value(Node *node, Plan **top, Node **value)
 
 /*
  * SC1: may the Seq Scan being checked join its rows to correlated scalar
- * subquery 'corr' grouped (df_subplan_correlated)?  Its outer sides are
+ * subquery 'corr' grouped (vx_subplan_correlated)?  Its outer sides are
  * the scan's expressions, compared with the inner ones as = compares
  * them: keys of one type, integers of two widths, strings under a
  * deterministic collation.  The grouped aggregate is a node below a join,
  * read by name (A1).
  */
 static void
-df_check_correlated(DfCheckContext *cxt, DfCorrelated *corr)
+vx_check_correlated(VxCheckContext *cxt, VxCorrelated *corr)
 {
-	DfCheckContext saved = *cxt;
+	VxCheckContext saved = *cxt;
 	ListCell   *lo,
 			   *li;
 	bool		failed;
@@ -2801,25 +2801,25 @@ df_check_correlated(DfCheckContext *cxt, DfCorrelated *corr)
 	{
 		Oid			ot = exprType(lfirst(lo));
 		Oid			it = exprType(lfirst(li));
-		Oid			type = df_join_key_type(ot, it);
+		Oid			type = vx_join_key_type(ot, it);
 		const char *problem;
 
-		if (!df_type_supported(type) || type == NUMERICOID || type == FLOAT4OID ||
+		if (!vx_type_supported(type) || type == NUMERICOID || type == FLOAT4OID ||
 			type == FLOAT8OID)
 		{
-			df_reject(cxt, "correlated scalar subquery by = on %s and %s",
+			vx_reject(cxt, "correlated scalar subquery by = on %s and %s",
 					  format_type_be(ot), format_type_be(it));
 			return;
 		}
-		if (df_type_is_string(type) &&
-			(problem = df_string_compare_problem(cxt, "=",
+		if (vx_type_is_string(type) &&
+			(problem = vx_string_compare_problem(cxt, "=",
 												 corr->agg->grpCollations[foreach_current_index(lo)])) != NULL)
 		{
-			df_reject(cxt, "correlated scalar subquery by = on %s %s",
+			vx_reject(cxt, "correlated scalar subquery by = on %s %s",
 					  format_type_be(type), problem);
 			return;
 		}
-		if (df_check_expr(lfirst(lo), cxt))
+		if (vx_check_expr(lfirst(lo), cxt))
 			return;
 	}
 
@@ -2842,7 +2842,7 @@ df_check_correlated(DfCheckContext *cxt, DfCorrelated *corr)
 	cxt->top = NULL;
 	cxt->output = NULL;
 	cxt->order_free = true;
-	df_check_plan((Plan *) corr->agg, cxt, NULL, false);
+	vx_check_plan((Plan *) corr->agg, cxt, NULL, false);
 	failed = cxt->failed;
 	locale_dependent = cxt->locale_dependent;
 	*cxt = saved;
@@ -2852,7 +2852,7 @@ df_check_correlated(DfCheckContext *cxt, DfCorrelated *corr)
 
 /* Expression walker: returns true to stop at the first unsupported node. */
 static bool
-df_check_expr(Node *node, DfCheckContext *cxt)
+vx_check_expr(Node *node, VxCheckContext *cxt)
 {
 	static const char *const operators[] =
 	{"=", "<>", "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "~~", "!~~", "||", NULL};
@@ -2877,9 +2877,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				Var		   *var = (Var *) node;
 
 				if (var->varattno == 0)
-					df_reject(cxt, "whole-row reference");
+					vx_reject(cxt, "whole-row reference");
 				else if (var->varattno < 0 &&
-						 (IS_SPECIAL_VARNO(var->varno) || df_cursor_sysattrs(cxt->stmt) ||
+						 (IS_SPECIAL_VARNO(var->varno) || vx_cursor_sysattrs(cxt->stmt) ||
 						  (var->varattno != SelfItemPointerAttributeNumber &&
 						   var->varattno != GpSegmentIdAttributeNumber)))
 				{
@@ -2895,11 +2895,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					if (!IS_SPECIAL_VARNO(var->varno))
 						attname = get_attname(rt_fetch(var->varno, cxt->stmt->rtable)->relid,
 											  var->varattno, true);
-					df_reject(cxt, "system column %s", attname ? attname : "reference");
+					vx_reject(cxt, "system column %s", attname ? attname : "reference");
 				}
-				else if (!df_type_supported(var->vartype) &&
-						 !(IS_SPECIAL_VARNO(var->varno) && df_state_var(cxt->node, var, cxt->batches)))
-					df_reject(cxt, "column of type %s", format_type_be(var->vartype));
+				else if (!vx_type_supported(var->vartype) &&
+						 !(IS_SPECIAL_VARNO(var->varno) && vx_state_var(cxt->node, var, cxt->batches)))
+					vx_reject(cxt, "column of type %s", format_type_be(var->vartype));
 				else if (var->vartype == NUMERICOID)
 				{
 					int			p,
@@ -2908,9 +2908,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					bool		dyn;
 
 					/* DN1: or one of display scales of its own, within bounds */
-					if (!df_numeric_range(cxt->node, node, &p, &s, &dyn))
-						df_reject(cxt, "numeric column without a precision of at most %d",
-								  DF_NUMERIC_MAX_PRECISION);
+					if (!vx_numeric_range(cxt->node, node, &p, &s, &dyn))
+						vx_reject(cxt, "numeric column without a precision of at most %d",
+								  VX_NUMERIC_MAX_PRECISION);
 				}
 				return cxt->failed;
 			}
@@ -2922,7 +2922,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			 * rows (df_core::rowid)
 			 */
 			if (!cxt->rowid_ok)
-				df_reject(cxt, "RowIdExpr outside a scan's or join's output");
+				vx_reject(cxt, "RowIdExpr outside a scan's or join's output");
 			return cxt->failed;
 
 		case T_Const:
@@ -2932,11 +2932,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				int			p,
 							s;
 
-				if (!df_type_supported(c->consttype) || c->consttype == TIDOID)
-					df_reject(cxt, "constant of type %s", format_type_be(c->consttype));
-				else if (c->consttype == NUMERICOID && !df_numeric_ps(cxt->node, node, &p, &s))
-					df_reject(cxt, "numeric constant of more than %d digits or infinite",
-							  DF_NUMERIC_MAX_PRECISION);
+				if (!vx_type_supported(c->consttype) || c->consttype == TIDOID)
+					vx_reject(cxt, "constant of type %s", format_type_be(c->consttype));
+				else if (c->consttype == NUMERICOID && !vx_numeric_ps(cxt->node, node, &p, &s))
+					vx_reject(cxt, "numeric constant of more than %d digits or infinite",
+							  VX_NUMERIC_MAX_PRECISION);
 				return cxt->failed;
 			}
 
@@ -2947,20 +2947,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				ListCell   *lc;
 
 				if (list_length(op->args) != 2)
-					df_reject(cxt, "unary operator %s", name ? name : "?");
+					vx_reject(cxt, "unary operator %s", name ? name : "?");
 				else if (op->opno >= FirstGenbkiObjectId)
-					df_reject(cxt, "user-defined operator %s", name ? name : "?");
-				else if (name == NULL || !df_name_in(name, operators))
-					df_reject(cxt, "operator %s", name ? name : "?");
-				else if (!df_type_supported(op->opresulttype))
-					df_reject(cxt, "operator %s returning %s", name,
+					vx_reject(cxt, "user-defined operator %s", name ? name : "?");
+				else if (name == NULL || !vx_name_in(name, operators))
+					vx_reject(cxt, "operator %s", name ? name : "?");
+				else if (!vx_type_supported(op->opresulttype))
+					vx_reject(cxt, "operator %s returning %s", name,
 							  format_type_be(op->opresulttype));
 				foreach(lc, op->args)
 				{
 					Oid			argtype = exprType(lfirst(lc));
 
-					if (!df_type_supported(argtype))
-						df_reject(cxt, "operator %s on %s", name ? name : "?",
+					if (!vx_type_supported(argtype))
+						vx_reject(cxt, "operator %s on %s", name ? name : "?",
 								  format_type_be(argtype));
 				}
 				if (!cxt->failed)
@@ -2979,16 +2979,16 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					{
 						/* text || text only, not text || anynonarray */
 						if (get_opcode(op->opno) != F_TEXTCAT)
-							df_reject(cxt, "operator || on %s and %s",
+							vx_reject(cxt, "operator || on %s and %s",
 									  format_type_be(ltype), format_type_be(rtype));
 					}
-					else if ((df_type_is_datetime(ltype) || df_type_is_datetime(rtype)) &&
+					else if ((vx_type_is_datetime(ltype) || vx_type_is_datetime(rtype)) &&
 							 (op->opresulttype != BOOLOID || ltype != rtype) &&
-							 !df_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value) &&
+							 !vx_date_timestamp_cmp(op, &date_arg, &date_cmp, &date_value) &&
 							 /* DT3: a date plus or minus days */
 							 op->opfuncid != F_DATE_PLI && op->opfuncid != F_DATE_MII &&
 							 op->opfuncid != F_INTEGER_PL_DATE)
-						df_reject(cxt, "operator %s on %s and %s", name,
+						vx_reject(cxt, "operator %s on %s and %s", name,
 								  format_type_be(ltype), format_type_be(rtype));
 					else if (ltype == NUMERICOID || rtype == NUMERICOID)
 					{
@@ -3005,45 +3005,45 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 * at the largest they may have
 						 */
 						if (ltype != rtype)
-							df_reject(cxt, "operator %s on %s and %s", name,
+							vx_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
 						else if (op->opresulttype != BOOLOID)
 						{
-							if (df_numeric_may_be_infinite(cxt->node, linitial(op->args)) ||
-								df_numeric_may_be_infinite(cxt->node, lsecond(op->args)))
-								df_reject(cxt, "operator %s on a numeric that may be infinite", name);
-							else if (!df_numeric_range(cxt->node, node, &lp, &ls, &dyn))
-								df_reject(cxt, "operator %s on numeric: %s", name,
+							if (vx_numeric_may_be_infinite(cxt->node, linitial(op->args)) ||
+								vx_numeric_may_be_infinite(cxt->node, lsecond(op->args)))
+								vx_reject(cxt, "operator %s on a numeric that may be infinite", name);
+							else if (!vx_numeric_range(cxt->node, node, &lp, &ls, &dyn))
+								vx_reject(cxt, "operator %s on numeric: %s", name,
 										  strcmp(name, "%") == 0 ? "not supported" :
 										  "of unknown precision or more than 76 digits");
 						}
-						else if (df_numeric_param_cmp(cxt->node, op, NULL, NULL))
+						else if (vx_numeric_param_cmp(cxt->node, op, NULL, NULL))
 							/* IP1: the parameter, rounded to the other side's scale */
 							cxt->numeric_param_ok = IsA(linitial(op->args), Param) ?
 								linitial(op->args) : lsecond(op->args);
-						else if (df_numcmp_needed(cxt->node, op) &&
-								 df_numcmp_term(cxt->node, linitial(op->args), cxt->batches) &&
-								 df_numcmp_term(cxt->node, lsecond(op->args), cxt->batches))
+						else if (vx_numcmp_needed(cxt->node, op) &&
+								 vx_numcmp_term(cxt->node, linitial(op->args), cxt->batches) &&
+								 vx_numcmp_term(cxt->node, lsecond(op->args), cxt->batches))
 						{
 							/*
 							 * compared exactly, as PostgreSQL computes each
-							 * side (df_numcmp_term); their parts checked here
+							 * side (vx_numcmp_term); their parts checked here
 							 */
-							df_check_numcmp_term(linitial(op->args), cxt);
-							df_check_numcmp_term(lsecond(op->args), cxt);
+							vx_check_numcmp_term(linitial(op->args), cxt);
+							vx_check_numcmp_term(lsecond(op->args), cxt);
 							return cxt->failed;
 						}
-						else if (!df_numeric_range(cxt->node, linitial(op->args), &lp, &ls, &dyn) ||
-								 !df_numeric_range(cxt->node, lsecond(op->args), &rp, &rs, &dyn))
-							df_reject(cxt, "operator %s on numeric of unknown precision", name);
-						else if (t = Max(ls, rs), lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
-								 rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION)
-							df_reject(cxt, "operator %s on numeric beyond %d digits at a common scale",
-									  name, DF_NUMERIC_MAX_EXPR_PRECISION);
-						else if (df_rescales_infinity(cxt->node, linitial(op->args), lsecond(op->args)))
-							df_reject(cxt, "operator %s rescaling a numeric that may be infinite", name);
+						else if (!vx_numeric_range(cxt->node, linitial(op->args), &lp, &ls, &dyn) ||
+								 !vx_numeric_range(cxt->node, lsecond(op->args), &rp, &rs, &dyn))
+							vx_reject(cxt, "operator %s on numeric of unknown precision", name);
+						else if (t = Max(ls, rs), lp - ls + t > VX_NUMERIC_MAX_EXPR_PRECISION ||
+								 rp - rs + t > VX_NUMERIC_MAX_EXPR_PRECISION)
+							vx_reject(cxt, "operator %s on numeric beyond %d digits at a common scale",
+									  name, VX_NUMERIC_MAX_EXPR_PRECISION);
+						else if (vx_rescales_infinity(cxt->node, linitial(op->args), lsecond(op->args)))
+							vx_reject(cxt, "operator %s rescaling a numeric that may be infinite", name);
 					}
-					else if (df_type_is_string(ltype) || df_type_is_string(rtype))
+					else if (vx_type_is_string(ltype) || vx_type_is_string(rtype))
 					{
 						const char *problem;
 
@@ -3052,15 +3052,15 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							(strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0);
 
 						if (op->opresulttype != BOOLOID || (ltype != rtype && !bplike))
-							df_reject(cxt, "operator %s on %s and %s", name,
+							vx_reject(cxt, "operator %s on %s and %s", name,
 									  format_type_be(ltype), format_type_be(rtype));
-						else if ((problem = df_string_order_problem(cxt, name, op->inputcollid)) != NULL)
-							df_reject(cxt, "operator %s on %s %s", name,
+						else if ((problem = vx_string_order_problem(cxt, name, op->inputcollid)) != NULL)
+							vx_reject(cxt, "operator %s on %s %s", name,
 									  format_type_be(ltype), problem);
 						else if ((strcmp(name, "~~") == 0 || strcmp(name, "!~~") == 0) &&
-								 df_like_pattern_ends_in_escape(lsecond(op->args)))
+								 vx_like_pattern_ends_in_escape(lsecond(op->args)))
 							/* PostgreSQL may raise an error, depending on the rows */
-							df_reject(cxt, "LIKE pattern ending with an escape character");
+							vx_reject(cxt, "LIKE pattern ending with an escape character");
 					}
 				}
 				if (cxt->failed)
@@ -3071,7 +3071,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 		case T_NullTest:
 			if (((NullTest *) node)->argisrow)
 			{
-				df_reject(cxt, "row-valued IS NULL");
+				vx_reject(cxt, "row-valued IS NULL");
 				return true;
 			}
 			break;
@@ -3084,21 +3084,21 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							ns;
 
 				if (!cxt->allow_aggref)
-					df_reject(cxt, "aggregate outside an Aggregate node");
+					vx_reject(cxt, "aggregate outside an Aggregate node");
 				else if (agg->aggfnoid >= FirstGenbkiObjectId)
-					df_reject(cxt, "user-defined aggregate %s", name ? name : "?");
-				else if (name == NULL || !df_name_in(name, aggregates))
-					df_reject(cxt, "aggregate %s", name ? name : "?");
+					vx_reject(cxt, "user-defined aggregate %s", name ? name : "?");
+				else if (name == NULL || !vx_name_in(name, aggregates))
+					vx_reject(cxt, "aggregate %s", name ? name : "?");
 				else if (agg->aggtype == NUMERICOID && strcmp(name, "avg") != 0 &&
 						 strcmp(name, "sum") != 0 && strcmp(name, "min") != 0 &&
-						 strcmp(name, "max") != 0 && !df_stddev_agg(agg, NULL, NULL))
+						 strcmp(name, "max") != 0 && !vx_stddev_agg(agg, NULL, NULL))
 					/* STD1: of int2 or int4, in one stage, only */
-					df_reject(cxt, "aggregate %s of %s or in stages", name,
+					vx_reject(cxt, "aggregate %s of %s or in stages", name,
 							  format_type_be(list_length(agg->aggargtypes) == 1 ?
 											 linitial_oid(agg->aggargtypes) : InvalidOid));
-				else if (df_stddev_agg(agg, NULL, NULL) && agg->aggsplit == AGGSPLIT_SIMPLE)
-					return cxt->failed || df_check_expr((Node *) agg->args, cxt);
-				else if (df_stddev_agg(agg, NULL, NULL))
+				else if (vx_stddev_agg(agg, NULL, NULL) && agg->aggsplit == AGGSPLIT_SIMPLE)
+					return cxt->failed || vx_check_expr((Node *) agg->args, cxt);
+				else if (vx_stddev_agg(agg, NULL, NULL))
 				{
 					/*
 					 * STD2: split, DataFusion's state (sum, count, sum of
@@ -3107,8 +3107,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 */
 					if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? !cxt->partial_states :
 						!(cxt->final_states ||
-						  (cxt->through_states && df_state_through(cxt->node, agg, cxt->batches))))
-						df_reject(cxt, "%s aggregate %s without batch Motions",
+						  (cxt->through_states && vx_state_through(cxt->node, agg, cxt->batches))))
+						vx_reject(cxt, "%s aggregate %s without batch Motions",
 								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining",
 								  name);
 					else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
@@ -3116,50 +3116,50 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						/* its argument is the state column of the Motion below */
 						if (list_length(agg->args) != 1 ||
 							!IsA(linitial_node(TargetEntry, agg->args)->expr, Var))
-							df_reject(cxt, "combining aggregate %s over an expression", name);
+							vx_reject(cxt, "combining aggregate %s over an expression", name);
 						return cxt->failed;
 					}
-					return cxt->failed || df_check_expr((Node *) agg->args, cxt);
+					return cxt->failed || vx_check_expr((Node *) agg->args, cxt);
 				}
 				else if (agg->aggorder != NIL)
-					df_reject(cxt, "ORDER BY inside aggregate %s", name);
+					vx_reject(cxt, "ORDER BY inside aggregate %s", name);
 				else if (agg->aggdistinct != NIL && cxt->agg_sets)
-					df_reject(cxt, "DISTINCT inside aggregate %s with grouping sets", name);
+					vx_reject(cxt, "DISTINCT inside aggregate %s with grouping sets", name);
 				else if (agg->aggdistinct != NIL && agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
-						 df_distinct_problem(cxt, agg) != NULL)
-					df_reject(cxt, "DISTINCT inside aggregate %s %s", name,
-							  df_distinct_problem(cxt, agg));
+						 vx_distinct_problem(cxt, agg) != NULL)
+					vx_reject(cxt, "DISTINCT inside aggregate %s %s", name,
+							  vx_distinct_problem(cxt, agg));
 				else if (agg->aggfilter != NULL)
-					df_reject(cxt, "FILTER clause on aggregate %s", name);
+					vx_reject(cxt, "FILTER clause on aggregate %s", name);
 				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL)
-					df_reject(cxt, "combining stage of aggregate %s", name);
-				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
-						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
+					vx_reject(cxt, "combining stage of aggregate %s", name);
+				else if ((vx_agg_state(agg) == VX_AGG_SUM_NUMERIC ||
+						  vx_agg_state(agg) == VX_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_FINAL_DESERIAL &&
-						 !((df_numeric_ps(cxt->node,
+						 !((vx_numeric_ps(cxt->node,
 										  (Node *) linitial_node(TargetEntry, agg->args)->expr,
 										  &np, &ns) ||
-							(df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED &&
-							 df_numeric_mixed(cxt->node,
+							(vx_agg_state_at(cxt->node, agg) == VX_AGG_SUM_NUMERIC_MIXED &&
+							 vx_numeric_mixed(cxt->node,
 											  (Node *) linitial_node(TargetEntry, agg->args)->expr,
 											  &np, &ns))) &&
-						   np <= DF_NUMERIC_MAX_SUM_PRECISION))
+						   np <= VX_NUMERIC_MAX_SUM_PRECISION))
 					/* the sum must stay within Decimal128's 38 digits */
-					df_reject(cxt, "aggregate %s of numeric of unknown precision or more than %d digits",
-							  name, DF_NUMERIC_MAX_SUM_PRECISION);
-				else if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
-						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
-						 df_numeric_may_be_infinite(cxt->node,
+					vx_reject(cxt, "aggregate %s of numeric of unknown precision or more than %d digits",
+							  name, VX_NUMERIC_MAX_SUM_PRECISION);
+				else if ((vx_agg_state(agg) == VX_AGG_SUM_NUMERIC ||
+						  vx_agg_state(agg) == VX_AGG_AVG_NUMERIC) &&
+						 vx_numeric_may_be_infinite(cxt->node,
 													(Node *) linitial_node(TargetEntry, agg->args)->expr))
 					/* DT2: the sum would take an infinity for a number */
-					df_reject(cxt, "aggregate %s of a numeric that may be infinite", name);
-				else if (agg->aggtype == NUMERICOID && df_agg_state(agg) == DF_AGG_PLAIN &&
-						 !df_numeric_ps(cxt->node, node, &np, &ns))
-					df_reject(cxt, "aggregate %s returning numeric of unknown precision", name);
-				else if ((df_agg_state(agg) == DF_AGG_AVG_INT ||
-						  df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
+					vx_reject(cxt, "aggregate %s of a numeric that may be infinite", name);
+				else if (agg->aggtype == NUMERICOID && vx_agg_state(agg) == VX_AGG_PLAIN &&
+						 !vx_numeric_ps(cxt->node, node, &np, &ns))
+					vx_reject(cxt, "aggregate %s returning numeric of unknown precision", name);
+				else if ((vx_agg_state(agg) == VX_AGG_AVG_INT ||
+						  vx_agg_state(agg) == VX_AGG_AVG_NUMERIC) &&
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL && cxt->agg_to_batches &&
 						 list_member_ptr(cxt->whole_aggs, agg))
 					/*
@@ -3167,8 +3167,8 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * where tuples are made; one in an expression is
 					 * DataFusion's (AVG1)
 					 */
-					df_reject(cxt, "aggregate avg returning numeric into a batch Motion");
-				else if (df_agg_state(agg) != DF_AGG_PLAIN && agg->aggsplit != AGGSPLIT_SIMPLE)
+					vx_reject(cxt, "aggregate avg returning numeric into a batch Motion");
+				else if (vx_agg_state(agg) != VX_AGG_PLAIN && agg->aggsplit != AGGSPLIT_SIMPLE)
 				{
 					/*
 					 * M7d, N1: through a batch Motion, a split avg or
@@ -3176,7 +3176,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * for avg) instead of PostgreSQL's array or serialized
 					 * state.
 					 */
-					DfAggState	state = df_agg_state_at(cxt->node, agg);
+					VxAggState	state = vx_agg_state_at(cxt->node, agg);
 					bool		allowed = agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ?
 						cxt->partial_states ||
 						/*
@@ -3184,19 +3184,19 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						 * state from DataFusion's
 						 */
 						(cxt->pg_states && list_member_ptr(cxt->whole_aggs, agg) &&
-						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
-						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT)) :
+						 (state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC ||
+						  state == VX_AGG_SUM_INT8 || state == VX_AGG_AVG_INT)) :
 						cxt->final_states ||
 						/* PS1: from tuples, the C side reads PostgreSQL's state */
 						(cxt->pg_final_states &&
-						 (state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
-						  state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT) &&
-						 df_pg_partial_readable(cxt->node, agg)) ||
+						 (state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC ||
+						  state == VX_AGG_SUM_INT8 || state == VX_AGG_AVG_INT) &&
+						 vx_pg_partial_readable(cxt->node, agg)) ||
 						/* CS2: through joins above the Motion */
-						(cxt->through_states && df_state_through(cxt->node, agg, cxt->batches));
+						(cxt->through_states && vx_state_through(cxt->node, agg, cxt->batches));
 
 					if (!allowed)
-						df_reject(cxt, "%s aggregate %s without batch Motions",
+						vx_reject(cxt, "%s aggregate %s without batch Motions",
 								  agg->aggsplit == AGGSPLIT_INITIAL_SERIAL ? "partial" : "combining",
 								  name);
 					else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
@@ -3204,12 +3204,12 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 						/* its argument is the state column of the Motion below */
 						if (list_length(agg->args) != 1 ||
 							!IsA(linitial_node(TargetEntry, agg->args)->expr, Var))
-							df_reject(cxt, "combining aggregate %s over an expression", name);
+							vx_reject(cxt, "combining aggregate %s over an expression", name);
 						return cxt->failed;
 					}
 				}
 				else if (strcmp(name, "avg") == 0 && agg->aggsplit != AGGSPLIT_SIMPLE)
-					df_reject(cxt, "split aggregate avg of %s",
+					vx_reject(cxt, "split aggregate avg of %s",
 							  format_type_be(list_length(agg->aggargtypes) == 1 ?
 											 linitial_oid(agg->aggargtypes) : InvalidOid));
 				else if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
@@ -3220,30 +3220,30 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * states (avg's array, serialized states) stay on
 					 * PostgreSQL.
 					 */
-					df_reject(cxt, "combining stage of aggregate %s", name);
+					vx_reject(cxt, "combining stage of aggregate %s", name);
 				else if (agg->aggsplit == AGGSPLIT_INITIAL_SERIAL &&
 						 agg->aggtype == BYTEAOID)
-					df_reject(cxt, "partial aggregate %s with a serialized transition state", name);
-				else if (!df_type_supported(agg->aggtype) && df_agg_state(agg) == DF_AGG_PLAIN)
-					df_reject(cxt, "aggregate %s returning %s", name,
+					vx_reject(cxt, "partial aggregate %s with a serialized transition state", name);
+				else if (!vx_type_supported(agg->aggtype) && vx_agg_state(agg) == VX_AGG_PLAIN)
+					vx_reject(cxt, "aggregate %s returning %s", name,
 							  format_type_be(agg->aggtype));
 				else if (strcmp(name, "sum") == 0 && agg->aggtype == FLOAT4OID)
 					/* PostgreSQL adds real values in single precision. */
-					df_reject(cxt, "sum of real values");
+					vx_reject(cxt, "sum of real values");
 				else if (agg->aggtype == BPCHAROID)
 					/* bpchar_larger compares without trailing blanks, returns the padded value */
-					df_reject(cxt, "aggregate %s of character", name);
-				else if (df_type_is_string(agg->aggtype) &&
-						 df_string_order_problem(cxt, name, agg->inputcollid) != NULL)
-					df_reject(cxt, "aggregate %s of %s %s", name, format_type_be(agg->aggtype),
-							  df_string_order_problem(cxt, name, agg->inputcollid));
+					vx_reject(cxt, "aggregate %s of character", name);
+				else if (vx_type_is_string(agg->aggtype) &&
+						 vx_string_order_problem(cxt, name, agg->inputcollid) != NULL)
+					vx_reject(cxt, "aggregate %s of %s %s", name, format_type_be(agg->aggtype),
+							  vx_string_order_problem(cxt, name, agg->inputcollid));
 				if (cxt->failed)
 					return true;
 				/* MS1: the branches of a sum's argument may differ in scale */
-				if (df_agg_state_at(cxt->node, agg) == DF_AGG_SUM_NUMERIC_MIXED)
+				if (vx_agg_state_at(cxt->node, agg) == VX_AGG_SUM_NUMERIC_MIXED)
 					cxt->mixed_scales_ok = (Node *) linitial_node(TargetEntry, agg->args)->expr;
 				/* the arguments; aggdistinct holds sort clauses, checked above */
-				return df_check_expr((Node *) agg->args, cxt);
+				return vx_check_expr((Node *) agg->args, cxt);
 			}
 
 		case T_WindowFunc:
@@ -3262,22 +3262,22 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 							ns;
 
 				if (cxt->window == NULL || wf->winref != cxt->window->winref)
-					df_reject(cxt, "window function outside its WindowAgg");
+					vx_reject(cxt, "window function outside its WindowAgg");
 				else if (wf->winfnoid >= FirstGenbkiObjectId)
-					df_reject(cxt, "user-defined window function %s", name ? name : "?");
+					vx_reject(cxt, "user-defined window function %s", name ? name : "?");
 				else if (wf->aggfilter != NULL)
-					df_reject(cxt, "FILTER clause on window function %s", name);
+					vx_reject(cxt, "FILTER clause on window function %s", name);
 				else if (wf->windistinct)
-					df_reject(cxt, "DISTINCT inside window function %s", name);
+					vx_reject(cxt, "DISTINCT inside window function %s", name);
 				else if (!wf->winagg)
 				{
-					if (name == NULL || !df_name_in(name, ranks) || wf->args != NIL)
-						df_reject(cxt, "window function %s", name ? name : "?");
+					if (name == NULL || !vx_name_in(name, ranks) || wf->args != NIL)
+						vx_reject(cxt, "window function %s", name ? name : "?");
 					return cxt->failed;
 				}
 				if (cxt->failed)
 					return true;
-				agg = df_window_aggref(wf);
+				agg = vx_window_aggref(wf);
 				if ((strcmp(name, "min") == 0 || strcmp(name, "max") == 0) &&
 					(wf->wintype == FLOAT4OID || wf->wintype == FLOAT8OID))
 				{
@@ -3287,29 +3287,29 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * DataFusion keeps the smaller or larger order key
 					 * (pgfloat).
 					 */
-					df_reject(cxt, "window function %s of %s", name, format_type_be(wf->wintype));
+					vx_reject(cxt, "window function %s of %s", name, format_type_be(wf->wintype));
 					return true;
 				}
-				if (df_agg_state(agg) == DF_AGG_AVG_FLOAT)
+				if (vx_agg_state(agg) == VX_AGG_AVG_FLOAT)
 				{
 					/*
 					 * float8_accum adds the frame's values one by one;
 					 * DataFusion adds a batch's in another order, which may
 					 * give other last digits
 					 */
-					df_reject(cxt, "window function avg of %s", format_type_be(wf->wintype));
+					vx_reject(cxt, "window function avg of %s", format_type_be(wf->wintype));
 					return true;
 				}
-				if ((df_agg_state(agg) == DF_AGG_SUM_NUMERIC ||
-					 df_agg_state(agg) == DF_AGG_AVG_NUMERIC) &&
-					!df_numeric_ps(cxt->node, (Node *) linitial(wf->args), &np, &ns))
+				if ((vx_agg_state(agg) == VX_AGG_SUM_NUMERIC ||
+					 vx_agg_state(agg) == VX_AGG_AVG_NUMERIC) &&
+					!vx_numeric_ps(cxt->node, (Node *) linitial(wf->args), &np, &ns))
 				{
 					/* not one whose values have display scales of their own (DN1) */
-					df_reject(cxt, "window function %s of numeric of unknown precision or "
+					vx_reject(cxt, "window function %s of numeric of unknown precision or "
 							  "of display scales of their own", name);
 					return true;
 				}
-				if (df_window_avg(wf))
+				if (vx_window_avg(wf))
 				{
 					bool		dyn;
 
@@ -3317,16 +3317,16 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					 * WIN2: numeric_avg of the frame's sum and count, at the
 					 * largest scale it may pick (AVG1), within 76 digits
 					 */
-					if (!df_numeric_range(cxt->node, node, &np, &ns, &dyn))
+					if (!vx_numeric_range(cxt->node, node, &np, &ns, &dyn))
 					{
-						df_reject(cxt, "window function avg returning numeric of more than %d digits",
-								  DF_NUMERIC_MAX_EXPR_PRECISION);
+						vx_reject(cxt, "window function avg returning numeric of more than %d digits",
+								  VX_NUMERIC_MAX_EXPR_PRECISION);
 						return true;
 					}
 				}
 				saved = cxt->allow_aggref;
 				cxt->allow_aggref = true;
-				df_check_expr((Node *) agg, cxt);
+				vx_check_expr((Node *) agg, cxt);
 				cxt->allow_aggref = saved;
 				return cxt->failed;
 			}
@@ -3334,7 +3334,7 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 		case T_FuncExpr:
 			{
 				FuncExpr   *fe = (FuncExpr *) node;
-				const DfStringFunc *f = df_string_func(fe->funcid);
+				const VxStringFunc *f = vx_string_func(fe->funcid);
 				char	   *name = get_func_name(fe->funcid);
 				const char *problem;
 				ListCell   *lc;
@@ -3344,68 +3344,68 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 
 				foreach(lc, fe->args)
 				{
-					if (df_numeric_may_be_infinite(cxt->node, lfirst(lc)))
+					if (vx_numeric_may_be_infinite(cxt->node, lfirst(lc)))
 					{
-						df_reject(cxt, "function %s() of a numeric that may be infinite",
+						vx_reject(cxt, "function %s() of a numeric that may be infinite",
 								  name ? name : "?");
 						return true;
 					}
 				}
-				if (df_extract_field(fe) != NULL)
+				if (vx_extract_field(fe) != NULL)
 				{
 					/* DT2: the date (the field is a constant) */
-					df_check_expr(lsecond(fe->args), cxt);
+					vx_check_expr(lsecond(fe->args), cxt);
 					return cxt->failed;
 				}
 				if ((fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS) &&
-					df_numeric_range(cxt->node, node, &np, &ns, &dyn))
+					vx_numeric_range(cxt->node, node, &np, &ns, &dyn))
 					break;		/* of numeric of any display scales (DN1) */
-				if (fe->funcresulttype == NUMERICOID && df_numeric_ps(cxt->node, node, &np, &ns))
+				if (fe->funcresulttype == NUMERICOID && vx_numeric_ps(cxt->node, node, &np, &ns))
 				{
 					/* an integer made numeric (N3), numeric(p, s) (E2) */
 					if (fe->funcid == F_NUMERIC_NUMERIC_INT4)
 					{
-						df_check_expr(linitial(fe->args), cxt);
+						vx_check_expr(linitial(fe->args), cxt);
 						return cxt->failed;
 					}
 					break;
 				}
-				if (df_cast_kind(fe->funcid) != NULL && fe->funcid != F_NUMERIC_NUMERIC_INT4)
+				if (vx_cast_kind(fe->funcid) != NULL && fe->funcid != F_NUMERIC_NUMERIC_INT4)
 				{
 					Node	   *arg = linitial(fe->args);
 
 					/* E2: a numeric argument needs a precision */
-					if (exprType(arg) == NUMERICOID && !df_numeric_ps(cxt->node, arg, &np, &ns))
+					if (exprType(arg) == NUMERICOID && !vx_numeric_ps(cxt->node, arg, &np, &ns))
 					{
-						df_reject(cxt, "cast of numeric of unknown precision");
+						vx_reject(cxt, "cast of numeric of unknown precision");
 						return true;
 					}
 					break;
 				}
-				if (df_bpchar_func(fe->funcid) != NULL)
+				if (vx_bpchar_func(fe->funcid) != NULL)
 					break;		/* B1: character to text, lengths */
 				if (fe->funcid == F_REGEXP_REPLACE_TEXT_TEXT_TEXT)
 				{
-					/* RX1: of a constant expression of the subset df_regex.c takes */
+					/* RX1: of a constant expression of the subset vx_regex.c takes */
 					List	   *segments;
 					char	   *replacement;
 
-					if ((problem = df_regexp_replace_problem(fe, &segments, &replacement)) != NULL)
+					if ((problem = vx_regexp_replace_problem(fe, &segments, &replacement)) != NULL)
 					{
-						df_reject(cxt, "function regexp_replace() %s", problem);
+						vx_reject(cxt, "function regexp_replace() %s", problem);
 						return true;
 					}
-					df_check_expr(linitial(fe->args), cxt);
+					vx_check_expr(linitial(fe->args), cxt);
 					return cxt->failed;
 				}
 				if (f == NULL || fe->funcretset || fe->funcvariadic)
 				{
-					df_reject(cxt, "function %s()", name ? name : "?");
+					vx_reject(cxt, "function %s()", name ? name : "?");
 					return true;
 				}
-				if ((problem = df_string_func_problem(cxt, f, fe->inputcollid)) != NULL)
+				if ((problem = vx_string_func_problem(cxt, f, fe->inputcollid)) != NULL)
 				{
-					df_reject(cxt, "function %s() %s", name, problem);
+					vx_reject(cxt, "function %s() %s", name, problem);
 					return true;
 				}
 				/* concat() takes "any": only text arguments here */
@@ -3413,9 +3413,9 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				{
 					Oid			argtype = exprType(lfirst(lc));
 
-					if (fe->funcid == F_CONCAT && !df_type_is_string(argtype))
+					if (fe->funcid == F_CONCAT && !vx_type_is_string(argtype))
 					{
-						df_reject(cxt, "function concat() of %s", format_type_be(argtype));
+						vx_reject(cxt, "function concat() of %s", format_type_be(argtype));
 						return true;
 					}
 				}
@@ -3436,34 +3436,34 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					Plan	   *top;
 					TargetEntry *tle;
 
-					DfCorrelated *corr;
+					VxCorrelated *corr;
 
-					if ((problem = df_subplan_scalar(cxt->stmt, sp, &top, &tle)) == NULL)
+					if ((problem = vx_subplan_scalar(cxt->stmt, sp, &top, &tle)) == NULL)
 						return false;
 					if (sp->parParam == NIL)
-						df_reject(cxt, "%s", problem);
-					else if ((problem = df_subplan_correlated(cxt->stmt, sp, &corr)) != NULL)
-						df_reject(cxt, "%s", problem);
+						vx_reject(cxt, "%s", problem);
+					else if ((problem = vx_subplan_correlated(cxt->stmt, sp, &corr)) != NULL)
+						vx_reject(cxt, "%s", problem);
 					else if (!cxt->correlated_ok)
-						df_reject(cxt, "correlated scalar subquery other than in a scan's filter");
+						vx_reject(cxt, "correlated scalar subquery other than in a scan's filter");
 					else
-						df_check_correlated(cxt, corr);
+						vx_check_correlated(cxt, corr);
 					return cxt->failed;
 				}
-				problem = df_subplan_in_set(cxt->stmt, sp, &arg);
+				problem = vx_subplan_in_set(cxt->stmt, sp, &arg);
 				if (problem != NULL)
-					df_reject(cxt, "%s", problem);
-				else if (df_type_is_string(exprType(arg)) &&
-						 (sproblem = df_string_compare_problem(cxt, "=",
+					vx_reject(cxt, "%s", problem);
+				else if (vx_type_is_string(exprType(arg)) &&
+						 (sproblem = vx_string_compare_problem(cxt, "=",
 															  ((OpExpr *) sp->testexpr)->inputcollid)) != NULL)
-					df_reject(cxt, "IN subquery of %s %s", format_type_be(exprType(arg)), sproblem);
+					vx_reject(cxt, "IN subquery of %s %s", format_type_be(exprType(arg)), sproblem);
 				else
-					(void) df_check_expr(arg, cxt);
+					(void) vx_check_expr(arg, cxt);
 				return cxt->failed;
 			}
 
 		case T_AlternativeSubPlan:
-			df_reject(cxt, "subquery");
+			vx_reject(cxt, "subquery");
 			return true;
 
 		case T_Param:
@@ -3482,17 +3482,17 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				 * plan's value, a constant of that scale
 				 */
 				if (param->paramkind != PARAM_EXEC ||
-					!bms_is_member(param->paramid, df_init_params(cxt)))
-					df_reject(cxt, "query parameter");
-				else if (!df_type_supported(param->paramtype))
-					df_reject(cxt, "query parameter of type %s", format_type_be(param->paramtype));
+					!bms_is_member(param->paramid, vx_init_params(cxt)))
+					vx_reject(cxt, "query parameter");
+				else if (!vx_type_supported(param->paramtype))
+					vx_reject(cxt, "query parameter of type %s", format_type_be(param->paramtype));
 				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok &&
-						 (!df_numeric_range(cxt->node, node, &p, &s, &dyn) ||
-						  p > DF_NUMERIC_MAX_EXPR_PRECISION))
-					df_reject(cxt, "numeric query parameter of unknown precision");
+						 (!vx_numeric_range(cxt->node, node, &p, &s, &dyn) ||
+						  p > VX_NUMERIC_MAX_EXPR_PRECISION))
+					vx_reject(cxt, "numeric query parameter of unknown precision");
 				else if (param->paramtype == NUMERICOID && node != cxt->numeric_param_ok &&
-						 df_numeric_may_be_infinite(cxt->node, node))
-					df_reject(cxt, "numeric query parameter that may be infinite");
+						 vx_numeric_may_be_infinite(cxt->node, node))
+					vx_reject(cxt, "numeric query parameter that may be infinite");
 				return cxt->failed;
 			}
 
@@ -3505,24 +3505,24 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				int			p,
 							s;
 
-				if (!df_type_supported(ce->casetype))
+				if (!vx_type_supported(ce->casetype))
 				{
-					df_reject(cxt, "CASE returning %s", format_type_be(ce->casetype));
+					vx_reject(cxt, "CASE returning %s", format_type_be(ce->casetype));
 					return true;
 				}
 				if (ce->arg != NULL && exprType((Node *) ce->arg) == NUMERICOID)
 				{
 					/* CN1: as its searched CASE, x = v in each WHEN */
-					CaseExpr   *searched = df_case_searched(ce);
+					CaseExpr   *searched = vx_case_searched(ce);
 
 					if (searched == ce)
 					{
-						df_reject(cxt, "CASE on a numeric value PostgreSQL computes once");
+						vx_reject(cxt, "CASE on a numeric value PostgreSQL computes once");
 						return true;
 					}
 					if (cxt->mixed_scales_ok == node)
 						cxt->mixed_scales_ok = (Node *) searched;
-					(void) df_check_expr((Node *) searched, cxt);
+					(void) vx_check_expr((Node *) searched, cxt);
 					if (cxt->mixed_scales_ok == (Node *) searched)
 						cxt->mixed_scales_ok = node;
 					return true;
@@ -3531,11 +3531,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					results = lappend(results, lfirst_node(CaseWhen, lc)->result);
 				results = lappend(results, ce->defresult);
 				if (ce->casetype == NUMERICOID && node != cxt->mixed_scales_ok &&
-					!df_numeric_same_scale(cxt->node, results, -1) &&
-					!df_numeric_mixed(cxt->node, node, &p, &s))
+					!vx_numeric_same_scale(cxt->node, results, -1) &&
+					!vx_numeric_mixed(cxt->node, node, &p, &s))
 				{
 					/* DN1: branches of different scales, each value its own */
-					df_reject(cxt, "CASE returning numeric of different scales");
+					vx_reject(cxt, "CASE returning numeric of different scales");
 					return true;
 				}
 				break;
@@ -3551,16 +3551,16 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				int			p,
 							s;
 
-				if (!df_type_supported(co->coalescetype))
+				if (!vx_type_supported(co->coalescetype))
 				{
-					df_reject(cxt, "COALESCE of %s", format_type_be(co->coalescetype));
+					vx_reject(cxt, "COALESCE of %s", format_type_be(co->coalescetype));
 					return true;
 				}
 				if (co->coalescetype == NUMERICOID && node != cxt->mixed_scales_ok &&
-					!df_numeric_same_scale(cxt->node, co->args, -1) &&
-					!df_numeric_mixed(cxt->node, node, &p, &s))
+					!vx_numeric_same_scale(cxt->node, co->args, -1) &&
+					!vx_numeric_mixed(cxt->node, node, &p, &s))
 				{
-					df_reject(cxt, "COALESCE of numeric of different scales");
+					vx_reject(cxt, "COALESCE of numeric of different scales");
 					return true;
 				}
 				break;
@@ -3572,10 +3572,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 
 				if (list_length(ni->args) != 2)
 				{
-					df_reject(cxt, "NULLIF");
+					vx_reject(cxt, "NULLIF");
 					return true;
 				}
-				df_check_equality(cxt, "NULLIF", linitial(ni->args), lsecond(ni->args),
+				vx_check_equality(cxt, "NULLIF", linitial(ni->args), lsecond(ni->args),
 								  ni->inputcollid);
 				if (cxt->failed)
 					return true;
@@ -3602,12 +3602,12 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					!((sa->useOr && strcmp(name, "=") == 0) ||
 					  (!sa->useOr && strcmp(name, "<>") == 0)))
 				{
-					df_reject(cxt, "%s %s list", name ? name : "?", sa->useOr ? "ANY" : "ALL");
+					vx_reject(cxt, "%s %s list", name ? name : "?", sa->useOr ? "ANY" : "ALL");
 					return true;
 				}
 				if (!IsA(arr, Const) || arr->constisnull)
 				{
-					df_reject(cxt, "IN list that is not a constant");
+					vx_reject(cxt, "IN list that is not a constant");
 					return true;
 				}
 				elemtype = ARR_ELEMTYPE(DatumGetArrayTypeP(arr->constvalue));
@@ -3619,11 +3619,11 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 					Const	   *c = makeConst(elemtype, -1, sa->inputcollid, elmlen,
 											  elems[i], nulls[i], elmbyval);
 
-					df_check_equality(cxt, sa->useOr ? "IN list" : "NOT IN list", left,
+					vx_check_equality(cxt, sa->useOr ? "IN list" : "NOT IN list", left,
 									  (Node *) c, sa->inputcollid);
 				}
 				if (!cxt->failed)
-					df_check_expr(left, cxt);
+					vx_check_expr(left, cxt);
 				return cxt->failed;
 			}
 
@@ -3635,20 +3635,20 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 				 * varchar is read as text, the same bytes; COLLATE keeps the
 				 * type and the comparison above checks the collation.
 				 */
-				if (df_type_is_string(r->resulttype) &&
+				if (vx_type_is_string(r->resulttype) &&
 					(r->resulttype == exprType((Node *) r->arg) ||
 					 (r->resulttype == TEXTOID && exprType((Node *) r->arg) == VARCHAROID)))
 					break;
 				/* RL1: numeric relabeled with a wider type modifier, the same value */
 				if (r->resulttype == NUMERICOID && exprType((Node *) r->arg) == NUMERICOID)
 					break;
-				df_reject(cxt, "type cast");
+				vx_reject(cxt, "type cast");
 				return true;
 			}
 
 		case T_CoerceViaIO:
 		case T_ArrayCoerceExpr:
-			df_reject(cxt, "type cast");
+			vx_reject(cxt, "type cast");
 			return true;
 
 		case T_DistinctExpr:
@@ -3657,10 +3657,10 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 
 				if (list_length(de->args) != 2)
 				{
-					df_reject(cxt, "IS DISTINCT FROM");
+					vx_reject(cxt, "IS DISTINCT FROM");
 					return true;
 				}
-				df_check_equality(cxt, "IS DISTINCT FROM", linitial(de->args),
+				vx_check_equality(cxt, "IS DISTINCT FROM", linitial(de->args),
 								  lsecond(de->args), de->inputcollid);
 				if (cxt->failed)
 					return true;
@@ -3676,22 +3676,22 @@ df_check_expr(Node *node, DfCheckContext *cxt)
 			 * (df_core::query::build_node)
 			 */
 			if (!cxt->agg_sets)
-				df_reject(cxt, "%s outside an Aggregate with grouping sets",
+				vx_reject(cxt, "%s outside an Aggregate with grouping sets",
 						  IsA(node, GroupingFunc) ? "GROUPING()" :
 						  IsA(node, GroupId) ? "GROUP_ID()" : "GROUPINGSET_ID()");
 			return cxt->failed;
 
 		default:
-			df_reject(cxt, "expression node type %d", (int) nodeTag(node));
+			vx_reject(cxt, "expression node type %d", (int) nodeTag(node));
 			return true;
 	}
 
-	return expression_tree_walker(node, df_check_expr, cxt);
+	return expression_tree_walker(node, vx_check_expr, cxt);
 }
 
 /* Collect the child targetlist positions an upper node refers to. */
 static bool
-df_collect_outer_refs(Node *node, Bitmapset **refs)
+vx_collect_outer_refs(Node *node, Bitmapset **refs)
 {
 	if (node == NULL)
 		return false;
@@ -3700,18 +3700,18 @@ df_collect_outer_refs(Node *node, Bitmapset **refs)
 		*refs = bms_add_member(*refs, ((Var *) node)->varattno);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_outer_refs, refs);
+	return expression_tree_walker(node, vx_collect_outer_refs, refs);
 }
 
 /* Columns of scan relation 'relid' that an expression reads. */
-typedef struct DfScanRefs
+typedef struct VxScanRefs
 {
 	Index		relid;
 	Bitmapset  *refs;
-} DfScanRefs;
+} VxScanRefs;
 
 static bool
-df_collect_scan_refs(Node *node, DfScanRefs *c)
+vx_collect_scan_refs(Node *node, VxScanRefs *c)
 {
 	if (node == NULL)
 		return false;
@@ -3720,12 +3720,12 @@ df_collect_scan_refs(Node *node, DfScanRefs *c)
 		c->refs = bms_add_member(c->refs, ((Var *) node)->varattno);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_scan_refs, c);
+	return expression_tree_walker(node, vx_collect_scan_refs, c);
 }
 
 /* The same for a join's inner child (INNER_VAR). */
 static bool
-df_collect_inner_refs(Node *node, Bitmapset **refs)
+vx_collect_inner_refs(Node *node, Bitmapset **refs)
 {
 	if (node == NULL)
 		return false;
@@ -3734,12 +3734,12 @@ df_collect_inner_refs(Node *node, Bitmapset **refs)
 		*refs = bms_add_member(*refs, ((Var *) node)->varattno);
 		return false;
 	}
-	return expression_tree_walker(node, df_collect_inner_refs, refs);
+	return expression_tree_walker(node, vx_collect_inner_refs, refs);
 }
 
 /* The type both sides of a join key are compared in, or InvalidOid. */
 Oid
-df_join_key_type(Oid a, Oid b)
+vx_join_key_type(Oid a, Oid b)
 {
 	static const Oid ints[] = {INT2OID, INT4OID, INT8OID};
 	static const Oid floats[] = {FLOAT4OID, FLOAT8OID};
@@ -3771,16 +3771,16 @@ df_join_key_type(Oid a, Oid b)
 	return InvalidOid;
 }
 
-/* A copy of 'node' with each Aggref a Var of its type (df_plain_outputs). */
+/* A copy of 'node' with each Aggref a Var of its type (vx_plain_outputs). */
 static Node *
-df_aggrefs_as_vars(Node *node, void *context)
+vx_aggrefs_as_vars(Node *node, void *context)
 {
 	if (node == NULL)
 		return NULL;
 	if (IsA(node, Aggref))
 		return (Node *) makeVar(OUTER_VAR, 1, exprType(node), exprTypmod(node),
 								exprCollation(node), 0);
-	return expression_tree_mutator(node, df_aggrefs_as_vars, context);
+	return expression_tree_mutator(node, vx_aggrefs_as_vars, context);
 }
 
 /*
@@ -3790,7 +3790,7 @@ df_aggrefs_as_vars(Node *node, void *context)
  * DataFusion, evaluating them above the join, would not do.
  */
 static bool
-df_plain_outputs(Plan *plan, Bitmapset *attnos)
+vx_plain_outputs(Plan *plan, Bitmapset *attnos)
 {
 	Bitmapset  *outer = NULL;
 	Bitmapset  *inner = NULL;
@@ -3798,8 +3798,8 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 
 	if (plan == NULL)
 		return false;
-	if (IsA(plan, Motion) || df_append_plans(plan) != NIL || IsA(plan, SetOp) ||
-		IsA(plan, Unique) || df_empty_result(plan) || IsA(plan, ShareInputScan))
+	if (IsA(plan, Motion) || vx_append_plans(plan) != NIL || IsA(plan, SetOp) ||
+		IsA(plan, Unique) || vx_empty_result(plan) || IsA(plan, ShareInputScan))
 		return true;			/* UA1, SO1, UQ1: columns of its union or grouping */
 	if (IsA(plan, Result))
 	{
@@ -3816,7 +3816,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 				return false;
 			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
 		}
-		return df_plain_outputs(outerPlan(plan), sub);
+		return vx_plain_outputs(outerPlan(plan), sub);
 	}
 	if (IsA(plan, SubqueryScan))
 	{
@@ -3834,7 +3834,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 				return false;
 			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
 		}
-		return df_plain_outputs(((SubqueryScan *) plan)->subplan, sub);
+		return vx_plain_outputs(((SubqueryScan *) plan)->subplan, sub);
 	}
 	if (IsA(plan, WindowAgg))
 	{
@@ -3854,7 +3854,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 				return false;
 			sub = bms_add_member(sub, ((Var *) tle->expr)->varattno);
 		}
-		return sub == NULL || df_plain_outputs(df_below_sort(outerPlan(plan)), sub);
+		return sub == NULL || vx_plain_outputs(vx_below_sort(outerPlan(plan)), sub);
 	}
 	if (IsA(plan, Agg))
 	{
@@ -3873,7 +3873,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 				!(IsA(e, Var) && ((Var *) e)->varno == OUTER_VAR))
 			{
 				/* its calls are its inputs, as its columns are */
-				e = df_aggrefs_as_vars(e, NULL);
+				e = vx_aggrefs_as_vars(e, NULL);
 				if (contain_nonstrict_functions(e) || pull_var_clause(e, 0) == NIL)
 					return false;
 			}
@@ -3899,10 +3899,10 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
 	if (IsA(plan, SeqScan))
 		return true;
 	if (IsA(plan, Hash) || IsA(plan, Material) || IsA(plan, Sort))
-		return inner == NULL && df_plain_outputs(outerPlan(plan), outer);
+		return inner == NULL && vx_plain_outputs(outerPlan(plan), outer);
 	if (IsA(plan, HashJoin) || IsA(plan, NestLoop) || IsA(plan, MergeJoin))
-		return (outer == NULL || df_plain_outputs(outerPlan(plan), outer)) &&
-			(inner == NULL || df_plain_outputs(innerPlan(plan), inner));
+		return (outer == NULL || vx_plain_outputs(outerPlan(plan), outer)) &&
+			(inner == NULL || vx_plain_outputs(innerPlan(plan), inner));
 	return false;
 }
 
@@ -3911,7 +3911,7 @@ df_plain_outputs(Plan *plan, Bitmapset *attnos)
  * width, plus a per-row allowance for DataFusion's hash table.
  */
 static double
-df_hash_estimate(Plan *hash)
+vx_hash_estimate(Plan *hash)
 {
 	return hash->plan_rows * (hash->plan_width + 48.0);
 }
@@ -3921,13 +3921,13 @@ df_hash_estimate(Plan *hash)
  * join, and the most rows the planner expects of any node.  A join's own
  * estimate is the one to doubt: TPC-H Q9 at scale factor 10 builds a hash
  * table on partsupp joined with lineitem, estimated at 40 rows, while it
- * holds about a million per segment.  Only datafusion.join_estimates other
+ * holds about a million per segment.  Only vec.join_estimates other
  * than 'spill' asks this: they check a build side as if the join could not
  * spill, which was so before SHJ (spilljoin.rs) and still is for a NOT IN
  * anti join.
  */
 static void
-df_build_inputs(Plan *plan, bool *join, double *rows)
+vx_build_inputs(Plan *plan, bool *join, double *rows)
 {
 	ListCell   *lc;
 
@@ -3937,37 +3937,37 @@ df_build_inputs(Plan *plan, bool *join, double *rows)
 		*join = true;
 	else
 		*rows = Max(*rows, plan->plan_rows);
-	df_build_inputs(outerPlan(plan), join, rows);
-	df_build_inputs(innerPlan(plan), join, rows);
-	if (df_append_plans(plan) != NIL)
-		foreach(lc, df_append_plans(plan))
-			df_build_inputs(lfirst(lc), join, rows);
+	vx_build_inputs(outerPlan(plan), join, rows);
+	vx_build_inputs(innerPlan(plan), join, rows);
+	if (vx_append_plans(plan) != NIL)
+		foreach(lc, vx_append_plans(plan))
+			vx_build_inputs(lfirst(lc), join, rows);
 	if (IsA(plan, SubqueryScan))
-		df_build_inputs(((SubqueryScan *) plan)->subplan, join, rows);
+		vx_build_inputs(((SubqueryScan *) plan)->subplan, join, rows);
 }
 
 /*
  * Why a Hash node's table may outgrow its budget although its estimate fits,
- * or NULL (datafusion.join_estimates): with 'strict', any join below it
+ * or NULL (vec.join_estimates): with 'strict', any join below it
  * makes the estimate untrusted; with 'bounded', its rows are taken to be at
  * most the largest input's below it, which holds for joins on keys.
  */
 static const char *
-df_hash_doubt(Plan *hash, double *bound)
+vx_hash_doubt(Plan *hash, double *bound)
 {
 	bool		join = false;
 	double		rows = 0;
 
-	if (df_join_estimates == DF_JOIN_ESTIMATES_TRUSTED ||
-		df_join_estimates == DF_JOIN_ESTIMATES_SPILL)
+	if (vx_join_estimates == VX_JOIN_ESTIMATES_TRUSTED ||
+		vx_join_estimates == VX_JOIN_ESTIMATES_SPILL)
 		return NULL;			/* spill: as trusted where it does not spill */
-	df_build_inputs(outerPlan(hash), &join, &rows);
+	vx_build_inputs(outerPlan(hash), &join, &rows);
 	if (!join)
 		return NULL;
-	if (df_join_estimates == DF_JOIN_ESTIMATES_STRICT)
+	if (vx_join_estimates == VX_JOIN_ESTIMATES_STRICT)
 		return "comes from a join, whose estimate is not trusted";
 	*bound = rows * (hash->plan_width + 48.0);
-	return *bound > df_hash_budget(hash) ?
+	return *bound > vx_hash_budget(hash) ?
 		"comes from a join of inputs whose largest exceeds its budget" : NULL;
 }
 
@@ -3976,7 +3976,7 @@ df_hash_doubt(Plan *hash, double *bound)
  * budget, min(operatorMemKB, work_mem) * hash_mem_multiplier.
  */
 double
-df_hash_budget(Plan *hash)
+vx_hash_budget(Plan *hash)
 {
 	double		kb = work_mem;
 
@@ -3995,30 +3995,30 @@ df_hash_budget(Plan *hash)
  * side, as PostgreSQL rescans it.
  */
 bool
-df_nestloop_swapped(Plan *plan)
+vx_nestloop_swapped(Plan *plan)
 {
 	Plan	   *outer = outerPlan(plan);
 	Plan	   *inner = innerPlan(plan);
 
 	return IsA(plan, NestLoop) && ((Join *) plan)->jointype == JOIN_INNER &&
 		outer != NULL && inner != NULL &&
-		df_hash_estimate(inner) > df_hash_budget(inner) &&
-		df_hash_estimate(outer) <= df_hash_budget(inner);
+		vx_hash_estimate(inner) > vx_hash_budget(inner) &&
+		vx_hash_estimate(outer) <= vx_hash_budget(inner);
 }
 
 /*
  * WIN1: bytes a WindowAgg's input is estimated to take in DataFusion, as a
- * Hash node's table (df_hash_estimate), and the bytes PostgreSQL would
+ * Hash node's table (vx_hash_estimate), and the bytes PostgreSQL would
  * give its WindowAgg's tuplestore: min(operatorMemKB, work_mem).
  */
 static double
-df_window_estimate(Plan *input)
+vx_window_estimate(Plan *input)
 {
 	return input->plan_rows * (input->plan_width + 48.0);
 }
 
 static double
-df_window_budget(Plan *plan)
+vx_window_budget(Plan *plan)
 {
 	double		kb = work_mem;
 
@@ -4040,19 +4040,19 @@ df_window_budget(Plan *plan)
 
 /* Could DataFusion compute 'node' whole?  Leaves no trace of a failure. */
 static bool
-df_expr_ok(Node *node, DfCheckContext *cxt)
+vx_expr_ok(Node *node, VxCheckContext *cxt)
 {
 	bool		ok;
 
 	Assert(!cxt->failed);
-	df_check_expr(node, cxt);
+	vx_check_expr(node, cxt);
 	ok = !cxt->failed;
 	cxt->failed = false;
 	cxt->reason[0] = '\0';
 	return ok;
 }
 
-static void df_check_tail(Node *node, DfCheckContext *cxt);
+static void vx_check_tail(Node *node, VxCheckContext *cxt);
 
 /*
  * AVG1: an avg returning numeric that DataFusion computes (pg_avg) holds
@@ -4061,14 +4061,14 @@ static void df_check_tail(Node *node, DfCheckContext *cxt);
  * PostgreSQL as a tuple.  Does numeric 'expr' of node 'ctx' depend on one,
  * through the nodes below?
  */
-typedef struct DfVarying
+typedef struct VxVarying
 {
 	Plan	   *ctx;
 	bool		found;
-} DfVarying;
+} VxVarying;
 
 static bool
-df_numeric_varying_walker(Node *node, DfVarying *v)
+vx_numeric_varying_walker(Node *node, VxVarying *v)
 {
 	if (node == NULL || v->found)
 		return v->found;
@@ -4076,11 +4076,11 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 	{
 		Aggref	   *agg = (Aggref *) node;
 
-		if ((df_agg_state(agg) == DF_AGG_AVG_NUMERIC || df_agg_state(agg) == DF_AGG_AVG_INT) &&
+		if ((vx_agg_state(agg) == VX_AGG_AVG_NUMERIC || vx_agg_state(agg) == VX_AGG_AVG_INT) &&
 			agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 			return v->found = true;
 	}
-	if (IsA(node, WindowFunc) && df_window_avg((WindowFunc *) node))
+	if (IsA(node, WindowFunc) && vx_window_avg((WindowFunc *) node))
 		return v->found = true; /* WIN2 */
 	if (IsA(node, SubPlan))
 	{
@@ -4089,10 +4089,10 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 		Plan	   *top;
 		Node	   *value;
 
-		if (df_subplan_value(node, &top, &value))
+		if (vx_subplan_value(node, &top, &value))
 		{
 			v->ctx = top;
-			(void) df_numeric_varying_walker(value, v);
+			(void) vx_numeric_varying_walker(value, v);
 			v->ctx = saved;
 		}
 		return v->found;
@@ -4104,28 +4104,28 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 		Plan	   *top;
 		Node	   *value;
 
-		if (df_init_param_value(node, &top, &value))
+		if (vx_init_param_value(node, &top, &value))
 		{
 			v->ctx = top;
-			(void) df_numeric_varying_walker(value, v);
+			(void) vx_numeric_varying_walker(value, v);
 			v->ctx = saved;
 		}
 		return v->found;
 	}
-	if (IsA(node, Var) && df_append_plans(v->ctx) != NIL && ((Var *) node)->varno == OUTER_VAR)
+	if (IsA(node, Var) && vx_append_plans(v->ctx) != NIL && ((Var *) node)->varno == OUTER_VAR)
 	{
 		/* UA1: any input's */
 		Plan	   *saved = v->ctx;
 		ListCell   *lc;
 
-		foreach(lc, df_append_plans(saved))
+		foreach(lc, vx_append_plans(saved))
 		{
 			TargetEntry *tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist,
 												((Var *) node)->varattno);
 
 			v->ctx = lfirst(lc);
 			if (tle != NULL)
-				(void) df_numeric_varying_walker((Node *) tle->expr, v);
+				(void) vx_numeric_varying_walker((Node *) tle->expr, v);
 		}
 		v->ctx = saved;
 		return v->found;
@@ -4140,7 +4140,7 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 		{
 			/* a Shared Scan's column is its producer's input's */
 			Plan	   *producer = outerPlan(v->ctx) ? v->ctx :
-				df_share_producer((ShareInputScan *) v->ctx);
+				vx_share_producer((ShareInputScan *) v->ctx);
 
 			child = producer ? outerPlan(producer) : NULL;
 		}
@@ -4158,52 +4158,52 @@ df_numeric_varying_walker(Node *node, DfVarying *v)
 			Plan	   *saved = v->ctx;
 
 			v->ctx = child;
-			(void) df_numeric_varying_walker((Node *) tle->expr, v);
+			(void) vx_numeric_varying_walker((Node *) tle->expr, v);
 			v->ctx = saved;
 		}
 		return v->found;
 	}
-	return expression_tree_walker(node, df_numeric_varying_walker, v);
+	return expression_tree_walker(node, vx_numeric_varying_walker, v);
 }
 
 bool
-df_numeric_varying(Plan *ctx, Node *expr)
+vx_numeric_varying(Plan *ctx, Node *expr)
 {
-	DfVarying	v = {ctx, false};
+	VxVarying	v = {ctx, false};
 
-	(void) df_numeric_varying_walker(expr, &v);
+	(void) vx_numeric_varying_walker(expr, &v);
 	return v.found;
 }
 
 /*
  * The same for an output column of 'ctx': not an avg of the Agg itself,
- * whose value the C side divides as numeric_avg does (DF_OUT_NUMERIC_AVG).
+ * whose value the C side divides as numeric_avg does (VX_OUT_NUMERIC_AVG).
  */
 bool
-df_output_varying(Plan *ctx, Node *expr)
+vx_output_varying(Plan *ctx, Node *expr)
 {
 	if (IsA(ctx, Agg) && IsA(expr, Aggref) &&
-		(df_agg_state((Aggref *) expr) == DF_AGG_AVG_NUMERIC ||
-		 df_agg_state((Aggref *) expr) == DF_AGG_AVG_INT))
+		(vx_agg_state((Aggref *) expr) == VX_AGG_AVG_NUMERIC ||
+		 vx_agg_state((Aggref *) expr) == VX_AGG_AVG_INT))
 		return false;
-	return df_numeric_varying(ctx, expr);
+	return vx_numeric_varying(ctx, expr);
 }
 
 /*
  * AV2: can DataFusion give each value of numeric 'expr' of node 'ctx' its
- * display scale (df_emit_dscale)?  One of one scale has that one, an avg
+ * display scale (vx_emit_dscale)?  One of one scale has that one, an avg
  * returning numeric the scale numeric_avg picks from its sum and count, a
  * value received from a Motion carrying tuples (not in 'batches') or read
  * from a Shared Scan its own;
  * operators, CASE and COALESCE as DN1 has them.
  */
 static bool
-df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
+vx_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 {
 	int			p,
 				s;
 
-	if (df_numeric_ps(ctx, expr, &p, &s) && !df_numeric_varying(ctx, expr))
+	if (vx_numeric_ps(ctx, expr, &p, &s) && !vx_numeric_varying(ctx, expr))
 		return true;
 	switch (nodeTag(expr))
 	{
@@ -4217,10 +4217,10 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 				Node	   *value;
 				TargetEntry *tle;
 
-				if (df_subplan_scalar(df_numeric_stmt, (SubPlan *) expr, &top, &tle) == NULL)
+				if (vx_subplan_scalar(vx_numeric_stmt, (SubPlan *) expr, &top, &tle) == NULL)
 					return true;
-				return df_subplan_value(expr, &top, &value) &&
-					df_dscale_ok(top, value, batches);
+				return vx_subplan_value(expr, &top, &value) &&
+					vx_dscale_ok(top, value, batches);
 			}
 		case T_Param:
 			{
@@ -4228,7 +4228,7 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 				Plan	   *top;
 				Node	   *value;
 
-				return df_init_param_value(expr, &top, &value);
+				return vx_init_param_value(expr, &top, &value);
 			}
 		case T_Var:
 			{
@@ -4238,15 +4238,15 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 
 				if (IsA(ctx, Agg))
 					return false;	/* a grouping column */
-				if (df_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
+				if (vx_append_plans(ctx) != NIL && var->varno == OUTER_VAR)
 				{
 					/* UA1: each input gives its own beside the value */
 					ListCell   *lc;
 
-					foreach(lc, df_append_plans(ctx))
+					foreach(lc, vx_append_plans(ctx))
 					{
 						tle = get_tle_by_resno(((Plan *) lfirst(lc))->targetlist, var->varattno);
-						if (tle == NULL || !df_dscale_ok(lfirst(lc), (Node *) tle->expr, batches))
+						if (tle == NULL || !vx_dscale_ok(lfirst(lc), (Node *) tle->expr, batches))
 							return false;
 					}
 					return true;
@@ -4266,7 +4266,7 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 					return !bms_is_member(((Motion *) child)->motionID, batches);
 				if (IsA(child, ShareInputScan) && outerPlan(child) == NULL)
 					return true;	/* a reader's tuples carry it, as a Motion's */
-				return df_dscale_ok(child, (Node *) tle->expr, batches);
+				return vx_dscale_ok(child, (Node *) tle->expr, batches);
 			}
 		case T_OpExpr:
 			{
@@ -4276,8 +4276,8 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 				return name != NULL && list_length(op->args) == 2 &&
 					(strcmp(name, "+") == 0 || strcmp(name, "-") == 0 ||
 					 strcmp(name, "*") == 0 || strcmp(name, "/") == 0) &&
-					df_dscale_ok(ctx, linitial(op->args), batches) &&
-					df_dscale_ok(ctx, lsecond(op->args), batches);
+					vx_dscale_ok(ctx, linitial(op->args), batches) &&
+					vx_dscale_ok(ctx, lsecond(op->args), batches);
 			}
 		case T_CaseExpr:
 			{
@@ -4285,10 +4285,10 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 
 				foreach(lc, ((CaseExpr *) expr)->args)
 				{
-					if (!df_dscale_ok(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
+					if (!vx_dscale_ok(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
 						return false;
 				}
-				return df_dscale_ok(ctx, (Node *) ((CaseExpr *) expr)->defresult, batches);
+				return vx_dscale_ok(ctx, (Node *) ((CaseExpr *) expr)->defresult, batches);
 			}
 		case T_CoalesceExpr:
 			{
@@ -4296,7 +4296,7 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 
 				foreach(lc, ((CoalesceExpr *) expr)->args)
 				{
-					if (!df_dscale_ok(ctx, lfirst(lc), batches))
+					if (!vx_dscale_ok(ctx, lfirst(lc), batches))
 						return false;
 				}
 				return true;
@@ -4304,28 +4304,28 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
 		case T_Const:
 			return ((Const *) expr)->constisnull;
 		case T_NullIfExpr:
-			return df_dscale_ok(ctx, linitial(((NullIfExpr *) expr)->args), batches);
+			return vx_dscale_ok(ctx, linitial(((NullIfExpr *) expr)->args), batches);
 		case T_FuncExpr:
 			return (((FuncExpr *) expr)->funcid == F_ABS_NUMERIC ||
 					((FuncExpr *) expr)->funcid == F_NUMERIC_ABS) &&
-				df_dscale_ok(ctx, linitial(((FuncExpr *) expr)->args), batches);
+				vx_dscale_ok(ctx, linitial(((FuncExpr *) expr)->args), batches);
 		case T_Aggref:
 			{
 				Aggref	   *agg = (Aggref *) expr;
 
 				if (!IsA(ctx, Agg))
 					return false;
-				if (df_agg_state_at(ctx, agg) == DF_AGG_SUM_NUMERIC_MIXED)
+				if (vx_agg_state_at(ctx, agg) == VX_AGG_SUM_NUMERIC_MIXED)
 					return true;	/* MS1 */
-				if (df_stddev_agg(agg, NULL, NULL))
+				if (vx_stddev_agg(agg, NULL, NULL))
 					return agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;	/* STD1 */
-				return (df_agg_state(agg) == DF_AGG_AVG_NUMERIC ||
-						df_agg_state(agg) == DF_AGG_AVG_INT) &&
+				return (vx_agg_state(agg) == VX_AGG_AVG_NUMERIC ||
+						vx_agg_state(agg) == VX_AGG_AVG_INT) &&
 					agg->aggsplit != AGGSPLIT_INITIAL_SERIAL;
 			}
 		case T_WindowFunc:
 			/* WIN2: as an avg of an Agg, over its frame */
-			return IsA(ctx, WindowAgg) && df_window_avg((WindowFunc *) expr);
+			return IsA(ctx, WindowAgg) && vx_window_avg((WindowFunc *) expr);
 		default:
 			return false;
 	}
@@ -4337,10 +4337,10 @@ df_dscale_ok(Plan *ctx, Node *expr, Bitmapset *batches)
  * or beyond them?  A quotient's bound (DN1) can be: a value of the
  * largest scale an avg may pick divided by another.  df_core's PgNumCmp
  * then computes each side exactly, as PostgreSQL does, and compares them
- * (df_numcmp_term).
+ * (vx_numcmp_term).
  */
 bool
-df_numcmp_needed(Plan *ctx, OpExpr *op)
+vx_numcmp_needed(Plan *ctx, OpExpr *op)
 {
 	static const char *const cmps[] = {"<", "<=", "=", "<>", ">=", ">", NULL};
 	char	   *name = get_opname(op->opno);
@@ -4351,17 +4351,17 @@ df_numcmp_needed(Plan *ctx, OpExpr *op)
 				t;
 	bool		dyn;
 
-	if (name == NULL || !df_name_in(name, cmps) || op->opresulttype != BOOLOID ||
+	if (name == NULL || !vx_name_in(name, cmps) || op->opresulttype != BOOLOID ||
 		op->opno >= FirstGenbkiObjectId || list_length(op->args) != 2 ||
 		exprType(linitial(op->args)) != NUMERICOID ||
 		exprType(lsecond(op->args)) != NUMERICOID)
 		return false;
-	if (!df_numeric_range(ctx, linitial(op->args), &lp, &ls, &dyn) ||
-		!df_numeric_range(ctx, lsecond(op->args), &rp, &rs, &dyn))
+	if (!vx_numeric_range(ctx, linitial(op->args), &lp, &ls, &dyn) ||
+		!vx_numeric_range(ctx, lsecond(op->args), &rp, &rs, &dyn))
 		return true;
 	t = Max(ls, rs);
-	return lp - ls + t > DF_NUMERIC_MAX_EXPR_PRECISION ||
-		rp - rs + t > DF_NUMERIC_MAX_EXPR_PRECISION;
+	return lp - ls + t > VX_NUMERIC_MAX_EXPR_PRECISION ||
+		rp - rs + t > VX_NUMERIC_MAX_EXPR_PRECISION;
 }
 
 /*
@@ -4372,7 +4372,7 @@ df_numcmp_needed(Plan *ctx, OpExpr *op)
  * may be infinite.
  */
 static bool
-df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
+vx_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
 {
 	int			p,
 				s;
@@ -4382,8 +4382,8 @@ df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
 		return false;
 	if (IsA(node, Const) && ((Const *) node)->constisnull)
 		return true;
-	if (df_numeric_range(ctx, node, &p, &s, &dyn))
-		return !df_numeric_may_be_infinite(ctx, node);
+	if (vx_numeric_range(ctx, node, &p, &s, &dyn))
+		return !vx_numeric_may_be_infinite(ctx, node);
 	switch (nodeTag(node))
 	{
 		case T_OpExpr:
@@ -4403,11 +4403,11 @@ df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
 				x = linitial(op->args);
 				y = lsecond(op->args);
 				return exprType(x) == NUMERICOID && exprType(y) == NUMERICOID &&
-					df_numeric_range(ctx, x, &xp, &xs, &dyn) &&
-					df_numeric_range(ctx, y, &yp, &ys, &dyn) &&
-					!df_numeric_may_be_infinite(ctx, x) &&
-					!df_numeric_may_be_infinite(ctx, y) &&
-					df_dscale_ok(ctx, x, batches) && df_dscale_ok(ctx, y, batches);
+					vx_numeric_range(ctx, x, &xp, &xs, &dyn) &&
+					vx_numeric_range(ctx, y, &yp, &ys, &dyn) &&
+					!vx_numeric_may_be_infinite(ctx, x) &&
+					!vx_numeric_may_be_infinite(ctx, y) &&
+					vx_dscale_ok(ctx, x, batches) && vx_dscale_ok(ctx, y, batches);
 			}
 		case T_FuncExpr:
 			{
@@ -4415,30 +4415,30 @@ df_numcmp_term(Plan *ctx, Node *node, Bitmapset *batches)
 
 				return (fe->funcid == F_ABS_NUMERIC || fe->funcid == F_NUMERIC_ABS) &&
 					IsA(linitial(fe->args), OpExpr) &&
-					df_numcmp_term(ctx, linitial(fe->args), batches);
+					vx_numcmp_term(ctx, linitial(fe->args), batches);
 			}
 		case T_CaseExpr:
 			{
-				CaseExpr   *ce = df_case_searched((CaseExpr *) node);
+				CaseExpr   *ce = vx_case_searched((CaseExpr *) node);
 				ListCell   *lc;
 
 				if (ce->arg != NULL)
 					return false;
 				foreach(lc, ce->args)
 				{
-					if (!df_numcmp_term(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
+					if (!vx_numcmp_term(ctx, (Node *) lfirst_node(CaseWhen, lc)->result, batches))
 						return false;
 				}
-				return df_numcmp_term(ctx, (Node *) ce->defresult, batches);
+				return vx_numcmp_term(ctx, (Node *) ce->defresult, batches);
 			}
 		default:
 			return false;
 	}
 }
 
-/* The parts of df_numcmp_term 'node' that DataFusion evaluates as usual. */
+/* The parts of vx_numcmp_term 'node' that DataFusion evaluates as usual. */
 static void
-df_check_numcmp_term(Node *node, DfCheckContext *cxt)
+vx_check_numcmp_term(Node *node, VxCheckContext *cxt)
 {
 	int			p,
 				s;
@@ -4446,35 +4446,35 @@ df_check_numcmp_term(Node *node, DfCheckContext *cxt)
 
 	if (cxt->failed || (IsA(node, Const) && ((Const *) node)->constisnull))
 		return;
-	if (df_numeric_range(cxt->node, node, &p, &s, &dyn))
+	if (vx_numeric_range(cxt->node, node, &p, &s, &dyn))
 	{
-		df_check_expr(node, cxt);
+		vx_check_expr(node, cxt);
 		return;
 	}
 	switch (nodeTag(node))
 	{
 		case T_OpExpr:
-			df_check_expr(linitial(((OpExpr *) node)->args), cxt);
-			df_check_expr(lsecond(((OpExpr *) node)->args), cxt);
+			vx_check_expr(linitial(((OpExpr *) node)->args), cxt);
+			vx_check_expr(lsecond(((OpExpr *) node)->args), cxt);
 			return;
 		case T_FuncExpr:
-			df_check_numcmp_term(linitial(((FuncExpr *) node)->args), cxt);
+			vx_check_numcmp_term(linitial(((FuncExpr *) node)->args), cxt);
 			return;
 		case T_CaseExpr:
 			{
-				CaseExpr   *ce = df_case_searched((CaseExpr *) node);
+				CaseExpr   *ce = vx_case_searched((CaseExpr *) node);
 				ListCell   *lc;
 
 				foreach(lc, ce->args)
 				{
-					df_check_expr((Node *) lfirst_node(CaseWhen, lc)->expr, cxt);
-					df_check_numcmp_term((Node *) lfirst_node(CaseWhen, lc)->result, cxt);
+					vx_check_expr((Node *) lfirst_node(CaseWhen, lc)->expr, cxt);
+					vx_check_numcmp_term((Node *) lfirst_node(CaseWhen, lc)->result, cxt);
 				}
-				df_check_numcmp_term((Node *) ce->defresult, cxt);
+				vx_check_numcmp_term((Node *) ce->defresult, cxt);
 				return;
 			}
 		default:
-			df_reject(cxt, "a side of an exact numeric comparison");
+			vx_reject(cxt, "a side of an exact numeric comparison");
 			return;
 	}
 }
@@ -4484,16 +4484,16 @@ df_check_numcmp_term(Node *node, DfCheckContext *cxt)
  * that depends on an avg below, with its display scale beside it (AV2).
  */
 static bool
-df_value_ok(Node *node, DfCheckContext *cxt)
+vx_value_ok(Node *node, VxCheckContext *cxt)
 {
-	return df_expr_ok(node, cxt) &&
-		(!df_output_varying(cxt->node, node) || df_dscale_ok(cxt->node, node, cxt->batches));
+	return vx_expr_ok(node, cxt) &&
+		(!vx_output_varying(cxt->node, node) || vx_dscale_ok(cxt->node, node, cxt->batches));
 }
 
 static bool
-df_check_tail_walker(Node *node, DfCheckContext *cxt)
+vx_check_tail_walker(Node *node, VxCheckContext *cxt)
 {
-	df_check_tail(node, cxt);
+	vx_check_tail(node, cxt);
 	return cxt->failed;
 }
 
@@ -4506,7 +4506,7 @@ df_check_tail_walker(Node *node, DfCheckContext *cxt)
  * functions, and no CaseTestExpr to split from its CASE.
  */
 static void
-df_check_tail(Node *node, DfCheckContext *cxt)
+vx_check_tail(Node *node, VxCheckContext *cxt)
 {
 	if (node == NULL || cxt->failed)
 		return;
@@ -4515,25 +4515,25 @@ df_check_tail(Node *node, DfCheckContext *cxt)
 		ListCell   *lc;
 
 		foreach(lc, (List *) node)
-			df_check_tail(lfirst(lc), cxt);
+			vx_check_tail(lfirst(lc), cxt);
 		return;
 	}
 	if (IsA(node, CaseWhen))
 	{
 		/* part of its CASE, never an expression of its own */
-		df_check_tail((Node *) ((CaseWhen *) node)->expr, cxt);
-		df_check_tail((Node *) ((CaseWhen *) node)->result, cxt);
+		vx_check_tail((Node *) ((CaseWhen *) node)->expr, cxt);
+		vx_check_tail((Node *) ((CaseWhen *) node)->result, cxt);
 		return;
 	}
-	if (df_value_ok(node, cxt))
+	if (vx_value_ok(node, cxt))
 	{
 		cxt->tails.leaves = lappend(cxt->tails.leaves, node);
 		return;
 	}
-	if (df_output_varying(cxt->node, node) && !IsA(node, OpExpr) && !IsA(node, FuncExpr))
+	if (vx_output_varying(cxt->node, node) && !IsA(node, OpExpr) && !IsA(node, FuncExpr))
 	{
 		/* AVG1: its value is DataFusion's, at a scale not PostgreSQL's */
-		df_reject(cxt, "avg returning numeric of an aggregate below in an output column");
+		vx_reject(cxt, "avg returning numeric of an aggregate below in an output column");
 		return;
 	}
 	switch (nodeTag(node))
@@ -4543,21 +4543,21 @@ df_check_tail(Node *node, DfCheckContext *cxt)
 		case T_OpExpr:
 			if (((OpExpr *) node)->opretset)
 			{
-				df_reject(cxt, "set-returning operator in an output column");
+				vx_reject(cxt, "set-returning operator in an output column");
 				return;
 			}
 			break;
 		case T_FuncExpr:
 			if (((FuncExpr *) node)->funcretset)
 			{
-				df_reject(cxt, "set-returning function in an output column");
+				vx_reject(cxt, "set-returning function in an output column");
 				return;
 			}
 			break;
 		case T_CaseExpr:
 			if (((CaseExpr *) node)->arg != NULL)
 			{
-				df_check_expr(node, cxt);	/* DataFusion's reason */
+				vx_check_expr(node, cxt);	/* DataFusion's reason */
 				return;
 			}
 			break;
@@ -4574,16 +4574,16 @@ df_check_tail(Node *node, DfCheckContext *cxt)
 			break;
 		default:
 			/* a column, an aggregate, ...: DataFusion's reason */
-			df_check_expr(node, cxt);
+			vx_check_expr(node, cxt);
 			if (!cxt->failed)
-				df_reject(cxt, "expression node %d in an output column", (int) nodeTag(node));
+				vx_reject(cxt, "expression node %d in an output column", (int) nodeTag(node));
 			return;
 	}
-	(void) expression_tree_walker(node, df_check_tail_walker, cxt);
+	(void) expression_tree_walker(node, vx_check_tail_walker, cxt);
 }
 
 static void
-df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
+vx_check_targetlist(List *targetlist, Bitmapset *needed, VxCheckContext *cxt)
 {
 	ListCell   *lc;
 	bool		output = cxt->tails_ok && cxt->node == cxt->output;
@@ -4597,16 +4597,16 @@ df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 		if (needed != NULL && !bms_is_member(tle->resno, needed))
 			continue;
 		if (output && bms_is_member(tle->resno, cxt->sort_keys) &&
-			df_output_varying(cxt->node, (Node *) tle->expr) &&
-			!df_dscale_ok(cxt->node, (Node *) tle->expr, cxt->batches))
-			df_reject(cxt, "sort key of an avg returning numeric");
+			vx_output_varying(cxt->node, (Node *) tle->expr) &&
+			!vx_dscale_ok(cxt->node, (Node *) tle->expr, cxt->batches))
+			vx_reject(cxt, "sort key of an avg returning numeric");
 		else if (!output || bms_is_member(tle->resno, cxt->sort_keys) ||
-				 df_value_ok((Node *) tle->expr, cxt))
-			df_check_expr((Node *) tle->expr, cxt);
+				 vx_value_ok((Node *) tle->expr, cxt))
+			vx_check_expr((Node *) tle->expr, cxt);
 		else
 		{
 			/* P1: PostgreSQL finishes it */
-			df_check_tail((Node *) tle->expr, cxt);
+			vx_check_tail((Node *) tle->expr, cxt);
 			cxt->tails.tles = lappend(cxt->tails.tles, tle);
 		}
 	}
@@ -4614,11 +4614,11 @@ df_check_targetlist(List *targetlist, Bitmapset *needed, DfCheckContext *cxt)
 
 /*
  * Table access methods whose scans DataFusion can read.  The main thread
- * reads them through the table AM interface (df_exec.c), so any AM whose
+ * reads them through the table AM interface (vx_exec.c), so any AM whose
  * slots carry the columns works; these are the ones tested.
  */
 static bool
-df_am_supported(Oid relam)
+vx_am_supported(Oid relam)
 {
 	static const char *const ams[] = {"heap", "ao_row", "ao_column", "pax", NULL};
 	char	   *name;
@@ -4626,12 +4626,12 @@ df_am_supported(Oid relam)
 	if (relam == HEAP_TABLE_AM_OID)
 		return true;
 	name = get_am_name(relam);
-	return name != NULL && df_name_in(name, ams);
+	return name != NULL && vx_name_in(name, ams);
 }
 
 /* Access method of a relation, read from its pg_class row. */
 static Oid
-df_relation_am(Oid relid)
+vx_relation_am(Oid relid)
 {
 	HeapTuple	tup;
 	Oid			relam;
@@ -4655,7 +4655,7 @@ df_relation_am(Oid relid)
  * in LIMIT ALL).  A negative value is PostgreSQL's error to raise.
  */
 bool
-df_limit_value(Node *expr, int64 *value)
+vx_limit_value(Node *expr, int64 *value)
 {
 	Node	   *folded;
 	Const	   *c;
@@ -4679,7 +4679,7 @@ df_limit_value(Node *expr, int64 *value)
  * sorts by (strings under a C collation, floats through pg_float_key).
  */
 bool
-df_sort_direction(Oid sortop, Oid type, bool *desc)
+vx_sort_direction(Oid sortop, Oid type, bool *desc)
 {
 	Oid			opfamily;
 	Oid			opcintype;
@@ -4699,7 +4699,7 @@ df_sort_direction(Oid sortop, Oid type, bool *desc)
  * an Append where nothing reads its order), or NIL.
  */
 List *
-df_append_plans(Plan *plan)
+vx_append_plans(Plan *plan)
 {
 	if (plan != NULL && IsA(plan, Append))
 		return ((Append *) plan)->appendplans;
@@ -4716,7 +4716,7 @@ df_append_plans(Plan *plan)
  * without a length.
  */
 static bool
-df_alike_type(TargetEntry *tle)
+vx_alike_type(TargetEntry *tle)
 {
 	Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
 
@@ -4731,7 +4731,7 @@ df_alike_type(TargetEntry *tle)
  * child's column 'attno', or -1.
  */
 int
-df_unique_group(Unique *uq, AttrNumber attno)
+vx_unique_group(Unique *uq, AttrNumber attno)
 {
 	int			k;
 
@@ -4746,7 +4746,7 @@ df_unique_group(Unique *uq, AttrNumber attno)
  * its child's column 'attno', or -1.
  */
 int
-df_setop_group(SetOp *setop, AttrNumber attno)
+vx_setop_group(SetOp *setop, AttrNumber attno)
 {
 	int			k;
 
@@ -4761,7 +4761,7 @@ df_setop_group(SetOp *setop, AttrNumber attno)
  * to 1000, or 0; -1 for any other.
  */
 int
-df_round_scale(FuncExpr *fe)
+vx_round_scale(FuncExpr *fe)
 {
 	Const	   *c;
 
@@ -4782,7 +4782,7 @@ df_round_scale(FuncExpr *fe)
  * join matches NULL keys, every one of them?
  */
 bool
-df_null_equal_join(HashJoin *hj)
+vx_null_equal_join(HashJoin *hj)
 {
 	ListCell   *lh,
 			   *lq;
@@ -4818,7 +4818,7 @@ df_null_equal_join(HashJoin *hj)
  * 2 for one known only there, -1 for any other.
  */
 int
-df_one_time_value(Node *qual, bool evaluate)
+vx_one_time_value(Node *qual, bool evaluate)
 {
 	ListCell   *lc;
 	int			v = 1;
@@ -4860,16 +4860,16 @@ df_one_time_value(Node *qual, bool evaluate)
 
 /* OF1: is 'plan' a Result without a child that never gives a row? */
 bool
-df_empty_result(Plan *plan)
+vx_empty_result(Plan *plan)
 {
 	return plan != NULL && IsA(plan, Result) && outerPlan(plan) == NULL &&
 		innerPlan(plan) == NULL &&
-		df_one_time_value(((Result *) plan)->resconstantqual, false) == 0;
+		vx_one_time_value(((Result *) plan)->resconstantqual, false) == 0;
 }
 
 /* Is each output column of 'plan' a column of its child, as it is? */
 static bool
-df_plain_columns(Plan *plan)
+vx_plain_columns(Plan *plan)
 {
 	ListCell   *lc;
 
@@ -4890,7 +4890,7 @@ df_plain_columns(Plan *plan)
  * constant itself.
  */
 bool
-df_passes_through(Plan *plan)
+vx_passes_through(Plan *plan)
 {
 	ListCell   *lc;
 	Plan	   *child = outerPlan(plan);
@@ -4918,7 +4918,7 @@ df_passes_through(Plan *plan)
  * merges by?  The planner builds them so; this guards the assumption.
  */
 static bool
-df_sorted_for(Plan *top, Motion *motion)
+vx_sorted_for(Plan *top, Motion *motion)
 {
 	Plan	   *result = NULL;
 	Sort	   *sort;
@@ -4938,7 +4938,7 @@ df_sorted_for(Plan *top, Motion *motion)
 	{
 		TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, motion->sortColIdx[i]);
 		Var		   *var = tle ? (Var *) tle->expr : NULL;
-		AttrNumber	col = result ? df_output_of(result, sort->sortColIdx[i]) :
+		AttrNumber	col = result ? vx_output_of(result, sort->sortColIdx[i]) :
 			sort->sortColIdx[i];
 
 		if (var == NULL || !IsA(var, Var) || var->varno != OUTER_VAR ||
@@ -4952,7 +4952,7 @@ df_sorted_for(Plan *top, Motion *motion)
 
 /* Column of 'plan' that outputs its child's column 'attno', or 0. */
 AttrNumber
-df_output_of(Plan *plan, AttrNumber attno)
+vx_output_of(Plan *plan, AttrNumber attno)
 {
 	ListCell   *lc;
 
@@ -4968,14 +4968,14 @@ df_output_of(Plan *plan, AttrNumber attno)
 }
 
 /*
- * GS1: the grouping of 'agg' (DfAggGroups) as ExecInitAgg reads it: the
+ * GS1: the grouping of 'agg' (VxAggGroups) as ExecInitAgg reads it: the
  * Agg, then each Agg of its chain; a hashed one is one set of its columns,
  * a sorted or plain one a set per entry of its groupingSets, that many of
  * its first columns.  GROUP_ID() counts the sets equal to the one before,
  * among the hashed ones or within one sorted Agg.
  */
 void
-df_agg_groups(Agg *agg, DfAggGroups *g)
+vx_agg_groups(Agg *agg, VxAggGroups *g)
 {
 	bool		gsets = agg->groupingSets != NIL || agg->chain != NIL;
 	int			nnodes = 1 + list_length(agg->chain);
@@ -5052,9 +5052,9 @@ df_agg_groups(Agg *agg, DfAggGroups *g)
 
 /* GS1: index of child column 'attno' among 'agg's grouping columns, or -1. */
 int
-df_agg_group_index(Agg *agg, AttrNumber attno)
+vx_agg_group_index(Agg *agg, AttrNumber attno)
 {
-	DfAggGroups g;
+	VxAggGroups g;
 	int			k;
 
 	if (agg->chain == NIL)
@@ -5064,7 +5064,7 @@ df_agg_group_index(Agg *agg, AttrNumber attno)
 				return k;
 		return -1;
 	}
-	df_agg_groups(agg, &g);
+	vx_agg_groups(agg, &g);
 	for (k = 0; k < g.ncols; k++)
 		if (g.cols[k] == attno)
 			return k;
@@ -5077,7 +5077,7 @@ df_agg_group_index(Agg *agg, AttrNumber attno)
  * the set does not group by it.
  */
 int
-df_grouping_value(List *cols, Bitmapset *set)
+vx_grouping_value(List *cols, Bitmapset *set)
 {
 	ListCell   *lc;
 	int			v = 0;
@@ -5093,7 +5093,7 @@ df_grouping_value(List *cols, Bitmapset *set)
  * else.
  */
 static bool
-df_group_input_order(Plan *plan, int *ncols, AttrNumber **cols, Oid **ops,
+vx_group_input_order(Plan *plan, int *ncols, AttrNumber **cols, Oid **ops,
 					 Oid **collations, bool **nulls)
 {
 	if (plan != NULL && IsA(plan, Sort))
@@ -5125,14 +5125,14 @@ df_group_input_order(Plan *plan, int *ncols, AttrNumber **cols, Oid **ops,
  * D4, D7: may the slice run GroupAggregate 'agg' hashed and sort its
  * output in the order the GroupAggregate gives, for a Limit above it to
  * keep the first rows or for the rows to leave in?  That order is its
- * input's (df_group_input_order), when those keys are grouping columns
+ * input's (vx_group_input_order), when those keys are grouping columns
  * covering all of them (one row per group, so no ties), each an output
  * column.  Below sorted Motion 'motion' (D4, TPC-H Q18), the Motion merges
  * by a prefix of them; at the top of a slice (D7), 'motion' is NULL.
  * Records it.
  */
 static bool
-df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
+vx_check_group_order(VxCheckContext *cxt, Motion *motion, Agg *agg)
 {
 	/* UQ2: also a Unique, a grouping by its columns (UQ1) */
 	bool		unique = agg != NULL && IsA(agg, Unique);
@@ -5150,7 +5150,7 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 				k;
 
 	if (input == NULL || (!unique && agg->aggstrategy != AGG_SORTED) ||
-		!df_group_input_order(input, &ncols, &cols, &ops, &collations, &nulls) ||
+		!vx_group_input_order(input, &ncols, &cols, &ops, &collations, &nulls) ||
 		ngroups <= 0)
 		return false;
 	if (motion != NULL && (motion->numSortCols == 0 || ncols < motion->numSortCols))
@@ -5159,13 +5159,13 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 	 * GS1: one sorted rollup, over its input sorted by its columns in turn,
 	 * gives a set's row after those of the longer sets it sums up: where
 	 * their NULLs sort last.  A tie with a NULL of the data goes to the
-	 * longer set first (df_emit_resort_by).
+	 * longer set first (vx_emit_resort_by).
 	 */
 	if (!unique && agg->chain != NIL)
 		return false;
 	for (i = 0; i < ncols && bms_num_members(groups) < ngroups; i++)
 	{
-		AttrNumber	col = df_output_of((Plan *) agg, cols[i]);
+		AttrNumber	col = vx_output_of((Plan *) agg, cols[i]);
 		TargetEntry *tle = col > 0 ? get_tle_by_resno(((Plan *) agg)->targetlist, col) : NULL;
 		Oid			type;
 		bool		desc;
@@ -5178,13 +5178,13 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
 			return false;
 		groups = bms_add_member(groups, k);
 		type = exprType((Node *) tle->expr);
-		if (!df_type_supported(type) || !df_sort_direction(ops[i], type, &desc))
+		if (!vx_type_supported(type) || !vx_sort_direction(ops[i], type, &desc))
 			return false;
-		if (df_type_is_string(type) &&
-			df_string_compare_problem(cxt, "<", collations[i]) != NULL)
+		if (vx_type_is_string(type) &&
+			vx_string_compare_problem(cxt, "<", collations[i]) != NULL)
 		{
-			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-					  df_string_compare_problem(cxt, "<", collations[i]));
+			vx_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  vx_string_compare_problem(cxt, "<", collations[i]));
 			return false;
 		}
 		if (motion != NULL && i < motion->numSortCols)
@@ -5216,10 +5216,10 @@ df_check_group_order(DfCheckContext *cxt, Motion *motion, Agg *agg)
  * ones over a Sort it does not run.  DataFusion numbers the sets in an
  * integer of 64 bits, a bit per column and the rest for repeated sets.
  * DISTINCT aggregates run over a grouping by all columns first, which the
- * sets would count again (df_check_expr).
+ * sets would count again (vx_check_expr).
  */
 static bool
-df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups)
+vx_check_grouping_sets(VxCheckContext *cxt, Agg *agg, VxAggGroups *groups)
 {
 	ListCell   *lc;
 
@@ -5231,13 +5231,13 @@ df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups)
 			(a->aggstrategy != AGG_HASHED && a->aggstrategy != AGG_SORTED &&
 			 a->aggstrategy != AGG_PLAIN))
 		{
-			df_reject(cxt, "grouping sets of an unknown form");
+			vx_reject(cxt, "grouping sets of an unknown form");
 			return false;
 		}
 	}
 	if (groups->ncols > 32 || groups->nsets > 1024)
 	{
-		df_reject(cxt, "grouping sets of more than 32 columns or 1024 sets");
+		vx_reject(cxt, "grouping sets of more than 32 columns or 1024 sets");
 		return false;
 	}
 	return true;
@@ -5248,7 +5248,7 @@ df_check_grouping_sets(DfCheckContext *cxt, Agg *agg, DfAggGroups *groups)
  * 'input', or the child of the WindowAggs it is.
  */
 Plan *
-df_window_order_input(Plan *input)
+vx_window_order_input(Plan *input)
 {
 	while (input != NULL && IsA(input, WindowAgg))
 		input = outerPlan(input);
@@ -5260,7 +5260,7 @@ df_window_order_input(Plan *input)
  * 'sortop' under 'collation', as PostgreSQL does?
  */
 static bool
-df_check_order_key(DfCheckContext *cxt, Plan *plan, AttrNumber col, Oid sortop, Oid collation)
+vx_check_order_key(VxCheckContext *cxt, Plan *plan, AttrNumber col, Oid sortop, Oid collation)
 {
 	TargetEntry *tle = get_tle_by_resno(plan->targetlist, col);
 	Oid			type;
@@ -5272,15 +5272,15 @@ df_check_order_key(DfCheckContext *cxt, Plan *plan, AttrNumber col, Oid sortop, 
 	if (tle == NULL)
 		return false;
 	type = exprType((Node *) tle->expr);
-	if (!df_type_supported(type) || !df_sort_direction(sortop, type, &desc) ||
+	if (!vx_type_supported(type) || !vx_sort_direction(sortop, type, &desc) ||
 		(type == NUMERICOID &&
-		 (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
-		  p > DF_NUMERIC_MAX_EXPR_PRECISION)))
+		 (!vx_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
+		  p > VX_NUMERIC_MAX_EXPR_PRECISION)))
 		return false;
-	if (df_type_is_string(type) && df_string_compare_problem(cxt, "<", collation) != NULL)
+	if (vx_type_is_string(type) && vx_string_compare_problem(cxt, "<", collation) != NULL)
 	{
-		df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-				  df_string_compare_problem(cxt, "<", collation));
+		vx_reject(cxt, "sort key of type %s %s", format_type_be(type),
+				  vx_string_compare_problem(cxt, "<", collation));
 		return false;
 	}
 	return true;
@@ -5293,18 +5293,18 @@ df_check_order_key(DfCheckContext *cxt, Plan *plan, AttrNumber col, Oid sortop, 
  * the WindowAgg's rows by?
  */
 static bool
-df_check_window_order(DfCheckContext *cxt, Plan *input)
+vx_check_window_order(VxCheckContext *cxt, Plan *input)
 {
 	int			i;
 
-	input = df_window_order_input(input);
+	input = vx_window_order_input(input);
 
-	if (IsA(input, Sort) && df_passes_through(input))
+	if (IsA(input, Sort) && vx_passes_through(input))
 	{
 		Sort	   *sort = (Sort *) input;
 
 		for (i = 0; i < sort->numCols; i++)
-			if (!df_check_order_key(cxt, input, sort->sortColIdx[i], sort->sortOperators[i],
+			if (!vx_check_order_key(cxt, input, sort->sortColIdx[i], sort->sortOperators[i],
 									sort->collations[i]))
 				return false;
 		return true;
@@ -5314,7 +5314,7 @@ df_check_window_order(DfCheckContext *cxt, Plan *input)
 		Motion	   *motion = (Motion *) input;
 
 		for (i = 0; i < motion->numSortCols; i++)
-			if (!df_check_order_key(cxt, input, motion->sortColIdx[i], motion->sortOperators[i],
+			if (!vx_check_order_key(cxt, input, motion->sortColIdx[i], motion->sortOperators[i],
 									motion->collations[i]))
 				return false;
 		return true;
@@ -5327,7 +5327,7 @@ df_check_window_order(DfCheckContext *cxt, Plan *input)
  * which keep their child's rows in order?
  */
 static bool
-df_order_path(Plan *from, Plan *plan)
+vx_order_path(Plan *from, Plan *plan)
 {
 	while (from != NULL && from != plan)
 	{
@@ -5347,7 +5347,7 @@ df_order_path(Plan *from, Plan *plan)
  * Agg's grouping columns, in its default order.  Records it.
  */
 static bool
-df_check_resort(DfCheckContext *cxt, Motion *motion)
+vx_check_resort(VxCheckContext *cxt, Motion *motion)
 {
 	Agg		   *agg = (Agg *) outerPlan(motion);
 	int			i,
@@ -5357,14 +5357,14 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 	{
 		Plan	   *below = outerPlan(agg);
 
-		if (!df_passes_through((Plan *) agg))
+		if (!vx_passes_through((Plan *) agg))
 			return false;
 		/* WIN1: as below without the Limit, which applies after (TPC-DS Q51) */
 		while (below != NULL && (IsA(below, SubqueryScan) || IsA(below, Result)))
 			below = IsA(below, SubqueryScan) ? ((SubqueryScan *) below)->subplan : outerPlan(below);
 		if (below != NULL && IsA(below, WindowAgg))
 			return true;
-		return df_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
+		return vx_check_group_order(cxt, motion, (Agg *) outerPlan(agg));
 	}
 	if (agg != NULL)
 	{
@@ -5381,7 +5381,7 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 	}
 	/* UQ2: a Unique over a Sort, run hashed, sorted by the Motion's keys */
 	if (agg != NULL && IsA(agg, Unique))
-		return df_check_group_order(cxt, motion, agg);
+		return vx_check_group_order(cxt, motion, agg);
 	/* SR1: also below Subquery Scans passing its columns on (TPC-DS Q24) */
 	while (agg != NULL && IsA(agg, SubqueryScan))
 		agg = (Agg *) ((SubqueryScan *) agg)->subplan;
@@ -5421,13 +5421,13 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
 		if (k == agg->numCols)
 			return false;
 		type = exprType((Node *) grp);
-		if (!df_type_supported(type) || !df_sort_direction(motion->sortOperators[i], type, &desc))
+		if (!vx_type_supported(type) || !vx_sort_direction(motion->sortOperators[i], type, &desc))
 			return false;
-		if (df_type_is_string(type) &&
-			df_string_compare_problem(cxt, "<", motion->collations[i]) != NULL)
+		if (vx_type_is_string(type) &&
+			vx_string_compare_problem(cxt, "<", motion->collations[i]) != NULL)
 		{
-			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-					  df_string_compare_problem(cxt, "<", motion->collations[i]));
+			vx_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  vx_string_compare_problem(cxt, "<", motion->collations[i]));
 			return false;
 		}
 		cxt->sort_keys = bms_add_member(cxt->sort_keys, var->varattno);
@@ -5441,7 +5441,7 @@ df_check_resort(DfCheckContext *cxt, Motion *motion)
  * columns of its child of the types DataFusion sorts as PostgreSQL does.
  */
 static bool
-df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
+vx_check_sort_keys(VxCheckContext *cxt, Sort *sort)
 {
 	Plan	   *child = outerPlan(sort);
 	int			i;
@@ -5454,31 +5454,31 @@ df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
 
 		if (tle == NULL)
 		{
-			df_reject(cxt, "sort key outside the target list");
+			vx_reject(cxt, "sort key outside the target list");
 			return false;
 		}
 		type = exprType((Node *) tle->expr);
-		if (!df_type_supported(type))
+		if (!vx_type_supported(type))
 		{
-			df_reject(cxt, "sort key of type %s", format_type_be(type));
+			vx_reject(cxt, "sort key of type %s", format_type_be(type));
 			return false;
 		}
-		if (!df_sort_direction(sort->sortOperators[i], type, &desc))
+		if (!vx_sort_direction(sort->sortOperators[i], type, &desc))
 		{
-			df_reject(cxt, "sort key ordered by operator %s",
+			vx_reject(cxt, "sort key ordered by operator %s",
 					  get_opname(sort->sortOperators[i]));
 			return false;
 		}
-		if (df_type_is_string(type) &&
-			df_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
+		if (vx_type_is_string(type) &&
+			vx_string_compare_problem(cxt, "<", sort->collations[i]) != NULL)
 		{
-			df_reject(cxt, "sort key of type %s %s", format_type_be(type),
-					  df_string_compare_problem(cxt, "<", sort->collations[i]));
+			vx_reject(cxt, "sort key of type %s %s", format_type_be(type),
+					  vx_string_compare_problem(cxt, "<", sort->collations[i]));
 			return false;
 		}
 		if (IsA(tle->expr, Aggref) &&
-			(df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_INT ||
-			 df_agg_state((Aggref *) tle->expr) == DF_AGG_AVG_NUMERIC))
+			(vx_agg_state((Aggref *) tle->expr) == VX_AGG_AVG_INT ||
+			 vx_agg_state((Aggref *) tle->expr) == VX_AGG_AVG_NUMERIC))
 		{
 			int			p,
 						s;
@@ -5488,10 +5488,10 @@ df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
 			 * AV2: DataFusion divides it (pg_avg) to sort by, and gives it
 			 * its display scale, within 76 digits
 			 */
-			if (!df_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
+			if (!vx_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
 			{
-				df_reject(cxt, "sort key avg returning numeric of more than %d digits",
-						  DF_NUMERIC_MAX_EXPR_PRECISION);
+				vx_reject(cxt, "sort key avg returning numeric of more than %d digits",
+						  VX_NUMERIC_MAX_EXPR_PRECISION);
 				return false;
 			}
 		}
@@ -5501,7 +5501,7 @@ df_check_sort_keys(DfCheckContext *cxt, Sort *sort)
 
 /* Does 'plan' aggregate, join or window rows of its slice? */
 static bool
-df_plan_computes(Plan *plan)
+vx_plan_computes(Plan *plan)
 {
 	ListCell   *lc;
 
@@ -5512,29 +5512,29 @@ df_plan_computes(Plan *plan)
 		IsA(plan, Unique))
 		return true;
 	if (IsA(plan, SubqueryScan))
-		return df_plan_computes(((SubqueryScan *) plan)->subplan);
+		return vx_plan_computes(((SubqueryScan *) plan)->subplan);
 	if (IsA(plan, Sequence))
-		return df_plan_computes(llast(((Sequence *) plan)->subplans));
-	foreach(lc, df_append_plans(plan))
-		if (df_plan_computes(lfirst(lc)))
+		return vx_plan_computes(llast(((Sequence *) plan)->subplans));
+	foreach(lc, vx_append_plans(plan))
+		if (vx_plan_computes(lfirst(lc)))
 			return true;
-	return df_plan_computes(outerPlan(plan)) || df_plan_computes(innerPlan(plan));
+	return vx_plan_computes(outerPlan(plan)) || vx_plan_computes(innerPlan(plan));
 }
 
-/* Does an input of Append 'plan' compute (df_plan_computes)? */
+/* Does an input of Append 'plan' compute (vx_plan_computes)? */
 static bool
-df_append_computes(Plan *plan)
+vx_append_computes(Plan *plan)
 {
 	ListCell   *lc;
 
-	foreach(lc, df_append_plans(plan))
-		if (df_plan_computes(lfirst(lc)))
+	foreach(lc, vx_append_plans(plan))
+		if (vx_plan_computes(lfirst(lc)))
 			return true;
 	return false;
 }
 
 static void
-df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+vx_check_plan(Plan *plan, VxCheckContext *cxt, Bitmapset *needed,
 			  bool root_is_sender)
 {
 	Plan	   *saved = cxt->node;
@@ -5542,7 +5542,7 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 	cxt->node = plan;
 	cxt->node_order_free = cxt->order_free;
 	cxt->order_free = false;
-	df_check_plan_node(plan, cxt, needed, root_is_sender);
+	vx_check_plan_node(plan, cxt, needed, root_is_sender);
 	cxt->node = saved;
 }
 
@@ -5550,17 +5550,17 @@ df_check_plan(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  * Does the engine have 'feature'?  If not, rejects the slice saying so.
  */
 static bool
-df_engine_has(DfCheckContext *cxt, uint64 feature)
+vx_engine_has(VxCheckContext *cxt, uint64 feature)
 {
-	if ((df_engine_features() & feature) != 0)
+	if ((vx_engine_features() & feature) != 0)
 		return true;
-	df_reject(cxt, "engine %s lacks %s", df_engine->name, df_feature_name(feature));
+	vx_reject(cxt, "engine %s lacks %s", vx_engine->name, vx_feature_name(feature));
 	return false;
 }
 
 /* The engine feature running 'plan' takes beyond VEC_F_QUERIES, or 0. */
 static uint64
-df_plan_feature(Plan *plan)
+vx_plan_feature(Plan *plan)
 {
 	switch (nodeTag(plan))
 	{
@@ -5586,15 +5586,15 @@ df_plan_feature(Plan *plan)
 }
 
 static void
-df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
+vx_check_plan_node(Plan *plan, VxCheckContext *cxt, Bitmapset *needed,
 				   bool root_is_sender)
 {
 	uint64		feature;
 
 	if (plan == NULL || cxt->failed)
 		return;
-	feature = df_plan_feature(plan);
-	if (feature != 0 && !df_engine_has(cxt, feature))
+	feature = vx_plan_feature(plan);
+	if (feature != 0 && !vx_engine_has(cxt, feature))
 		return;
 
 	switch (nodeTag(plan))
@@ -5607,24 +5607,24 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				if (rte->rtekind != RTE_RELATION || rte->tablesample != NULL)
 				{
-					df_reject(cxt, "Seq Scan over something other than a plain table");
+					vx_reject(cxt, "Seq Scan over something other than a plain table");
 					return;
 				}
-				relam = df_relation_am(rte->relid);
-				if (!df_am_supported(relam))
+				relam = vx_relation_am(rte->relid);
+				if (!vx_am_supported(relam))
 				{
 					char	   *amname = get_am_name(relam);
 
-					df_reject(cxt, "table %s uses access method %s",
+					vx_reject(cxt, "table %s uses access method %s",
 							  get_rel_name(rte->relid), amname ? amname : "?");
 					return;
 				}
 				cxt->allow_aggref = false;
 				cxt->rowid_ok = true;
-				df_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
 				cxt->rowid_ok = false;
 				cxt->correlated_ok = true;
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				cxt->correlated_ok = false;
 				return;
 			}
@@ -5634,13 +5634,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				Agg		   *agg = (Agg *) plan;
 				Plan	   *child = outerPlan(plan);
 				Bitmapset  *child_needed = NULL;
-				DfAggGroups groups;
+				VxAggGroups groups;
 				bool		inner;
 				ListCell   *lc;
 				int			i;
 
-				df_agg_groups(agg, &groups);
-				if (groups.nsets > 0 && !df_check_grouping_sets(cxt, agg, &groups))
+				vx_agg_groups(agg, &groups);
+				if (groups.nsets > 0 && !vx_check_grouping_sets(cxt, agg, &groups))
 					return;
 				if (groups.nsets > 0 && (agg->aggstrategy != AGG_SORTED || agg->chain != NIL))
 				{
@@ -5674,7 +5674,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				else if (agg->aggstrategy == AGG_SORTED && plan == cxt->top &&
 						 cxt->tails.resort == NULL && cxt->tails.resort_by == NULL &&
-						 df_check_group_order(cxt, NULL, agg))
+						 vx_check_group_order(cxt, NULL, agg))
 				{
 					/*
 					 * D7: one at the top of the slice, or below a Limit there,
@@ -5694,7 +5694,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				else if (agg->aggstrategy != AGG_PLAIN && agg->aggstrategy != AGG_HASHED)
 				{
-					df_reject(cxt, "sorted or mixed aggregation");
+					vx_reject(cxt, "sorted or mixed aggregation");
 					return;
 				}
 				/*
@@ -5706,7 +5706,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->window_input;
 				if (inner && agg->aggsplit == AGGSPLIT_INITIAL_SERIAL)
 				{
-					df_reject(cxt, "partial aggregate below a join or another aggregate");
+					vx_reject(cxt, "partial aggregate below a join or another aggregate");
 					return;
 				}
 				/*
@@ -5723,18 +5723,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				if (agg->aggsplit == AGGSPLIT_FINAL_DESERIAL)
 				{
-					if ((child == NULL || !IsA(df_below_sort(child), Motion)) &&
-						!df_agg_plain_states(agg) &&
-						!df_agg_states_through(agg, cxt->batches))
+					if ((child == NULL || !IsA(vx_below_sort(child), Motion)) &&
+						!vx_agg_plain_states(agg) &&
+						!vx_agg_states_through(agg, cxt->batches))
 					{
-						df_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
+						vx_reject(cxt, "combining stage of a multi-stage aggregation not above a Motion");
 						return;
 					}
 				}
 				else if (agg->aggsplit != AGGSPLIT_SIMPLE &&
 						 agg->aggsplit != AGGSPLIT_INITIAL_SERIAL)
 				{
-					df_reject(cxt, "combining stage of a multi-stage aggregation");
+					vx_reject(cxt, "combining stage of a multi-stage aggregation");
 					return;
 				}
 				for (i = 0; i < groups.ncols && child != NULL; i++)
@@ -5742,9 +5742,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = get_tle_by_resno(child->targetlist,
 														groups.cols[i]);
 
-					if (tle && !df_type_supported(exprType((Node *) tle->expr)))
+					if (tle && !vx_type_supported(exprType((Node *) tle->expr)))
 					{
-						df_reject(cxt, "GROUP BY key of type %s",
+						vx_reject(cxt, "GROUP BY key of type %s",
 								  format_type_be(exprType((Node *) tle->expr)));
 						return;
 					}
@@ -5758,26 +5758,26 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						/*
 						 * DN1: one of display scales of its own groups by
 						 * value, its display scale one of the group's
-						 * (df_key_scale_call)
+						 * (vx_key_scale_call)
 						 */
-						if (!df_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
+						if (!vx_numeric_range(child, (Node *) tle->expr, &p, &s, &dyn))
 						{
-							df_reject(cxt, "GROUP BY key of numeric of unknown precision");
+							vx_reject(cxt, "GROUP BY key of numeric of unknown precision");
 							return;
 						}
 						if (dyn && groups.nsets > 0)
 						{
-							df_reject(cxt, "GROUP BY key of numeric of display scales of its own "
+							vx_reject(cxt, "GROUP BY key of numeric of display scales of its own "
 									  "with grouping sets");
 							return;
 						}
 					}
-					if (tle && df_type_is_string(exprType((Node *) tle->expr)) &&
-						df_string_compare_problem(cxt, "=", groups.collations[i]) != NULL)
+					if (tle && vx_type_is_string(exprType((Node *) tle->expr)) &&
+						vx_string_compare_problem(cxt, "=", groups.collations[i]) != NULL)
 					{
-						df_reject(cxt, "GROUP BY key of type %s %s",
+						vx_reject(cxt, "GROUP BY key of type %s %s",
 								  format_type_be(exprType((Node *) tle->expr)),
-								  df_string_compare_problem(cxt, "=", groups.collations[i]));
+								  vx_string_compare_problem(cxt, "=", groups.collations[i]));
 						return;
 					}
 				}
@@ -5786,15 +5786,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					!inner && plan == cxt->output;
 				cxt->agg_to_batches = cxt->batch_sender && !inner;
 				cxt->final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
-					IsA(df_below_sort(child), Motion) &&
-					bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches);
+					IsA(vx_below_sort(child), Motion) &&
+					bms_is_member(((Motion *) vx_below_sort(child))->motionID, cxt->batches);
 				cxt->through_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL &&
-					(child == NULL || !IsA(df_below_sort(child), Motion));
+					(child == NULL || !IsA(vx_below_sort(child), Motion));
 				cxt->pg_final_states = agg->aggsplit == AGGSPLIT_FINAL_DESERIAL && child != NULL &&
-					IsA(df_below_sort(child), Motion) &&
-					!bms_is_member(((Motion *) df_below_sort(child))->motionID, cxt->batches) &&
-					outerPlan(df_below_sort(child)) != NULL &&
-					IsA(outerPlan(df_below_sort(child)), Agg);
+					IsA(vx_below_sort(child), Motion) &&
+					!bms_is_member(((Motion *) vx_below_sort(child))->motionID, cxt->batches) &&
+					outerPlan(vx_below_sort(child)) != NULL &&
+					IsA(outerPlan(vx_below_sort(child)), Agg);
 				cxt->batch_sender = false;
 				cxt->allow_aggref = true;
 				cxt->agg_sets = groups.nsets > 0;
@@ -5804,9 +5804,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (IsA(lfirst_node(TargetEntry, lc)->expr, Aggref))
 						cxt->whole_aggs = lappend(cxt->whole_aggs,
 												  lfirst_node(TargetEntry, lc)->expr);
-				/* A1: an Agg below computes all its calls (df_emit_node) */
-				df_check_targetlist(plan->targetlist, inner ? NULL : needed, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				/* A1: an Agg below computes all its calls (vx_emit_node) */
+				vx_check_targetlist(plan->targetlist, inner ? NULL : needed, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				cxt->inner_agg = false;
 				cxt->allow_aggref = false;
 				cxt->agg_sets = false;
@@ -5818,15 +5818,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->agg_to_batches = false;
 
 				/* The child must produce what the aggregate reads. */
-				df_collect_outer_refs((Node *) plan->targetlist, &child_needed);
-				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				vx_collect_outer_refs((Node *) plan->targetlist, &child_needed);
+				vx_collect_outer_refs((Node *) plan->qual, &child_needed);
 				for (i = 0; i < groups.ncols; i++)
 					child_needed = bms_add_member(child_needed, groups.cols[i]);
 				/* count(*) alone reads no column; keep the set non-NULL. */
 				child_needed = bms_add_member(child_needed, 0);
 				cxt->agg_input = true;
 				cxt->order_free = true; /* hashed: the order of its input is not read */
-				df_check_plan(child, cxt, child_needed, false);
+				vx_check_plan(child, cxt, child_needed, false);
 				cxt->agg_input = false;
 				return;
 			}
@@ -5843,9 +5843,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				bool		saved = cxt->projection_input;
 				ListCell   *lc;
 
-				if (df_empty_result(plan))
+				if (vx_empty_result(plan))
 				{
-					/* OF1: no rows, its columns of no value (df_emit_output_of) */
+					/* OF1: no rows, its columns of no value (vx_emit_output_of) */
 					foreach(lc, plan->targetlist)
 					{
 						Node	   *e = (Node *) lfirst_node(TargetEntry, lc)->expr;
@@ -5853,10 +5853,10 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						int			p,
 									sc;
 
-						if (!df_type_supported(type) ||
-							(type == NUMERICOID && !df_numeric_ps(plan, e, &p, &sc)))
+						if (!vx_type_supported(type) ||
+							(type == NUMERICOID && !vx_numeric_ps(plan, e, &p, &sc)))
 						{
-							df_reject(cxt, "empty Result with a column of type %s",
+							vx_reject(cxt, "empty Result with a column of type %s",
 									  format_type_be(type));
 							return;
 						}
@@ -5864,14 +5864,14 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					return;
 				}
 				if (outerPlan(plan) == NULL || innerPlan(plan) != NULL ||
-					df_one_time_value(((Result *) plan)->resconstantqual, false) < 0)
+					vx_one_time_value(((Result *) plan)->resconstantqual, false) < 0)
 				{
-					df_reject(cxt, "Result without a child or with a one-time filter");
+					vx_reject(cxt, "Result without a child or with a one-time filter");
 					return;
 				}
 				if (plan == cxt->top && IsA(outerPlan(plan), Limit) && plan->qual == NIL &&
 					outerPlan(outerPlan(plan)) != NULL &&
-					IsA(outerPlan(outerPlan(plan)), Motion) && df_plain_columns(plan))
+					IsA(outerPlan(outerPlan(plan)), Motion) && vx_plain_columns(plan))
 				{
 					/*
 					 * GPORCA's Result over the coordinator's Limit over a
@@ -5892,20 +5892,20 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					int			i;
 
 					cxt->top = NULL;
-					if (!df_passes_through((Plan *) sort))
+					if (!vx_passes_through((Plan *) sort))
 					{
-						df_reject(cxt, "Sort that computes columns");
+						vx_reject(cxt, "Sort that computes columns");
 						return;
 					}
-					if (!df_check_sort_keys(cxt, sort))
+					if (!vx_check_sort_keys(cxt, sort))
 						return;
 					for (i = 0; i < sort->numCols; i++)
 					{
-						AttrNumber	col = df_output_of(plan, sort->sortColIdx[i]);
+						AttrNumber	col = vx_output_of(plan, sort->sortColIdx[i]);
 
 						if (col == 0)
 						{
-							df_reject(cxt, "sort key the Result above does not pass on");
+							vx_reject(cxt, "sort key the Result above does not pass on");
 							return;
 						}
 						cxt->sort_keys = bms_add_member(cxt->sort_keys, col);
@@ -5914,8 +5914,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->skipped_sort = (Plan *) sort;
 				}
 				cxt->allow_aggref = false;
-				df_check_targetlist(plan->targetlist, needed, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
 					return;
 				foreach(lc, plan->targetlist)
@@ -5923,13 +5923,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
-						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+						vx_collect_outer_refs((Node *) tle->expr, &child_needed);
 				}
-				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				vx_collect_outer_refs((Node *) plan->qual, &child_needed);
 				child_needed = bms_add_member(child_needed, 0);
 				cxt->order_free = cxt->node_order_free; /* its child's order */
 				cxt->projection_input = true;
-				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				vx_check_plan(outerPlan(plan), cxt, child_needed, false);
 				cxt->projection_input = saved;
 				return;
 			}
@@ -5943,13 +5943,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * which those above read by name (A1).
 				 */
 				SubqueryScan *sq = (SubqueryScan *) plan;
-				DfScanRefs	refs = {sq->scan.scanrelid, NULL};
+				VxScanRefs	refs = {sq->scan.scanrelid, NULL};
 				bool		saved = cxt->projection_input;
 				ListCell   *lc;
 
 				cxt->allow_aggref = false;
-				df_check_targetlist(plan->targetlist, needed, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
 					return;
 				foreach(lc, plan->targetlist)
@@ -5957,13 +5957,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
-						df_collect_scan_refs((Node *) tle->expr, &refs);
+						vx_collect_scan_refs((Node *) tle->expr, &refs);
 				}
-				df_collect_scan_refs((Node *) plan->qual, &refs);
+				vx_collect_scan_refs((Node *) plan->qual, &refs);
 				refs.refs = bms_add_member(refs.refs, 0);
 				cxt->order_free = cxt->node_order_free; /* its plan's order */
 				cxt->projection_input = true;
-				df_check_plan(sq->subplan, cxt, refs.refs, false);
+				vx_check_plan(sq->subplan, cxt, refs.refs, false);
 				cxt->projection_input = saved;
 				return;
 			}
@@ -5988,21 +5988,21 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (IsA(plan, Append) ? ((Append *) plan)->part_prune_info != NULL :
 					((MergeAppend *) plan)->part_prune_info != NULL)
 				{
-					df_reject(cxt, "Append with run-time partition pruning");
+					vx_reject(cxt, "Append with run-time partition pruning");
 					return;
 				}
-				if (df_append_plans(plan) == NIL || plan->qual != NIL)
+				if (vx_append_plans(plan) == NIL || plan->qual != NIL)
 				{
-					df_reject(cxt, "Append without inputs or with a filter");
+					vx_reject(cxt, "Append without inputs or with a filter");
 					return;
 				}
 				if (!cxt->node_order_free)
 				{
-					df_reject(cxt, "Append whose order of rows is read");
+					vx_reject(cxt, "Append whose order of rows is read");
 					return;
 				}
 				cxt->allow_aggref = false;
-				df_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
 				foreach(lc, plan->targetlist)
 				{
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
@@ -6013,16 +6013,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						return;
 					if ((needed == NULL || bms_is_member(tle->resno, needed)) &&
 						exprType((Node *) tle->expr) == NUMERICOID &&
-						(df_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
-						 df_numeric_varying(plan, (Node *) tle->expr)) &&
-						!df_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
-						df_reject(cxt, "Append of numeric of display scales of their own");
+						(vx_numeric_dyn(plan, (Node *) tle->expr, &p, &sc) ||
+						 vx_numeric_varying(plan, (Node *) tle->expr)) &&
+						!vx_dscale_ok(plan, (Node *) tle->expr, cxt->batches))
+						vx_reject(cxt, "Append of numeric of display scales of their own");
 				}
 				agg_input = cxt->agg_input;
 				join_input = cxt->join_input;
 				window_input = cxt->window_input;
 				union_input = cxt->union_input;
-				foreach(lc, df_append_plans(plan))
+				foreach(lc, vx_append_plans(plan))
 				{
 					/*
 					 * as above each input: an Agg in one clears agg_input
@@ -6034,9 +6034,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->agg_input = agg_input;
 					cxt->join_input = join_input;
 					cxt->window_input = window_input;
-					cxt->union_input = union_input || df_append_computes(plan);
+					cxt->union_input = union_input || vx_append_computes(plan);
 					cxt->order_free = true;
-					df_check_plan(lfirst(lc), cxt, needed, false);
+					vx_check_plan(lfirst(lc), cxt, needed, false);
 				}
 				cxt->union_input = union_input;
 				return;
@@ -6058,12 +6058,12 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (outerPlan(plan) == NULL || ao->errcode != ERRCODE_TOO_MANY_ROWS ||
 					list_length(ao->errmessage) < 1 || !IsA(linitial(ao->errmessage), String))
 				{
-					df_reject(cxt, "Assert other than of a scalar subquery's rows");
+					vx_reject(cxt, "Assert other than of a scalar subquery's rows");
 					return;
 				}
 				cxt->allow_aggref = false;
-				df_check_targetlist(plan->targetlist, needed, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
 					return;
 				foreach(lc, plan->targetlist)
@@ -6071,12 +6071,12 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
-						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+						vx_collect_outer_refs((Node *) tle->expr, &child_needed);
 				}
-				df_collect_outer_refs((Node *) plan->qual, &child_needed);
+				vx_collect_outer_refs((Node *) plan->qual, &child_needed);
 				child_needed = bms_add_member(child_needed, 0);
 				cxt->order_free = cxt->node_order_free; /* its child's order */
-				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				vx_check_plan(outerPlan(plan), cxt, child_needed, false);
 				return;
 			}
 
@@ -6100,13 +6100,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				if (plan->qual != NIL || child == NULL || uq->numCols <= 0)
 				{
-					df_reject(cxt, "Unique with a filter or without columns");
+					vx_reject(cxt, "Unique with a filter or without columns");
 					return;
 				}
 				/* UQ2: or in the order the slice sorts its rows in */
 				if (!cxt->node_order_free && cxt->tails.resort_by != child)
 				{
-					df_reject(cxt, "Unique whose order of rows is read");
+					vx_reject(cxt, "Unique whose order of rows is read");
 					return;
 				}
 				for (k = 0; k < uq->numCols; k++)
@@ -6114,16 +6114,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = get_tle_by_resno(child->targetlist, uq->uniqColIdx[k]);
 					const char *problem;
 
-					if (!df_alike_type(tle))
+					if (!vx_alike_type(tle))
 					{
-						df_reject(cxt, "Unique on a column of type %s",
+						vx_reject(cxt, "Unique on a column of type %s",
 								  tle ? format_type_be(exprType((Node *) tle->expr)) : "?");
 						return;
 					}
-					if (df_type_is_string(exprType((Node *) tle->expr)) &&
-						(problem = df_string_compare_problem(cxt, "=", uq->uniqCollations[k])) != NULL)
+					if (vx_type_is_string(exprType((Node *) tle->expr)) &&
+						(problem = vx_string_compare_problem(cxt, "=", uq->uniqCollations[k])) != NULL)
 					{
-						df_reject(cxt, "Unique on text %s", problem);
+						vx_reject(cxt, "Unique on text %s", problem);
 						return;
 					}
 					child_needed = bms_add_member(child_needed, uq->uniqColIdx[k]);
@@ -6136,9 +6136,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (needed != NULL && !bms_is_member(tle->resno, needed))
 						continue;
 					if (!IsA(var, Var) || var->varno != OUTER_VAR ||
-						df_unique_group(uq, var->varattno) < 0)
+						vx_unique_group(uq, var->varattno) < 0)
 					{
-						df_reject(cxt, "Unique output other than its columns");
+						vx_reject(cxt, "Unique output other than its columns");
 						return;
 					}
 				}
@@ -6146,7 +6146,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->skipped_sort = child;	/* grouped hashed (D2) */
 				cxt->order_free = true;
 				cxt->agg_input = true;	/* a grouping, worth the Motions below */
-				df_check_plan(child, cxt, child_needed, false);
+				vx_check_plan(child, cxt, child_needed, false);
 				cxt->agg_input = false;
 				return;
 			}
@@ -6172,23 +6172,23 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				if (so->cmd != SETOPCMD_INTERSECT && so->cmd != SETOPCMD_EXCEPT)
 				{
-					df_reject(cxt, "INTERSECT ALL or EXCEPT ALL");
+					vx_reject(cxt, "INTERSECT ALL or EXCEPT ALL");
 					return;
 				}
 				if (plan->qual != NIL || child == NULL || so->flagColIdx <= 0)
 				{
-					df_reject(cxt, "SetOp with a filter or without a flag column");
+					vx_reject(cxt, "SetOp with a filter or without a flag column");
 					return;
 				}
 				if (!cxt->node_order_free)
 				{
-					df_reject(cxt, "SetOp whose order of rows is read");
+					vx_reject(cxt, "SetOp whose order of rows is read");
 					return;
 				}
 				flag = get_tle_by_resno(child->targetlist, so->flagColIdx);
 				if (flag == NULL || exprType((Node *) flag->expr) != INT4OID)
 				{
-					df_reject(cxt, "SetOp flag column not of type integer");
+					vx_reject(cxt, "SetOp flag column not of type integer");
 					return;
 				}
 				for (k = 0; k < so->numCols; k++)
@@ -6197,16 +6197,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					Oid			type = tle ? exprType((Node *) tle->expr) : InvalidOid;
 					const char *problem;
 
-					if (!df_alike_type(tle))
+					if (!vx_alike_type(tle))
 					{
-						df_reject(cxt, "INTERSECT or EXCEPT on a column of type %s",
+						vx_reject(cxt, "INTERSECT or EXCEPT on a column of type %s",
 								  type == InvalidOid ? "?" : format_type_be(type));
 						return;
 					}
-					if (df_type_is_string(type) &&
-						(problem = df_string_compare_problem(cxt, "=", so->dupCollations[k])) != NULL)
+					if (vx_type_is_string(type) &&
+						(problem = vx_string_compare_problem(cxt, "=", so->dupCollations[k])) != NULL)
 					{
-						df_reject(cxt, "INTERSECT or EXCEPT on text %s", problem);
+						vx_reject(cxt, "INTERSECT or EXCEPT on text %s", problem);
 						return;
 					}
 					child_needed = bms_add_member(child_needed, so->dupColIdx[k]);
@@ -6220,9 +6220,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (needed != NULL && !bms_is_member(tle->resno, needed))
 						continue;
 					if (!IsA(var, Var) || var->varno != OUTER_VAR ||
-						df_setop_group(so, var->varattno) < 0)
+						vx_setop_group(so, var->varattno) < 0)
 					{
-						df_reject(cxt, "SetOp output other than its columns");
+						vx_reject(cxt, "SetOp output other than its columns");
 						return;
 					}
 				}
@@ -6231,7 +6231,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					cxt->skipped_sort = child;	/* grouped hashed (D2) */
 				cxt->order_free = true;
 				cxt->agg_input = true;	/* a grouping, worth the Motions below */
-				df_check_plan(child, cxt, child_needed, false);
+				vx_check_plan(child, cxt, child_needed, false);
 				cxt->agg_input = false;
 				return;
 			}
@@ -6265,13 +6265,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 */
 					if (!order_free)
 					{
-						df_reject(cxt, "Merge Join whose order of rows is read");
+						vx_reject(cxt, "Merge Join whose order of rows is read");
 						return;
 					}
 					if (join->jointype == JOIN_LASJ_NOTIN || mj->mergeclauses == NIL ||
 						inner == NULL || outer == NULL)
 					{
-						df_reject(cxt, "this kind of Merge Join");
+						vx_reject(cxt, "this kind of Merge Join");
 						return;
 					}
 				}
@@ -6286,18 +6286,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 */
 					if (((NestLoop *) plan)->nestParams != NIL)
 					{
-						df_reject(cxt, "Nested Loop with parameters");
+						vx_reject(cxt, "Nested Loop with parameters");
 						return;
 					}
 					if (join->jointype != JOIN_INNER && join->jointype != JOIN_LEFT &&
 						join->jointype != JOIN_SEMI && join->jointype != JOIN_ANTI)
 					{
-						df_reject(cxt, "this kind of Nested Loop");
+						vx_reject(cxt, "this kind of Nested Loop");
 						return;
 					}
 					if (inner == NULL || outer == NULL)
 					{
-						df_reject(cxt, "Nested Loop without two children");
+						vx_reject(cxt, "Nested Loop without two children");
 						return;
 					}
 				}
@@ -6315,24 +6315,24 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					join->jointype != JOIN_SEMI && join->jointype != JOIN_ANTI &&
 					join->jointype != JOIN_RIGHT_ANTI && join->jointype != JOIN_LASJ_NOTIN)
 				{
-					df_reject(cxt, "this kind of join");
+					vx_reject(cxt, "this kind of join");
 					return;
 				}
 				if (hj != NULL && join->jointype == JOIN_LASJ_NOTIN &&
 					(list_length(hj->hashclauses) != 1 || join->joinqual != NIL))
 				{
 					/* NJ1: DataFusion's null-aware anti join takes one key */
-					df_reject(cxt, "NOT IN anti join on several columns or with a join filter");
+					vx_reject(cxt, "NOT IN anti join on several columns or with a join filter");
 					return;
 				}
-				if (hj != NULL && hj->hashqualclauses != NIL && !df_null_equal_join(hj))
+				if (hj != NULL && hj->hashqualclauses != NIL && !vx_null_equal_join(hj))
 				{
-					df_reject(cxt, "join on IS NOT DISTINCT FROM and = keys together");
+					vx_reject(cxt, "join on IS NOT DISTINCT FROM and = keys together");
 					return;
 				}
 				if (hj != NULL && (inner == NULL || !IsA(inner, Hash) || outer == NULL))
 				{
-					df_reject(cxt, "Hash Join without a Hash node");
+					vx_reject(cxt, "Hash Join without a Hash node");
 					return;
 				}
 				foreach(lc, hashclauses)
@@ -6343,13 +6343,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (!IsA(op, OpExpr) || list_length(op->args) != 2 ||
 						(name = get_opname(op->opno)) == NULL || strcmp(name, "=") != 0)
 					{
-						df_reject(cxt, "%s condition other than =", df_plan_name(plan));
+						vx_reject(cxt, "%s condition other than =", vx_plan_name(plan));
 						return;
 					}
-					if (!OidIsValid(df_join_key_type(exprType(linitial(op->args)),
+					if (!OidIsValid(vx_join_key_type(exprType(linitial(op->args)),
 													 exprType(lsecond(op->args)))))
 					{
-						df_reject(cxt, "%s on %s = %s", df_plan_name(plan),
+						vx_reject(cxt, "%s on %s = %s", vx_plan_name(plan),
 								  format_type_be(exprType(linitial(op->args))),
 								  format_type_be(exprType(lsecond(op->args))));
 						return;
@@ -6359,55 +6359,55 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * SHJ: a hash join spills what does not fit, but for a NOT IN
 				 * anti join (null-aware) and a nested loop
 				 */
-				spills = df_join_estimates == DF_JOIN_ESTIMATES_SPILL &&
+				spills = vx_join_estimates == VX_JOIN_ESTIMATES_SPILL &&
 					(hj != NULL || mj != NULL) && join->jointype != JOIN_LASJ_NOTIN;
-				build = df_nestloop_swapped(plan) ? outer : inner;
+				build = vx_nestloop_swapped(plan) ? outer : inner;
 				if (build == outer && !order_free)
 				{
-					df_reject(cxt, "Nested Loop whose order of rows is read, its inner side "
+					vx_reject(cxt, "Nested Loop whose order of rows is read, its inner side "
 							  "of about %.0f kB beyond its %.0f kB",
-							  df_hash_estimate(inner) / 1024, df_hash_budget(inner) / 1024);
+							  vx_hash_estimate(inner) / 1024, vx_hash_budget(inner) / 1024);
 					return;
 				}
-				if (!spills && df_hash_estimate(build) > df_hash_budget(inner))
+				if (!spills && vx_hash_estimate(build) > vx_hash_budget(inner))
 				{
-					df_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
-							  df_plan_name(plan), df_hash_estimate(build) / 1024,
-							  df_hash_budget(inner) / 1024);
+					vx_reject(cxt, "%s build side of about %.0f kB exceeds its %.0f kB",
+							  vx_plan_name(plan), vx_hash_estimate(build) / 1024,
+							  vx_hash_budget(inner) / 1024);
 					return;
 				}
 				{
 					double		bound = 0;
-					const char *doubt = spills ? NULL : df_hash_doubt(build, &bound);
+					const char *doubt = spills ? NULL : vx_hash_doubt(build, &bound);
 
 					if (doubt != NULL && bound > 0)
 					{
-						df_reject(cxt, "%s build side %s (up to about %.0f kB, budget %.0f kB)",
-								  df_plan_name(plan), doubt, bound / 1024,
-								  df_hash_budget(inner) / 1024);
+						vx_reject(cxt, "%s build side %s (up to about %.0f kB, budget %.0f kB)",
+								  vx_plan_name(plan), doubt, bound / 1024,
+								  vx_hash_budget(inner) / 1024);
 						return;
 					}
 					if (doubt != NULL)
 					{
-						df_reject(cxt, "%s build side %s", df_plan_name(plan), doubt);
+						vx_reject(cxt, "%s build side %s", vx_plan_name(plan), doubt);
 						return;
 					}
 				}
 				if (join->jointype == JOIN_LASJ_NOTIN &&
-					df_hash_estimate(outer) > df_hash_budget(inner))
+					vx_hash_estimate(outer) > vx_hash_budget(inner))
 				{
 					/* NJ1: DataFusion builds its table on the outer side */
-					df_reject(cxt, "NOT IN anti join outer side of about %.0f kB exceeds its %.0f kB",
-							  df_hash_estimate(outer) / 1024, df_hash_budget(inner) / 1024);
+					vx_reject(cxt, "NOT IN anti join outer side of about %.0f kB exceeds its %.0f kB",
+							  vx_hash_estimate(outer) / 1024, vx_hash_budget(inner) / 1024);
 					return;
 				}
 				cxt->allow_aggref = false;
 				cxt->rowid_ok = true;
-				df_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
 				cxt->rowid_ok = false;
-				df_check_expr_list(hashclauses, cxt);
-				df_check_expr_list(join->joinqual, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_expr_list(hashclauses, cxt);
+				vx_check_expr_list(join->joinqual, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				if (cxt->failed)
 					return;
 
@@ -6438,9 +6438,9 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 						if (var->varno == dropped &&
 							(join->jointype != JOIN_SEMI || hj == NULL ||
-							 df_semi_key_for(hj, var) == NULL))
+							 vx_semi_key_for(hj, var) == NULL))
 						{
-							df_reject(cxt, "column of the side a semi or anti join drops");
+							vx_reject(cxt, "column of the side a semi or anti join drops");
 							return;
 						}
 					}
@@ -6453,16 +6453,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
 					{
-						df_collect_outer_refs((Node *) tle->expr, &outer_needed);
-						df_collect_inner_refs((Node *) tle->expr, &inner_needed);
+						vx_collect_outer_refs((Node *) tle->expr, &outer_needed);
+						vx_collect_inner_refs((Node *) tle->expr, &inner_needed);
 					}
 				}
-				df_collect_outer_refs((Node *) hashclauses, &outer_needed);
-				df_collect_inner_refs((Node *) hashclauses, &inner_needed);
-				df_collect_outer_refs((Node *) join->joinqual, &outer_needed);
-				df_collect_inner_refs((Node *) join->joinqual, &inner_needed);
-				df_collect_outer_refs((Node *) plan->qual, &outer_needed);
-				df_collect_inner_refs((Node *) plan->qual, &inner_needed);
+				vx_collect_outer_refs((Node *) hashclauses, &outer_needed);
+				vx_collect_inner_refs((Node *) hashclauses, &inner_needed);
+				vx_collect_outer_refs((Node *) join->joinqual, &outer_needed);
+				vx_collect_inner_refs((Node *) join->joinqual, &inner_needed);
+				vx_collect_outer_refs((Node *) plan->qual, &outer_needed);
+				vx_collect_inner_refs((Node *) plan->qual, &inner_needed);
 
 				/* Above an outer join, the nulled side's columns must be plain. */
 				{
@@ -6475,18 +6475,18 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 						if (needed == NULL || bms_is_member(tle->resno, needed))
 						{
-							df_collect_outer_refs((Node *) tle->expr, &above_outer);
-							df_collect_inner_refs((Node *) tle->expr, &above_inner);
+							vx_collect_outer_refs((Node *) tle->expr, &above_outer);
+							vx_collect_inner_refs((Node *) tle->expr, &above_inner);
 						}
 					}
-					df_collect_outer_refs((Node *) plan->qual, &above_outer);
-					df_collect_inner_refs((Node *) plan->qual, &above_inner);
+					vx_collect_outer_refs((Node *) plan->qual, &above_outer);
+					vx_collect_inner_refs((Node *) plan->qual, &above_inner);
 					if (((join->jointype == JOIN_LEFT || join->jointype == JOIN_FULL) &&
-						 !df_plain_outputs(inner, above_inner)) ||
+						 !vx_plain_outputs(inner, above_inner)) ||
 						((join->jointype == JOIN_RIGHT || join->jointype == JOIN_FULL) &&
-						 !df_plain_outputs(outer, above_outer)))
+						 !vx_plain_outputs(outer, above_outer)))
 					{
-						df_reject(cxt, "expression on the nullable side of an outer join");
+						vx_reject(cxt, "expression on the nullable side of an outer join");
 						return;
 					}
 				}
@@ -6502,13 +6502,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				cxt->order_free = true;
 				if (mj != NULL)
-					cxt->skipped_sort = df_merge_sort(inner);
-				df_check_plan(inner, cxt, inner_needed, false);
+					cxt->skipped_sort = vx_merge_sort(inner);
+				vx_check_plan(inner, cxt, inner_needed, false);
 				cxt->join_input = true;
 				cxt->order_free = hj != NULL || mj != NULL || order_free;
 				if (mj != NULL)
-					cxt->skipped_sort = df_merge_sort(outer);
-				df_check_plan(outer, cxt, outer_needed, false);
+					cxt->skipped_sort = vx_merge_sort(outer);
+				vx_check_plan(outer, cxt, outer_needed, false);
 				cxt->join_input = false;
 				return;
 			}
@@ -6518,7 +6518,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				/*
 				 * WIN1: DataFusion's window over the child's rows, which it
 				 * sorts by the partition and order keys itself, in the
-				 * order PostgreSQL sorted them by (df_window_order): a Sort
+				 * order PostgreSQL sorted them by (vx_window_order): a Sort
 				 * below is left out, a merging Motion read unmerged.  Its
 				 * window functions are columns of its node, which the
 				 * nodes above read by name, as an Agg's calls (A1).
@@ -6526,7 +6526,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				WindowAgg  *wa = (WindowAgg *) plan;
 				Plan	   *child = outerPlan(plan);
 				Bitmapset  *child_needed = NULL;
-				const char *frame = df_window_frame(wa);
+				const char *frame = vx_window_frame(wa);
 				WindowAgg  *saved_window = cxt->window;
 				bool		saved_input = cxt->window_input;
 				bool		whole = false;
@@ -6536,12 +6536,12 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				if (child == NULL || innerPlan(plan) != NULL)
 				{
-					df_reject(cxt, "WindowAgg without a child");
+					vx_reject(cxt, "WindowAgg without a child");
 					return;
 				}
 				if (frame == NULL)
 				{
-					df_reject(cxt, "window frame other than from the first row of the partition "
+					vx_reject(cxt, "window frame other than from the first row of the partition "
 							  "to the current row or the last");
 					return;
 				}
@@ -6549,15 +6549,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				{
 					/*
 					 * The top WindowAgg leaves out the rows that fail its run
-					 * condition (df_window_run_condition); one below passes
+					 * condition (vx_window_run_condition); one below passes
 					 * them on with its window functions NULL.
 					 */
-					df_reject(cxt, "run condition of a WindowAgg below another");
+					vx_reject(cxt, "run condition of a WindowAgg below another");
 					return;
 				}
-				if (wa->runCondition != NIL && df_window_run_condition(wa) == NIL)
+				if (wa->runCondition != NIL && vx_window_run_condition(wa) == NIL)
 				{
-					df_reject(cxt, "run condition of the WindowAgg");
+					vx_reject(cxt, "run condition of the WindowAgg");
 					return;
 				}
 				if (!cxt->node_order_free)
@@ -6569,11 +6569,11 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					 * slice's output by the keys of the Sort or merging
 					 * Motion below.
 					 */
-					if (!df_order_path(cxt->output, plan) || cxt->tails.resort != NULL ||
-						cxt->tails.resort_by != NULL || !df_check_window_order(cxt, child))
+					if (!vx_order_path(cxt->output, plan) || cxt->tails.resort != NULL ||
+						cxt->tails.resort_by != NULL || !vx_check_window_order(cxt, child))
 					{
 						if (!cxt->failed)
-							df_reject(cxt, "WindowAgg whose order of rows is read");
+							vx_reject(cxt, "WindowAgg whose order of rows is read");
 						return;
 					}
 					cxt->tails.window_order = child;
@@ -6594,35 +6594,35 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 					if (tle == NULL)
 					{
-						df_reject(cxt, "window key outside the target list");
+						vx_reject(cxt, "window key outside the target list");
 						return;
 					}
 					type = exprType((Node *) tle->expr);
-					if (!df_type_supported(type))
+					if (!vx_type_supported(type))
 					{
-						df_reject(cxt, "window key of type %s", format_type_be(type));
+						vx_reject(cxt, "window key of type %s", format_type_be(type));
 						return;
 					}
 					if (type == NUMERICOID &&
-						(!df_numeric_range(child, (Node *) tle->expr, &p, &sc, &dyn) ||
-						 p > DF_NUMERIC_MAX_EXPR_PRECISION))
+						(!vx_numeric_range(child, (Node *) tle->expr, &p, &sc, &dyn) ||
+						 p > VX_NUMERIC_MAX_EXPR_PRECISION))
 					{
-						df_reject(cxt, "window key of numeric of unknown precision");
+						vx_reject(cxt, "window key of numeric of unknown precision");
 						return;
 					}
 					if (part)
 						coll = wa->partCollations[i];
-					else if (!df_window_order(child, col, &sortop, &nulls_first, &coll) ||
-							 !df_sort_direction(sortop, type, &desc))
+					else if (!vx_window_order(child, col, &sortop, &nulls_first, &coll) ||
+							 !vx_sort_direction(sortop, type, &desc))
 					{
-						df_reject(cxt, "window order key without the Sort that orders by it");
+						vx_reject(cxt, "window order key without the Sort that orders by it");
 						return;
 					}
-					if (df_type_is_string(type) &&
-						df_string_compare_problem(cxt, part ? "=" : "<", coll) != NULL)
+					if (vx_type_is_string(type) &&
+						vx_string_compare_problem(cxt, part ? "=" : "<", coll) != NULL)
 					{
-						df_reject(cxt, "window key of type %s %s", format_type_be(type),
-								  df_string_compare_problem(cxt, part ? "=" : "<", coll));
+						vx_reject(cxt, "window key of type %s %s", format_type_be(type),
+								  vx_string_compare_problem(cxt, part ? "=" : "<", coll));
 						return;
 					}
 					child_needed = bms_add_member(child_needed, col);
@@ -6635,25 +6635,25 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * Loop's build side.  The others hold a partition's rows up
 				 * to the current one's peers (BoundedWindowAggExec).
 				 */
-				funcs = df_window_funcs(wa);
+				funcs = vx_window_funcs(wa);
 				foreach(lc, funcs)
 					if (((WindowFunc *) lfirst(lc))->winagg && strcmp(frame, "partition") == 0)
 						whole = true;
-				if (whole && df_window_estimate(child) > df_window_budget(plan))
+				if (whole && vx_window_estimate(child) > vx_window_budget(plan))
 				{
-					df_reject(cxt, "window over whole partitions of about %.0f kB exceeds its %.0f kB",
-							  df_window_estimate(child) / 1024, df_window_budget(plan) / 1024);
+					vx_reject(cxt, "window over whole partitions of about %.0f kB exceeds its %.0f kB",
+							  vx_window_estimate(child) / 1024, vx_window_budget(plan) / 1024);
 					return;
 				}
 				cxt->window = wa;
 				cxt->allow_aggref = false;
-				df_check_targetlist(plan->targetlist, needed, cxt);
-				df_check_expr_list(plan->qual, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_expr_list(plan->qual, cxt);
 				if (wa->runCondition != NIL)
-					df_check_expr_list(df_window_run_condition(wa), cxt);
+					vx_check_expr_list(vx_window_run_condition(wa), cxt);
 				/* all of them are computed, those of columns no one reads too */
 				foreach(lc, funcs)
-					df_check_expr(lfirst(lc), cxt);
+					vx_check_expr(lfirst(lc), cxt);
 				cxt->window = saved_window;
 				if (cxt->failed)
 					return;
@@ -6662,16 +6662,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
-						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+						vx_collect_outer_refs((Node *) tle->expr, &child_needed);
 				}
-				df_collect_outer_refs((Node *) plan->qual, &child_needed);
-				df_collect_outer_refs((Node *) funcs, &child_needed);
+				vx_collect_outer_refs((Node *) plan->qual, &child_needed);
+				vx_collect_outer_refs((Node *) funcs, &child_needed);
 				child_needed = bms_add_member(child_needed, 0);
 				if (IsA(child, Sort))
 					cxt->skipped_sort = child;
 				cxt->order_free = true; /* DataFusion sorts its rows */
 				cxt->window_input = true;
-				df_check_plan(child, cxt, child_needed, false);
+				vx_check_plan(child, cxt, child_needed, false);
 				cxt->window_input = saved_input;
 				return;
 			}
@@ -6685,21 +6685,21 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				/* NL1: a Materialize passes its child's rows on, as a Hash */
 				if (plan->qual != NIL)
 				{
-					df_reject(cxt, "filter on a %s node", df_plan_name(plan));
+					vx_reject(cxt, "filter on a %s node", vx_plan_name(plan));
 					return;
 				}
-				df_check_targetlist(plan->targetlist, needed, cxt);
+				vx_check_targetlist(plan->targetlist, needed, cxt);
 				foreach(lc, plan->targetlist)
 				{
 					TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
 					if (needed == NULL || bms_is_member(tle->resno, needed))
-						df_collect_outer_refs((Node *) tle->expr, &child_needed);
+						vx_collect_outer_refs((Node *) tle->expr, &child_needed);
 				}
 				child_needed = bms_add_member(child_needed, 0);
 				/* D6: a Hash keeps no order, a Materialize its child's */
 				cxt->order_free = IsA(plan, Hash) || cxt->node_order_free;
-				df_check_plan(outerPlan(plan), cxt, child_needed, false);
+				vx_check_plan(outerPlan(plan), cxt, child_needed, false);
 				return;
 			}
 
@@ -6710,23 +6710,23 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 				if (plan != cxt->top)
 				{
-					df_reject(cxt, "Limit below the top of the slice");
+					vx_reject(cxt, "Limit below the top of the slice");
 					return;
 				}
 				if (limit->limitOption != LIMIT_OPTION_COUNT)
 				{
-					df_reject(cxt, "LIMIT WITH TIES");
+					vx_reject(cxt, "LIMIT WITH TIES");
 					return;
 				}
-				if (!df_limit_value(limit->limitCount, &v) ||
-					!df_limit_value(limit->limitOffset, &v))
+				if (!vx_limit_value(limit->limitCount, &v) ||
+					!vx_limit_value(limit->limitOffset, &v))
 				{
-					df_reject(cxt, "LIMIT or OFFSET that is not a constant of at least 0");
+					vx_reject(cxt, "LIMIT or OFFSET that is not a constant of at least 0");
 					return;
 				}
-				if (!df_passes_through(plan))
+				if (!vx_passes_through(plan))
 				{
-					df_reject(cxt, "Limit that computes columns");
+					vx_reject(cxt, "Limit that computes columns");
 					return;
 				}
 				/* a Sort may be below it */
@@ -6734,7 +6734,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				cxt->output = outerPlan(plan);
 				/* D4: the GroupAggregate below, in the order the slice sorts by */
 				cxt->order_free = cxt->node_order_free && cxt->tails.resort_by != NULL;
-				df_check_plan(outerPlan(plan), cxt, needed, false);
+				vx_check_plan(outerPlan(plan), cxt, needed, false);
 				return;
 			}
 
@@ -6749,27 +6749,27 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				{
 					/* D2: below a GroupAggregate DataFusion runs hashed */
 					cxt->skipped_sort = NULL;
-					if (!df_passes_through(plan))
+					if (!vx_passes_through(plan))
 					{
-						df_reject(cxt, "Sort that computes columns");
+						vx_reject(cxt, "Sort that computes columns");
 						return;
 					}
 					cxt->order_free = true;
-					df_check_plan(child, cxt, needed, false);
+					vx_check_plan(child, cxt, needed, false);
 					return;
 				}
 				if (plan != cxt->top)
 				{
-					df_reject(cxt, "Sort below the top of the slice");
+					vx_reject(cxt, "Sort below the top of the slice");
 					return;
 				}
 				cxt->top = NULL;
-				if (!df_passes_through(plan))
+				if (!vx_passes_through(plan))
 				{
-					df_reject(cxt, "Sort that computes columns");
+					vx_reject(cxt, "Sort that computes columns");
 					return;
 				}
-				if (!df_check_sort_keys(cxt, sort))
+				if (!vx_check_sort_keys(cxt, sort))
 					return;
 				for (i = 0; i < sort->numCols; i++)
 				{
@@ -6780,7 +6780,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				}
 				cxt->output = child;
 				cxt->order_free = true; /* sorted here */
-				df_check_plan(child, cxt, child_needed, false);
+				vx_check_plan(child, cxt, child_needed, false);
 				return;
 			}
 
@@ -6801,13 +6801,13 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				if (outerPlan(plan) != NULL)
 				{
-					df_reject(cxt, "the producer of a Shared Scan");
+					vx_reject(cxt, "the producer of a Shared Scan");
 					return;
 				}
 				if (!cxt->agg_input && !cxt->join_input && !cxt->window_input &&
 					!cxt->union_input && !cxt->batch_sender)
 				{
-					df_reject(cxt, "reads a Shared Scan with nothing to compute on its rows");
+					vx_reject(cxt, "reads a Shared Scan with nothing to compute on its rows");
 					return;
 				}
 				foreach(lc, plan->targetlist)
@@ -6820,16 +6820,16 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 					if (!IsA(tle->expr, Var) || ((Var *) tle->expr)->varattno != tle->resno)
 					{
-						df_reject(cxt, "a Shared Scan reader whose columns are not the producer's");
+						vx_reject(cxt, "a Shared Scan reader whose columns are not the producer's");
 						return;
 					}
 					if (bms_is_member(tle->resno, needed) &&
-						(!df_type_supported(type) ||
+						(!vx_type_supported(type) ||
 						 (type == NUMERICOID &&
-						  (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
-						   p > DF_NUMERIC_MAX_EXPR_PRECISION))))
+						  (!vx_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
+						   p > VX_NUMERIC_MAX_EXPR_PRECISION))))
 					{
-						df_reject(cxt, "reads a Shared Scan column of type %s", format_type_be(type));
+						vx_reject(cxt, "reads a Shared Scan column of type %s", format_type_be(type));
 						return;
 					}
 				}
@@ -6842,7 +6842,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 * GPORCA's Sequence: its inputs but the last are Shared Scan
 				 * producers, which PostgreSQL runs to their end first, as
 				 * ExecSequence does, writing the stores their readers share
-				 * (df_exec_prerun); DataFusion runs their own inputs below
+				 * (vx_exec_prerun); DataFusion runs their own inputs below
 				 * them (T2).  Its rows are its last input's, which the
 				 * slice computes.
 				 */
@@ -6856,14 +6856,14 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 					if (sub != body && (!IsA(sub, ShareInputScan) || outerPlan(sub) == NULL))
 					{
-						df_reject(cxt, "Sequence of something other than Shared Scan producers");
+						vx_reject(cxt, "Sequence of something other than Shared Scan producers");
 						return;
 					}
 				}
 				if (plan->qual != NIL ||
 					list_length(plan->targetlist) != list_length(body->targetlist))
 				{
-					df_reject(cxt, "Sequence that computes columns");
+					vx_reject(cxt, "Sequence that computes columns");
 					return;
 				}
 				foreach(lc, plan->targetlist)
@@ -6873,7 +6873,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 					if (!IsA(var, Var) || var->varno != OUTER_VAR || var->varattno != tle->resno)
 					{
-						df_reject(cxt, "Sequence that computes columns");
+						vx_reject(cxt, "Sequence that computes columns");
 						return;
 					}
 				}
@@ -6882,7 +6882,7 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				if (plan == cxt->output)
 					cxt->output = body;
 				cxt->order_free = cxt->node_order_free; /* its last input's order */
-				df_check_plan(body, cxt, needed, false);
+				vx_check_plan(body, cxt, needed, false);
 				return;
 			}
 
@@ -6905,19 +6905,19 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					if (!cxt->agg_input && !cxt->join_input && !cxt->window_input &&
 						!cxt->union_input)
 					{
-						df_reject(cxt, "receives rows from a %s with nothing to compute on them",
-								  df_plan_name(plan));
+						vx_reject(cxt, "receives rows from a %s with nothing to compute on them",
+								  vx_plan_name(plan));
 						return;
 					}
 					if (motion->sendSorted && !cxt->node_order_free)
 					{
 						/* D5: unmerged where no one reads the order */
-						df_reject(cxt, "receives rows from a sorted %s", df_plan_name(plan));
+						vx_reject(cxt, "receives rows from a sorted %s", vx_plan_name(plan));
 						return;
 					}
 					if (plan->qual != NIL)
 					{
-						df_reject(cxt, "filter on a %s", df_plan_name(plan));
+						vx_reject(cxt, "filter on a %s", vx_plan_name(plan));
 						return;
 					}
 					foreach(lc, plan->targetlist)
@@ -6927,8 +6927,8 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 
 						bool		batch = bms_is_member(motion->motionID, cxt->batches);
 						bool		state = batch ?
-							df_motion_state_columns(motion, tle->resno) > 0 :
-							df_motion_pg_state(motion, tle->resno);
+							vx_motion_state_columns(motion, tle->resno) > 0 :
+							vx_motion_pg_state(motion, tle->resno);
 						int			p,
 									s;
 						bool		dyn;
@@ -6937,15 +6937,15 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 						 * Tuples' numeric values are read into Decimal256's
 						 * 76 digits, as batches carry them (an avg, AVG1); one
 						 * of display scales of their own with them (DN1),
-						 * which only tuples carry (df_motion_batchable)
+						 * which only tuples carry (vx_motion_batchable)
 						 */
 						if (bms_is_member(tle->resno, needed) && !state &&
-							(!df_type_supported(type) ||
+							(!vx_type_supported(type) ||
 							 (type == NUMERICOID &&
-							  (!df_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
-							   p > DF_NUMERIC_MAX_EXPR_PRECISION))))
+							  (!vx_numeric_range(plan, (Node *) tle->expr, &p, &s, &dyn) ||
+							   p > VX_NUMERIC_MAX_EXPR_PRECISION))))
 						{
-							df_reject(cxt, "receives a column of type %s", format_type_be(type));
+							vx_reject(cxt, "receives a column of type %s", format_type_be(type));
 							return;
 						}
 					}
@@ -6961,17 +6961,17 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 				 */
 				sorted = motion->sendSorted && !bms_is_member(motion->motionID, cxt->batches);
 				if (sorted &&
-					(outerPlan(plan) == NULL || !df_sorted_for(outerPlan(plan), motion)))
+					(outerPlan(plan) == NULL || !vx_sorted_for(outerPlan(plan), motion)))
 				{
 					/*
 					 * D3: a GroupAggregate below sorts by its groups, which
 					 * are unique: the slice runs it hashed and sorts its
 					 * output by the Motion's keys, the same order.
 					 */
-					if (!df_check_resort(cxt, motion))
+					if (!vx_check_resort(cxt, motion))
 					{
 						if (!cxt->failed)
-							df_reject(cxt, "sorted %s without a Sort below it", df_plan_name(plan));
+							vx_reject(cxt, "sorted %s without a Sort below it", vx_plan_name(plan));
 						return;
 					}
 				}
@@ -6980,19 +6980,19 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
 					motion->motionType != MOTIONTYPE_HASH &&
 					motion->motionType != MOTIONTYPE_BROADCAST)
 				{
-					df_reject(cxt, "%s is not supported", df_plan_name(plan));
+					vx_reject(cxt, "%s is not supported", vx_plan_name(plan));
 					return;
 				}
 				cxt->agg_input = false;
 				cxt->batch_sender = bms_is_member(motion->motionID, cxt->batches);
 				cxt->order_free = !sorted || cxt->tails.resort != NULL;
-				df_check_plan(outerPlan(plan), cxt, NULL, false);
+				vx_check_plan(outerPlan(plan), cxt, NULL, false);
 				cxt->batch_sender = false;
 				return;
 			}
 
 		default:
-			df_reject_plan(cxt, plan);
+			vx_reject_plan(cxt, plan);
 			return;
 	}
 }
@@ -7004,12 +7004,12 @@ df_check_plan_node(Plan *plan, DfCheckContext *cxt, Bitmapset *needed,
  * anywhere else in the slice is a receiver.
  */
 static bool
-df_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-				 Bitmapset *batches, DfTails *tails, char *reason, size_t reasonlen,
+vx_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+				 Bitmapset *batches, VxTails *tails, char *reason, size_t reasonlen,
 				 bool *locale_dependent, bool order_free)
 {
-	DfCheckContext cxt;
-	PlannedStmt *volatile saved_stmt = df_numeric_stmt;
+	VxCheckContext cxt;
+	PlannedStmt *volatile saved_stmt = vx_numeric_stmt;
 
 	memset(&cxt, 0, sizeof(cxt));
 	cxt.stmt = stmt;
@@ -7020,32 +7020,32 @@ df_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	reason[0] = '\0';
 
 	if (stmt->commandType != CMD_SELECT)
-		df_reject(&cxt, "only SELECT is supported");
+		vx_reject(&cxt, "only SELECT is supported");
 	else if (stmt->intoClause != NULL)
-		df_reject(&cxt, "SELECT INTO and CREATE TABLE AS are not supported");
+		vx_reject(&cxt, "SELECT INTO and CREATE TABLE AS are not supported");
 	else if (stmt->rowMarks != NIL)
-		df_reject(&cxt, "row locking clauses are not supported");
+		vx_reject(&cxt, "row locking clauses are not supported");
 	else if (stmt->hasModifyingCTE)
-		df_reject(&cxt, "data-modifying WITH is not supported");
-	else if (VEC_IR_VERSION < df_engine_load()->caps.ir_min ||
-			 VEC_IR_VERSION > df_engine_load()->caps.ir_max)
-		df_reject(&cxt, "engine %s does not read IR version %d", df_engine->name,
+		vx_reject(&cxt, "data-modifying WITH is not supported");
+	else if (VEC_IR_VERSION < vx_engine_load()->caps.ir_min ||
+			 VEC_IR_VERSION > vx_engine_load()->caps.ir_max)
+		vx_reject(&cxt, "engine %s does not read IR version %d", vx_engine->name,
 				  VEC_IR_VERSION);
-	else if (df_engine_has(&cxt, VEC_F_QUERIES))
+	else if (vx_engine_has(&cxt, VEC_F_QUERIES))
 	{
 		cxt.top = root_is_sender ? outerPlan(root) : root;
 		cxt.output = cxt.top;
 		cxt.order_free = order_free;
 		cxt.tails_ok = !(root_is_sender &&
 						 bms_is_member(((Motion *) root)->motionID, batches));
-		df_numeric_stmt = stmt;
+		vx_numeric_stmt = stmt;
 		PG_TRY();
 		{
-			df_check_plan(root, &cxt, NULL, root_is_sender);
+			vx_check_plan(root, &cxt, NULL, root_is_sender);
 		}
 		PG_FINALLY();
 		{
-			df_numeric_stmt = saved_stmt;
+			vx_numeric_stmt = saved_stmt;
 		}
 		PG_END_TRY();
 	}
@@ -7057,21 +7057,21 @@ df_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	return !cxt.failed;
 }
 
-/* df_check_slice_o of a slice part whose order of rows a node above may read */
+/* vx_check_slice_o of a slice part whose order of rows a node above may read */
 static bool
-df_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-				 Bitmapset *batches, DfTails *tails, char *reason, size_t reasonlen,
+vx_check_slice_b(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+				 Bitmapset *batches, VxTails *tails, char *reason, size_t reasonlen,
 				 bool *locale_dependent)
 {
-	return df_check_slice_o(stmt, root, root_is_sender, batches, tails, reason, reasonlen,
+	return vx_check_slice_o(stmt, root, root_is_sender, batches, tails, reason, reasonlen,
 							locale_dependent, false);
 }
 
 bool
-df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
-			   DfTails *tails, char *reason, size_t reasonlen)
+vx_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
+			   VxTails *tails, char *reason, size_t reasonlen)
 {
-	return df_check_slice_b(stmt, root, root_is_sender, df_batch_motions(stmt),
+	return vx_check_slice_b(stmt, root, root_is_sender, vx_batch_motions(stmt),
 							tails, reason, reasonlen, NULL);
 }
 
@@ -7083,7 +7083,7 @@ df_check_slice(PlannedStmt *stmt, Plan *root, bool root_is_sender,
  * segments, after the executor was set up on the original.
  */
 Plan *
-df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
+vx_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
 {
 	int			idx = LocallyExecutingSliceIndex(queryDesc->estate);
 	Motion	   *sender = findSenderMotion(queryDesc->plannedstmt, idx);
@@ -7108,7 +7108,7 @@ df_local_slice_root(QueryDesc *queryDesc, int *slice_index, bool *is_sender)
  * reader's, or a table's without a filter.
  */
 static bool
-df_attach_worth(Plan *plan)
+vx_attach_worth(Plan *plan)
 {
 	if (IsA(plan, Motion) || IsA(plan, Hash) || IsA(plan, ShareInputScan))
 		return false;
@@ -7122,22 +7122,22 @@ df_attach_worth(Plan *plan)
  * and look below them instead, for subtrees every node runs alike.
  */
 static void
-df_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
+vx_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
 				 bool order_free, List **points)
 {
 	char		reason[256];
-	DfTails		tails;
+	VxTails		tails;
 	bool		locale_dependent = false;
 	ListCell   *lc;
 
 	if (plan == NULL || IsA(plan, Motion))
 		return;
-	if (df_attach_worth(plan) &&
-		df_check_slice_o(stmt, plan, false, batches, &tails, reason, sizeof(reason),
+	if (vx_attach_worth(plan) &&
+		vx_check_slice_o(stmt, plan, false, batches, &tails, reason, sizeof(reason),
 						 &locale_dependent, order_free) &&
 		!(locale_free && locale_dependent))
 	{
-		DfAttach   *a = palloc0(sizeof(DfAttach));
+		VxAttach   *a = palloc0(sizeof(VxAttach));
 
 		a->plan = plan;
 		a->tails = tails;
@@ -7165,23 +7165,23 @@ df_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_
 		case T_Hash:
 		case T_NestLoop:
 		case T_MergeJoin:
-			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
+			vx_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
 			return;
 		case T_HashJoin:
-			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
-			df_find_attach_o(stmt, innerPlan(plan), batches, locale_free, false, points);
+			vx_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
+			vx_find_attach_o(stmt, innerPlan(plan), batches, locale_free, false, points);
 			return;
 		case T_SubqueryScan:
-			df_find_attach_o(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, false, points);
+			vx_find_attach_o(stmt, ((SubqueryScan *) plan)->subplan, batches, locale_free, false, points);
 			return;
 		case T_Append:
-			foreach(lc, df_append_plans(plan))
-				df_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
+			foreach(lc, vx_append_plans(plan))
+				vx_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
 			return;
 		case T_Sequence:
 			/* GPORCA's Sequence runs each input once, in order */
 			foreach(lc, ((Sequence *) plan)->subplans)
-				df_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
+				vx_find_attach_o(stmt, lfirst(lc), batches, locale_free, false, points);
 			return;
 		case T_ShareInputScan:
 
@@ -7195,7 +7195,7 @@ df_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_
 			 * Append: DataFusion may interleave them (TPC-DS Q4, Q11 and
 			 * Q74 under GPORCA, a UNION ALL in a CTE).
 			 */
-			df_find_attach_o(stmt, outerPlan(plan), batches, locale_free, true, points);
+			vx_find_attach_o(stmt, outerPlan(plan), batches, locale_free, true, points);
 			return;
 		default:
 			return;
@@ -7203,10 +7203,10 @@ df_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_
 }
 
 static void
-df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
+vx_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_free,
 			   List **points)
 {
-	df_find_attach_o(stmt, plan, batches, locale_free, false, points);
+	vx_find_attach_o(stmt, plan, batches, locale_free, false, points);
 }
 
 /*
@@ -7217,17 +7217,17 @@ df_find_attach(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_fr
  * this way sends no batches.
  */
 List *
-df_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches)
+vx_slice_attach_points(PlannedStmt *stmt, Plan *compute, Bitmapset *batches)
 {
 	List	   *points = NIL;
 
-	df_find_attach(stmt, compute, batches, false, &points);
+	vx_find_attach(stmt, compute, batches, false, &points);
 	return points;
 }
 
 /* Is 'target' a node of 'plan' within its slice? */
 static bool
-df_plan_contains(Plan *plan, Plan *target)
+vx_plan_contains(Plan *plan, Plan *target)
 {
 	if (plan == NULL)
 		return false;
@@ -7235,30 +7235,30 @@ df_plan_contains(Plan *plan, Plan *target)
 		return true;
 	if (IsA(plan, Motion))
 		return false;
-	if (IsA(plan, SubqueryScan) && df_plan_contains(((SubqueryScan *) plan)->subplan, target))
+	if (IsA(plan, SubqueryScan) && vx_plan_contains(((SubqueryScan *) plan)->subplan, target))
 		return true;
 	if (IsA(plan, Sequence))
 	{
 		ListCell   *lc;
 
 		foreach(lc, ((Sequence *) plan)->subplans)
-			if (df_plan_contains(lfirst(lc), target))
+			if (vx_plan_contains(lfirst(lc), target))
 				return true;
 	}
-	if (df_append_plans(plan) != NIL)
+	if (vx_append_plans(plan) != NIL)
 	{
 		ListCell   *lc;
 
-		foreach(lc, df_append_plans(plan))
-			if (df_plan_contains(lfirst(lc), target))
+		foreach(lc, vx_append_plans(plan))
+			if (vx_plan_contains(lfirst(lc), target))
 				return true;
 	}
-	return df_plan_contains(outerPlan(plan), target) ||
-		df_plan_contains(innerPlan(plan), target);
+	return vx_plan_contains(outerPlan(plan), target) ||
+		vx_plan_contains(innerPlan(plan), target);
 }
 
 static void
-df_collect_producers(Plan *plan, List **producers)
+vx_collect_producers(Plan *plan, List **producers)
 {
 	ListCell   *lc;
 
@@ -7271,28 +7271,28 @@ df_collect_producers(Plan *plan, List **producers)
 		foreach(lc, ((Sequence *) plan)->subplans)
 			if (lfirst(lc) != body)
 				*producers = lappend(*producers, lfirst(lc));
-		df_collect_producers(body, producers);
+		vx_collect_producers(body, producers);
 		return;
 	}
 	if (IsA(plan, SubqueryScan))
-		df_collect_producers(((SubqueryScan *) plan)->subplan, producers);
-	foreach(lc, df_append_plans(plan))
-		df_collect_producers(lfirst(lc), producers);
-	df_collect_producers(outerPlan(plan), producers);
-	df_collect_producers(innerPlan(plan), producers);
+		vx_collect_producers(((SubqueryScan *) plan)->subplan, producers);
+	foreach(lc, vx_append_plans(plan))
+		vx_collect_producers(lfirst(lc), producers);
+	vx_collect_producers(outerPlan(plan), producers);
+	vx_collect_producers(innerPlan(plan), producers);
 }
 
 /*
  * The Shared Scan producers that the Sequences of the slice part 'plan'
- * DataFusion runs (df_check_slice) run first, in the order they run: what
- * PostgreSQL still runs of it, before DataFusion starts (df_exec_prerun).
+ * DataFusion runs (vx_check_slice) run first, in the order they run: what
+ * PostgreSQL still runs of it, before DataFusion starts (vx_exec_prerun).
  */
 List *
-df_slice_producers(Plan *plan)
+vx_slice_producers(Plan *plan)
 {
 	List	   *producers = NIL;
 
-	df_collect_producers(plan, &producers);
+	vx_collect_producers(plan, &producers);
 	return producers;
 }
 
@@ -7300,18 +7300,18 @@ df_slice_producers(Plan *plan)
  * M7b: which Gather Motions carry Arrow batches
  * ---------------------------------------------------------------------
  */
-bool		df_motion_batches = false;
-bool		df_key_filters = true;
-double		df_partial_agg_skip_ratio = 0.2;
-bool		df_cluster_collation_c = false;
+bool		vx_motion_batches = false;
+bool		vx_key_filters = true;
+double		vx_partial_agg_skip_ratio = 0.2;
+bool		vx_cluster_collation_c = false;
 
 /*
  * CL2: on the coordinator, whether the default collation's LC_COLLATE and
- * LC_CTYPE are C on every primary segment, as df_probe_cluster_collation
+ * LC_CTYPE are C on every primary segment, as vx_probe_cluster_collation
  * found; -1 before it has, or if it could not.
  */
-static int	df_segments_collate_c = -1;
-static int	df_segments_ctype_c = -1;
+static int	vx_segments_collate_c = -1;
+static int	vx_segments_ctype_c = -1;
 
 /*
  * Does the database's default collation order strings by their bytes on
@@ -7322,7 +7322,7 @@ static int	df_segments_ctype_c = -1;
  * their LC_CTYPE is C, for EXPLAIN (CL2).
  */
 static bool
-df_probe_cluster_collation(void)
+vx_probe_cluster_collation(void)
 {
 	MemoryContext cxt = CurrentMemoryContext;
 	ResourceOwner owner = CurrentResourceOwner;
@@ -7340,16 +7340,16 @@ df_probe_cluster_collation(void)
 			elog(ERROR, "SPI_connect failed");
 
 		/*
-		 * Each segment's row, with whether it orders df_bytewise_pairs by
+		 * Each segment's row, with whether it orders vx_bytewise_pairs by
 		 * their bytes (CU1): compared in the scan's projection, on the
 		 * segment, under its default collation; e (empty, of the default
 		 * collation where datname's is C) keeps them from being folded here.
 		 */
 		initStringInfo(&sql);
 		appendStringInfoString(&sql, "SELECT datlocprovider, datcollate, datctype, ");
-		for (i = 0; i < lengthof(df_bytewise_pairs); i++)
+		for (i = 0; i < lengthof(vx_bytewise_pairs); i++)
 		{
-			const pg_wchar *sides[2] = {df_bytewise_pairs[i].x, df_bytewise_pairs[i].y};
+			const pg_wchar *sides[2] = {vx_bytewise_pairs[i].x, vx_bytewise_pairs[i].y};
 			int			side;
 
 			appendStringInfoString(&sql, i > 0 ? " AND (" : "(");
@@ -7386,17 +7386,17 @@ df_probe_cluster_collation(void)
 				if (provider != COLLPROVIDER_LIBC)
 					continue;
 				if (strcmp(collate, "C") == 0 || strcmp(collate, "POSIX") == 0 ||
-					(df_c_utf8_name(collate) && pairs))
+					(vx_c_utf8_name(collate) && pairs))
 					clike++;
 				if (strcmp(ctype, "C") == 0 || strcmp(ctype, "POSIX") == 0)
 					ctlike++;
 			}
 			if (all == getgpsegmentCount())
 			{
-				df_segments_collate_c = clike == all;
-				df_segments_ctype_c = ctlike == all;
+				vx_segments_collate_c = clike == all;
+				vx_segments_ctype_c = ctlike == all;
 			}
-			c = df_default_collation_bytewise() && df_segments_collate_c == 1;
+			c = vx_default_collation_bytewise() && vx_segments_collate_c == 1;
 		}
 		SPI_finish();
 		ReleaseCurrentSubTransaction();
@@ -7415,7 +7415,7 @@ df_probe_cluster_collation(void)
 		CurrentResourceOwner = owner;
 		if (edata->sqlerrcode == ERRCODE_QUERY_CANCELED)
 			ReThrowError(edata);
-		elog(LOG, "datafusion: cannot ask the segments for their collation: %s",
+		elog(LOG, "vec_executor: cannot ask the segments for their collation: %s",
 			 edata->message);
 		FreeErrorData(edata);
 		c = false;
@@ -7426,7 +7426,7 @@ df_probe_cluster_collation(void)
 
 /*
  * On the coordinator, before a query is planned for EXPLAIN or dispatched:
- * set datafusion.cluster_collation_c to whether the default collation is C
+ * set vec.cluster_collation_c to whether the default collation is C
  * on every node, here and on the segments.  Their running processes get
  * the SET; those started later, every synchronized setting (makeOptions).
  * The checker of each process then reads one value, so all of them agree
@@ -7434,13 +7434,13 @@ df_probe_cluster_collation(void)
  * SET everywhere, and the next query sets it again.
  */
 void
-df_sync_cluster_collation(void)
+vx_sync_cluster_collation(void)
 {
 	static int	verdict = -1;	/* not asked yet */
 	static bool asking = false;
 	bool		c;
 
-	if (Gp_role != GP_ROLE_DISPATCH || df_mode == DF_MODE_OFF || asking ||
+	if (Gp_role != GP_ROLE_DISPATCH || vx_mode == VX_MODE_OFF || asking ||
 		!IsTransactionState())
 		return;
 	if (verdict < 0)
@@ -7449,7 +7449,7 @@ df_sync_cluster_collation(void)
 		asking = true;
 		PG_TRY();
 		{
-			verdict = df_probe_cluster_collation() ? 1 : 0;
+			verdict = vx_probe_cluster_collation() ? 1 : 0;
 		}
 		PG_FINALLY();
 		{
@@ -7458,13 +7458,13 @@ df_sync_cluster_collation(void)
 		PG_END_TRY();
 	}
 	c = verdict == 1;
-	if (df_cluster_collation_c == c)
+	if (vx_cluster_collation_c == c)
 		return;
-	SetConfigOption("datafusion.cluster_collation_c", c ? "on" : "off",
+	SetConfigOption("vec.cluster_collation_c", c ? "on" : "off",
 					PGC_USERSET, PGC_S_SESSION);
 	if (cdbcomponent_qesExist())
-		CdbDispatchSetCommand(c ? "SET datafusion.cluster_collation_c TO on" :
-							  "SET datafusion.cluster_collation_c TO off", true);
+		CdbDispatchSetCommand(c ? "SET vec.cluster_collation_c TO on" :
+							  "SET vec.cluster_collation_c TO off", true);
 }
 
 /*
@@ -7475,7 +7475,7 @@ df_sync_cluster_collation(void)
  * executor hook ever sees the query.  NULL for any other subplan.
  */
 static Plan *
-df_init_plan_root(PlannedStmt *stmt, int i, int *slice)
+vx_init_plan_root(PlannedStmt *stmt, int i, int *slice)
 {
 	int			s;
 
@@ -7491,7 +7491,7 @@ df_init_plan_root(PlannedStmt *stmt, int i, int *slice)
 
 /* IP2: is slice 'index' the top slice of an init plan? */
 static bool
-df_is_init_plan_slice(PlannedStmt *stmt, int index)
+vx_is_init_plan_slice(PlannedStmt *stmt, int index)
 {
 	int			i;
 
@@ -7499,7 +7499,7 @@ df_is_init_plan_slice(PlannedStmt *stmt, int index)
 	{
 		int			s;
 
-		if (df_init_plan_root(stmt, i, &s) != NULL && s == index)
+		if (vx_init_plan_root(stmt, i, &s) != NULL && s == index)
 			return true;
 	}
 	return false;
@@ -7513,58 +7513,58 @@ df_is_init_plan_slice(PlannedStmt *stmt, int index)
  * Motions, and its Motions carry tuples whichever way each node decides.
  */
 /*
- * df_translate_slice for a verdict, with the statement at hand for
- * df_numeric_ps (NR1).
+ * vx_translate_slice for a verdict, with the statement at hand for
+ * vx_numeric_ps (NR1).
  */
 static bool
-df_try_translate(PlannedStmt *stmt, Plan *root, const DfTails *tails, bool tuples,
+vx_try_translate(PlannedStmt *stmt, Plan *root, const VxTails *tails, bool tuples,
 				 char *reason, size_t reasonlen)
 {
-	PlannedStmt *volatile saved = df_numeric_stmt;
-	DfSliceSpec spec;
+	PlannedStmt *volatile saved = vx_numeric_stmt;
+	VxSliceSpec spec;
 	volatile bool ok = false;
 
-	df_numeric_stmt = stmt;
+	vx_numeric_stmt = stmt;
 	PG_TRY();
 	{
-		ok = df_translate_slice(root, tails, tuples, &spec, reason, reasonlen);
+		ok = vx_translate_slice(root, tails, tuples, &spec, reason, reasonlen);
 	}
 	PG_FINALLY();
 	{
-		df_numeric_stmt = saved;
+		vx_numeric_stmt = saved;
 	}
 	PG_END_TRY();
 	return ok;
 }
 
 /*
- * While df_batch_motions_of decides, each slice's verdict for its current
+ * While vx_batch_motions_of decides, each slice's verdict for its current
  * set of batch Motions, which it forgets when the set changes: -1 unknown.
  * A slice is asked once as the sender of its Motion and once per Motion
  * it receives.
  */
-static int8 *df_runs_memo = NULL;
+static int8 *vx_runs_memo = NULL;
 
-static bool df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches);
+static bool vx_slice_runs_in_engine_b(PlannedStmt *stmt, int index, Bitmapset *batches);
 
 static bool
-df_slice_runs_in_datafusion(PlannedStmt *stmt, int index, Bitmapset *batches)
+vx_slice_runs_in_engine(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	bool		runs;
 
-	if (df_runs_memo == NULL || index < 0 || index >= stmt->numSlices)
-		return df_slice_runs_in_datafusion_b(stmt, index, batches);
-	if (df_runs_memo[index] < 0)
-		df_runs_memo[index] = df_slice_runs_in_datafusion_b(stmt, index, batches) ? 1 : 0;
-	runs = df_runs_memo[index] == 1;
+	if (vx_runs_memo == NULL || index < 0 || index >= stmt->numSlices)
+		return vx_slice_runs_in_engine_b(stmt, index, batches);
+	if (vx_runs_memo[index] < 0)
+		vx_runs_memo[index] = vx_slice_runs_in_engine_b(stmt, index, batches) ? 1 : 0;
+	runs = vx_runs_memo[index] == 1;
 	return runs;
 }
 
 static bool
-df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches)
+vx_slice_runs_in_engine_b(PlannedStmt *stmt, int index, Bitmapset *batches)
 {
 	char		reason[256];
-	DfTails		tails;
+	VxTails		tails;
 	Motion	   *sender;
 	Plan	   *root;
 	Plan	   *compute;
@@ -7572,25 +7572,25 @@ df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches)
 
 	if (index < 0 || index >= stmt->numSlices)
 		return false;
-	if (df_is_init_plan_slice(stmt, index))
+	if (vx_is_init_plan_slice(stmt, index))
 	{
-		elog(DEBUG2, "datafusion: slice %d is an init plan's top slice", index);
+		elog(DEBUG2, "vec_executor: slice %d is an init plan's top slice", index);
 		return false;
 	}
 	sender = findSenderMotion(stmt, index);
 	root = sender ? (Plan *) sender : stmt->planTree;
 	compute = sender ? outerPlan(root) : root;
 	if (compute != NULL &&
-		df_check_slice_b(stmt, root, sender != NULL, batches, &tails, reason, sizeof(reason),
+		vx_check_slice_b(stmt, root, sender != NULL, batches, &tails, reason, sizeof(reason),
 						 &locale_dependent) &&
 		!locale_dependent &&
-		df_try_translate(stmt, compute, &tails,
+		vx_try_translate(stmt, compute, &tails,
 						 !(sender && bms_is_member(sender->motionID, batches)),
 						 reason, sizeof(reason)))
 		return true;
 	if (locale_dependent)
 		snprintf(reason, sizeof(reason), "its verdict depends on the node's default collation");
-	elog(DEBUG2, "datafusion: with these batch Motions slice %d cannot run: %s",
+	elog(DEBUG2, "vec_executor: with these batch Motions slice %d cannot run: %s",
 		 index, compute ? reason : "no plan");
 	return false;
 }
@@ -7604,40 +7604,40 @@ df_slice_runs_in_datafusion_b(PlannedStmt *stmt, int index, Bitmapset *batches)
  * default collation, where that is C), which reads the Motion too.
  */
 static bool
-df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *batches)
+vx_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *batches)
 {
 	Motion	   *sender;
 	Plan	   *compute;
 	List	   *points = NIL;
 	ListCell   *lc;
 
-	if (index < 0 || index >= stmt->numSlices || df_is_init_plan_slice(stmt, index))
+	if (index < 0 || index >= stmt->numSlices || vx_is_init_plan_slice(stmt, index))
 		return false;
 	sender = findSenderMotion(stmt, index);
 	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
-	if (df_slice_runs_in_datafusion(stmt, index, batches))
+	if (vx_slice_runs_in_engine(stmt, index, batches))
 	{
 		/* PostgreSQL runs its Shared Scan producers, their inputs below (T2) */
-		List	   *producers = df_slice_producers(compute);
+		List	   *producers = vx_slice_producers(compute);
 		bool		produced = false;
 
 		foreach(lc, producers)
-			produced = produced || df_plan_contains(lfirst(lc), (Plan *) motion);
+			produced = produced || vx_plan_contains(lfirst(lc), (Plan *) motion);
 		if (!produced)
 			return true;
 		foreach(lc, producers)
-			df_find_attach(stmt, lfirst(lc), batches, true, &points);
+			vx_find_attach(stmt, lfirst(lc), batches, true, &points);
 	}
 	else
-		df_find_attach(stmt, compute, batches, true, &points);
+		vx_find_attach(stmt, compute, batches, true, &points);
 	foreach(lc, points)
 	{
-		DfAttach   *a = lfirst(lc);
+		VxAttach   *a = lfirst(lc);
 		char		reason[256];
 
 		/* T2: below PostgreSQL's nodes, the output is tuples */
-		if (df_plan_contains(a->plan, (Plan *) motion))
-			return df_try_translate(stmt, a->plan, &a->tails, true, reason, sizeof(reason));
+		if (vx_plan_contains(a->plan, (Plan *) motion))
+			return vx_try_translate(stmt, a->plan, &a->tails, true, reason, sizeof(reason));
 	}
 	return false;
 }
@@ -7649,7 +7649,7 @@ df_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *
  * the type tag (which also names the hash, see df_core::cdbhash).
  */
 bool
-df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
+vx_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 {
 	static const struct
 	{
@@ -7690,7 +7690,7 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 		if (hashes[k].type == var->vartype && strcmp(hashes[k].func, func) == 0)
 		{
 			*column = var->varattno - 1;
-			*tag = df_type_tag(var->vartype);
+			*tag = vx_type_tag(var->vartype);
 			if (var->vartype == NUMERICOID)
 			{
 				/* the column's scale places the digits (df_core::cdbhash) */
@@ -7699,7 +7699,7 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
 				int			p,
 							sc;
 
-				if (tle == NULL || !df_numeric_ps(child, (Node *) tle->expr, &p, &sc))
+				if (tle == NULL || !vx_numeric_ps(child, (Node *) tle->expr, &p, &sc))
 					return false;
 				if (sc != 0)
 					*tag = psprintf("numeric:%d", sc);
@@ -7715,7 +7715,7 @@ df_motion_hash_key(Motion *motion, int i, int *column, const char **tag)
  * Redistribute whose keys DataFusion hashes as cdbhash() does.
  */
 static bool
-df_motion_batchable(Motion *motion)
+vx_motion_batchable(Motion *motion)
 {
 	ListCell   *lc;
 
@@ -7730,8 +7730,8 @@ df_motion_batchable(Motion *motion)
 					s;
 
 		if (exprType((Node *) tle->expr) == NUMERICOID &&
-			df_numeric_dyn((Plan *) motion, (Node *) tle->expr, &p, &s) &&
-			df_motion_column_partial(motion, tle->resno, NULL) == NULL)
+			vx_numeric_dyn((Plan *) motion, (Node *) tle->expr, &p, &s) &&
+			vx_motion_column_partial(motion, tle->resno, NULL) == NULL)
 			return false;
 	}
 	/* D5: a sorted Gather's receiver reading batches merges nothing */
@@ -7750,7 +7750,7 @@ df_motion_batchable(Motion *motion)
 			int			column;
 			const char *tag;
 
-			if (!df_motion_hash_key(motion, i, &column, &tag))
+			if (!vx_motion_hash_key(motion, i, &column, &tag))
 				return false;
 		}
 		return true;
@@ -7764,7 +7764,7 @@ df_motion_batchable(Motion *motion)
  * Append and a Sequence.  Those of init plans are listed by the caller (IP2).
  */
 static void
-df_list_motions(Plan *plan, List **motions)
+vx_list_motions(Plan *plan, List **motions)
 {
 	ListCell   *lc;
 
@@ -7772,16 +7772,16 @@ df_list_motions(Plan *plan, List **motions)
 		return;
 	if (IsA(plan, Motion))
 		*motions = lappend(*motions, plan);
-	df_list_motions(outerPlan(plan), motions);
-	df_list_motions(innerPlan(plan), motions);
+	vx_list_motions(outerPlan(plan), motions);
+	vx_list_motions(innerPlan(plan), motions);
 	if (IsA(plan, SubqueryScan))
-		df_list_motions(((SubqueryScan *) plan)->subplan, motions);
+		vx_list_motions(((SubqueryScan *) plan)->subplan, motions);
 	if (IsA(plan, Sequence))
 		foreach(lc, ((Sequence *) plan)->subplans)
-			df_list_motions(lfirst(lc), motions);
-	if (df_append_plans(plan) != NIL)
-		foreach(lc, df_append_plans(plan))
-			df_list_motions(lfirst(lc), motions);
+			vx_list_motions(lfirst(lc), motions);
+	if (vx_append_plans(plan) != NIL)
+		foreach(lc, vx_append_plans(plan))
+			vx_list_motions(lfirst(lc), motions);
 }
 
 /*
@@ -7798,7 +7798,7 @@ df_list_motions(Plan *plan, List **motions)
  * tuple chunks, so nothing is ever misread.
  */
 static Bitmapset *
-df_batch_motions_of(PlannedStmt *stmt)
+vx_batch_motions_of(PlannedStmt *stmt)
 {
 	List	   *motions = NIL;
 	Bitmapset  *batches = NULL;
@@ -7806,21 +7806,21 @@ df_batch_motions_of(PlannedStmt *stmt)
 	bool		changed;
 	int			i;
 
-	if (!df_motion_batches || df_mode == DF_MODE_OFF ||
-		(df_engine_features() & VEC_F_IPC_MOTION) == 0)
+	if (!vx_motion_batches || vx_mode == VX_MODE_OFF ||
+		(vx_engine_features() & VEC_F_IPC_MOTION) == 0)
 		return NULL;
-	df_list_motions(stmt->planTree, &motions);
+	vx_list_motions(stmt->planTree, &motions);
 	for (i = 0; i < list_length(stmt->subplans); i++)
-		df_list_motions(df_init_plan_root(stmt, i, NULL), &motions);
+		vx_list_motions(vx_init_plan_root(stmt, i, NULL), &motions);
 	foreach(lc, motions)
 	{
 		Motion	   *m = (Motion *) lfirst(lc);
 
-		if (m->motionID > 0 && m->motionID < stmt->numSlices && df_motion_batchable(m))
+		if (m->motionID > 0 && m->motionID < stmt->numSlices && vx_motion_batchable(m))
 			batches = bms_add_member(batches, m->motionID);
 	}
-	df_runs_memo = palloc(sizeof(int8) * Max(stmt->numSlices, 1));
-	memset(df_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
+	vx_runs_memo = palloc(sizeof(int8) * Max(stmt->numSlices, 1));
+	memset(vx_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
 	PG_TRY();
 	{
 		do
@@ -7831,36 +7831,36 @@ df_batch_motions_of(PlannedStmt *stmt)
 				Motion	   *m = (Motion *) lfirst(lc);
 
 				if (bms_is_member(m->motionID, batches) &&
-					!(df_slice_runs_in_datafusion(stmt, m->motionID, batches) &&
-					  df_slice_reads_batches(stmt, stmt->slices[m->motionID].parentIndex,
+					!(vx_slice_runs_in_engine(stmt, m->motionID, batches) &&
+					  vx_slice_reads_batches(stmt, stmt->slices[m->motionID].parentIndex,
 											 m, batches)))
 				{
 					batches = bms_del_member(batches, m->motionID);
 					changed = true;
-					memset(df_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
+					memset(vx_runs_memo, -1, sizeof(int8) * Max(stmt->numSlices, 1));
 				}
 			}
 		} while (changed);
 	}
 	PG_FINALLY();
 	{
-		pfree(df_runs_memo);
-		df_runs_memo = NULL;
+		pfree(vx_runs_memo);
+		vx_runs_memo = NULL;
 	}
 	PG_END_TRY();
 	return batches;
 }
 
 /*
- * df_batch_motions_of, with 'stmt' the statement whose Shared Scans
- * df_numeric_range follows to their producers: a Motion of a reader's
+ * vx_batch_motions_of, with 'stmt' the statement whose Shared Scans
+ * vx_numeric_range follows to their producers: a Motion of a reader's
  * rows carries what its producer's input computes, and both ends must
  * see the same.
  */
 /*
- * df_batch_motions' answer for the statement it last decided, and the
+ * vx_batch_motions' answer for the statement it last decided, and the
  * settings it depends on besides the plan; forgotten at the start of each
- * ExecutorStart and EXPLAIN (df_batch_motions_forget), which every caller
+ * ExecutorStart and EXPLAIN (vx_batch_motions_forget), which every caller
  * runs within, so that a statement at a freed one's address is decided
  * anew.  Deciding checks and translates each slice, more than once:
  * TPC-DS Q14a under GPORCA took 100 to 600 ms per decision, which each
@@ -7872,64 +7872,64 @@ static struct
 	PlannedStmt *stmt;
 	bool		motion_batches;
 	int			mode;
-	int			features;		/* datafusion.debug_features_off */
+	int			features;		/* vec.debug_features_off */
 	int			collate_c;
 	int			ctype_c;
 	Bitmapset  *batches;		/* in TopMemoryContext */
-}			df_batches_cache;
+}			vx_batches_cache;
 
 void
-df_batch_motions_forget(void)
+vx_batch_motions_forget(void)
 {
-	if (df_batches_cache.batches != NULL)
-		bms_free(df_batches_cache.batches);
-	memset(&df_batches_cache, 0, sizeof(df_batches_cache));
+	if (vx_batches_cache.batches != NULL)
+		bms_free(vx_batches_cache.batches);
+	memset(&vx_batches_cache, 0, sizeof(vx_batches_cache));
 }
 
 Bitmapset *
-df_batch_motions(PlannedStmt *stmt)
+vx_batch_motions(PlannedStmt *stmt)
 {
-	PlannedStmt *volatile saved = df_numeric_stmt;
+	PlannedStmt *volatile saved = vx_numeric_stmt;
 	Bitmapset  *volatile batches = NULL;
 	MemoryContext oldcxt;
 
-	if (df_batches_cache.valid && df_batches_cache.stmt == stmt &&
-		df_batches_cache.motion_batches == df_motion_batches &&
-		df_batches_cache.mode == df_mode &&
-		df_batches_cache.features == df_debug_features_off &&
-		df_batches_cache.collate_c == df_explain_collate_c &&
-		df_batches_cache.ctype_c == df_explain_ctype_c)
-		return df_batches_cache.batches;
+	if (vx_batches_cache.valid && vx_batches_cache.stmt == stmt &&
+		vx_batches_cache.motion_batches == vx_motion_batches &&
+		vx_batches_cache.mode == vx_mode &&
+		vx_batches_cache.features == vx_debug_features_off &&
+		vx_batches_cache.collate_c == vx_explain_collate_c &&
+		vx_batches_cache.ctype_c == vx_explain_ctype_c)
+		return vx_batches_cache.batches;
 
-	df_numeric_stmt = stmt;
+	vx_numeric_stmt = stmt;
 	PG_TRY();
 	{
-		batches = df_batch_motions_of(stmt);
+		batches = vx_batch_motions_of(stmt);
 	}
 	PG_FINALLY();
 	{
-		df_numeric_stmt = saved;
+		vx_numeric_stmt = saved;
 	}
 	PG_END_TRY();
-	df_batch_motions_forget();
+	vx_batch_motions_forget();
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
-	df_batches_cache.batches = bms_copy(batches);
+	vx_batches_cache.batches = bms_copy(batches);
 	MemoryContextSwitchTo(oldcxt);
-	df_batches_cache.stmt = stmt;
-	df_batches_cache.motion_batches = df_motion_batches;
-	df_batches_cache.mode = df_mode;
-	df_batches_cache.features = df_debug_features_off;
-	df_batches_cache.collate_c = df_explain_collate_c;
-	df_batches_cache.ctype_c = df_explain_ctype_c;
-	df_batches_cache.valid = true;
-	return df_batches_cache.batches;
+	vx_batches_cache.stmt = stmt;
+	vx_batches_cache.motion_batches = vx_motion_batches;
+	vx_batches_cache.mode = vx_mode;
+	vx_batches_cache.features = vx_debug_features_off;
+	vx_batches_cache.collate_c = vx_explain_collate_c;
+	vx_batches_cache.ctype_c = vx_explain_ctype_c;
+	vx_batches_cache.valid = true;
+	return vx_batches_cache.batches;
 }
 
 /* Does 'motion' carry Arrow IPC batches instead of tuples? */
 bool
-df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
+vx_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
 {
-	return bms_is_member(motion->motionID, df_batch_motions(stmt));
+	return bms_is_member(motion->motionID, vx_batch_motions(stmt));
 }
 
 /*
@@ -7937,7 +7937,7 @@ df_motion_sends_batches(PlannedStmt *stmt, Motion *motion)
  * becomes its Agg, the Motion's child.
  */
 Aggref *
-df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg)
+vx_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg)
 {
 	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
 	Plan	   *child = outerPlan(motion);
@@ -7962,20 +7962,20 @@ df_motion_column_partial(Motion *motion, AttrNumber resno, Plan **agg)
 
 /*
  * PS1: does column 'resno' of Motion of tuples 'motion' carry PostgreSQL's
- * state of a partial aggregate the C side reads (df_state_part)?
+ * state of a partial aggregate the C side reads (vx_state_part)?
  */
 bool
-df_motion_pg_state(Motion *motion, AttrNumber resno)
+vx_motion_pg_state(Motion *motion, AttrNumber resno)
 {
 	Plan	   *child = NULL;
-	Aggref	   *partial = df_motion_column_partial(motion, resno, &child);
-	DfAggState	state;
+	Aggref	   *partial = vx_motion_column_partial(motion, resno, &child);
+	VxAggState	state;
 
 	if (partial == NULL)
 		return false;
-	state = df_agg_state_at(child, partial);
-	return state == DF_AGG_SUM_NUMERIC || state == DF_AGG_AVG_NUMERIC ||
-		state == DF_AGG_SUM_INT8 || state == DF_AGG_AVG_INT;
+	state = vx_agg_state_at(child, partial);
+	return state == VX_AGG_SUM_NUMERIC || state == VX_AGG_AVG_NUMERIC ||
+		state == VX_AGG_SUM_INT8 || state == VX_AGG_AVG_INT;
 }
 
 /*
@@ -7985,42 +7985,42 @@ df_motion_pg_state(Motion *motion, AttrNumber resno)
  * becomes the same columns (PS1).
  */
 int
-df_motion_state_columns(Motion *motion, AttrNumber resno)
+vx_motion_state_columns(Motion *motion, AttrNumber resno)
 {
 	Plan	   *child = NULL;
-	Aggref	   *partial = df_motion_column_partial(motion, resno, &child);
+	Aggref	   *partial = vx_motion_column_partial(motion, resno, &child);
 
 	if (partial == NULL)
 		return 0;
-	return df_agg_state_ncols(df_agg_state_at(child, partial));
+	return vx_agg_state_ncols(vx_agg_state_at(child, partial));
 }
 
 /* Which state DataFusion keeps for 'agg'. */
-DfAggState
-df_agg_state(Aggref *agg)
+VxAggState
+vx_agg_state(Aggref *agg)
 {
 	char	   *name = get_func_name(agg->aggfnoid);
 	Oid			argtype = list_length(agg->aggargtypes) == 1 ?
 		linitial_oid(agg->aggargtypes) : InvalidOid;
 
 	if (name == NULL || agg->aggfnoid >= FirstGenbkiObjectId)
-		return DF_AGG_PLAIN;
+		return VX_AGG_PLAIN;
 	if (strcmp(name, "avg") == 0)
 	{
 		if (argtype == FLOAT4OID || argtype == FLOAT8OID)
-			return DF_AGG_AVG_FLOAT;
+			return VX_AGG_AVG_FLOAT;
 		if (argtype == INT2OID || argtype == INT4OID || argtype == INT8OID)
-			return DF_AGG_AVG_INT;
+			return VX_AGG_AVG_INT;
 	}
 	if (strcmp(name, "sum") == 0 && argtype == INT8OID)
-		return DF_AGG_SUM_INT8;
+		return VX_AGG_SUM_INT8;
 	if (argtype == NUMERICOID && strcmp(name, "sum") == 0)
-		return DF_AGG_SUM_NUMERIC;
+		return VX_AGG_SUM_NUMERIC;
 	if (argtype == NUMERICOID && strcmp(name, "avg") == 0)
-		return DF_AGG_AVG_NUMERIC;
-	if (agg->aggsplit != AGGSPLIT_SIMPLE && df_stddev_agg(agg, NULL, NULL))
-		return DF_AGG_STDDEV;
-	return DF_AGG_PLAIN;
+		return VX_AGG_AVG_NUMERIC;
+	if (agg->aggsplit != AGGSPLIT_SIMPLE && vx_stddev_agg(agg, NULL, NULL))
+		return VX_AGG_STDDEV;
+	return VX_AGG_PLAIN;
 }
 
 /* ---------------------------------------------------------------------
@@ -8029,7 +8029,7 @@ df_agg_state(Aggref *agg)
  */
 
 static bool
-df_window_funcs_walker(Node *node, List **funcs)
+vx_window_funcs_walker(Node *node, List **funcs)
 {
 	if (node == NULL)
 		return false;
@@ -8038,21 +8038,21 @@ df_window_funcs_walker(Node *node, List **funcs)
 		*funcs = list_append_unique(*funcs, node);
 		return false;
 	}
-	return expression_tree_walker(node, df_window_funcs_walker, funcs);
+	return expression_tree_walker(node, vx_window_funcs_walker, funcs);
 }
 
 /*
  * The window functions WindowAgg 'wa' computes, each once, in the order its
  * targetlist and then its filter name them: DataFusion's columns
- * <name>_w<k> (df_emit_plan_node).
+ * <name>_w<k> (vx_emit_plan_node).
  */
 List *
-df_window_funcs(WindowAgg *wa)
+vx_window_funcs(WindowAgg *wa)
 {
 	List	   *funcs = NIL;
 
-	(void) df_window_funcs_walker((Node *) wa->plan.targetlist, &funcs);
-	(void) df_window_funcs_walker((Node *) wa->plan.qual, &funcs);
+	(void) vx_window_funcs_walker((Node *) wa->plan.targetlist, &funcs);
+	(void) vx_window_funcs_walker((Node *) wa->plan.qual, &funcs);
 	return funcs;
 }
 
@@ -8062,7 +8062,7 @@ df_window_funcs(WindowAgg *wa)
  * is what it computes over each group, checked and built as that.
  */
 Aggref *
-df_window_aggref(WindowFunc *wf)
+vx_window_aggref(WindowFunc *wf)
 {
 	Aggref	   *agg = makeNode(Aggref);
 	ListCell   *lc;
@@ -8093,24 +8093,24 @@ df_window_aggref(WindowFunc *wf)
  * DataFusion computes from the frame's sum and count as an Agg's (AVG1)?
  */
 bool
-df_window_avg(WindowFunc *wf)
+vx_window_avg(WindowFunc *wf)
 {
-	DfAggState	state;
+	VxAggState	state;
 
 	if (!wf->winagg)
 		return false;
-	state = df_agg_state(df_window_aggref(wf));
-	return state == DF_AGG_AVG_NUMERIC || state == DF_AGG_AVG_INT;
+	state = vx_agg_state(vx_window_aggref(wf));
+	return state == VX_AGG_AVG_NUMERIC || state == VX_AGG_AVG_INT;
 }
 
-typedef struct DfRunCondition
+typedef struct VxRunCondition
 {
 	WindowAgg  *wa;
 	bool		ok;
-} DfRunCondition;
+} VxRunCondition;
 
 static Node *
-df_run_condition_mutator(Node *node, DfRunCondition *c)
+vx_run_condition_mutator(Node *node, VxRunCondition *c)
 {
 	if (node == NULL)
 		return NULL;
@@ -8126,7 +8126,7 @@ df_run_condition_mutator(Node *node, DfRunCondition *c)
 		}
 		return copyObject((Node *) tle->expr);
 	}
-	return expression_tree_mutator(node, df_run_condition_mutator, c);
+	return expression_tree_mutator(node, vx_run_condition_mutator, c);
 }
 
 /*
@@ -8140,10 +8140,10 @@ df_run_condition_mutator(Node *node, DfRunCondition *c)
  * after that one too: the rows that pass it.
  */
 List *
-df_window_run_condition(WindowAgg *wa)
+vx_window_run_condition(WindowAgg *wa)
 {
-	DfRunCondition c = {wa, true};
-	List	   *cond = (List *) df_run_condition_mutator((Node *) wa->runCondition, &c);
+	VxRunCondition c = {wa, true};
+	List	   *cond = (List *) vx_run_condition_mutator((Node *) wa->runCondition, &c);
 
 	return c.ok ? cond : NULL;
 }
@@ -8158,7 +8158,7 @@ df_window_run_condition(WindowAgg *wa)
  * partition holds one value of them.)
  */
 const char *
-df_window_frame(WindowAgg *wa)
+vx_window_frame(WindowAgg *wa)
 {
 	int			opts = wa->frameOptions;
 
@@ -8183,7 +8183,7 @@ df_window_frame(WindowAgg *wa)
  * WindowAgg below).  DataFusion sorts its rows itself, in that order.
  */
 bool
-df_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls_first, Oid *collation)
+vx_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls_first, Oid *collation)
 {
 	int			i;
 
@@ -8247,19 +8247,19 @@ df_window_order(Plan *plan, AttrNumber col, Oid *sortop, bool *nulls_first, Oid 
 
 /* Columns its state takes in a batch stream (0 for a plain aggregate). */
 int
-df_agg_state_ncols(DfAggState state)
+vx_agg_state_ncols(VxAggState state)
 {
 	switch (state)
 	{
-		case DF_AGG_STDDEV:
+		case VX_AGG_STDDEV:
 			return 3;
-		case DF_AGG_AVG_FLOAT:
-		case DF_AGG_AVG_INT:
-		case DF_AGG_AVG_NUMERIC:
-		case DF_AGG_SUM_NUMERIC_MIXED:
+		case VX_AGG_AVG_FLOAT:
+		case VX_AGG_AVG_INT:
+		case VX_AGG_AVG_NUMERIC:
+		case VX_AGG_SUM_NUMERIC_MIXED:
 			return 2;
-		case DF_AGG_SUM_INT8:
-		case DF_AGG_SUM_NUMERIC:
+		case VX_AGG_SUM_INT8:
+		case VX_AGG_SUM_NUMERIC:
 			return 1;
 		default:
 			return 0;
@@ -8271,59 +8271,59 @@ df_agg_state_ncols(DfAggState state)
  * partial avg's state takes two columns (sum, then count).
  */
 int
-df_motion_stream_column(Motion *motion, AttrNumber resno)
+vx_motion_stream_column(Motion *motion, AttrNumber resno)
 {
 	int			pos = 0;
 	AttrNumber	r;
 
 	for (r = 1; r < resno; r++)
-		pos += Max(df_motion_state_columns(motion, r), 1);
+		pos += Max(vx_motion_state_columns(motion, r), 1);
 	return pos;
 }
 
 /*
  * CP1: the length n of column 'resno' of batch Motion 'motion' when its
  * values are a table's character(n), each padded to n characters
- * (df_bpchar_length), or -1.  The sender sends them without their trailing
+ * (vx_bpchar_length), or -1.  The sender sends them without their trailing
  * blanks, most of the bytes of a wide character(n), and the receiver pads
  * them back to n characters.  A character(1) has no blanks to save.
  */
 int
-df_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
+vx_motion_bpchar_pad(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
 {
 	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
-	PlannedStmt *volatile saved = df_numeric_stmt;
+	PlannedStmt *volatile saved = vx_numeric_stmt;
 	volatile int n = -1;
 
 	if (tle == NULL || exprType((Node *) tle->expr) != BPCHAROID)
 		return -1;
 	/* a Shared Scan's reader leads to its producer */
-	df_numeric_stmt = stmt;
+	vx_numeric_stmt = stmt;
 	PG_TRY();
 	{
-		n = df_bpchar_length((Plan *) motion, (Node *) tle->expr);
+		n = vx_bpchar_length((Plan *) motion, (Node *) tle->expr);
 	}
 	PG_FINALLY();
 	{
-		df_numeric_stmt = saved;
+		vx_numeric_stmt = saved;
 	}
 	PG_END_TRY();
 	return n > 1 ? n : -1;
 }
 
-/* CP1: df_motion_bpchar_pad of the column at stream column 'pos'. */
+/* CP1: vx_motion_bpchar_pad of the column at stream column 'pos'. */
 int
-df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos)
+vx_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos)
 {
 	int			start = 0;
 	AttrNumber	r;
 
 	for (r = 1; r <= list_length(motion->plan.targetlist); r++)
 	{
-		int			width = df_motion_state_columns(motion, r);
+		int			width = vx_motion_state_columns(motion, r);
 
 		if (start == pos)
-			return width > 0 ? -1 : df_motion_bpchar_pad(stmt, motion, r);
+			return width > 0 ? -1 : vx_motion_bpchar_pad(stmt, motion, r);
 		start += Max(width, 1);
 	}
 	return -1;
@@ -8332,51 +8332,51 @@ df_motion_stream_pad(PlannedStmt *stmt, Motion *motion, int pos)
 /*
  * NW1: the digits of column 'resno' of batch Motion 'motion' when its
  * values are numeric of one scale with at most 38 digits
- * (df_numeric_ps), or -1.  Such a column goes through the Motion with its
+ * (vx_numeric_ps), or -1.  Such a column goes through the Motion with its
  * integers narrowed to 8 or 16 bytes instead of Decimal256's 32, and the
  * receiver widens them back.
  */
 int
-df_motion_numeric_digits(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
+vx_motion_numeric_digits(PlannedStmt *stmt, Motion *motion, AttrNumber resno)
 {
 	TargetEntry *tle = get_tle_by_resno(motion->plan.targetlist, resno);
-	PlannedStmt *volatile saved = df_numeric_stmt;
+	PlannedStmt *volatile saved = vx_numeric_stmt;
 	volatile int digits = -1;
 
 	if (tle == NULL || exprType((Node *) tle->expr) != NUMERICOID ||
-		df_motion_state_columns(motion, resno) > 0)
+		vx_motion_state_columns(motion, resno) > 0)
 		return -1;
 	/* a Shared Scan's reader leads to its producer */
-	df_numeric_stmt = stmt;
+	vx_numeric_stmt = stmt;
 	PG_TRY();
 	{
 		int			p,
 					s;
 
-		if (df_numeric_ps((Plan *) motion, (Node *) tle->expr, &p, &s) && p <= 38)
+		if (vx_numeric_ps((Plan *) motion, (Node *) tle->expr, &p, &s) && p <= 38)
 			digits = p;
 	}
 	PG_FINALLY();
 	{
-		df_numeric_stmt = saved;
+		vx_numeric_stmt = saved;
 	}
 	PG_END_TRY();
 	return digits;
 }
 
-/* NW1: df_motion_numeric_digits of the column at stream column 'pos'. */
+/* NW1: vx_motion_numeric_digits of the column at stream column 'pos'. */
 int
-df_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos)
+vx_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos)
 {
 	int			start = 0;
 	AttrNumber	r;
 
 	for (r = 1; r <= list_length(motion->plan.targetlist); r++)
 	{
-		int			width = df_motion_state_columns(motion, r);
+		int			width = vx_motion_state_columns(motion, r);
 
 		if (start == pos)
-			return width > 0 ? -1 : df_motion_numeric_digits(stmt, motion, r);
+			return width > 0 ? -1 : vx_motion_numeric_digits(stmt, motion, r);
 		start += Max(width, 1);
 	}
 	return -1;
@@ -8391,27 +8391,27 @@ df_motion_stream_digits(PlannedStmt *stmt, Motion *motion, int pos)
  * checks it.
  */
 uint64
-df_motion_signature(PlannedStmt *stmt, Motion *motion)
+vx_motion_signature(PlannedStmt *stmt, Motion *motion)
 {
 	uint64		h = UINT64CONST(14695981039346656037);
 	const char *p;
 	ListCell   *lc;
 
-#define DF_MIX(v) (h = (h ^ (uint64) (v)) * UINT64CONST(1099511628211))
-	for (p = df_engine_load()->name; *p != '\0'; p++)
-		DF_MIX((unsigned char) *p);
-	DF_MIX(VEC_IR_VERSION);
-	DF_MIX(motion->motionID);
-	DF_MIX(list_length(motion->plan.targetlist));
+#define VX_MIX(v) (h = (h ^ (uint64) (v)) * UINT64CONST(1099511628211))
+	for (p = vx_engine_load()->name; *p != '\0'; p++)
+		VX_MIX((unsigned char) *p);
+	VX_MIX(VEC_IR_VERSION);
+	VX_MIX(motion->motionID);
+	VX_MIX(list_length(motion->plan.targetlist));
 	foreach(lc, motion->plan.targetlist)
 	{
 		TargetEntry *tle = lfirst_node(TargetEntry, lc);
 
-		DF_MIX(exprType((Node *) tle->expr));
-		DF_MIX(df_motion_bpchar_pad(stmt, motion, tle->resno));
-		DF_MIX(df_motion_numeric_digits(stmt, motion, tle->resno));
+		VX_MIX(exprType((Node *) tle->expr));
+		VX_MIX(vx_motion_bpchar_pad(stmt, motion, tle->resno));
+		VX_MIX(vx_motion_numeric_digits(stmt, motion, tle->resno));
 	}
-#undef DF_MIX
+#undef VX_MIX
 	return h;
 }
 
@@ -8419,28 +8419,28 @@ df_motion_signature(PlannedStmt *stmt, Motion *motion)
  * EXPLAIN: one line per slice
  * ---------------------------------------------------------------------
  */
-typedef struct DfSliceRoot
+typedef struct VxSliceRoot
 {
 	int			index;
 	Plan	   *root;
 	bool		is_sender;		/* root is the Motion this slice sends through */
 	bool		init_plan;		/* the top slice of an init plan (IP2) */
-} DfSliceRoot;
+} VxSliceRoot;
 
-typedef struct DfCollectContext
+typedef struct VxCollectContext
 {
-	DfSliceRoot *roots;
+	VxSliceRoot *roots;
 	int			nroots;
 	int			maxroots;
-} DfCollectContext;
+} VxCollectContext;
 
 static void
-df_add_root(DfCollectContext *cxt, int index, Plan *root, bool is_sender)
+vx_add_root(VxCollectContext *cxt, int index, Plan *root, bool is_sender)
 {
 	if (cxt->nroots == cxt->maxroots)
 	{
 		cxt->maxroots *= 2;
-		cxt->roots = repalloc(cxt->roots, sizeof(DfSliceRoot) * cxt->maxroots);
+		cxt->roots = repalloc(cxt->roots, sizeof(VxSliceRoot) * cxt->maxroots);
 	}
 	cxt->roots[cxt->nroots].index = index;
 	cxt->roots[cxt->nroots].root = root;
@@ -8450,28 +8450,28 @@ df_add_root(DfCollectContext *cxt, int index, Plan *root, bool is_sender)
 }
 
 static bool
-df_collect_motions(Node *node, DfCollectContext *cxt)
+vx_collect_motions(Node *node, VxCollectContext *cxt)
 {
 	if (node == NULL)
 		return false;
 	if (IsA(node, Motion))
-		df_add_root(cxt, ((Motion *) node)->motionID, (Plan *) node, true);
-	return plan_tree_walker(node, df_collect_motions, cxt, true);
+		vx_add_root(cxt, ((Motion *) node)->motionID, (Plan *) node, true);
+	return plan_tree_walker(node, vx_collect_motions, cxt, true);
 }
 
 static int
-df_root_cmp(const void *a, const void *b)
+vx_root_cmp(const void *a, const void *b)
 {
-	return ((const DfSliceRoot *) a)->index - ((const DfSliceRoot *) b)->index;
+	return ((const VxSliceRoot *) a)->index - ((const VxSliceRoot *) b)->index;
 }
 
-static void df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out);
+static void vx_explain_slice(PlannedStmt *stmt, VxSliceRoot *root, StringInfo out);
 
-/* Append "DataFusion: slice N ..." lines for every slice of 'stmt'. */
+/* Append "Vectorized: slice N ..." lines for every slice of 'stmt'. */
 void
-df_explain_slices(PlannedStmt *stmt, StringInfo out)
+vx_explain_slices(PlannedStmt *stmt, StringInfo out)
 {
-	DfCollectContext cxt;
+	VxCollectContext cxt;
 	int			root_index = 0;
 	int			i;
 
@@ -8486,13 +8486,13 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 
 	cxt.maxroots = 8;
 	cxt.nroots = 0;
-	cxt.roots = palloc(sizeof(DfSliceRoot) * cxt.maxroots);
-	df_add_root(&cxt, root_index, stmt->planTree, false);
-	df_collect_motions((Node *) stmt->planTree, &cxt);
+	cxt.roots = palloc(sizeof(VxSliceRoot) * cxt.maxroots);
+	vx_add_root(&cxt, root_index, stmt->planTree, false);
+	vx_collect_motions((Node *) stmt->planTree, &cxt);
 	for (i = 0; i < list_length(stmt->subplans); i++)
 	{
 		int			slice;
-		Plan	   *plan = df_init_plan_root(stmt, i, &slice);
+		Plan	   *plan = vx_init_plan_root(stmt, i, &slice);
 
 		if (plan == NULL)
 		{
@@ -8500,24 +8500,24 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 			 * A SubPlan's plan runs in the slice of the node it is in; the
 			 * slices sending to its Motions are slices of the query too
 			 */
-			df_collect_motions((Node *) list_nth(stmt->subplans, i), &cxt);
+			vx_collect_motions((Node *) list_nth(stmt->subplans, i), &cxt);
 			continue;
 		}
-		df_add_root(&cxt, slice, plan, false);
+		vx_add_root(&cxt, slice, plan, false);
 		cxt.roots[cxt.nroots - 1].init_plan = true;
-		df_collect_motions((Node *) plan, &cxt);
+		vx_collect_motions((Node *) plan, &cxt);
 	}
-	qsort(cxt.roots, cxt.nroots, sizeof(DfSliceRoot), df_root_cmp);
+	qsort(cxt.roots, cxt.nroots, sizeof(VxSliceRoot), vx_root_cmp);
 
 	PG_TRY();
 	{
 		for (i = 0; i < cxt.nroots; i++)
-			df_explain_slice(stmt, &cxt.roots[i], out);
+			vx_explain_slice(stmt, &cxt.roots[i], out);
 	}
 	PG_FINALLY();
 	{
-		df_explain_collate_c = -1;
-		df_explain_ctype_c = -1;
+		vx_explain_collate_c = -1;
+		vx_explain_ctype_c = -1;
 	}
 	PG_END_TRY();
 	pfree(cxt.roots);
@@ -8525,16 +8525,16 @@ df_explain_slices(PlannedStmt *stmt, StringInfo out)
 
 /* The rows Limit 'plan' lets through at most: its constant count, else -1. */
 static int64
-df_limit_rows(Plan *plan)
+vx_limit_rows(Plan *plan)
 {
 	Limit	   *limit = (Limit *) plan;
 	int64		count;
 	int64		offset;
 
 	if (plan == NULL || !IsA(plan, Limit) || limit->limitOption != LIMIT_OPTION_COUNT ||
-		!df_passes_through(plan) ||
-		!df_limit_value(limit->limitCount, &count) ||
-		!df_limit_value(limit->limitOffset, &offset))
+		!vx_passes_through(plan) ||
+		!vx_limit_value(limit->limitCount, &count) ||
+		!vx_limit_value(limit->limitOffset, &offset))
 		return -1;
 	return count;
 }
@@ -8546,7 +8546,7 @@ df_limit_rows(Plan *plan)
  * store; 'below' itself if not a Sequence; NULL otherwise.
  */
 static Plan *
-df_through_producers(Plan *below, List *points)
+vx_through_producers(Plan *below, List *points)
 {
 	Plan	   *body;
 	ListCell   *lc;
@@ -8581,7 +8581,7 @@ df_through_producers(Plan *below, List *points)
 			if (IsA(outerPlan(sub), Motion))
 				continue;
 			foreach(pc, points)
-				if (((DfAttach *) lfirst(pc))->plan == outerPlan(sub))
+				if (((VxAttach *) lfirst(pc))->plan == outerPlan(sub))
 					found = true;
 			if (!found)
 				return NULL;
@@ -8601,12 +8601,12 @@ df_through_producers(Plan *below, List *points)
  * the rows it receives, as a Gather Motion has not.
  */
 static int64
-df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
+vx_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
 {
 	Plan	   *below;
 	Plan	   *body;
 
-	if (compute == NULL || !IsA(compute, Sort) || !df_passes_through(compute))
+	if (compute == NULL || !IsA(compute, Sort) || !vx_passes_through(compute))
 		return -1;
 	below = outerPlan(compute);
 	if (IsA(below, Limit))
@@ -8614,17 +8614,17 @@ df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
 		if (points != NIL || outerPlan(below) == NULL || !IsA(outerPlan(below), Motion))
 			return -1;
 		*motion = (Motion *) outerPlan(below);
-		return df_limit_rows(below);
+		return vx_limit_rows(below);
 	}
 	/* through the Sequences, some within others, to the last input */
-	below = df_through_producers(below, points);
+	below = vx_through_producers(below, points);
 	if (below == NULL)
 		return -1;
 	if (below == outerPlan(compute) || !IsA(below, Motion))
 		return -1;
 	body = below;
 	*motion = (Motion *) body;
-	return df_limit_rows(outerPlan(body));
+	return vx_limit_rows(outerPlan(body));
 }
 
 /*
@@ -8635,13 +8635,13 @@ df_sorts_limited_rows(Plan *compute, List *points, Motion **motion)
  * sends a Limit's rows back to the segments to pass them on.
  */
 static Motion *
-df_forwards_motion(Plan *compute, List *points)
+vx_forwards_motion(Plan *compute, List *points)
 {
 	Plan	   *below;
 
 	if (compute == NULL || !IsA(compute, Sequence) || points == NIL)
 		return NULL;
-	below = df_through_producers(compute, points);
+	below = vx_through_producers(compute, points);
 	return below != NULL && IsA(below, Motion) ? (Motion *) below : NULL;
 }
 
@@ -8652,7 +8652,7 @@ df_forwards_motion(Plan *compute, List *points)
  * rows of shared year totals so, each slice filtering one year.
  */
 static bool
-df_passes_reader(Plan *compute, bool *filtered)
+vx_passes_reader(Plan *compute, bool *filtered)
 {
 	Plan	   *p = compute;
 
@@ -8678,12 +8678,12 @@ df_passes_reader(Plan *compute, bool *filtered)
 }
 
 /*
- * The "DataFusion: slice N ..." line of slice 'root'.  CL2: a slice the
+ * The "Vectorized: slice N ..." line of slice 'root'.  CL2: a slice the
  * segments run is reported as they check it, by their default collation,
  * which can differ from the coordinator's (C and C.UTF-8).
  */
 static void
-df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
+vx_explain_slice(PlannedStmt *stmt, VxSliceRoot *root, StringInfo out)
 {
 	char		reason[256];
 	GangType	gang = stmt->slices[root->index].gangType;
@@ -8691,43 +8691,43 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 	if ((gang == GANGTYPE_PRIMARY_READER || gang == GANGTYPE_PRIMARY_WRITER ||
 		 gang == GANGTYPE_SINGLETON_READER) && Gp_role == GP_ROLE_DISPATCH)
 	{
-		df_explain_collate_c = df_segments_collate_c;
-		df_explain_ctype_c = df_segments_ctype_c;
+		vx_explain_collate_c = vx_segments_collate_c;
+		vx_explain_ctype_c = vx_segments_ctype_c;
 	}
 	else
 	{
-		df_explain_collate_c = -1;
-		df_explain_ctype_c = -1;
+		vx_explain_collate_c = -1;
+		vx_explain_ctype_c = -1;
 	}
 	if (root->init_plan && IsA(root->root, Motion))
 		/* only gathers the rows its slices below compute, as a query's top */
-		appendStringInfo(out, "DataFusion: slice %d not eligible: receives rows from a %s "
+		appendStringInfo(out, "Vectorized: slice %d not eligible: receives rows from a %s "
 						 "with nothing to compute on them\n", root->index,
-						 df_plan_name(root->root));
+						 vx_plan_name(root->root));
 	else if (root->init_plan)
-		appendStringInfo(out, "DataFusion: slice %d not eligible: the top slice of an init plan, "
+		appendStringInfo(out, "Vectorized: slice %d not eligible: the top slice of an init plan, "
 						 "which the coordinator runs before the query\n", root->index);
-	else if (df_check_slice(stmt, root->root, root->is_sender, NULL, reason, sizeof(reason)))
+	else if (vx_check_slice(stmt, root->root, root->is_sender, NULL, reason, sizeof(reason)))
 	{
 		Plan	   *compute = root->is_sender ? outerPlan(root->root) : root->root;
 		ListCell   *lc;
 		int			n = 0;
 
-		appendStringInfo(out, "DataFusion: slice %d eligible%s", root->index,
+		appendStringInfo(out, "Vectorized: slice %d eligible%s", root->index,
 						 root->is_sender &&
-						 df_motion_sends_batches(stmt, (Motion *) root->root) ?
+						 vx_motion_sends_batches(stmt, (Motion *) root->root) ?
 						 ", sends Arrow batches" : "");
 		/* T2: below the Shared Scan producers PostgreSQL runs first */
-		foreach(lc, df_slice_producers(compute))
+		foreach(lc, vx_slice_producers(compute))
 		{
 			ListCell   *pc;
 
-			foreach(pc, df_slice_attach_points(stmt, lfirst(lc), df_batch_motions(stmt)))
+			foreach(pc, vx_slice_attach_points(stmt, lfirst(lc), vx_batch_motions(stmt)))
 			{
-				Plan	   *p = ((DfAttach *) lfirst(pc))->plan;
+				Plan	   *p = ((VxAttach *) lfirst(pc))->plan;
 
 				appendStringInfo(out, "%s %s", n++ > 0 ? "," : "; below its Shared Scan producers:",
-								 df_plan_name(p) ? df_plan_name(p) : "?");
+								 vx_plan_name(p) ? vx_plan_name(p) : "?");
 			}
 		}
 		appendStringInfoChar(out, '\n');
@@ -8735,57 +8735,57 @@ df_explain_slice(PlannedStmt *stmt, DfSliceRoot *root, StringInfo out)
 	else
 	{
 		Plan	   *compute = root->is_sender ? outerPlan(root->root) : root->root;
-		List	   *points = df_slice_attach_points(stmt, compute, df_batch_motions(stmt));
+		List	   *points = vx_slice_attach_points(stmt, compute, vx_batch_motions(stmt));
 		ListCell   *lc;
 
 		Motion	   *motion = NULL;
 		bool		filtered;
-		int64		rows = df_sorts_limited_rows(compute, points, &motion);
+		int64		rows = vx_sorts_limited_rows(compute, points, &motion);
 
 		if (rows >= 0)
 			snprintf(reason, sizeof(reason),
 					 "sorts at most " INT64_FORMAT " rows of a Limit, received from a %s, "
 					 "with nothing else to compute on them",
-					 rows, df_plan_name((Plan *) motion));
-		else if (points == NIL && root->is_sender && df_passes_reader(compute, &filtered))
+					 rows, vx_plan_name((Plan *) motion));
+		else if (points == NIL && root->is_sender && vx_passes_reader(compute, &filtered))
 		{
 			/* RS1: as a receiving slice that only passes rows on */
-			appendStringInfo(out, "DataFusion: slice %d not eligible: passes on rows read from "
+			appendStringInfo(out, "Vectorized: slice %d not eligible: passes on rows read from "
 							 "a Shared Scan%s, with nothing else to compute on them\n",
 							 root->index, filtered ? ", filtered" : "");
 			return;
 		}
-		else if ((motion = df_forwards_motion(compute, points)) != NULL)
+		else if ((motion = vx_forwards_motion(compute, points)) != NULL)
 		{
 			/* FW1: what runs below its Shared Scan producers, all of it */
-			appendStringInfo(out, "DataFusion: slice %d not eligible: passes on rows received "
+			appendStringInfo(out, "Vectorized: slice %d not eligible: passes on rows received "
 							 "from a %s, with nothing else to compute on them; below its "
 							 "Shared Scan producers:", root->index,
-							 df_plan_name((Plan *) motion));
+							 vx_plan_name((Plan *) motion));
 			foreach(lc, points)
 			{
-				Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
+				Plan	   *p = ((VxAttach *) lfirst(lc))->plan;
 
 				appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
-								 df_plan_name(p) ? df_plan_name(p) : "?");
+								 vx_plan_name(p) ? vx_plan_name(p) : "?");
 			}
 			appendStringInfoChar(out, '\n');
 			return;
 		}
 		if (points == NIL)
-			appendStringInfo(out, "DataFusion: slice %d not eligible: %s\n",
+			appendStringInfo(out, "Vectorized: slice %d not eligible: %s\n",
 							 root->index, reason);
 		else
 		{
 			/* T2: what runs below PostgreSQL's nodes, and why they stay */
-			appendStringInfo(out, "DataFusion: slice %d eligible below the top:",
+			appendStringInfo(out, "Vectorized: slice %d eligible below the top:",
 							 root->index);
 			foreach(lc, points)
 			{
-				Plan	   *p = ((DfAttach *) lfirst(lc))->plan;
+				Plan	   *p = ((VxAttach *) lfirst(lc))->plan;
 
 				appendStringInfo(out, "%s %s", foreach_current_index(lc) > 0 ? "," : "",
-								 df_plan_name(p) ? df_plan_name(p) : "?");
+								 vx_plan_name(p) ? vx_plan_name(p) : "?");
 			}
 			appendStringInfo(out, " (above: %s)\n", reason);
 		}

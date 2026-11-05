@@ -15,13 +15,13 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- The experimental direct PAX reader (datafusion.pax_direct_read): PAX
+-- The experimental direct PAX reader (vec.pax_direct_read): PAX
 -- micro-partitions decoded column by column on DataFusion's threads,
--- through datafusion_pax.so.  The coordinator-local part runs in utility
+-- through vec_pax.so.  The coordinator-local part runs in utility
 -- mode (data/paxdirect_utility.sql); a distributed table exercises the
 -- segments.  Each query runs with the reader off, then on; results match.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 \! PGOPTIONS='-c gp_role=utility' psql -X -a -q -d contrib_regression -f data/paxdirect_utility.sql 2>&1
 -- Licensed to the Apache Software Foundation (ASF) under one
 -- or more contributor license agreements.  See the NOTICE file
@@ -42,11 +42,11 @@ CREATE EXTENSION datafusion_executor;
 --
 -- Body of the paxdirect test, run in utility mode on the coordinator by
 -- sql/paxdirect.sql, so that the scans and the counter of direct reads are
--- in the same backend.  Each query runs with datafusion.mode off, then on
--- with datafusion.pax_direct_read; the results must match, and the counter
+-- in the same backend.  Each query runs with vec.mode off, then on
+-- with vec.pax_direct_read; the results must match, and the counter
 -- shows that the PAX reader read the table directly.
 --
-LOAD 'datafusion_executor';
+LOAD 'vec_executor';
 CREATE TABLE df_pd (a int4, b int8, c float8, d bool, e int2) USING pax;
 CREATE TABLE df_pd_vec (a int4, b int8, c float8, d bool, e int2) USING pax
   WITH (storage_format = 'porc_vec');
@@ -56,7 +56,7 @@ INSERT INTO df_pd VALUES (NULL, NULL, NULL, NULL, NULL), (300001, NULL, 1.5, NUL
 INSERT INTO df_pd_vec SELECT * FROM df_pd;
 DELETE FROM df_pd WHERE a % 1000 = 7;
 DELETE FROM df_pd_vec WHERE a % 1000 = 7;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd WHERE e < 50;
  count  | count  | count  |     sum     |   sum   | min  |   max   
 --------+--------+--------+-------------+---------+------+---------
@@ -111,8 +111,8 @@ SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
    |      2 |       7
 (3 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(a), count(b), sum(a), sum(e), min(c), max(b) FROM df_pd WHERE e < 50;
  count  | count  | count  |     sum     |   sum   | min  |   max   
 --------+--------+--------+-------------+---------+------+---------
@@ -167,7 +167,7 @@ SELECT d, count(*), sum(e) FROM df_pd_vec GROUP BY d ORDER BY d;
    |      2 |       7
 (3 rows)
 
-SELECT datafusion_debug_pax_direct_scans() AS direct_scans;
+SELECT vec_debug_pax_direct_scans() AS direct_scans;
  direct_scans 
 --------------
             7
@@ -184,7 +184,7 @@ SELECT count(*), sum(a) FROM df_pd;
  299613 | 44959592913
 (1 row)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a) FROM df_pd;
  count  |     sum     
 --------+-------------
@@ -192,7 +192,7 @@ SELECT count(*), sum(a) FROM df_pd;
 (1 row)
 
 ROLLBACK;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a) FROM df_pd;
  count  |     sum     
 --------+-------------
@@ -208,7 +208,7 @@ CREATE TABLE df_pd_skip (a int4, b int8, e int2) USING pax WITH (minmax_columns 
 INSERT INTO df_pd_skip SELECT i, i * 10, (i % 100)::int2 FROM generate_series(1, 500000) i;
 RESET pax.max_tuples_per_file;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
  count |    sum     |   max   
 -------+------------+---------
@@ -233,7 +233,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
   5000 | 1249785000 | 4999070
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 210000;
  count |    sum     |   max   
 -------+------------+---------
@@ -241,7 +241,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 21000
 (1 row)
 
 SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb > 0 AS decoded
-FROM datafusion_debug_last_pax();
+FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped | decoded 
 -------+---------------+--------+----------------+---------
      4 |             3 |      8 |              7 | t
@@ -253,7 +253,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a < 5000 OR a > 490000;
  14999 | 4962502500 | 5000000
 (1 row)
 
-SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT files, files_skipped, groups, groups_skipped FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped 
 -------+---------------+--------+----------------
      4 |             2 |     15 |             12
@@ -265,7 +265,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a > 600000;
      0 |     |    
 (1 row)
 
-SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb FROM datafusion_debug_last_pax();
+SELECT files, files_skipped, groups, groups_skipped, decode_peak_kb FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped | decode_peak_kb 
 -------+---------------+--------+----------------+----------------
      4 |             4 |      0 |              0 |              0
@@ -277,7 +277,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE e = 7;
   5000 | 1249785000 | 4999070
 (1 row)
 
-SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT files, files_skipped, groups, groups_skipped FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped 
 -------+---------------+--------+----------------
      4 |             0 |     31 |              0
@@ -291,7 +291,7 @@ SELECT count(*), sum(a), max(b) FROM df_pd_skip WHERE a BETWEEN 200000 AND 21000
  10001 | 2050205000 | 2100000
 (1 row)
 
-SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT files, files_skipped, groups, groups_skipped FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped 
 -------+---------------+--------+----------------
      4 |             0 |      0 |              0
@@ -305,7 +305,7 @@ INSERT INTO df_pd_date SELECT date '1990-01-01' + i / 100, timestamp '1990-01-01
 FROM generate_series(1, 100000) i;
 INSERT INTO df_pd_date VALUES ('infinity', '-infinity'), (NULL, NULL);
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
  count |           min            |           max            
 -------+--------------------------+--------------------------
@@ -319,14 +319,14 @@ SELECT d, ts FROM df_pd_date WHERE d > '2040-01-01' OR d IS NULL ORDER BY d, ts;
           | 
 (2 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), min(ts), max(ts) FROM df_pd_date WHERE d >= '1991-03-01' AND d < '1991-04-01';
  count |           min            |           max            
 -------+--------------------------+--------------------------
   3100 | Tue Jan 30 10:40:00 1990 | Thu Feb 01 14:19:00 1990
 (1 row)
 
-SELECT files, files_skipped, groups, groups_skipped FROM datafusion_debug_last_pax();
+SELECT files, files_skipped, groups, groups_skipped FROM vec_debug_last_pax();
  files | files_skipped | groups | groups_skipped 
 -------+---------------+--------+----------------
      2 |             1 |      7 |              6
@@ -346,14 +346,14 @@ SELECT count(*) FROM df_pd_skip;
  500000
 (1 row)
 
-SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM datafusion_debug_vmem();
+SELECT heap_bytes < 4 * 1024 * 1024 AS heap_returned FROM vec_debug_vmem();
  heap_returned 
 ---------------
  t
 (1 row)
 
 DROP TABLE df_pd, df_pd_vec, df_pd_skip, df_pd_date;
--- DC1: the decoded-column cache (datafusion.pax_decode_cache), in a
+-- DC1: the decoded-column cache (vec.pax_decode_cache), in a
 -- directory of the coordinator's data directory.  The first scans fill it;
 -- run again, they read all 4 groups from it each and write nothing.
 -- Entries that do not fit what they should hold, one cut short and one
@@ -367,7 +367,7 @@ INSERT INTO df_pd_cache SELECT i, i * 7, i / 100.0,
 FROM generate_series(1, 20000) i;
 RESET pax.max_tuples_per_group;
 DELETE FROM df_pd_cache WHERE a % 777 = 0;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum  |  sum  |  max  
 -------+-----------+------------+------------+-------+-------+-------+-------
@@ -383,11 +383,11 @@ SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
  19996 | 199.96 | v19996 | xxxxxx
 (4 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT current_setting('data_directory') AS dd \gset
 \setenv DF_PD_DD :dd
-SET datafusion.pax_decode_cache = 'df_pd_cache_dir';
-SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SET vec.pax_decode_cache = 'df_pd_cache_dir';
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum  |  sum  |  max  
 -------+-----------+------------+------------+-------+-------+-------+-------
@@ -403,13 +403,13 @@ SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
  19996 | 199.96 | v19996 | xxxxxx
 (4 rows)
 
-SELECT fills - :f0 > 0 AS filled, bad - :b0 AS bad, unusable FROM datafusion_debug_pax_cache();
+SELECT fills - :f0 > 0 AS filled, bad - :b0 AS bad, unusable FROM vec_debug_pax_cache();
  filled | bad | unusable 
 --------+-----+----------
  t      |   0 |        0
 (1 row)
 
-SELECT hits AS h0, fills AS f0 FROM datafusion_debug_pax_cache() \gset
+SELECT hits AS h0, fills AS f0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum  |  sum  |  max  
 -------+-----------+------------+------------+-------+-------+-------+-------
@@ -425,7 +425,7 @@ SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
  19996 | 199.96 | v19996 | xxxxxx
 (4 rows)
 
-SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM datafusion_debug_pax_cache();
+SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM vec_debug_pax_cache();
  hits | fills 
 ------+-------
     7 |     1
@@ -460,27 +460,27 @@ SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1');
          1
 (1 row)
 
-SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum  |  sum  |  max  
 -------+-----------+------------+------------+-------+-------+-------+-------
  19975 | 199757475 | 1398302325 | 1997574.75 | 17761 | 96703 | 79900 | v9998
 (1 row)
 
-SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM datafusion_debug_pax_cache();
+SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM vec_debug_pax_cache();
  hits | fills | bad 
 ------+-------+-----
     2 |     2 |   2
 (1 row)
 
-SELECT hits AS h0, fills AS f0, bad AS b0 FROM datafusion_debug_pax_cache() \gset
+SELECT hits AS h0, fills AS f0, bad AS b0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum  |  sum  |  max  
 -------+-----------+------------+------------+-------+-------+-------+-------
  19975 | 199757475 | 1398302325 | 1997574.75 | 17761 | 96703 | 79900 | v9998
 (1 row)
 
-SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM datafusion_debug_pax_cache();
+SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM vec_debug_pax_cache();
  hits | fills | bad 
 ------+-------+-----
     4 |     0 |   0
@@ -488,24 +488,24 @@ SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM datafusio
 
 -- a cache of 1 MB, smaller than the table's columns (about 200 kB a group)
 INSERT INTO df_pd_cache SELECT * FROM df_pd_cache;
-SET datafusion.pax_decode_cache = 'df_pd_cache_small';
-SET datafusion.pax_decode_cache_size = '1MB';
-SELECT refused AS r0 FROM datafusion_debug_pax_cache() \gset
+SET vec.pax_decode_cache = 'df_pd_cache_small';
+SET vec.pax_decode_cache_size = '1MB';
+SELECT refused AS r0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum   |  sum   |  max  
 -------+-----------+------------+------------+-------+--------+--------+-------
  39950 | 399514950 | 2796604650 | 3995149.50 | 35522 | 193406 | 159800 | v9998
 (1 row)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
  count |    sum    |    sum     |    sum     | count |  sum   |  sum   |  max  
 -------+-----------+------------+------------+-------+--------+--------+-------
  39950 | 399514950 | 2796604650 | 3995149.50 | 35522 | 193406 | 159800 | v9998
 (1 row)
 
-SET datafusion.mode = on;
-SELECT refused - :r0 > 0 AS refused FROM datafusion_debug_pax_cache();
+SET vec.mode = on;
+SELECT refused - :r0 > 0 AS refused FROM vec_debug_pax_cache();
  refused 
 ---------
  t
@@ -519,33 +519,33 @@ FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WH
 (1 row)
 
 -- a directory that cannot be used leaves scans without the cache
-SET datafusion.pax_decode_cache = '/proc/df_pd_no_cache';
-SELECT unusable AS u0 FROM datafusion_debug_pax_cache() \gset
+SET vec.pax_decode_cache = '/proc/df_pd_no_cache';
+SELECT unusable AS u0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a) FROM df_pd_cache;
  count |    sum    
 -------+-----------
  39950 | 399514950
 (1 row)
 
-SELECT unusable - :u0 AS unusable FROM datafusion_debug_pax_cache();
+SELECT unusable - :u0 AS unusable FROM vec_debug_pax_cache();
  unusable 
 ----------
         1
 (1 row)
 
-RESET datafusion.pax_decode_cache;
-RESET datafusion.pax_decode_cache_size;
+RESET vec.pax_decode_cache;
+RESET vec.pax_decode_cache_size;
 \! rm -rf "$DF_PD_DD/df_pd_cache_dir" "$DF_PD_DD/df_pd_cache_small"
 DROP TABLE df_pd_cache;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 CREATE TABLE df_pd_dist (a int4, b int8, c float8, e int2) USING pax DISTRIBUTED BY (a);
 INSERT INTO df_pd_dist SELECT i, i * 10, i / 4.0, (i % 100)::int2 FROM generate_series(1, 200000) i;
 INSERT INTO df_pd_dist VALUES (NULL, NULL, NULL, NULL);
 DELETE FROM df_pd_dist WHERE a % 1000 = 7;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
  count | count |    sum     |  max  |   sum   
 -------+-------+------------+-------+---------
@@ -561,8 +561,8 @@ SELECT e, count(*), sum(a) FROM df_pd_dist WHERE e >= 97 OR e IS NULL GROUP BY e
     |     1 |          
 (4 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_pd_dist WHERE e < 50;
  count | count |    sum     |  max  |   sum   
 -------+-------+------------+-------+---------
@@ -600,8 +600,8 @@ CREATE TABLE df_pd_vec (id int, t text, b char(4)) USING pax
   WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
 INSERT INTO df_pd_vec SELECT k, CASE WHEN k % 9 = 0 THEN NULL ELSE 'v' || k END,
   CASE WHEN k % 6 = 0 THEN NULL ELSE (k % 50)::text END FROM generate_series(1, 5000) k;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), count(t), count(v), count(b), sum(length(t)), sum(length(v)), sum(octet_length(b)) FROM df_pd_str;
  count | count | count | count |   sum    |  sum   |  sum  
 -------+-------+-------+-------+----------+--------+-------
@@ -698,8 +698,8 @@ SELECT id, t, b, octet_length(b) FROM df_pd_vec WHERE id BETWEEN 5 AND 13 ORDER 
  13 | v13 | 13   |            4
 (9 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(t), count(v), count(b), sum(length(t)), sum(length(v)), sum(octet_length(b)) FROM df_pd_str;
  count | count | count | count |   sum    |  sum   |  sum  
 -------+-------+-------+-------+----------+--------+-------
@@ -813,9 +813,9 @@ INSERT INTO df_pd_num VALUES (-1, 9999999999999.99, 99999999999999999999.9999999
   (-3, 0, 0, 0), (-4, 0.01, 0.0000000001, 0.00001), (-5, -0.01, -0.0000000001, -0.00001);
 INSERT INTO df_pd_vnum SELECT * FROM df_pd_num;
 RESET pax.max_tuples_per_group;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.motion_batches = on;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_num;
  count | sum |        min        | max | count |          sum           |               min                |               max               |     sum      |   min    |   max   
 -------+-----+-------------------+-----+-------+------------------------+----------------------------------+---------------------------------+--------------+----------+---------
@@ -868,8 +868,8 @@ SELECT id, a, b, d FROM df_pd_vnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
  19996 |         -10249.48 |              61234567.4052345232 | -0.80003
 (9 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(d), min(d), max(d) FROM df_pd_num;
  count | sum |        min        | max | count |          sum           |               min                |               max               |     sum      |   min    |   max   
 -------+-----+-------------------+-----+-------+------------------------+----------------------------------+---------------------------------+--------------+----------+---------
@@ -941,8 +941,8 @@ INSERT INTO df_pd_vwnum SELECT id, trunc(w / 10000, 4), trunc(z / 10000), trunc(
 DELETE FROM df_pd_wnum WHERE id % 7 = 3;
 DELETE FROM df_pd_vwnum WHERE id % 7 = 3;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
  count | count | sum |                   min                    | max |                 sum                 |                   min                   |                  max                   |                   sum                    |                    min                     |                    max                    
 -------+-------+-----+------------------------------------------+-----+-------------------------------------+-----------------------------------------+----------------------------------------+------------------------------------------+--------------------------------------------+-------------------------------------------
@@ -979,8 +979,8 @@ SELECT id, w, z, v FROM df_pd_vwnum WHERE id < 0 OR id % 4999 = 0 ORDER BY id;
  19996 |        1234074062967407406296740.7406 |     12340740629674074062967407406296 |    1234074062967407406296740740629.67
 (7 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(w), sum(w), min(w), max(w), sum(z), min(z), max(z), sum(v), min(v), max(v) FROM df_pd_wnum;
  count | count | sum |                   min                    | max |                 sum                 |                   min                   |                  max                   |                   sum                    |                    min                     |                    max                    
 -------+-------+-----+------------------------------------------+-----+-------------------------------------+-----------------------------------------+----------------------------------------+------------------------------------------+--------------------------------------------+-------------------------------------------
@@ -1033,8 +1033,8 @@ INSERT INTO df_pd_lm SELECT i,
   CASE WHEN i % 37 = 0 THEN NULL ELSE 'v' || i END
 FROM generate_series(1, 30000) i;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
  count | count |    sum    |  min   |  max  
 -------+-------+-----------+--------+-------
@@ -1107,8 +1107,8 @@ SELECT id, k, dt, a, t FROM df_pd_lm WHERE k = 7 AND dt = date '2020-01-08' AND 
  7967 | 7 | 01-08-2020 |         | v7967
 (31 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(a), sum(a), min(t), max(t) FROM df_pd_lm WHERE k BETWEEN 3 AND 5 AND a > 0;
  count | count |    sum    |  min   |  max  
 -------+-------+-----------+--------+-------
@@ -1198,8 +1198,8 @@ INSERT INTO df_pd_s2 SELECT i,
 FROM generate_series(1, 30000) i;
 DELETE FROM df_pd_s2 WHERE id % 1000 = 7;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
  count |   sum   | min |  max  
 -------+---------+-----+-------
@@ -1311,8 +1311,8 @@ SELECT count(*), sum(a) FROM df_pd_s2 WHERE s NOT LIKE '%IN%PER%' AND a > 400;
   1725 | 776491.25
 (1 row)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), sum(a), min(v), max(id) FROM df_pd_s2 WHERE m IN ('AIR', 'AIR REG') AND s = 'DELIVER IN PERSON';
  count |   sum   | min |  max  
 -------+---------+-----+-------
@@ -1440,8 +1440,8 @@ FROM generate_series(1, 30000) i;
 INSERT INTO df_pd_vlm3 SELECT * FROM df_pd_lm3;
 DELETE FROM df_pd_lm3 WHERE id % 1000 = 11;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
  count | count | sum  |      sum       |   sum    |  sum   
 -------+-------+------+----------------+----------+--------
@@ -1488,8 +1488,8 @@ SELECT id, k, f, g, h, a FROM df_pd_vlm3 WHERE k = 3 AND id % 997 < 2 ORDER BY i
  28913 | 3 | f | 28913086739 | 14456.5 | -177.50
 (6 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), count(f), sum(f::int), sum(g), sum(h), sum(a) FROM df_pd_lm3 WHERE k IN (2, 7) AND id > 5;
  count | count | sum  |      sum       |   sum    |  sum   
 -------+-------+------+----------------+----------+--------
@@ -1565,8 +1565,8 @@ INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 6000 AND id <= 7000;
 INSERT INTO df_pd_vlt SELECT * FROM df_pd_lt WHERE id > 7000;
 DELETE FROM df_pd_lt WHERE id % 50 = 3;
 RESET pax.max_tuples_per_group;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT * FROM df_pd_lt WHERE s LIKE '%7%' ORDER BY k DESC LIMIT 3;
   id  |  k   |   s   |              t              |  c   | b | a |         w          
 ------+------+-------+-----------------------------+------+---+---+--------------------
@@ -1611,8 +1611,8 @@ SELECT id, b, w, c FROM df_pd_vlt WHERE s LIKE '%33%' ORDER BY k LIMIT 3;
  4330 | t |            | 
 (3 rows)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT * FROM df_pd_lt WHERE s LIKE '%7%' ORDER BY k DESC LIMIT 3;
   id  |  k   |   s   |              t              |  c   | b | a |         w          
 ------+------+-------+-----------------------------+------+---+---+--------------------
@@ -1662,8 +1662,8 @@ SELECT id, b, w, c FROM df_pd_vlt WHERE s LIKE '%33%' ORDER BY k LIMIT 3;
 -- on their distribution key, and one joined with a heap table.
 CREATE TABLE df_pd_heap (id int, w numeric(12,2)) DISTRIBUTED BY (id);
 INSERT INTO df_pd_heap SELECT k, k * 0.25 FROM generate_series(1, 20000, 3) k;
-SET datafusion.mode = off;
-SET datafusion.pax_direct_read = off;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
 SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
  count |     sum      | count |  sum   
 -------+--------------+-------+--------
@@ -1722,8 +1722,8 @@ SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id =
   6667 | 16667500.00 | -5806.69678
 (1 row)
 
-SET datafusion.mode = on;
-SET datafusion.pax_direct_read = on;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
 SELECT count(*), sum(n.a) FILTER (WHERE n.a <> 'NaN'), count(s.t), sum(length(s.v)) FROM df_pd_str s JOIN df_pd_num n ON n.id = s.id;
  count |     sum      | count |  sum   
 -------+--------------+-------+--------
@@ -1782,7 +1782,7 @@ SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id =
   6667 | 16667500.00 | -5806.69678
 (1 row)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3, df_pd_lt, df_pd_vlt;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

@@ -14,52 +14,32 @@
 -- KIND, either express or implied.  See the License for the
 -- specific language governing permissions and limitations
 -- under the License.
-CREATE EXTENSION datafusion_executor;
-SELECT datafusion_version() ~ '^datafusion [0-9]+\.[0-9]+\.[0-9]+$' AS version_ok;
- version_ok 
-------------
- t
-(1 row)
+
+CREATE EXTENSION vec_executor;
+
+SELECT vec_version() ~ '^datafusion [0-9]+\.[0-9]+\.[0-9]+$' AS version_ok;
 
 -- A panic inside Rust must surface as an ordinary ERROR and leave the
 -- backend usable.
-SELECT datafusion_debug_panic();
-ERROR:  datafusion panicked: datafusion_debug_panic requested (df_init.c:298)
+SELECT vec_debug_panic();
 SELECT 1 AS backend_alive;
- backend_alive 
----------------
-             1
-(1 row)
 
 -- The engine is a library of its own, $libdir/vec_engine_<name>.so, opened
 -- on first use (above) and kept for the session.
-SHOW datafusion.engine;
- datafusion.engine 
--------------------
- datafusion
-(1 row)
+SHOW vec.engine;
+SET vec.engine = 'other';
+SET vec.engine = '../datafusion';
+RESET vec.engine;
 
-SET datafusion.engine = 'other';
-ERROR:  invalid value for parameter "datafusion.engine": "other"
-DETAIL:  This session already runs engine "datafusion".
-SET datafusion.engine = '../datafusion';
-ERROR:  invalid value for parameter "datafusion.engine": "../datafusion"
-DETAIL:  An engine name consists of lowercase letters, digits and underscores.
-RESET datafusion.engine;
 -- A new session may name another engine before it uses one.  One that is
 -- not installed fails to load (the detail names the file), and the session
 -- can still go back.
 \c
-SET datafusion.engine = 'missing';
+SET vec.engine = 'missing';
 \set VERBOSITY terse
-SELECT datafusion_version();
-ERROR:  datafusion: could not load engine "missing"
+SELECT vec_version();
 \set VERBOSITY default
-SET datafusion.engine = 'datafusion';
-SELECT datafusion_version() ~ '^datafusion ' AS version_ok;
- version_ok 
-------------
- t
-(1 row)
+SET vec.engine = 'datafusion';
+SELECT vec_version() ~ '^datafusion ' AS version_ok;
 
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

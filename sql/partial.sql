@@ -18,15 +18,15 @@
 -- Subtrees of a slice below PostgreSQL's nodes (T2).  When a slice as a
 -- whole cannot run, DataFusion runs its highest subtrees that can, in
 -- children their parents run once, and PostgreSQL's nodes above pull their
--- rows.  Each query runs with datafusion.mode off, then on; the two
+-- rows.  Each query runs with vec.mode off, then on; the two
 -- results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_pt (id int, k int, v int8, t text) DISTRIBUTED BY (id);
 INSERT INTO df_pt SELECT i, i % 13, i * 7, 'k' || (i % 31) FROM generate_series(1, 30000) i;
@@ -35,7 +35,7 @@ INSERT INTO df_pt2 SELECT i, i % 5 FROM generate_series(1, 40) i;
 ANALYZE df_pt;
 ANALYZE df_pt2;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 -- a Limit WITH TIES stays, the Sort and aggregate below run
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC FETCH FIRST 2 ROWS WITH TIES;
 -- each child of an Append
@@ -60,7 +60,7 @@ SET optimizer = on;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
 SET optimizer = off;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC, 1 FETCH FIRST 2 ROWS WITH TIES;
 SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w ORDER BY 1, 2;
 SET enable_hashjoin = off;
@@ -74,7 +74,7 @@ RESET enable_sort;
 SET optimizer = on;
 SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k HAVING count(*) > 10 ORDER BY k LIMIT 5;
 SET optimizer = off;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k, count(*) FROM df_pt GROUP BY k ORDER BY 2 DESC, 1 FETCH FIRST 2 ROWS WITH TIES;
 SELECT k, count(*) FROM df_pt WHERE v > 100 GROUP BY k UNION ALL SELECT w, count(*) FROM df_pt2 GROUP BY w ORDER BY 1, 2;
 SET enable_hashjoin = off;
@@ -100,7 +100,7 @@ SET optimizer = off;
 -- their Motions in the third).  The ROLLUP's grand total comes from a Motion with nothing
 -- computed on it, read as an input of the union of the other levels.
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
@@ -118,7 +118,7 @@ WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
 EXPLAIN (COSTS OFF) WITH c AS (SELECT 's' AS src, k, sum(v) AS s FROM df_pt GROUP BY k
   UNION ALL SELECT 'w', w, count(*) FROM df_pt2 GROUP BY w)
 SELECT x.k, x.s, y.s FROM c x JOIN c y ON x.k = y.k AND x.src = 's' AND y.src = 'w' ORDER BY x.k LIMIT 3;
-SET datafusion.mode = off;
+SET vec.mode = off;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
 WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
@@ -132,7 +132,7 @@ WHERE x.k = y.k AND x.s > y.a ORDER BY x.g, x.s LIMIT 4;
 WITH c AS (SELECT 's' AS src, k, sum(v) AS s FROM df_pt GROUP BY k
   UNION ALL SELECT 'w', w, count(*) FROM df_pt2 GROUP BY w)
 SELECT x.k, x.s, y.s FROM c x JOIN c y ON x.k = y.k AND x.src = 's' AND y.src = 'w' ORDER BY x.k LIMIT 3;
-SET datafusion.mode = on;
+SET vec.mode = on;
 WITH c AS (SELECT a.k, b.w, a.v FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700)
 SELECT x.k, count(*), sum(x.v), sum(y.w) FROM c x JOIN c y ON x.k = y.w GROUP BY x.k ORDER BY 1;
 WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
@@ -159,11 +159,11 @@ INSERT INTO df_ps SELECT i, i % 11, round((i % 1000) / 7.0, 2),
 FROM generate_series(1, 30000) i;
 ANALYZE df_ps;
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
 WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
 SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
-SET datafusion.mode = on;
+SET vec.mode = on;
 WITH c AS (SELECT k, avg(a) AS m FROM df_ps GROUP BY k) SELECT x.k, x.m, y.m FROM c x JOIN c y ON x.k = y.k ORDER BY 1;
 WITH c AS (SELECT k, sum(a - COALESCE(r, 0.0)) AS s, count(*) % 11 AS n FROM df_ps GROUP BY k)
 SELECT x.k, x.s, y.s - x.s, x.n FROM c x JOIN c y ON x.k = y.n ORDER BY 1, 2, 3;
@@ -187,26 +187,26 @@ INSERT INTO df_cs_r VALUES (3, 401), (6, 402), (6, 403);
 ANALYZE df_cs_s;
 ANALYZE df_cs_r;
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o;
 EXPLAIN (COSTS OFF) SELECT r.o, count(*), avg(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, count(*) c, count(s.w) cw, sum(s.w) sw, min(s.w) mn, max(s.w) mx FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) t;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT r.o, count(*), count(s.w), sum(s.w), min(s.w), max(s.w) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT count(*), sum(c), sum(cw), sum(sw), min(mn), max(mx) FROM (SELECT r.o, count(*) c, count(s.w) cw, sum(s.w) sw, min(s.w) mn, max(s.w) mx FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) t;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT max(t), min(t), sum(t) FROM (SELECT r.o, sum(s.a) t FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
-SET datafusion.motion_batches = off;
+SET vec.motion_batches = off;
 EXPLAIN (COSTS OFF) SELECT max(t), min(t), sum(t) FROM (SELECT r.o, sum(s.a) t FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SELECT r.o, sum(s.a), avg(s.a), sum(s.b), avg(s.w), avg(s.b) FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o ORDER BY r.o LIMIT 5;
 SELECT max(t), min(t), sum(t), sum(m), sum(n) FROM (SELECT r.o, sum(s.a) t, avg(s.a) m, sum(s.b) n FROM df_cs_r r JOIN df_cs_s s ON r.o = s.o GROUP BY r.o) q;
 SET optimizer = off;
@@ -220,15 +220,15 @@ CREATE TABLE df_rs (id int, c int, y int, a numeric(7,2)) DISTRIBUTED BY (id);
 INSERT INTO df_rs SELECT i, i % 500, 2000 + i % 3, (i % 977) * 0.13 FROM generate_series(1, 30000) i;
 ANALYZE df_rs;
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
 SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
 WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
-SET datafusion.mode = off;
+SET vec.mode = off;
 WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
 SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
 WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
-SET datafusion.mode = on;
+SET vec.mode = on;
 WITH t AS (SELECT c, y, sum(a) s, avg(a) m FROM df_rs GROUP BY c, y)
 SELECT t1.c, t1.s, t2.s, t2.m / t1.m FROM t t1 JOIN t t2 ON t1.c = t2.c JOIN t t3 ON t1.c = t3.c
 WHERE t1.y = 2000 AND t2.y = 2001 AND t3.y = 2002 AND t2.m > t1.m ORDER BY 1 LIMIT 5;
@@ -237,4 +237,4 @@ DROP TABLE df_rs;
 
 DROP TABLE df_pt, df_pt2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

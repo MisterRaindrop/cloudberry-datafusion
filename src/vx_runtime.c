@@ -17,7 +17,7 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_runtime.c
+ * vx_runtime.c
  *	  Lifecycle of the per-backend DataFusion runtime, and waiting on it.
  *
  * The runtime's threads never touch PostgreSQL and never receive signals.
@@ -26,7 +26,7 @@
  * cancel, a statement timeout or a terminate request is acted on within one
  * slice.
  *
- * src/df_runtime.c
+ * src/vx_runtime.c
  *
  *-------------------------------------------------------------------------
  */
@@ -43,41 +43,41 @@
 #include "storage/ipc.h"
 #include "utils/vmem_tracker.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
 /* How long one wait on the runtime lasts before interrupts are checked. */
-#define DF_WAIT_SLICE_MS	10
+#define VX_WAIT_SLICE_MS	10
 
 /* After a cancel, how long to wait for the tasks to stop before giving up. */
-#define DF_STOP_TIMEOUT_MS	10000
+#define VX_STOP_TIMEOUT_MS	10000
 
 /* On backend exit, how long running tasks get to reach a yield point. */
-#define DF_SHUTDOWN_TIMEOUT_MS	1000
+#define VX_SHUTDOWN_TIMEOUT_MS	1000
 
-int			df_worker_threads = 0;
+int			vx_worker_threads = 0;
 
 /* The process that started the runtime, or 0 if none has. */
-static pid_t df_runtime_pid = 0;
-static int	df_runtime_workers = 0;
+static pid_t vx_runtime_pid = 0;
+static int	vx_runtime_workers = 0;
 
 /* Bytes this backend has reserved from the vmem tracker for Rust's heap. */
-static int64 df_vmem_leased = 0;
+static int64 vx_vmem_leased = 0;
 
 /* This backend's directory for DataFusion spill files, once created. */
-static char df_spill_path[MAXPGPATH];
+static char vx_spill_path[MAXPGPATH];
 
 static void
-df_runtime_atexit(int code, Datum arg)
+vx_runtime_atexit(int code, Datum arg)
 {
-	if (df_runtime_pid == MyProcPid)
+	if (vx_runtime_pid == MyProcPid)
 	{
-		df_engine->runtime_shutdown(DF_SHUTDOWN_TIMEOUT_MS);
-		df_runtime_pid = 0;
+		vx_engine->runtime_shutdown(VX_SHUTDOWN_TIMEOUT_MS);
+		vx_runtime_pid = 0;
 	}
-	if (df_spill_path[0] != '\0')
+	if (vx_spill_path[0] != '\0')
 	{
-		(void) rmtree(df_spill_path, true);
-		df_spill_path[0] = '\0';
+		(void) rmtree(vx_spill_path, true);
+		vx_spill_path[0] = '\0';
 	}
 }
 
@@ -88,35 +88,35 @@ df_runtime_atexit(int code, Datum arg)
  * temporary files after a crash; a normal backend exit removes it.
  */
 const char *
-df_spill_dir(void)
+vx_spill_dir(void)
 {
 	char		parent[MAXPGPATH];
 
-	if (df_spill_path[0] != '\0')
-		return df_spill_path;
+	if (vx_spill_path[0] != '\0')
+		return vx_spill_path;
 
 	TempTablespacePath(parent, DEFAULTTABLESPACE_OID);
 	(void) MakePGDirectory(parent);	/* usually exists already */
-	snprintf(df_spill_path, sizeof(df_spill_path), "%s/%s/%s_datafusion_%d",
+	snprintf(vx_spill_path, sizeof(vx_spill_path), "%s/%s/%s_vec_%d",
 			 DataDir, parent, PG_TEMP_FILE_PREFIX, (int) MyProcPid);
-	if (MakePGDirectory(df_spill_path) < 0 && errno != EEXIST)
+	if (MakePGDirectory(vx_spill_path) < 0 && errno != EEXIST)
 	{
 		int			save_errno = errno;
 		char		path[MAXPGPATH];
 
-		strlcpy(path, df_spill_path, sizeof(path));
-		df_spill_path[0] = '\0';
+		strlcpy(path, vx_spill_path, sizeof(path));
+		vx_spill_path[0] = '\0';
 		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create directory \"%s\": %m", path)));
 	}
-	return df_spill_path;
+	return vx_spill_path;
 }
 
 /* Report a failed vmem reservation the way Cloudberry's allocator does. */
 static void
-df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
+vx_vmem_failed(MemoryAllocationStatus status, int64 bytes)
 {
 	if (status == MemoryFailure_QueryMemoryExhausted)
 		ereport(ERROR,
@@ -136,7 +136,7 @@ df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
 	ereport(ERROR,
 			(errcode(ERRCODE_GP_MEMPROT_KILL),
 			 errmsg("Out of memory"),
-			 errdetail("Could not reserve " INT64_FORMAT " bytes of vmem for DataFusion.",
+			 errdetail("Could not reserve " INT64_FORMAT " bytes of vmem for the engine.",
 					   bytes)));
 }
 
@@ -148,18 +148,18 @@ df_vmem_failed(MemoryAllocationStatus status, int64 bytes)
  * Fails the query, like an allocation would, when the tracker says no.
  */
 void
-df_vmem_sync(int64 headroom)
+vx_vmem_sync(int64 headroom)
 {
-	int64		want = Max(df_engine_load()->heap_bytes(), 0) + headroom;
+	int64		want = Max(vx_engine_load()->heap_bytes(), 0) + headroom;
 
-	if (want > df_vmem_leased)
+	if (want > vx_vmem_leased)
 	{
-		int64		more = want - df_vmem_leased;
+		int64		more = want - vx_vmem_leased;
 		MemoryAllocationStatus status = VmemTracker_ReserveVmem(more);
 
 		if (status != MemoryAllocation_Success)
-			df_vmem_failed(status, more);
-		df_vmem_leased = want;
+			vx_vmem_failed(status, more);
+		vx_vmem_leased = want;
 	}
 }
 
@@ -168,24 +168,24 @@ df_vmem_sync(int64 headroom)
  * so it never loads the engine: without one there is no lease.
  */
 void
-df_vmem_trim(void)
+vx_vmem_trim(void)
 {
 	int64		want;
 
-	if (df_engine == NULL)
+	if (vx_engine == NULL)
 		return;
-	want = Max(df_engine->heap_bytes(), 0);
-	if (want < df_vmem_leased)
+	want = Max(vx_engine->heap_bytes(), 0);
+	if (want < vx_vmem_leased)
 	{
-		VmemTracker_ReleaseVmem(df_vmem_leased - want);
-		df_vmem_leased = want;
+		VmemTracker_ReleaseVmem(vx_vmem_leased - want);
+		vx_vmem_leased = want;
 	}
 }
 
 int64
-df_vmem_leased_bytes(void)
+vx_vmem_leased_bytes(void)
 {
-	return df_vmem_leased;
+	return vx_vmem_leased;
 }
 
 /*
@@ -197,7 +197,7 @@ df_vmem_leased_bytes(void)
  * an error.
  */
 void
-df_signals_block(sigset_t *saved)
+vx_signals_block(sigset_t *saved)
 {
 	sigset_t	all;
 	int			rc;
@@ -209,7 +209,7 @@ df_signals_block(sigset_t *saved)
 }
 
 void
-df_signals_restore(const sigset_t *saved)
+vx_signals_restore(const sigset_t *saved)
 {
 	int			rc = pthread_sigmask(SIG_SETMASK, saved, NULL);
 
@@ -223,7 +223,7 @@ df_signals_restore(const sigset_t *saved)
  * number of worker threads.
  */
 int
-df_runtime_ensure(void)
+vx_runtime_ensure(void)
 {
 	const VecEngine *engine;
 	VecError	err;
@@ -231,32 +231,32 @@ df_runtime_ensure(void)
 	uint32_t	workers = 0;
 	int32		status;
 
-	if (df_runtime_pid == MyProcPid)
-		return df_runtime_workers;
+	if (vx_runtime_pid == MyProcPid)
+		return vx_runtime_workers;
 
 	/*
 	 * A runtime inherited across fork has no threads left.  This cannot
 	 * happen as long as nothing starts the runtime in the postmaster, but
 	 * using one would hang, so refuse loudly.
 	 */
-	if (df_runtime_pid != 0)
+	if (vx_runtime_pid != 0)
 		elog(ERROR, "DataFusion runtime was started in process %d, not in this backend",
-			 (int) df_runtime_pid);
+			 (int) vx_runtime_pid);
 
-	engine = df_engine_load();
-	DF_ERROR_INIT(err);
-	df_signals_block(&saved);
-	status = engine->runtime_init((uint32_t) df_worker_threads, &workers, &err);
-	df_signals_restore(&saved);
+	engine = vx_engine_load();
+	VX_ERROR_INIT(err);
+	vx_signals_block(&saved);
+	status = engine->runtime_init((uint32_t) vx_worker_threads, &workers, &err);
+	vx_signals_restore(&saved);
 
 	if (status != VEC_OK)
-		df_raise(status, err.message);
+		vx_raise(status, err.message);
 
-	df_runtime_pid = MyProcPid;
-	df_runtime_workers = (int) workers;
-	on_proc_exit(df_runtime_atexit, (Datum) 0);
+	vx_runtime_pid = MyProcPid;
+	vx_runtime_workers = (int) workers;
+	on_proc_exit(vx_runtime_atexit, (Datum) 0);
 
-	return df_runtime_workers;
+	return vx_runtime_workers;
 }
 
 /*
@@ -264,16 +264,16 @@ df_runtime_ensure(void)
  * and free it.  Used while an error is propagating.
  */
 static void
-df_task_stop(VecTask *task)
+vx_task_stop(VecTask *task)
 {
-	const VecEngineDebug *debug = df_engine->debug;
+	const VecEngineDebug *debug = vx_engine->debug;
 	VecError	err;
 	int			waited;
 
 	debug->task_cancel(task);
-	for (waited = 0; waited < DF_STOP_TIMEOUT_MS; waited += DF_WAIT_SLICE_MS)
+	for (waited = 0; waited < VX_STOP_TIMEOUT_MS; waited += VX_WAIT_SLICE_MS)
 	{
-		if (debug->task_wait(task, DF_WAIT_SLICE_MS, &err) != VEC_PENDING)
+		if (debug->task_wait(task, VX_WAIT_SLICE_MS, &err) != VEC_PENDING)
 		{
 			debug->task_free(task);
 			return;
@@ -285,7 +285,7 @@ df_task_stop(VecTask *task)
 	 * though they are still running; they only keep burning CPU.
 	 */
 	elog(LOG, "DataFusion tasks did not stop within %d ms after cancel",
-		 DF_STOP_TIMEOUT_MS);
+		 VX_STOP_TIMEOUT_MS);
 	debug->task_free(task);
 }
 
@@ -296,19 +296,19 @@ df_task_stop(VecTask *task)
  *
  * If an interrupt raises an ERROR while waiting, the task is cancelled and
  * has stopped before the error propagates.  A FATAL (terminate) exits the
- * process directly; df_runtime_atexit then shuts the runtime down.
+ * process directly; vx_runtime_atexit then shuts the runtime down.
  */
 int32
-df_task_wait_interruptible(VecTask *task, VecError *err)
+vx_task_wait_interruptible(VecTask *task, VecError *err)
 {
-	const VecEngineDebug *debug = df_engine_debug();
+	const VecEngineDebug *debug = vx_engine_debug();
 	volatile int32 status = VEC_PENDING;
 
 	PG_TRY();
 	{
 		for (;;)
 		{
-			status = debug->task_wait(task, DF_WAIT_SLICE_MS, err);
+			status = debug->task_wait(task, VX_WAIT_SLICE_MS, err);
 			if (status != VEC_PENDING)
 				break;
 			CHECK_FOR_INTERRUPTS();
@@ -316,7 +316,7 @@ df_task_wait_interruptible(VecTask *task, VecError *err)
 	}
 	PG_CATCH();
 	{
-		df_task_stop(task);
+		vx_task_stop(task);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -334,7 +334,7 @@ df_task_wait_interruptible(VecTask *task, VecError *err)
  * 1.1 million calls, a few milliseconds.
  */
 void
-df_case_maps_ensure(void)
+vx_case_maps_ensure(void)
 {
 	static bool done = false;
 	uint32_t   *upper;
@@ -368,8 +368,8 @@ df_case_maps_ensure(void)
 		}
 	}
 	if (nupper >= 8192 || nlower >= 8192)
-		elog(ERROR, "datafusion: more case mappings than expected");
-	df_engine_load()->set_case_maps(upper, nupper, lower, nlower);
+		elog(ERROR, "vec_executor: more case mappings than expected");
+	vx_engine_load()->set_case_maps(upper, nupper, lower, nlower);
 	pfree(upper);
 	pfree(lower);
 	done = true;

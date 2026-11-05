@@ -21,14 +21,14 @@
 -- merges the streams.  Keys sort as PostgreSQL's default btree order:
 -- NULLS FIRST/LAST, floats with -0 = 0 and NaN above all, numeric NaN
 -- above all, dates and timestamps with infinities, strings under C.  Each
--- query runs with datafusion.mode off, then on; the two results must match.
+-- query runs with vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_so (id int, a int, b int8, f float8, g float4, t text, n numeric(12,3),
   d date, ts timestamp, z bool) DISTRIBUTED BY (id);
@@ -47,7 +47,7 @@ INSERT INTO df_so SELECT i,
 FROM generate_series(1, 20000) i;
 ANALYZE df_so;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 -- top rows on each segment, merged by the coordinator
 EXPLAIN (COSTS OFF) SELECT id, a FROM df_so ORDER BY a, id LIMIT 5;
 -- every row sorted on each segment
@@ -71,7 +71,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT id, b FROM df_so ORDER BY id OFFSET 29
 PREPARE df_top(int8) AS SELECT id FROM df_so ORDER BY id DESC LIMIT $1;
 SET plan_cache_mode = force_generic_plan;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 EXECUTE df_top(3);
 SELECT id, a FROM df_so ORDER BY a, id LIMIT 5;
 SELECT id, a FROM df_so ORDER BY a DESC NULLS LAST, id DESC LIMIT 5 OFFSET 3;
@@ -100,7 +100,7 @@ SELECT id FROM df_so ORDER BY id LIMIT 0;
 SELECT id FROM df_so ORDER BY b, id LIMIT ALL OFFSET 19998;
 SELECT id FROM df_so ORDER BY b, id LIMIT NULL OFFSET 19998;
 SELECT id FROM df_so ORDER BY b, id OFFSET 30000;
-SET datafusion.mode = on;
+SET vec.mode = on;
 EXECUTE df_top(3);
 SELECT id, a FROM df_so ORDER BY a, id LIMIT 5;
 SELECT id, a FROM df_so ORDER BY a DESC NULLS LAST, id DESC LIMIT 5 OFFSET 3;
@@ -140,12 +140,12 @@ INSERT INTO df_lk SELECT i % 500, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 7 END,
   (i % 211) * 0.75, date '2000-01-01' + i % 3 FROM generate_series(1, 20000) i;
 ANALYZE df_lk;
 SET enable_hashagg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
 SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k, a, sum(n) FROM df_lk GROUP BY k, a ORDER BY a DESC NULLS LAST, k LIMIT 8;
 SELECT k, d, count(*) FROM df_lk GROUP BY k, d ORDER BY d, k DESC LIMIT 6 OFFSET 2;
 RESET enable_hashagg;
@@ -159,17 +159,17 @@ CREATE TABLE df_mg (k int, a int, n numeric(10,2)) DISTRIBUTED BY (k);
 INSERT INTO df_mg SELECT i, i % 23, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
 ANALYZE df_mg;
 SET enable_hashagg = off;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
 EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
 SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(s), max(s) FROM (SELECT a, sum(n) s FROM df_mg GROUP BY a) x;
 SELECT a, sum(n) FROM df_mg GROUP BY a ORDER BY a DESC;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 RESET enable_hashagg;
 DROP TABLE df_mg;
 
@@ -184,12 +184,12 @@ INSERT INTO df_go SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
   'v' || (i % 17), (i % 211) * 0.75 FROM generate_series(1, 20000) i;
 ANALYZE df_go;
 SET enable_hashagg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
 EXPLAIN (COSTS OFF) SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
 EXPLAIN (COSTS OFF) SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
 SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
 SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
@@ -201,21 +201,21 @@ RESET enable_hashagg;
 SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
 SET enable_hashagg = off;
 RESET gp_enable_multiphase_agg;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a LIMIT 5;
 SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
 SELECT a, count(*) FROM df_go GROUP BY a ORDER BY a NULLS FIRST;
 SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
 SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
 SET gp_enable_multiphase_agg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 1;
 RESET enable_hashagg;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPING SETS ((a), (t)) ORDER BY 3, 1, 2;
 RESET gp_enable_multiphase_agg;
 DROP TABLE df_go;
@@ -230,11 +230,11 @@ INSERT INTO df_sr SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 7 END, i % 5
 ANALYZE df_sr;
 SET enable_hashagg = off;
 SET gp_enable_multiphase_agg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x, a, b FROM df_sr GROUP BY a, b) q GROUP BY a ORDER BY a;
 RESET gp_enable_multiphase_agg;
 RESET enable_hashagg;
@@ -248,15 +248,15 @@ CREATE TABLE df_rs (k int, a int, t text, n numeric(10,2)) DISTRIBUTED BY (k);
 INSERT INTO df_rs SELECT i, CASE WHEN i % 61 = 0 THEN NULL ELSE i % 13 END,
   (i % 17)::text, (i % 211) * 0.75 FROM generate_series(1, 20000) i;
 ANALYZE df_rs;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
 EXPLAIN (COSTS OFF) SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
 SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
 SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
 SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY a ORDER BY a NULLS FIRST;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k, a, n * 2 AS d FROM df_rs WHERE k < 50 ORDER BY a, k LIMIT 7;
 SELECT a, sum(n) s, sum(n) * 2 AS d FROM df_rs GROUP BY a ORDER BY s DESC LIMIT 5;
 SELECT k, n, a + 1 AS b FROM df_rs WHERE k % 997 = 1 ORDER BY n DESC, k;
@@ -266,4 +266,4 @@ SET optimizer = off;
 
 DROP TABLE df_so;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

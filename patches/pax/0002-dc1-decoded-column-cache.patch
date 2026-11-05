@@ -1,5 +1,5 @@
---- a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
-+++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
+--- a/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
++++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
 @@ -36,7 +36,8 @@
   * the rows it hands out.  The file footer and PAX's small bookkeeping
   * objects are not counted, nor the values PAX decodes for GetDatum (toast,
@@ -8,11 +8,11 @@
 + * columns that point into the read buffer are counted twice.  A group read
 + * from the decoded-column cache (DC1) counts its mapped entries instead.
   *
-  * contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
+  * contrib/pax_storage/src/cpp/access/pax_direct_api.cc
   *
 @@ -47,9 +48,23 @@
  
- #include "access/datafusion_scan_api.h"
+ #include "access/pax_direct_api.h"
  
 +#include <dirent.h>
 +#include <fcntl.h>
@@ -37,7 +37,7 @@
 @@ -92,6 +107,10 @@
    std::vector<bool> late;    // per handed-out column: left to read_rows
    size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
-   DatafusionPaxScanInfo info;
+   PaxDirectScanInfo info;
 +  // DC1: the decoded-column cache's directory ("" without the cache) and
 +  // the bytes it may take (cache_config)
 +  std::string cache_dir;
@@ -137,7 +137,7 @@
 +}
 +
 +// DC1: a cache of decoded columns, as files read through mmap, under the
-+// directory datafusion.pax_decode_cache names (cache_config).  A group's
++// directory vec.pax_decode_cache names (cache_config).  A group's
 +// column is kept as read_block hands it out, a slot a row: fixed-width
 +// values converted (16-byte ones that all fit 8 bytes narrowed), strings
 +// without their headers.  Each micro-partition has a directory of its own,
@@ -169,7 +169,7 @@
 +  uint32_t pad;
 +};
 +
-+// What the cache did in this process, for datafusion_debug_pax_cache().
++// What the cache did in this process, for vec_debug_pax_cache().
 +struct CacheCounters {
 +  std::atomic<int64_t> hits{0};      // groups read from the cache
 +  std::atomic<int64_t> fills{0};     // entries written
@@ -463,7 +463,7 @@
 +
 +// Whether 'bytes' more may go into the cache of 'scan': counted as written
 +// if so.  Sweeps when it is this process's turn (see above).
-+bool CacheAdmit(const DfScan *scan, int64_t bytes) {
++bool CacheAdmit(const VxScan *scan, int64_t bytes) {
 +  std::unique_lock<std::mutex> lock(g_use.mu);
 +  const int64_t now = NowSeconds();
 +  if (g_use.dir != scan->cache_dir) {
@@ -620,7 +620,7 @@
 +// Looks group 'g' up in the cache: its entry and those of all its columns
 +// but the late ones ('maps'), or false.  Entries that do not fit are
 +// removed, all of the group's: the miss rebuilds them at once.
-+bool LookupGroup(const DfScan *scan, const std::string &key, size_t g,
++bool LookupGroup(const VxScan *scan, const std::string &key, size_t g,
 +                 Mapped &meta, std::vector<Mapped> &maps) {
 +  const std::string group_path = GroupEntry(key, g);
 +  switch (meta.Open(group_path)) {
@@ -674,7 +674,7 @@
 +// Puts the columns of group 'g' of 'rows' rows at 'row_offset', decoded
 +// into 'colv', in the cache: those it lacks, then the group's entry, as far
 +// as CacheAdmit lets them in.
-+void FillGroup(const DfScan *scan, const std::string &key, size_t g,
++void FillGroup(const VxScan *scan, const std::string &key, size_t g,
 +               const std::vector<pax::PaxColumn *> &colv, size_t rows,
 +               size_t row_offset) {
 +  if (!CacheAdmit(scan, 0)) {
@@ -728,9 +728,9 @@
 +  return static_cast<int64_t>(m.header()->rows);
 +}
 +
-+// DatafusionPaxScanApi.cache_config
++// PaxDirectScanApi.cache_config
 +void CacheConfig(void *scan_arg, const char *dir, int64_t limit) {
-+  auto scan = static_cast<DfScan *>(scan_arg);
++  auto scan = static_cast<VxScan *>(scan_arg);
 +  scan->cache_dir.clear();
 +  scan->cache_limit = 0;
 +  if (dir == nullptr || dir[0] == '\0' || limit <= 0) return;
@@ -746,8 +746,8 @@
 +  scan->cache_limit = limit;
 +}
 +
-+// DatafusionPaxScanApi.cache_stats
-+void CacheStats(DatafusionPaxCacheStats *out) {
++// PaxDirectScanApi.cache_stats
++void CacheStats(PaxDirectCacheStats *out) {
 +  out->hits = g_cache.hits.load();
 +  out->fills = g_cache.fills.load();
 +  out->bad = g_cache.bad.load();
@@ -762,7 +762,7 @@
 @@ -629,8 +1337,10 @@
                const std::vector<pax::PaxColumn *> &colv, size_t rows,
                const std::vector<uint32_t> &keep, bool all_kept, Ledger &ledger,
-               int64_t base, DatafusionPaxEmit emit, void *ctx, char *err,
+               int64_t base, PaxDirectEmit emit, void *ctx, char *err,
 -              size_t errlen) {
 +              size_t errlen, const std::vector<const char *> *cache) {
    const size_t ncols = scan->cols.size();
@@ -866,7 +866,7 @@
  
      auto held = [&]() {
 @@ -763,7 +1487,9 @@
-         out[k] = DatafusionPaxColumn{nullptr, nullptr, nullptr};
+         out[k] = PaxDirectColumn{nullptr, nullptr, nullptr};
          continue;
        }
 -      out[k].values = values[k].empty() ? &kNoBytes : values[k].data();
@@ -1000,37 +1000,37 @@
  };
  
  }  // namespace
---- a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
-+++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
+--- a/contrib/pax_storage/src/cpp/access/pax_direct_api.h
++++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.h
 @@ -54,7 +54,7 @@
  extern "C" {
  #endif
  
--#define DATAFUSION_PAX_SCAN_API_VERSION 9
-+#define DATAFUSION_PAX_SCAN_API_VERSION 10
+-#define PAX_DIRECT_SCAN_API_VERSION 9
++#define PAX_DIRECT_SCAN_API_VERSION 10
  
  struct List;
  struct RelationData;
 @@ -109,6 +109,16 @@
    int64_t groups_skipped; /* skipped by their statistics */
- } DatafusionPaxScanInfo;
+ } PaxDirectScanInfo;
  
 +/* What the decoded-column cache did in this process (cache_stats). */
-+typedef struct DatafusionPaxCacheStats {
++typedef struct PaxDirectCacheStats {
 +  int64_t hits;     /* groups read from the cache */
 +  int64_t fills;    /* entries written */
 +  int64_t bad;      /* entries that did not fit what they should hold, removed */
 +  int64_t evicted;  /* micro-partitions removed to keep the size limit */
 +  int64_t refused;  /* groups left out: the cache was full */
 +  int64_t unusable; /* scans whose cache directory could not be used */
-+} DatafusionPaxCacheStats;
++} PaxDirectCacheStats;
 +
- typedef struct DatafusionPaxScanApi {
-   uint32_t version; /* DATAFUSION_PAX_SCAN_API_VERSION */
+ typedef struct PaxDirectScanApi {
+   uint32_t version; /* PAX_DIRECT_SCAN_API_VERSION */
    /* GNU build ID of the pax.so this table was built against, in hex. */
 @@ -156,6 +166,15 @@
-                    uint32_t nrows, DatafusionPaxEmit emit,
-                    DatafusionPaxAccount account, void *ctx, char *err,
+                    uint32_t nrows, PaxDirectEmit emit,
+                    PaxDirectAccount account, void *ctx, char *err,
                     size_t errlen);
 +  /* Have read_block keep the groups' decoded columns in files under
 +   * directory 'dir' (created if missing; relative to the working
@@ -1040,7 +1040,7 @@
 +   * before any read_block. */
 +  void (*cache_config)(void *scan, const char *dir, int64_t limit);
 +  /* What the cache did in this process so far.  Any thread. */
-+  void (*cache_stats)(DatafusionPaxCacheStats *out);
- } DatafusionPaxScanApi;
++  void (*cache_stats)(PaxDirectCacheStats *out);
+ } PaxDirectScanApi;
  
- const DatafusionPaxScanApi *datafusion_pax_scan_api(void);
+ const PaxDirectScanApi *pax_direct_scan_api(void);

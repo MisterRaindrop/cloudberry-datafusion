@@ -17,24 +17,24 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_hooks.c
+ * vx_hooks.c
  *	  Executor and EXPLAIN hooks: where DataFusion takes over a slice.
  *
- * ExecutorStart runs the standard start, then asks df_check_slice whether
+ * ExecutorStart runs the standard start, then asks vx_check_slice whether
  * this process's slice qualifies.  A qualifying slice is recorded against
  * its QueryDesc, in the query's memory context with a reset callback, so
  * the record disappears with the query however it ends.  ExecutorRun then
  * routes recorded slices to DataFusion.
  *
- * A taken-over slice runs in DataFusion (df_exec.c): its top PlanState's
+ * A taken-over slice runs in DataFusion (vx_exec.c): its top PlanState's
  * ExecProcNode is replaced, so the rest of the executor is unchanged.
- * datafusion_debug_takeovers() counts the ExecutorRun calls that reached a
+ * vec_debug_takeovers() counts the ExecutorRun calls that reached a
  * taken-over slice.
  *
- * With datafusion.mode = explain or on, text-format EXPLAIN ends with one
+ * With vec.mode = explain or on, text-format EXPLAIN ends with one
  * line per slice saying whether DataFusion can run it, and why not.
  *
- * src/df_hooks.c
+ * src/vx_hooks.c
  *
  *-------------------------------------------------------------------------
  */
@@ -46,38 +46,38 @@
 #include "tcop/tcopprot.h"
 #include "utils/memutils.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
-PG_FUNCTION_INFO_V1(datafusion_debug_takeovers);
+PG_FUNCTION_INFO_V1(vec_debug_takeovers);
 
-int			df_mode = DF_MODE_OFF;
+int			vx_mode = VX_MODE_OFF;
 
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static ExecutorRun_hook_type prev_ExecutorRun = NULL;
 static ExplainOneQuery_hook_type prev_ExplainOneQuery = NULL;
 
 /* A slice DataFusion runs, recorded at ExecutorStart. */
-typedef struct DfTakeover
+typedef struct VxTakeover
 {
 	QueryDesc  *queryDesc;
 	int			slice_index;
-	struct DfTakeover *next;
+	struct VxTakeover *next;
 	MemoryContextCallback forget;
-} DfTakeover;
+} VxTakeover;
 
-static DfTakeover *df_takeovers = NULL;
+static VxTakeover *vx_takeovers = NULL;
 
 /* Number of ExecutorRun calls routed to DataFusion in this backend. */
-static int64 df_takeover_runs = 0;
+static int64 vx_takeover_runs = 0;
 
 static void
-df_takeover_forget(void *arg)
+vx_takeover_forget(void *arg)
 {
-	DfTakeover **link;
+	VxTakeover **link;
 
-	for (link = &df_takeovers; *link != NULL; link = &(*link)->next)
+	for (link = &vx_takeovers; *link != NULL; link = &(*link)->next)
 	{
-		if (*link == (DfTakeover *) arg)
+		if (*link == (VxTakeover *) arg)
 		{
 			*link = (*link)->next;
 			return;
@@ -86,33 +86,33 @@ df_takeover_forget(void *arg)
 }
 
 static void
-df_takeover_record(QueryDesc *queryDesc, int slice_index)
+vx_takeover_record(QueryDesc *queryDesc, int slice_index)
 {
 	MemoryContext cxt = queryDesc->estate->es_query_cxt;
-	DfTakeover *t = MemoryContextAllocZero(cxt, sizeof(DfTakeover));
+	VxTakeover *t = MemoryContextAllocZero(cxt, sizeof(VxTakeover));
 
 	t->queryDesc = queryDesc;
 	t->slice_index = slice_index;
-	t->forget.func = df_takeover_forget;
+	t->forget.func = vx_takeover_forget;
 	t->forget.arg = t;
 	MemoryContextRegisterResetCallback(cxt, &t->forget);
 
-	t->next = df_takeovers;
-	df_takeovers = t;
+	t->next = vx_takeovers;
+	vx_takeovers = t;
 }
 
-static DfTakeover *
-df_takeover_find(QueryDesc *queryDesc)
+static VxTakeover *
+vx_takeover_find(QueryDesc *queryDesc)
 {
-	DfTakeover *t;
+	VxTakeover *t;
 
-	for (t = df_takeovers; t != NULL; t = t->next)
+	for (t = vx_takeovers; t != NULL; t = t->next)
 		if (t->queryDesc == queryDesc)
 			return t;
 	return NULL;
 }
 
-static bool df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index,
+static bool vx_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index,
 							 List *points, bool record);
 
 /*
@@ -121,36 +121,36 @@ static bool df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_ind
  * Returns whether any does.
  */
 static bool
-df_attach_below(QueryDesc *queryDesc, PlanState *top, int slice_index)
+vx_attach_below(QueryDesc *queryDesc, PlanState *top, int slice_index)
 {
 	PlannedStmt *stmt = queryDesc->plannedstmt;
 
-	return df_attach_points(queryDesc, top, slice_index,
-							df_slice_attach_points(stmt, top->plan, df_batch_motions(stmt)),
+	return vx_attach_points(queryDesc, top, slice_index,
+							vx_slice_attach_points(stmt, top->plan, vx_batch_motions(stmt)),
 							true);
 }
 
 /*
  * T2: below the Shared Scan producers that PostgreSQL runs first in slice
  * 'slice_index', which DataFusion runs from its top PlanState 'top'
- * (df_exec_prerun): their inputs.
+ * (vx_exec_prerun): their inputs.
  */
 static void
-df_attach_producers(QueryDesc *queryDesc, PlanState *top, int slice_index)
+vx_attach_producers(QueryDesc *queryDesc, PlanState *top, int slice_index)
 {
 	PlannedStmt *stmt = queryDesc->plannedstmt;
 	List	   *points = NIL;
 	ListCell   *lc;
 
-	foreach(lc, df_slice_producers(top->plan))
-		points = list_concat(points, df_slice_attach_points(stmt, lfirst(lc),
-															df_batch_motions(stmt)));
+	foreach(lc, vx_slice_producers(top->plan))
+		points = list_concat(points, vx_slice_attach_points(stmt, lfirst(lc),
+															vx_batch_motions(stmt)));
 	if (points != NIL)
-		df_attach_points(queryDesc, top, slice_index, points, false);
+		vx_attach_points(queryDesc, top, slice_index, points, false);
 }
 
 static bool
-df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index, List *points,
+vx_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index, List *points,
 				 bool record)
 {
 	ListCell   *lc;
@@ -158,31 +158,31 @@ df_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index, List *po
 
 	foreach(lc, points)
 	{
-		DfAttach   *a = lfirst(lc);
-		PlanState  *ps = df_exec_find_state(top, a->plan);
+		VxAttach   *a = lfirst(lc);
+		PlanState  *ps = vx_exec_find_state(top, a->plan);
 		char		reason[256];
 
-		if (ps != NULL && df_exec_attach(queryDesc, ps, NULL, &a->tails, reason, sizeof(reason)))
+		if (ps != NULL && vx_exec_attach(queryDesc, ps, NULL, &a->tails, reason, sizeof(reason)))
 			attached++;
 		else
-			elog(DEBUG1, "datafusion: a subtree of slice %d stays on the PostgreSQL executor: %s",
+			elog(DEBUG1, "vec_executor: a subtree of slice %d stays on the PostgreSQL executor: %s",
 				 slice_index, ps ? reason : "no executor state");
 	}
 	if (attached > 0)
 	{
-		elog(DEBUG1, "datafusion: slice %d runs %d subtrees below its top", slice_index, attached);
+		elog(DEBUG1, "vec_executor: slice %d runs %d subtrees below its top", slice_index, attached);
 		if (record)
-			df_takeover_record(queryDesc, slice_index);
+			vx_takeover_record(queryDesc, slice_index);
 	}
 	return attached > 0;
 }
 
 static void
-df_ExecutorStart(QueryDesc *queryDesc, int eflags)
+vx_ExecutorStart(QueryDesc *queryDesc, int eflags)
 {
 	/* before the plan is dispatched */
-	df_sync_cluster_collation();
-	df_batch_motions_forget();
+	vx_sync_cluster_collation();
+	vx_batch_motions_forget();
 	if (prev_ExecutorStart)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
@@ -192,15 +192,15 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * Backward and mark/restore scans need a rewindable result, which the
 	 * DataFusion stream is not.
 	 */
-	if (df_mode == DF_MODE_ON &&
+	if (vx_mode == VX_MODE_ON &&
 		(eflags & (EXEC_FLAG_EXPLAIN_ONLY | EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK)) == 0 &&
 		queryDesc->estate != NULL && queryDesc->planstate != NULL)
 	{
 		char		reason[256];
 		int			slice_index;
 		bool		is_sender;
-		DfTails		tails;
-		Plan	   *root = df_local_slice_root(queryDesc, &slice_index, &is_sender);
+		VxTails		tails;
+		Plan	   *root = vx_local_slice_root(queryDesc, &slice_index, &is_sender);
 
 		/*
 		 * The top slice is attached at its top node.  Any other slice starts
@@ -213,46 +213,46 @@ df_ExecutorStart(QueryDesc *queryDesc, int eflags)
 		if (is_sender && IsA(attach, MotionState))
 		{
 			/* M7b: a Gather to another DataFusion slice carries batches. */
-			if (df_motion_sends_batches(queryDesc->plannedstmt, (Motion *) root))
+			if (vx_motion_sends_batches(queryDesc->plannedstmt, (Motion *) root))
 				send = (MotionState *) attach;
 			attach = outerPlanState(attach);
 		}
 		else if (is_sender)
 			attach = NULL;
 
-		if (df_check_slice(queryDesc->plannedstmt, root, is_sender, &tails,
+		if (vx_check_slice(queryDesc->plannedstmt, root, is_sender, &tails,
 						   reason, sizeof(reason)) &&
 			attach != NULL &&
-			df_exec_attach(queryDesc, attach, send, &tails, reason, sizeof(reason)))
+			vx_exec_attach(queryDesc, attach, send, &tails, reason, sizeof(reason)))
 		{
-			df_takeover_record(queryDesc, slice_index);
-			df_attach_producers(queryDesc, attach, slice_index);
+			vx_takeover_record(queryDesc, slice_index);
+			vx_attach_producers(queryDesc, attach, slice_index);
 		}
 		else if (send == NULL && attach != NULL &&
-				 df_attach_below(queryDesc, attach, slice_index))
+				 vx_attach_below(queryDesc, attach, slice_index))
 			 /* T2: subtrees below PostgreSQL's nodes */ ;
 		else if (send != NULL)
 			/* the receiver expects batches; tuples would only fail there */
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("datafusion: slice %d cannot send the batches its receiver expects: %s",
+					 errmsg("vec_executor: slice %d cannot send the batches its receiver expects: %s",
 							slice_index, reason)));
 		else
-			elog(DEBUG1, "datafusion: slice %d stays on the PostgreSQL executor: %s",
+			elog(DEBUG1, "vec_executor: slice %d stays on the PostgreSQL executor: %s",
 				 slice_index, reason);
 	}
 }
 
 static void
-df_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
+vx_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
 			   uint64 count, bool execute_once)
 {
-	DfTakeover *t = df_takeover_find(queryDesc);
+	VxTakeover *t = vx_takeover_find(queryDesc);
 
 	if (t != NULL)
 	{
-		df_takeover_runs++;
-		elog(DEBUG1, "datafusion: running slice %d", t->slice_index);
+		vx_takeover_runs++;
+		elog(DEBUG1, "vec_executor: running slice %d", t->slice_index);
 	}
 
 	if (prev_ExecutorRun)
@@ -268,7 +268,7 @@ df_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction,
  * has already closed its group, so nothing can be appended validly.
  */
 static void
-df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
+vx_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 				   ExplainState *es, const char *queryString,
 				   ParamListInfo params, QueryEnvironment *queryEnv)
 {
@@ -279,8 +279,8 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 				bufusage;
 	uint64		runs_before;
 
-	df_sync_cluster_collation();
-	df_batch_motions_forget();
+	vx_sync_cluster_collation();
+	vx_batch_motions_forget();
 	if (prev_ExplainOneQuery)
 	{
 		prev_ExplainOneQuery(query, cursorOptions, into, es, queryString,
@@ -306,49 +306,49 @@ df_ExplainOneQuery(Query *query, int cursorOptions, IntoClause *into,
 		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
 	}
 
-	runs_before = df_runs_completed;
+	runs_before = vx_runs_completed;
 	ExplainOnePlan(plan, into, es, queryString, params, queryEnv,
 				   &planduration, (es->buffers ? &bufusage : NULL),
 				   cursorOptions);
 
-	if (df_mode != DF_MODE_OFF && es->format == EXPLAIN_FORMAT_TEXT)
+	if (vx_mode != VX_MODE_OFF && es->format == EXPLAIN_FORMAT_TEXT)
 	{
-		df_explain_slices(plan, es->str);
-		if (es->analyze && df_runs_completed != runs_before)
+		vx_explain_slices(plan, es->str);
+		if (es->analyze && vx_runs_completed != runs_before)
 			appendStringInfo(es->str,
-							 "DataFusion: " UINT64_FORMAT " partitions, memory limit "
+							 "Vectorized: " UINT64_FORMAT " partitions, memory limit "
 							 UINT64_FORMAT " kB, peak " UINT64_FORMAT " kB, spilled "
 							 UINT64_FORMAT " kB in " UINT64_FORMAT " files\n",
-							 df_last_run.partitions,
-							 df_last_run.memory_limit / 1024,
-							 (df_last_run.memory_peak + 1023) / 1024,
-							 (df_last_run.spilled_bytes + 1023) / 1024,
-							 df_last_run.spill_count);
-		if (es->analyze && df_runs_completed != runs_before && df_last_run_pax)
+							 vx_last_run.partitions,
+							 vx_last_run.memory_limit / 1024,
+							 (vx_last_run.memory_peak + 1023) / 1024,
+							 (vx_last_run.spilled_bytes + 1023) / 1024,
+							 vx_last_run.spill_count);
+		if (es->analyze && vx_runs_completed != runs_before && vx_last_run_pax)
 			appendStringInfo(es->str,
-							 "DataFusion PAX direct read: skipped " INT64_FORMAT
+							 "Vectorized PAX direct read: skipped " INT64_FORMAT
 							 " of " INT64_FORMAT " micro-partitions and " INT64_FORMAT
 							 " of " INT64_FORMAT " groups, decode peak " UINT64_FORMAT " kB\n",
-							 df_last_pax_scan.files_skipped, df_last_pax_scan.files,
-							 df_last_pax_scan.groups_skipped, df_last_pax_scan.groups,
-							 (df_last_run.pax_decode_peak + 1023) / 1024);
+							 vx_last_pax_scan.files_skipped, vx_last_pax_scan.files,
+							 vx_last_pax_scan.groups_skipped, vx_last_pax_scan.groups,
+							 (vx_last_run.pax_decode_peak + 1023) / 1024);
 	}
 }
 
 void
-df_install_hooks(void)
+vx_install_hooks(void)
 {
 	prev_ExecutorStart = ExecutorStart_hook;
-	ExecutorStart_hook = df_ExecutorStart;
+	ExecutorStart_hook = vx_ExecutorStart;
 	prev_ExecutorRun = ExecutorRun_hook;
-	ExecutorRun_hook = df_ExecutorRun;
+	ExecutorRun_hook = vx_ExecutorRun;
 	prev_ExplainOneQuery = ExplainOneQuery_hook;
-	ExplainOneQuery_hook = df_ExplainOneQuery;
+	ExplainOneQuery_hook = vx_ExplainOneQuery;
 }
 
-/* datafusion_debug_takeovers() returns bigint */
+/* vec_debug_takeovers() returns bigint */
 Datum
-datafusion_debug_takeovers(PG_FUNCTION_ARGS)
+vec_debug_takeovers(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_INT64(df_takeover_runs);
+	PG_RETURN_INT64(vx_takeover_runs);
 }

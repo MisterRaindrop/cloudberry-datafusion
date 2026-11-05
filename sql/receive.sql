@@ -19,13 +19,13 @@
 -- running on PostgreSQL; DataFusion aggregates the rows it receives, which
 -- lets it run the combining stage (Finalize Aggregate) of count, sum, min
 -- and max on the coordinator and on the segments.  Each query runs with
--- datafusion.mode off, then on; the two results must match.
+-- vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 
 CREATE TABLE df_rcv (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_rcv SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
@@ -35,7 +35,7 @@ CREATE TABLE df_rcv_empty (a int4, b int8, c float8, e int2) DISTRIBUTED BY (a);
 ANALYZE df_rcv;
 
 -- Which slices qualify.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 -- Both stages: partial on the segments, combining on the coordinator.
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_rcv WHERE e < 50;
 -- The combining stage on the segments, between two Motions.
@@ -47,28 +47,28 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT e) FROM df_rcv;
 EXPLAIN (COSTS OFF) SELECT a, b FROM df_rcv WHERE a % 50000 = 0;
 
 -- Combining on the coordinator.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_rcv WHERE e < 50;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_rcv WHERE e < 50;
-SELECT datafusion_debug_takeovers() AS coordinator_takeovers;
+SELECT vec_debug_takeovers() AS coordinator_takeovers;
 
 -- Combining on the segments, with HAVING.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
 WHERE e >= 95 OR e IS NULL GROUP BY e;
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_rcv
 WHERE e >= 95 OR e IS NULL GROUP BY e;
 SELECT e, count(*) FROM df_rcv GROUP BY e HAVING count(*) >= 2000 AND sum(a) > 200090000;
 
 -- No rows: count is 0, the other aggregates NULL.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv_empty;
 SELECT count(*), sum(e), max(c) FROM df_rcv WHERE a IS NULL;
 SELECT count(*) FROM df_rcv HAVING count(*) > 1000000;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv_empty;
 SELECT count(*), sum(e), max(c) FROM df_rcv WHERE a IS NULL;
 SELECT count(*) FROM df_rcv HAVING count(*) > 1000000;
@@ -76,10 +76,10 @@ SELECT e, count(*), sum(a) FROM df_rcv_empty GROUP BY e;
 
 -- GPORCA's plans.
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
 SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_rcv WHERE e < 50;
 SELECT e, count(*), sum(a), min(c) FROM df_rcv WHERE e >= 95 OR e IS NULL GROUP BY e;
 SET optimizer = off;
@@ -97,19 +97,19 @@ COMMIT;
 SELECT count(*), sum(a) FROM df_rcv WHERE e < 50;
 SELECT memory_limit_kb = pg_size_bytes(current_setting('work_mem')) / 1024 AS work_mem_budget,
        spills
-FROM datafusion_debug_last_run();
+FROM vec_debug_last_run();
 
 -- A partial aggregate whose output no one reads (count(*) of a subquery
 -- without columns) still makes its one row per segment.
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM (SELECT count(*) FROM df_rcv x JOIN df_rcv y ON x.a = y.e) s;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 
 DROP TABLE df_rcv, df_rcv_empty;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

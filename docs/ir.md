@@ -1,6 +1,6 @@
 # Plan IR, version 1
 
-The C side (`src/df_translate.c`, plus the Motion members `src/df_exec.c`
+The C side (`src/vx_translate.c`, plus the Motion members `src/vx_exec.c`
 adds) describes each slice it hands to an engine as one JSON object, the
 plan IR.  This document is the contract between the two: an engine that
 reads every construct below, with the semantics given here, runs any slice
@@ -71,7 +71,7 @@ not know; it must not skip it.
   partial and a final step of its own, the groups per row, from 0 to 1, of
   the partial step's first rows above which it stops aggregating and passes
   rows on as they are (the reference reader's SK1, 0.2 without it;
-  `datafusion.partial_agg_skip_ratio`).  Not used when the plan's top
+  `vec.partial_agg_skip_ratio`).  Not used when the plan's top
   aggregate is `partial`.  A hint that changes no row.
 - `trim`, `narrow`, `route`: how a slice that sends through a Motion lays
   out its Arrow IPC streams; see [Motion output](#motion-output).
@@ -346,7 +346,7 @@ to the engine).
 
 `regexp_replace(<expr>, pattern, t)` of a pattern the host cut into
 segments at its top-level capturing groups (`capture`: the contents of
-one), in PostgreSQL's syntax, of the subset `src/df_regex.c` takes: the
+one), in PostgreSQL's syntax, of the subset `src/vx_regex.c` takes: the
 match is the leftmost, it ends at the end of the value, and each segment
 in turn ends as late as the rest allows.  `t` is the replacement as
 PostgreSQL reads it (`\1` to `\9`, `\&`, `\\`).
@@ -423,7 +423,7 @@ routed as `docs/wire.md` says.
   `hash` is the key's type tag (`date` hashes as int4; `time`, `timestamp`
   and `timestamptz` as int8).
 
-Both ends check the Motion's signature (`df_motion_signature`), which
+Both ends check the Motion's signature (`vx_motion_signature`), which
 covers the stream's column types, pads and digits, so a mismatch fails
 instead of misreading.
 

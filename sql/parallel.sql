@@ -18,13 +18,13 @@
 -- Cloudberry's parallel mode (M6): several QEs per segment share a parallel
 -- scan through the table AM, and each runs DataFusion on its part.  The
 -- costs below force parallel plans on small tables.  Each query runs with
--- datafusion.mode off, then on; the results must match.
+-- vec.mode off, then on; the results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 1;
+SET vec.worker_threads = 1;
 SET enable_parallel = on;
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
@@ -43,16 +43,16 @@ DELETE FROM df_par_pax WHERE a % 1000 = 7;
 ANALYZE df_par_heap;
 ANALYZE df_par_pax;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 50;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_pax WHERE e < 50;
 SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
 SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_pax WHERE e < 50;
 SELECT e, count(*), sum(a), max(c) FROM df_par_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
@@ -64,4 +64,4 @@ SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
 
 DROP TABLE df_par_heap, df_par_pax;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

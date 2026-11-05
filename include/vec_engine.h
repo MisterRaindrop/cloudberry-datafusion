@@ -34,7 +34,7 @@
  *
  * An engine is a library of its own, $libdir/vec_engine_<name>.so, which
  * exports vec_engine_entry and nothing else.  A backend opens the one
- * datafusion.engine names (RTLD_LOCAL) when it first needs it, and keeps it.
+ * vec.engine names (RTLD_LOCAL) when it first needs it, and keeps it.
  * The host blocks every signal while it opens the library and around
  * runtime_init and query_start, so that threads started there begin with
  * all of them blocked; a thread started at any other time must block them
@@ -157,7 +157,7 @@ typedef struct VecPaxColumn
 
 /*
  * A fixed-width column of the chunk being emitted, of its rows at 'rows'
- * (all if NULL); see DatafusionPaxFetch.
+ * (all if NULL); see PaxDirectFetch.
  */
 typedef int (*VecPaxFetch) (void *chunk, int col, const uint32_t *rows,
 							uint32_t nrows, VecPaxColumn *out);

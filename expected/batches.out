@@ -16,19 +16,19 @@
 -- under the License.
 --
 -- Gather Motions between two DataFusion slices carrying Arrow IPC batches
--- (M7b, datafusion.motion_batches), and Redistribute Motions routing them
+-- (M7b, vec.motion_batches), and Redistribute Motions routing them
 -- by Cloudberry's distribution hash (M7c), and split avg passing
 -- DataFusion's state through them (M7d).  The senders encode their
 -- results and send the bytes as tuple chunks of their own type; the
--- receivers decode them.  Each query runs with datafusion.mode off, then on;
+-- receivers decode them.  Each query runs with vec.mode off, then on;
 -- the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 CREATE TABLE df_bat (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_bat SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
 FROM generate_series(1, 200000) i;
@@ -37,7 +37,7 @@ CREATE TABLE df_bat_empty (a int4, b int8, c float8, e int2) DISTRIBUTED BY (a);
 ANALYZE df_bat;
 -- Which Motions carry batches: only a Gather whose receiving slice runs in
 -- DataFusion too.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat WHERE e < 50;
                     QUERY PLAN                     
 ---------------------------------------------------
@@ -47,8 +47,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat WHERE e < 50;
                ->  Seq Scan on df_bat
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
@@ -63,9 +63,9 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
                      Group Key: e
                      ->  Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
 SET gp_enable_multiphase_agg = off;
@@ -76,11 +76,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (6 rows)
 
-SET datafusion.motion_batches = off;
+SET vec.motion_batches = off;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
                    QUERY PLAN                   
 ------------------------------------------------
@@ -88,14 +88,14 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (6 rows)
 
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 -- Single-stage aggregates on the coordinator over every row, gathered as
 -- batches.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
  count  | count  |     sum     |   sum   | min  |  max  |   max   
 --------+--------+-------------+---------+------+-------+---------
@@ -131,7 +131,7 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
      0 |     0 |     |     |    
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
  count  | count  |     sum     |   sum   | min  |  max  |   max   
 --------+--------+-------------+---------+------+-------+---------
@@ -170,14 +170,14 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
 
 RESET gp_enable_multiphase_agg;
 -- Partial states gathered as batches and combined on the coordinator.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
  count  | count  |    sum     | min  |   max   
 --------+--------+------------+------+---------
  100000 | 100000 | 9997650000 | 0.25 | 2000000
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
  count  | count  |    sum     | min  |   max   
 --------+--------+------------+------+---------
@@ -196,18 +196,18 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
    ->  Gather Motion 6:1  (slice1; segments: 6)
          ->  Parallel Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (6 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a), max(c) FROM df_bat;
  count  |     sum     |  max  
 --------+-------------+-------
  200001 | 20000100000 | 50000
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a), max(c) FROM df_bat;
  count  |     sum     |  max  
 --------+-------------+-------
@@ -242,14 +242,14 @@ RESET gp_enable_multiphase_agg;
 -- Redistribute Motions (M7c).  The Rust transcription of cdbhash routes
 -- every row as cdbhash() does, for every key type, alone and combined, in
 -- and out of parallel mode.
-SELECT datafusion_debug_cdbhash_check(100000, 3, 1) AS mismatches,
-       datafusion_debug_cdbhash_check(100000, 7, 2) AS mismatches_parallel;
+SELECT vec_debug_cdbhash_check(100000, 3, 1) AS mismatches,
+       vec_debug_cdbhash_check(100000, 7, 2) AS mismatches_parallel;
  mismatches | mismatches_parallel 
 ------------+---------------------
           0 |                   0
 (1 row)
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -262,9 +262,9 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
                      Group Key: e
                      ->  Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
 -- A key the planner has no statistics for: every row is redistributed.
@@ -278,12 +278,12 @@ EXPLAIN (COSTS OFF) SELECT a % 1000, count(*), sum(a) FROM df_bat GROUP BY a % 1
                Hash Key: ((a % 1000))
                ->  Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (10 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count | count |    sum    |  min  |   max   
@@ -355,7 +355,7 @@ SELECT e, count(*) FROM df_bat_empty GROUP BY e;
 ---+-------
 (0 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count | count |    sum    |  min  |   max   
@@ -446,12 +446,12 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
                      Group Key: e
                      ->  Parallel Seq Scan on df_bat
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
  e | count |    sum    |   max    
 ---+-------+-----------+----------
@@ -462,7 +462,7 @@ SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
  2 |  2000 | 199904000 |  49975.5
 (5 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
  e | count |    sum    |   max    
 ---+-------+-----------+----------
@@ -485,7 +485,7 @@ INSERT INTO df_bat_avg SELECT i, (i % 977) / 8.0, i / 4.0, (i % 100)::int2
 FROM generate_series(1, 200000) i;
 INSERT INTO df_bat_avg VALUES (NULL, NULL, NULL, NULL), (200001, NULL, NULL, 7);
 ANALYZE df_bat_avg;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
                     QUERY PLAN                     
 ---------------------------------------------------
@@ -494,8 +494,8 @@ EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
          ->  Partial Aggregate
                ->  Seq Scan on df_bat_avg
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, avg(c) FROM df_bat_avg GROUP BY e;
@@ -510,12 +510,12 @@ EXPLAIN (COSTS OFF) SELECT e, avg(c) FROM df_bat_avg GROUP BY e;
                      Group Key: e
                      ->  Seq Scan on df_bat_avg
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
-SET datafusion.motion_batches = off;
+SET vec.motion_batches = off;
 EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
                                    QUERY PLAN                                    
 ---------------------------------------------------------------------------------
@@ -524,11 +524,11 @@ EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
          ->  Partial Aggregate
                ->  Seq Scan on df_bat_avg
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining aggregate avg without batch Motions
- DataFusion: slice 1 not eligible: partial aggregate avg without batch Motions
+ Vectorized: slice 0 not eligible: combining aggregate avg without batch Motions
+ Vectorized: slice 1 not eligible: partial aggregate avg without batch Motions
 (7 rows)
 
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT avg(a) FROM df_bat_avg;
                     QUERY PLAN                     
 ---------------------------------------------------
@@ -537,11 +537,11 @@ EXPLAIN (COSTS OFF) SELECT avg(a) FROM df_bat_avg;
          ->  Partial Aggregate
                ->  Seq Scan on df_bat_avg
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
     avg    |     avg     | count  |     sum     | min  
 -----------+-------------+--------+-------------+------
@@ -577,7 +577,7 @@ SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
  0 | 60.97975
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
     avg    |     avg     | count  |     sum     | min  
 -----------+-------------+--------+-------------+------
@@ -615,4 +615,4 @@ SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
 
 DROP TABLE df_bat, df_bat_empty, df_bat_avg;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

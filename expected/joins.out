@@ -19,13 +19,13 @@
 -- locally (tables colocated on the join key) or received through a
 -- Redistribute or Broadcast Motion, under an optional aggregate.  DataFusion builds its hash table on
 -- PostgreSQL's Hash side, which is also fed first.
--- Each query runs with datafusion.mode off, then on; the results must match.
+-- Each query runs with vec.mode off, then on; the results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 CREATE TABLE df_ja (k int4, a int4, c float8) DISTRIBUTED BY (k);
@@ -42,7 +42,7 @@ CREATE TABLE df_jdup (k int4, v int4) DISTRIBUTED BY (k);
 INSERT INTO df_jdup SELECT i % 10, i FROM generate_series(1, 100) i;
 ANALYZE df_ja; ANALYZE df_jb; ANALYZE df_jc; ANALYZE df_jempty; ANALYZE df_jdup;
 -- Which slices qualify.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
                      QUERY PLAN                     
 ----------------------------------------------------
@@ -56,8 +56,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja
                            ->  Seq Scan on df_jb jb
                                  Filter: (e < 10)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -74,8 +74,8 @@ EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k
                      ->  Hash
                            ->  Seq Scan on df_jc jc
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
 (13 rows)
 
 -- This stays on PostgreSQL, with the reason.
@@ -92,9 +92,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FR
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (13 rows)
 
 -- Keys cast to floats run since E2 (int4 and int8 to float8 and real).
@@ -114,10 +114,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::
                                  Hash Key: (jb.k)::real
                                  ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (17 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), count(s.isn) FROM df_ja ja
@@ -133,14 +133,14 @@ LEFT JOIN (SELECT k, b IS NULL AS isn FROM df_jb) s ON ja.k = s.k;
                      ->  Hash
                            ->  Seq Scan on df_jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: expression on the nullable side of an outer join
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: expression on the nullable side of an outer join
 (11 rows)
 
 SET work_mem = '64kB';
 -- A build side past the Hash node's budget stays on PostgreSQL unless hash
--- joins spill (datafusion.join_estimates = spill, the default).
-SET datafusion.join_estimates = trusted;
+-- joins spill (vec.join_estimates = spill, the default).
+SET vec.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                                         QUERY PLAN                                         
 -------------------------------------------------------------------------------------------
@@ -153,11 +153,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                      ->  Hash
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: Hash Join build side of about 169 kB exceeds its 128 kB
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: Hash Join build side of about 169 kB exceeds its 128 kB
 (11 rows)
 
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                      QUERY PLAN                     
 ----------------------------------------------------
@@ -170,12 +170,12 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                      ->  Hash
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (11 rows)
 
 RESET work_mem;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
  count |  sum  |  max   
 -------+-------+--------
@@ -252,7 +252,7 @@ SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
      0
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
  count |  sum  |  max   
 -------+-------+--------
@@ -333,7 +333,7 @@ SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a / (jb.e - jb.e) > 0;
 ERROR:  division by zero  (seg0 slice1 172.17.0.3:40000 pid=82858)
 -- With batch Motions, the joined rows' partial aggregates go out as batches.
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
  e | count |  sum   
 ---+-------+--------
@@ -344,14 +344,14 @@ SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHER
  3 |   200 | 497800
 (5 rows)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 -- Inputs received through Motions (J3): a table distributed otherwise is
 -- redistributed on the join key, or broadcast.
 CREATE TABLE df_jr (r int4, k int4, w int8) DISTRIBUTED BY (r);
 INSERT INTO df_jr SELECT i, i * 2, i FROM generate_series(1, 5000) i;
 INSERT INTO df_jr VALUES (0, NULL, 0);
 ANALYZE df_jr;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -366,9 +366,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja
                                  Hash Key: jr.k
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
@@ -384,12 +384,12 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (13 rows)
 
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -404,9 +404,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja
                                  Hash Key: jr.k
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
@@ -422,13 +422,13 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
-RESET datafusion.motion_batches;
-SET datafusion.mode = off;
+RESET vec.motion_batches;
+SET vec.mode = off;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
  count |  sum   | max  
 -------+--------+------
@@ -451,7 +451,7 @@ SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
  20001 |  99
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
  count |  sum   | max  
 -------+--------+------
@@ -474,7 +474,7 @@ SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
  20001 |  99
 (1 row)
 
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
  count |  sum   | max  
 -------+--------+------
@@ -499,13 +499,13 @@ SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
 
 SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
 ERROR:  division by zero  (seg2 slice1 172.17.0.3:40002 pid=82859)
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 -- Outer, semi and anti joins, and keys of two types (J4).
 CREATE TABLE df_jf (k8 int8, f4 real, k int4) DISTRIBUTED BY (k);
 INSERT INTO df_jf SELECT i * 4, (i * 4)::real, i * 4 FROM generate_series(1, 5000) i;
 INSERT INTO df_jf VALUES (NULL, NULL, NULL);
 ANALYZE df_jf;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
                      QUERY PLAN                     
 ----------------------------------------------------
@@ -518,8 +518,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb j
                      ->  Hash
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
@@ -534,8 +534,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FRO
                      ->  Hash
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
@@ -552,12 +552,12 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
                                  Hash Key: f.k8
                                  ->  Seq Scan on df_jf f
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (14 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
  count | count |  sum   
 -------+-------+--------
@@ -626,7 +626,7 @@ SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
   1250
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
  count | count |  sum   
 -------+-------+--------
@@ -708,8 +708,8 @@ INSERT INTO df_sj_l SELECT i % 2000, i % 100, i % 50 FROM generate_series(1, 600
 ANALYZE df_sj_ps;
 ANALYZE df_sj_p;
 ANALYZE df_sj_l;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF)
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
@@ -741,14 +741,14 @@ WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
                                                    Group Key: df_sj_l.l_partkey, df_sj_l.l_suppkey
                                                    ->  Seq Scan on df_sj_l
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
- DataFusion: slice 4 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 4 eligible, sends Arrow batches
 (30 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
@@ -757,7 +757,7 @@ WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   1556 | 1540827
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
@@ -766,7 +766,7 @@ WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   1556 | 1540827
 (1 row)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 -- Aggregates below a join or another aggregate (A1, TPC-H Q2, Q13, Q15
 -- and Q20): a node of the plan whose groups and calls the nodes above read
@@ -782,8 +782,8 @@ CREATE TABLE df_ag2 (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_ag2 SELECT i, i % 41, (i % 300) * 2.5 FROM generate_series(1, 3000) i;
 ANALYZE df_ag1;
 ANALYZE df_ag2;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(b.k) FROM df_ag2 b
   JOIN (SELECT g, 0.0001 * sum(n) h FROM df_ag1 GROUP BY g) a ON a.g = b.g AND b.n > a.h;
                                         QUERY PLAN                                        
@@ -805,10 +805,10 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(b.k) FROM df_ag2 b
                                                    Group Key: df_ag1.g
                                                    ->  Seq Scan on df_ag1
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM df_ag1 GROUP BY g) x ON x.g = b.g;
@@ -829,10 +829,10 @@ EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM 
                                              Group Key: df_ag1.g
                                              ->  Seq Scan on df_ag1
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible, sends Arrow batches
 (19 rows)
 
 SET optimizer = on;
@@ -858,10 +858,10 @@ EXPLAIN (COSTS OFF) SELECT c, count(*) FROM (SELECT b.k, count(a.k) c FROM df_ag
                                              ->  Seq Scan on df_ag1 a
                                                    Filter: (k < 400)
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (22 rows)
 
 -- computed below the join, NULL above it where nothing matched
@@ -890,14 +890,14 @@ WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
                                        ->  Seq Scan on df_ag1
                                              Filter: (g < 20)
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible below the top: Aggregate (above: expression on the nullable side of an outer join)
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible below the top: Aggregate (above: expression on the nullable side of an outer join)
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible, sends Arrow batches
 (24 rows)
 
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
   JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
  g |  c  | c  
@@ -1036,7 +1036,7 @@ WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
 (11 rows)
 
 SET optimizer = off;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
   JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
  g |  c  | c  
@@ -1175,15 +1175,15 @@ WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
 (11 rows)
 
 SET optimizer = off;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ag1, df_ag2;
 -- A Subquery Scan (SQ1) passes its plan's rows on, filtered by its own
 -- quals; the Motions below it carry batches too.
 CREATE TABLE df_sq (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_sq SELECT i, i % 37, (i % 1000) * 1.25 FROM generate_series(1, 10000) i;
 ANALYZE df_sq;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
                     QUERY PLAN                     
 ---------------------------------------------------
@@ -1194,8 +1194,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k
                ->  Seq Scan on df_sq
                      Filter: ((k % 3) = 0)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (9 rows)
 
 EXPLAIN (COSTS OFF) SELECT b.k, x.s FROM df_sq b
@@ -1224,13 +1224,13 @@ WHERE b.k < 12 ORDER BY 1;
                                              ->  Seq Scan on df_sq
                                                    Filter: (g < 5)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (25 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
  count |   sum   
 -------+---------
@@ -1269,7 +1269,7 @@ WHERE b.k < 12 ORDER BY 1;
  11 |          
 (11 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
  count |   sum   
 -------+---------
@@ -1308,7 +1308,7 @@ WHERE b.k < 12 ORDER BY 1;
  11 |          
 (11 rows)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_sq;
 -- A semi join deduplicated by RowIdExpr (RI1, TPC-H Q4 and Q21): the
 -- planner numbers the rows of one side, joins, and groups by the numbers
@@ -1323,8 +1323,8 @@ CREATE TABLE df_ri_i (k int, s int, v int) DISTRIBUTED BY (v);
 INSERT INTO df_ri_i SELECT i % 500, i % 37, i FROM generate_series(1, 60000) i;
 ANALYZE df_ri_o;
 ANALYZE df_ri_i;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -1349,14 +1349,14 @@ EXPLAIN (COSTS OFF) SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELE
                                                    ->  Broadcast Motion 3:3  (slice4; segments: 3)
                                                          ->  Seq Scan on df_ri_o o
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
- DataFusion: slice 4 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 4 eligible, sends Arrow batches
 (26 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
   c   | count |   sum   
 ------+-------+---------
@@ -1414,7 +1414,7 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
  29 | 29 | c1   | 7.25
 (34 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
   c   | count |   sum   
 ------+-------+---------
@@ -1476,7 +1476,7 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
 -- ones too (min stands in for first_value)
 UPDATE df_ri_o SET c = NULL WHERE id % 3 = 0;
 UPDATE df_ri_o SET n = NULL WHERE id % 4 = 0;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -1497,13 +1497,13 @@ EXPLAIN (COSTS OFF) SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FRO
                                        ->  Seq Scan on df_ri_o o
                                              Filter: (id < 30)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (21 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
  id | k  |  c   |  n   
 ----+----+------+------
@@ -1543,7 +1543,7 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
  29 | 29 | c1   | 7.25
 (34 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
  id | k  |  c   |  n   
 ----+----+------+------
@@ -1583,7 +1583,7 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
  29 | 29 | c1   | 7.25
 (34 rows)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
 -- GPORCA's Result (R1): a projection and filter over its child's rows,
 -- here a HAVING and a test of an outer join's NULLs.
@@ -1591,8 +1591,8 @@ CREATE TABLE df_rs (k int, g int) DISTRIBUTED BY (k);
 INSERT INTO df_rs SELECT i, i % 37 FROM generate_series(1, 10000) i;
 ANALYZE df_rs;
 SET optimizer = on;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -1610,12 +1610,12 @@ EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 2
                                  Group Key: g
                                  ->  Seq Scan on df_rs
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (17 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
  g  | count 
 ----+-------
@@ -1639,7 +1639,7 @@ WHERE coalesce(x.c, 0) = 0;
   4590 | 22970655
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
  g  | count 
 ----+-------
@@ -1663,7 +1663,7 @@ WHERE coalesce(x.c, 0) = 0;
   4590 | 22970655
 (1 row)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 SET optimizer = off;
 DROP TABLE df_rs;
 -- NOT IN (NJ1, TPC-H Q16): DataFusion's null-aware anti join, which keeps
@@ -1677,8 +1677,8 @@ INSERT INTO df_ni_i SELECT i, i * 3 % 450, 't' || (i * 7 % 250) FROM generate_se
 INSERT INTO df_ni_i VALUES (7, NULL, NULL);
 ANALYZE df_ni_o;
 ANALYZE df_ni_i;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
                                 QUERY PLAN                                 
 ---------------------------------------------------------------------------
@@ -1692,12 +1692,12 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_ni_i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
  count | sum 
 -------+-----
@@ -1722,7 +1722,7 @@ SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHER
    784 | 1979352
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
  count | sum 
 -------+-----
@@ -1747,7 +1747,7 @@ SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHER
    784 | 1979352
 (1 row)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ni_o, df_ni_i;
 -- A Nested Loop without parameters (NL1, GPORCA's TPC-H Q11): DataFusion's
 -- nested loop join, which collects PostgreSQL's inner side and streams the
@@ -1761,8 +1761,8 @@ ANALYZE df_nl_o;
 ANALYZE df_nl_i;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
                                 QUERY PLAN                                 
 ---------------------------------------------------------------------------
@@ -1776,12 +1776,12 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i 
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_nl_i b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
  count |   sum    |  sum   
 -------+----------+--------
@@ -1806,7 +1806,7 @@ SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i 
   2959 | 4448375
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
  count |   sum    |  sum   
 -------+----------+--------
@@ -1831,7 +1831,7 @@ SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i 
   2959 | 4448375
 (1 row)
 
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
@@ -1847,9 +1847,9 @@ INSERT INTO df_nl2s SELECT i, 2000 + i % 10, i % 12 FROM generate_series(1, 200)
 ANALYZE df_nl2;
 ANALYZE df_nl2s;
 SET work_mem = 64;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_nl2
 WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
   AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
@@ -1899,14 +1899,14 @@ WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
                                                                                              Filter: ((y = 2003) AND (m = 3))
                            ->  Seq Scan on df_nl2
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
- DataFusion: slice 4 eligible, sends Arrow batches
- DataFusion: slice 5 eligible, sends Arrow batches
- DataFusion: slice 6 eligible, sends Arrow batches
- DataFusion: slice 7 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 4 eligible, sends Arrow batches
+ Vectorized: slice 5 eligible, sends Arrow batches
+ Vectorized: slice 6 eligible, sends Arrow batches
+ Vectorized: slice 7 eligible, sends Arrow batches
 (52 rows)
 
 SET optimizer = off;
@@ -1925,12 +1925,12 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d 
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_nl2 d
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: Nested Loop build side of about 1094 kB exceeds its 128 kB
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: Nested Loop build side of about 1094 kB exceeds its 128 kB
+ Vectorized: slice 2 eligible
 (13 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
  count  |   sum    
 --------+----------
@@ -1946,7 +1946,7 @@ WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
    501 | 243465
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(v) FROM df_nl2
 WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
   AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
@@ -1964,9 +1964,9 @@ SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 RESET work_mem;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_nl2, df_nl2s;
 -- x IN (subquery) as a hashed SubPlan (SP1, TPC-DS Q10, Q45: under an OR,
 -- or as a column): the subquery's rows come from a Motion, which the
@@ -1986,8 +1986,8 @@ INSERT INTO df_sp_i VALUES (501, 1000, 'x  ', 'x  ', 'NaN'), (502, 1001, 'zz', '
 INSERT INTO df_sp_n SELECT i, i % 7 FROM generate_series(1, 300) i;
 INSERT INTO df_sp_n VALUES (301, NULL);
 ANALYZE df_sp_o; ANALYZE df_sp_i; ANALYZE df_sp_n; ANALYZE df_sp_e;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
                               QUERY PLAN                               
 -----------------------------------------------------------------------
@@ -2000,9 +2000,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k F
                        ->  Broadcast Motion 3:3  (slice2; segments: 3)
                              ->  Seq Scan on df_sp_i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
@@ -2023,11 +2023,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp
                        ->  Broadcast Motion 3:3  (slice4; segments: 3)
                              ->  Seq Scan on df_sp_i df_sp_i_2
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
- DataFusion: slice 4 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
+ Vectorized: slice 4 eligible
 (20 rows)
 
 -- a correlated subquery stays on PostgreSQL
@@ -2046,9 +2046,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o o WHERE k IN (SELECT k FROM df_
                                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                          ->  Seq Scan on df_sp_i i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: subquery other than a hashed IN
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: subquery other than a hashed IN
+ Vectorized: slice 2 eligible
 (15 rows)
 
 -- an init plan whose top slice only gathers its rows is reported as a
@@ -2066,13 +2066,13 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE k = (SELECT k FROM df_sp_
                ->  Seq Scan on df_sp_o
                      Filter: (k = $0)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 3 eligible
 (14 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
  count |  sum   
 -------+--------
@@ -2114,7 +2114,7 @@ SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SEL
  3003 | t        | f        | f
 (10 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
  count |  sum   
 -------+--------
@@ -2157,7 +2157,7 @@ SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SEL
 (10 rows)
 
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
                                     QUERY PLAN                                     
 -----------------------------------------------------------------------------------
@@ -2173,12 +2173,12 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k F
                                    ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                          ->  Seq Scan on df_sp_i
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
 (15 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
  count |  sum   
 -------+--------
@@ -2200,7 +2200,7 @@ SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp
  3003 | t        | f
 (10 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
  count |  sum   
 -------+--------
@@ -2223,8 +2223,8 @@ SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp
 (10 rows)
 
 SET optimizer = off;
-SET datafusion.mode = off;
-RESET datafusion.motion_batches;
+SET vec.mode = off;
+RESET vec.motion_batches;
 DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
 -- The value of an uncorrelated scalar subquery (SP2, TPC-DS Q44 under
 -- GPORCA), as GPORCA plans it when the subquery may return several rows:
@@ -2237,7 +2237,7 @@ INSERT INTO df_sc SELECT i, i % 50, ((i * 7919) % 20001 - 10000) / 100.0 FROM ge
 ANALYZE df_sc;
 SET optimizer = on;
 SET optimizer_enforce_subplans = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -2267,11 +2267,11 @@ EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 *
                                                      ->  Seq Scan on df_sc df_sc_1
                                                            Filter: (k = 3)
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
- DataFusion: slice 4 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
+ Vectorized: slice 4 eligible
 (31 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
@@ -2296,13 +2296,13 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(i
                                                            ->  Seq Scan on df_sc df_sc_1
                                                                  Filter: (k = 3)
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (23 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
  k  |           avg           
 ----+-------------------------
@@ -2367,7 +2367,7 @@ SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHER
 
 SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
 ERROR:  more than one row returned by a subquery used as an expression
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
  k  |           avg           
 ----+-------------------------
@@ -2434,7 +2434,7 @@ SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GRO
 ERROR:  more than one row returned by a subquery used as an expression
 RESET optimizer_enforce_subplans;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_sc;
 -- A correlated scalar subquery that is one aggregate of rows equal to the
 -- outer row on some keys (SC1, TPC-DS Q6 and Q41 under the Postgres
@@ -2454,8 +2454,8 @@ INSERT INTO df_ci SELECT i, CASE WHEN i % 53 = 0 THEN NULL ELSE i % 30 END, (i %
   i % 6 FROM generate_series(1, 600) i;
 ANALYZE df_co; ANALYZE df_ci;
 SET optimizer = off;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
                                        QUERY PLAN                                        
 -----------------------------------------------------------------------------------------
@@ -2472,9 +2472,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELEC
                                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                                ->  Seq Scan on df_ci i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
@@ -2494,9 +2494,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*)
                                                ->  Seq Scan on df_ci i
                                                      Filter: (f > 3)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
 (17 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
@@ -2515,9 +2515,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT
                                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                                ->  Seq Scan on df_ci i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible
 (16 rows)
 
 -- stay on PostgreSQL
@@ -2537,9 +2537,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > (SELECT max(w) FROM 
                                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                                ->  Seq Scan on df_ci i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: correlated scalar subquery correlated other than by =
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: correlated scalar subquery correlated other than by =
+ Vectorized: slice 2 eligible
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.n = o.n);
@@ -2558,9 +2558,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > 2 * (SELECT max(w) F
                                          ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                                ->  Seq Scan on df_ci i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: correlated scalar subquery by = on numeric and numeric
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: correlated scalar subquery by = on numeric and numeric
+ Vectorized: slice 2 eligible
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT id, (SELECT max(w) FROM df_ci i WHERE i.k = o.k) FROM df_co o WHERE id < 5;
@@ -2577,12 +2577,12 @@ EXPLAIN (COSTS OFF) SELECT id, (SELECT max(w) FROM df_ci i WHERE i.k = o.k) FROM
                              ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                    ->  Seq Scan on df_ci i
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: correlated scalar subquery other than in a scan's filter
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: correlated scalar subquery other than in a scan's filter
+ Vectorized: slice 2 eligible
 (14 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
  count |   sum   
 -------+---------
@@ -2614,7 +2614,7 @@ SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE 
    328 | 486247
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
  count |   sum   
 -------+---------
@@ -2646,8 +2646,8 @@ SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE 
    328 | 486247
 (1 row)
 
-SET datafusion.mode = off;
-RESET datafusion.motion_batches;
+SET vec.mode = off;
+RESET vec.motion_batches;
 DROP TABLE df_co, df_ci;
 -- A Merge Join whose order of rows no one reads runs as DataFusion's hash
 -- join on its merge clauses (MJ1, TPC-DS Q51 under GPORCA), the Sorts
@@ -2664,7 +2664,7 @@ ANALYZE df_mj_a;
 ANALYZE df_mj_b;
 SET enable_hashjoin = off;
 SET enable_nestloop = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -2684,10 +2684,10 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_m
                                  Hash Key: b.k, b.d
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (20 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
@@ -2710,10 +2710,10 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JO
                                  Hash Key: b.k
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT a.k, b.w FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k WHERE a.id < 50 ORDER BY a.k LIMIT 5;
@@ -2734,12 +2734,12 @@ EXPLAIN (COSTS OFF) SELECT a.k, b.w FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k W
                            Sort Key: b.k
                            ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: sorted Gather Motion without a Sort below it
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: sorted Gather Motion without a Sort below it
+ Vectorized: slice 2 eligible
 (18 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
  count |   sum    |   sum    
 -------+----------+----------
@@ -2752,7 +2752,7 @@ SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k 
  31481 | 30129 | 56889870
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
  count |   sum    |   sum    
 -------+----------+----------
@@ -2767,7 +2767,7 @@ SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k 
 
 -- semi and anti, with a join filter or not
 SET enable_hashagg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -2788,10 +2788,10 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 
                                  Hash Key: b.k
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
@@ -2814,13 +2814,13 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SEL
                                  Hash Key: b.k
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (21 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
  count |   sum    
 -------+----------
@@ -2845,7 +2845,7 @@ SELECT count(*), sum(w) FROM df_mj_b b WHERE NOT EXISTS (SELECT 1 FROM df_mj_a a
   1244 | 3171006
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
  count |   sum    
 -------+----------
@@ -2875,7 +2875,7 @@ RESET enable_hashjoin;
 RESET enable_nestloop;
 SET optimizer = on;
 SET optimizer_enable_hashjoin = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -2895,13 +2895,13 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) 
                                  Hash Key: a.k, a.t
                                  ->  Seq Scan on df_mj_a a
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (20 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
  count | count | count |   sum    |   sum    
 -------+-------+-------+----------+----------
@@ -2917,7 +2917,7 @@ SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN d
  t  | t  |   117
 (4 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
  count | count | count |   sum    |   sum    
 -------+-------+-------+----------+----------
@@ -2935,10 +2935,10 @@ SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN d
 
 RESET optimizer_enable_hashjoin;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_mj_a, df_mj_b;
 -- A hash join's build side coming from another join (JE1,
--- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
+-- vec.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
 -- scale factor 10: 40 rows estimated, a million per segment built).  Such
 -- a build side is taken to hold up to as many rows as its largest input;
@@ -2956,8 +2956,8 @@ ANALYZE df_je_a;
 ANALYZE df_je_b;
 SET join_collapse_limit = 1;
 SET work_mem = 64;
-SET datafusion.mode = explain;
-SET datafusion.join_estimates = bounded;
+SET vec.mode = explain;
+SET vec.join_estimates = bounded;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
                                                                                       QUERY PLAN                                                                                      
 --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -2975,11 +2975,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
                                        ->  Seq Scan on df_je_b b
                                              Filter: (y < 3000)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible below the top: Hash Join (above: Hash Join build side comes from a join of inputs whose largest exceeds its budget (up to about 365 kB, budget 128 kB))
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible below the top: Hash Join (above: Hash Join build side comes from a join of inputs whose largest exceeds its budget (up to about 365 kB, budget 128 kB))
 (16 rows)
 
-SET datafusion.join_estimates = trusted;
+SET vec.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
                            QUERY PLAN                            
 -----------------------------------------------------------------
@@ -2997,11 +2997,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
                                        ->  Seq Scan on df_je_b b
                                              Filter: (y < 3000)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (16 rows)
 
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 -- spill: the whole slice in DataFusion, its joins spilling within 64 kB
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
                            QUERY PLAN                            
@@ -3020,11 +3020,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
                                        ->  Seq Scan on df_je_b b
                                              Filter: (y < 3000)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (16 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
  count  |     sum     
 --------+-------------
@@ -3037,7 +3037,7 @@ SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHE
  15001 | 187512500
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
  count  |     sum     
 --------+-------------
@@ -3050,17 +3050,17 @@ SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHE
  15001 | 187512500
 (1 row)
 
-SET datafusion.join_estimates = bounded;
+SET vec.join_estimates = bounded;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
  count  |     sum     
 --------+-------------
  119960 | 11876040000
 (1 row)
 
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 RESET work_mem;
 RESET join_collapse_limit;
 DROP TABLE df_je_big, df_je_a, df_je_b;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

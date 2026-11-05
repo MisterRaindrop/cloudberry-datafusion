@@ -17,11 +17,11 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_paxload.c
- *	  Load datafusion_pax.so, the experimental PAX reader, built from the
- *	  PAX patch in patches/pax (access/datafusion_scan_api.cc).
+ * vx_paxload.c
+ *	  Load vec_pax.so, the experimental PAX reader, built from the
+ *	  PAX patch in patches/pax (access/pax_direct_api.cc).
  *
- * The library exports one symbol, datafusion_pax_scan_api(), a table of
+ * The library exports one symbol, pax_direct_scan_api(), a table of
  * functions.  They call PAX's internal C++ classes, so the table is only
  * used with the pax.so it was built against: both carry pax.so's ELF build
  * ID, the table as a string recorded at build time, the running pax.so in
@@ -29,7 +29,7 @@
  * another build ID) is reported once per backend as a WARNING and the scan
  * goes through the table AM instead.
  *
- * src/df_paxload.c
+ * src/vx_paxload.c
  *
  *-------------------------------------------------------------------------
  */
@@ -41,13 +41,13 @@
 
 #include "miscadmin.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
-typedef const DfPaxReader *(*ScanApiFn) (void);
+typedef const VxPaxReader *(*ScanApiFn) (void);
 
-static bool df_pax_tried = false;
-static const DfPaxReader *df_pax_reader;
-static bool df_pax_ok = false;
+static bool vx_pax_tried = false;
+static const VxPaxReader *vx_pax_reader;
+static bool vx_pax_ok = false;
 
 typedef struct BuildIdSearch
 {
@@ -57,7 +57,7 @@ typedef struct BuildIdSearch
 
 /* dl_iterate_phdr callback: the GNU build ID of the loaded pax.so. */
 static int
-df_find_pax_build_id(struct dl_phdr_info *info, size_t size, void *data)
+vx_find_pax_build_id(struct dl_phdr_info *info, size_t size, void *data)
 {
 	BuildIdSearch *search = (BuildIdSearch *) data;
 	const char *name = info->dlpi_name;
@@ -101,23 +101,23 @@ df_find_pax_build_id(struct dl_phdr_info *info, size_t size, void *data)
 }
 
 static bool
-df_pax_load(char *why, size_t whylen, bool *installed)
+vx_pax_load(char *why, size_t whylen, bool *installed)
 {
 	char		path[MAXPGPATH];
 	void	   *handle;
 	ScanApiFn	scan_api;
-	const DfPaxReader *api;
+	const VxPaxReader *api;
 	BuildIdSearch running;
 
 	memset(&running, 0, sizeof(running));
-	dl_iterate_phdr(df_find_pax_build_id, &running);
+	dl_iterate_phdr(vx_find_pax_build_id, &running);
 	if (!running.found)
 	{
 		snprintf(why, whylen, "pax.so is not loaded or has no build ID");
 		return false;
 	}
 
-	snprintf(path, sizeof(path), "%s/datafusion_pax.so", pkglib_path);
+	snprintf(path, sizeof(path), "%s/vec_pax.so", pkglib_path);
 	*installed = access(path, F_OK) == 0;
 	if (!*installed)
 	{
@@ -131,17 +131,17 @@ df_pax_load(char *why, size_t whylen, bool *installed)
 		return false;
 	}
 
-	scan_api = (ScanApiFn) dlsym(handle, "datafusion_pax_scan_api");
+	scan_api = (ScanApiFn) dlsym(handle, "pax_direct_scan_api");
 	if (scan_api == NULL)
 	{
-		snprintf(why, whylen, "%s lacks datafusion_pax_scan_api", path);
+		snprintf(why, whylen, "%s lacks pax_direct_scan_api", path);
 		return false;
 	}
 	api = scan_api();
-	if (api == NULL || api->version != DF_PAX_SCAN_API_VERSION)
+	if (api == NULL || api->version != VX_PAX_SCAN_API_VERSION)
 	{
 		snprintf(why, whylen, "%s has scan interface version %u, expected %u",
-				 path, api ? api->version : 0, DF_PAX_SCAN_API_VERSION);
+				 path, api ? api->version : 0, VX_PAX_SCAN_API_VERSION);
 		return false;
 	}
 	if (strcmp(api->pax_build_id, running.hex) != 0)
@@ -150,38 +150,38 @@ df_pax_load(char *why, size_t whylen, bool *installed)
 				 api->pax_build_id, running.hex);
 		return false;
 	}
-	df_pax_reader = api;
+	vx_pax_reader = api;
 	return true;
 }
 
 /*
  * The direct PAX reader, or NULL if it cannot be used in this backend.
  * Call only when a PAX relation is open, so that pax.so is loaded.  An
- * extension built without it (no DF_PAX_SRC) reads PAX through the table
+ * extension built without it (no VX_PAX_SRC) reads PAX through the table
  * AM and says so in the server log only; a reader that is installed but
  * does not fit the running pax.so is worth a warning.
  */
-const DfPaxReader *
-df_pax_reader_get(void)
+const VxPaxReader *
+vx_pax_reader_get(void)
 {
-	if (!df_pax_tried)
+	if (!vx_pax_tried)
 	{
 		char		why[512];
 		bool		installed = false;
 
-		df_pax_tried = true;
-		df_pax_ok = df_pax_load(why, sizeof(why), &installed);
-		if (!df_pax_ok)
+		vx_pax_tried = true;
+		vx_pax_ok = vx_pax_load(why, sizeof(why), &installed);
+		if (!vx_pax_ok)
 			ereport(installed ? WARNING : LOG,
-					(errmsg("datafusion: reading PAX tables through the table access method"),
+					(errmsg("vec_executor: reading PAX tables through the table access method"),
 					 errdetail("The direct PAX reader is unavailable: %s", why)));
 	}
-	return df_pax_ok ? df_pax_reader : NULL;
+	return vx_pax_ok ? vx_pax_reader : NULL;
 }
 
 /* The direct PAX reader if this backend has loaded it already, else NULL. */
-const DfPaxReader *
-df_pax_reader_loaded(void)
+const VxPaxReader *
+vx_pax_reader_loaded(void)
 {
-	return df_pax_tried && df_pax_ok ? df_pax_reader : NULL;
+	return vx_pax_tried && vx_pax_ok ? vx_pax_reader : NULL;
 }

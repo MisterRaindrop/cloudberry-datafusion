@@ -20,7 +20,7 @@
 
 usage: ir_keys.py [log ...]   (standard input without files)
 
-Reads text holding "datafusion plan: {...}" lines, as the extension logs
+Reads text holding "engine plan: {...}" lines, as the extension logs
 each plan at DEBUG1 (SET client_min_messages = debug1 shows the segments'
 ones too), and reports every member name, and every value of a member the
 catalog lists values for, that the catalog lacks.  Exits 1 if there is
@@ -51,9 +51,9 @@ def catalog():
 def plans(stream):
     decoder = json.JSONDecoder()
     for line in stream:
-        i = line.find("datafusion plan: {")
+        i = line.find("engine plan: {")
         if i >= 0:
-            yield decoder.raw_decode(line, i + len("datafusion plan: "))[0]
+            yield decoder.raw_decode(line, i + len("engine plan: "))[0]
 
 
 def walk(v, valued, seen_members, seen_values):

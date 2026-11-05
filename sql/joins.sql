@@ -19,13 +19,13 @@
 -- locally (tables colocated on the join key) or received through a
 -- Redistribute or Broadcast Motion, under an optional aggregate.  DataFusion builds its hash table on
 -- PostgreSQL's Hash side, which is also fed first.
--- Each query runs with datafusion.mode off, then on; the results must match.
+-- Each query runs with vec.mode off, then on; the results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 
@@ -44,7 +44,7 @@ INSERT INTO df_jdup SELECT i % 10, i FROM generate_series(1, 100) i;
 ANALYZE df_ja; ANALYZE df_jb; ANALYZE df_jc; ANALYZE df_jempty; ANALYZE df_jdup;
 
 -- Which slices qualify.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
 EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
 -- This stays on PostgreSQL, with the reason.
@@ -55,14 +55,14 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(s.isn) FROM df_ja ja
 LEFT JOIN (SELECT k, b IS NULL AS isn FROM df_jb) s ON ja.k = s.k;
 SET work_mem = '64kB';
 -- A build side past the Hash node's budget stays on PostgreSQL unless hash
--- joins spill (datafusion.join_estimates = spill, the default).
-SET datafusion.join_estimates = trusted;
+-- joins spill (vec.join_estimates = spill, the default).
+SET vec.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
 RESET work_mem;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
 SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -72,7 +72,7 @@ SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k + 1 = jb.k + 1;
 SELECT count(*), sum(x.v), sum(y.v) FROM df_jdup x JOIN df_jdup y ON x.k = y.k;
 SELECT count(*) FROM df_ja ja JOIN df_jempty je ON ja.k = je.k;
 SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ja.a), max(jb.b) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 10;
 SELECT ja.k, ja.c, jb.b FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a > jb.e WHERE ja.c < 10;
 SELECT count(*), sum(jb.b + jc.d) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -86,9 +86,9 @@ SELECT count(*) FROM df_jempty je JOIN df_ja ja ON ja.k = je.k;
 SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k AND ja.a / (jb.e - jb.e) > 0;
 
 -- With batch Motions, the joined rows' partial aggregates go out as batches.
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SELECT jb.e, count(*), sum(ja.c) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k WHERE jb.e < 5 GROUP BY jb.e;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 
 -- Inputs received through Motions (J3): a table distributed otherwise is
 -- redistributed on the join key, or broadcast.
@@ -96,38 +96,38 @@ CREATE TABLE df_jr (r int4, k int4, w int8) DISTRIBUTED BY (r);
 INSERT INTO df_jr SELECT i, i * 2, i FROM generate_series(1, 5000) i;
 INSERT INTO df_jr VALUES (0, NULL, 0);
 ANALYZE df_jr;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
-RESET datafusion.motion_batches;
-SET datafusion.mode = off;
+RESET vec.motion_batches;
+SET vec.mode = off;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
 SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
 SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
 SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
 SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SELECT count(*), sum(ja.a), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k;
 SELECT jr.r % 5, count(*), max(ja.c) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k GROUP BY jr.r % 5;
 SELECT count(*), max(jr.w) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
 SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.k = jr.k AND ja.a / (jr.w - jr.w) > 0;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 
 -- Outer, semi and anti joins, and keys of two types (J4).
 CREATE TABLE df_jf (k8 int8, f4 real, k int4) DISTRIBUTED BY (k);
 INSERT INTO df_jf SELECT i * 4, (i * 4)::real, i * 4 FROM generate_series(1, 5000) i;
 INSERT INTO df_jf VALUES (NULL, NULL, NULL);
 ANALYZE df_jf;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
 SELECT ja.k, jb.b, jb.b IS NULL AS missing FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k
 WHERE ja.k < 8 OR ja.k IS NULL;
@@ -139,7 +139,7 @@ SELECT count(*), sum(ja.a) FROM df_ja ja WHERE ja.k IN (SELECT k FROM df_jb);
 SELECT count(*), sum(ja.a) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
 SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
 SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.c = f.f4;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(jb.b), sum(ja.a) FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k;
 SELECT ja.k, jb.b, jb.b IS NULL AS missing FROM df_ja ja LEFT JOIN df_jb jb ON ja.k = jb.k
 WHERE ja.k < 8 OR ja.k IS NULL;
@@ -165,21 +165,21 @@ INSERT INTO df_sj_l SELECT i % 2000, i % 100, i % 50 FROM generate_series(1, 600
 ANALYZE df_sj_ps;
 ANALYZE df_sj_p;
 ANALYZE df_sj_l;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF)
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(ps_partkey) FROM df_sj_ps
 WHERE ps_partkey IN (SELECT p_partkey FROM df_sj_p WHERE p_name LIKE 'medium%')
   AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM df_sj_l WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey);
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_sj_ps, df_sj_p, df_sj_l;
 
 -- Aggregates below a join or another aggregate (A1, TPC-H Q2, Q13, Q15
@@ -196,8 +196,8 @@ CREATE TABLE df_ag2 (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_ag2 SELECT i, i % 41, (i % 300) * 2.5 FROM generate_series(1, 3000) i;
 ANALYZE df_ag1;
 ANALYZE df_ag2;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(b.k) FROM df_ag2 b
   JOIN (SELECT g, 0.0001 * sum(n) h FROM df_ag1 GROUP BY g) a ON a.g = b.g AND b.n > a.h;
 EXPLAIN (COSTS OFF) SELECT b.k, x.a FROM df_ag2 b JOIN (SELECT g, avg(k) a FROM df_ag1 GROUP BY g) x ON x.g = b.g;
@@ -209,7 +209,7 @@ EXPLAIN (COSTS OFF) SELECT b.k, x.m FROM df_ag2 b
   LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
 WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
   JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
 SELECT count(*), sum(b.k) FROM df_ag2 b
@@ -230,7 +230,7 @@ SELECT b.k, x.m FROM df_ag2 b
   LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
 WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
 SET optimizer = off;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT x.g, x.c, y.c FROM (SELECT g, count(*) c FROM df_ag1 GROUP BY g) x
   JOIN (SELECT g, count(*) c FROM df_ag2 GROUP BY g) y ON x.g = y.g WHERE x.g < 4 ORDER BY 1;
 SELECT count(*), sum(b.k) FROM df_ag2 b
@@ -251,7 +251,7 @@ SELECT b.k, x.m FROM df_ag2 b
   LEFT JOIN (SELECT g, coalesce(max(k), -1) m FROM df_ag1 WHERE g < 20 GROUP BY g) x ON x.g = b.g
 WHERE b.k BETWEEN 15 AND 25 ORDER BY 1;
 SET optimizer = off;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ag1, df_ag2;
 
 -- A Subquery Scan (SQ1) passes its plan's rows on, filtered by its own
@@ -259,13 +259,13 @@ DROP TABLE df_ag1, df_ag2;
 CREATE TABLE df_sq (k int, g int, n numeric(12,2)) DISTRIBUTED BY (k);
 INSERT INTO df_sq SELECT i, i % 37, (i % 1000) * 1.25 FROM generate_series(1, 10000) i;
 ANALYZE df_sq;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
 EXPLAIN (COSTS OFF) SELECT b.k, x.s FROM df_sq b
   LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
 WHERE b.k < 12 ORDER BY 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
 SELECT b.k, x.s2 FROM df_sq b
   JOIN (SELECT g, sum(n) * 2 s2, count(*) + 1 c FROM df_sq GROUP BY g) x ON x.g = b.g
@@ -273,7 +273,7 @@ WHERE b.k < 8 AND x.c > 270 ORDER BY 1;
 SELECT b.k, x.s FROM df_sq b
   LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
 WHERE b.k < 12 ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(k) FROM (SELECT k, g FROM df_sq WHERE k % 3 = 0 OFFSET 0) s WHERE g < 10;
 SELECT b.k, x.s2 FROM df_sq b
   JOIN (SELECT g, sum(n) * 2 s2, count(*) + 1 c FROM df_sq GROUP BY g) x ON x.g = b.g
@@ -281,7 +281,7 @@ WHERE b.k < 8 AND x.c > 270 ORDER BY 1;
 SELECT b.k, x.s FROM df_sq b
   LEFT JOIN (SELECT g, sum(n) s FROM df_sq WHERE g < 5 GROUP BY g) x ON x.g = b.g
 WHERE b.k < 12 ORDER BY 1;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_sq;
 
 -- A semi join deduplicated by RowIdExpr (RI1, TPC-H Q4 and Q21): the
@@ -297,14 +297,14 @@ CREATE TABLE df_ri_i (k int, s int, v int) DISTRIBUTED BY (v);
 INSERT INTO df_ri_i SELECT i % 500, i % 37, i FROM generate_series(1, 60000) i;
 ANALYZE df_ri_o;
 ANALYZE df_ri_i;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
 SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT c, count(*), sum(n) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k) GROUP BY c ORDER BY 1;
 SELECT count(*), sum(id) FROM df_ri_o o WHERE EXISTS (SELECT 1 FROM df_ri_i i WHERE i.k = o.k AND i.s <> o.k % 37);
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2;
@@ -312,13 +312,13 @@ SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 
 -- ones too (min stands in for first_value)
 UPDATE df_ri_o SET c = NULL WHERE id % 3 = 0;
 UPDATE df_ri_o SET n = NULL WHERE id % 4 = 0;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, k, c, n FROM df_ri_o o WHERE o.k IN (SELECT k FROM df_ri_i WHERE v < 3000) AND id < 30 ORDER BY 1, 2, 3, 4;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ri_o, df_ri_i;
 
 -- GPORCA's Result (R1): a projection and filter over its child's rows,
@@ -327,20 +327,20 @@ CREATE TABLE df_rs (k int, g int) DISTRIBUTED BY (k);
 INSERT INTO df_rs SELECT i, i % 37 FROM generate_series(1, 10000) i;
 ANALYZE df_rs;
 SET optimizer = on;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
 SELECT count(*), sum(a.k) FROM df_rs a
   LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
 WHERE coalesce(x.c, 0) = 0;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT g, count(*) FROM df_rs GROUP BY g HAVING count(*) > 270 ORDER BY 1;
 SELECT count(*), sum(a.k) FROM df_rs a
   LEFT JOIN (SELECT g, count(*) c FROM df_rs WHERE k % 2 = 0 AND g < 20 GROUP BY g) x ON x.g = a.g
 WHERE coalesce(x.c, 0) = 0;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 SET optimizer = off;
 DROP TABLE df_rs;
 
@@ -355,20 +355,20 @@ INSERT INTO df_ni_i SELECT i, i * 3 % 450, 't' || (i * 7 % 250) FROM generate_se
 INSERT INTO df_ni_i VALUES (7, NULL, NULL);
 ANALYZE df_ni_o;
 ANALYZE df_ni_i;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
 SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i);
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v > 1000000);
 SELECT count(*), sum(id) FROM df_ni_o WHERE k NOT IN (SELECT k FROM df_ni_i WHERE v <> 7);
 SELECT count(*), sum(id) FROM df_ni_o WHERE t NOT IN (SELECT t FROM df_ni_i WHERE v <> 7);
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 DROP TABLE df_ni_o, df_ni_i;
 
 -- A Nested Loop without parameters (NL1, GPORCA's TPC-H Q11): DataFusion's
@@ -383,20 +383,20 @@ ANALYZE df_nl_o;
 ANALYZE df_nl_i;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
 SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
 SELECT count(*), sum(id) FROM df_nl_o a WHERE EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
 SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a.id), sum(b.k) FROM df_nl_o a JOIN df_nl_i b ON a.k > b.k + 440;
 SELECT count(*), sum(a.id) FROM df_nl_o a LEFT JOIN df_nl_i b ON a.k < b.k - 440;
 SELECT count(*), sum(id) FROM df_nl_o a WHERE EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
 SELECT count(*), sum(id) FROM df_nl_o a WHERE NOT EXISTS (SELECT 1 FROM df_nl_i b WHERE b.k > a.k + 440);
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 DROP TABLE df_nl_o, df_nl_i;
@@ -413,9 +413,9 @@ INSERT INTO df_nl2s SELECT i, 2000 + i % 10, i % 12 FROM generate_series(1, 200)
 ANALYZE df_nl2;
 ANALYZE df_nl2s;
 SET work_mem = 64;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_nl2
 WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
   AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
@@ -423,13 +423,13 @@ SET optimizer = off;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
 SET optimizer = on;
 SELECT count(*), sum(v) FROM df_nl2
 WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
   AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(v) FROM df_nl2
 WHERE m >= (SELECT DISTINCT m + 1 FROM df_nl2s WHERE y = 2003 AND m = 3)
   AND m <= (SELECT DISTINCT m + 3 FROM df_nl2s WHERE y = 2003 AND m = 3);
@@ -437,9 +437,9 @@ SET optimizer = off;
 SELECT count(*), sum(d.v) FROM df_nl2s s LEFT JOIN df_nl2 d ON d.m > s.m + 110;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
-RESET datafusion.motion_batches;
+RESET vec.motion_batches;
 RESET work_mem;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_nl2, df_nl2s;
 
 -- x IN (subquery) as a hashed SubPlan (SP1, TPC-DS Q10, Q45: under an OR,
@@ -460,8 +460,8 @@ INSERT INTO df_sp_i VALUES (501, 1000, 'x  ', 'x  ', 'NaN'), (502, 1001, 'zz', '
 INSERT INTO df_sp_n SELECT i, i % 7 FROM generate_series(1, 300) i;
 INSERT INTO df_sp_n VALUES (301, NULL);
 ANALYZE df_sp_o; ANALYZE df_sp_i; ANALYZE df_sp_n; ANALYZE df_sp_e;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
 -- a correlated subquery stays on PostgreSQL
@@ -469,28 +469,28 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o o WHERE k IN (SELECT k FROM df_
 -- an init plan whose top slice only gathers its rows is reported as a
 -- query's top slice that does (TPC-DS Q58's)
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sp_o WHERE k = (SELECT k FROM df_sp_i WHERE w = 7);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
 SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
 SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
 SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
 SELECT count(*) FROM df_sp_o WHERE t IN (SELECT t FROM df_sp_i) OR v IN (SELECT v FROM df_sp_i) OR c IN (SELECT c FROM df_sp_i);
 SELECT id, t IN (SELECT t FROM df_sp_i), v IN (SELECT v FROM df_sp_i), c IN (SELECT c FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 0 OR id > 2999 ORDER BY id;
 SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i), k IN (SELECT k FROM df_sp_e) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
 SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_sp_o WHERE k IN (SELECT k FROM df_sp_i) OR id < 100;
 SELECT id, k IN (SELECT k FROM df_sp_n), k IN (SELECT k FROM df_sp_i) FROM df_sp_o WHERE id % 500 = 1 OR id > 2999 ORDER BY id;
 SET optimizer = off;
-SET datafusion.mode = off;
-RESET datafusion.motion_batches;
+SET vec.mode = off;
+RESET vec.motion_batches;
 DROP TABLE df_sp_o, df_sp_i, df_sp_n, df_sp_e;
 
 -- The value of an uncorrelated scalar subquery (SP2, TPC-DS Q44 under
@@ -504,17 +504,17 @@ INSERT INTO df_sc SELECT i, i % 50, ((i * 7919) % 20001 - 10000) / 100.0 FROM ge
 ANALYZE df_sc;
 SET optimizer = on;
 SET optimizer_enforce_subplans = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
 SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
 SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
 SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 99 GROUP BY k);
 SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
 SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 * (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) ORDER BY k;
 SELECT k, avg(n), (SELECT avg(n) FROM df_sc WHERE k = 3 GROUP BY k) AS a3 FROM df_sc GROUP BY k ORDER BY k LIMIT 3;
 SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k = 3 GROUP BY k) - 9000;
@@ -523,7 +523,7 @@ SELECT count(*) FROM df_sc WHERE id < 0 AND id < (SELECT max(id) FROM df_sc WHER
 SELECT count(*) FROM df_sc WHERE id < (SELECT max(id) FROM df_sc WHERE k < 3 GROUP BY k);
 RESET optimizer_enforce_subplans;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_sc;
 
 -- A correlated scalar subquery that is one aggregate of rows equal to the
@@ -544,8 +544,8 @@ INSERT INTO df_ci SELECT i, CASE WHEN i % 53 = 0 THEN NULL ELSE i % 30 END, (i %
   i % 6 FROM generate_series(1, 600) i;
 ANALYZE df_co; ANALYZE df_ci;
 SET optimizer = off;
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
@@ -553,22 +553,22 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > (SELECT max(w) FROM df_ci i WHERE i.k < o.k);
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.n = o.n);
 EXPLAIN (COSTS OFF) SELECT id, (SELECT max(w) FROM df_ci i WHERE i.k = o.k) FROM df_co o WHERE id < 5;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
 SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
 SELECT count(*), sum(id) FROM df_co o WHERE coalesce((SELECT sum(f) FROM df_ci i WHERE i.k = o.k), -1) = -1;
 SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
 SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE (i.k = o.k AND i.f = 1) OR (i.k = o.k AND i.f = 4)) > 3
   AND n < (SELECT avg(n) FROM df_ci i WHERE i.t = o.t);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(id) FROM df_co o WHERE n > 1.2 * (SELECT avg(i.n) FROM df_ci i WHERE i.k = o.k);
 SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE i.k = o.k AND i.f > 3) < 15;
 SELECT count(*), sum(id) FROM df_co o WHERE coalesce((SELECT sum(f) FROM df_ci i WHERE i.k = o.k), -1) = -1;
 SELECT count(*), sum(id) FROM df_co o WHERE id > 2 * (SELECT max(w) FROM df_ci i WHERE i.t = o.t AND i.v = o.v);
 SELECT count(*), sum(id) FROM df_co o WHERE (SELECT count(*) FROM df_ci i WHERE (i.k = o.k AND i.f = 1) OR (i.k = o.k AND i.f = 4)) > 3
   AND n < (SELECT avg(n) FROM df_ci i WHERE i.t = o.t);
-SET datafusion.mode = off;
-RESET datafusion.motion_batches;
+SET vec.mode = off;
+RESET vec.motion_batches;
 DROP TABLE df_co, df_ci;
 
 -- A Merge Join whose order of rows no one reads runs as DataFusion's hash
@@ -586,27 +586,27 @@ ANALYZE df_mj_a;
 ANALYZE df_mj_b;
 SET enable_hashjoin = off;
 SET enable_nestloop = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
 EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
 EXPLAIN (COSTS OFF) SELECT a.k, b.w FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k WHERE a.id < 50 ORDER BY a.k LIMIT 5;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
 SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k AND a.d = b.d;
 SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
 -- semi and anti, with a join filter or not
 SET enable_hashagg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
 SELECT count(*), sum(w) FROM df_mj_b b WHERE EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k AND a.t = b.t);
 SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
 SELECT count(*), sum(w) FROM df_mj_b b WHERE NOT EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
 SELECT count(*), sum(w) FROM df_mj_b b WHERE EXISTS (SELECT 1 FROM df_mj_a a WHERE a.k = b.k AND a.t = b.t);
 SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
@@ -616,21 +616,21 @@ RESET enable_hashjoin;
 RESET enable_nestloop;
 SET optimizer = on;
 SET optimizer_enable_hashjoin = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
 SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t GROUP BY 1, 2 ORDER BY 1, 2;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t;
 SELECT a.k IS NULL AS an, b.k IS NULL AS bn, count(*) FROM df_mj_a a FULL JOIN df_mj_b b ON a.k = b.k AND a.t = b.t GROUP BY 1, 2 ORDER BY 1, 2;
 RESET optimizer_enable_hashjoin;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_mj_a, df_mj_b;
 
 -- A hash join's build side coming from another join (JE1,
--- datafusion.join_estimates = bounded): DataFusion's own hash join cannot
+-- vec.join_estimates = bounded): DataFusion's own hash join cannot
 -- spill, and the planner's estimate of a join can be far off (TPC-H Q9 at
 -- scale factor 10: 40 rows estimated, a million per segment built).  Such
 -- a build side is taken to hold up to as many rows as its largest input;
@@ -648,27 +648,27 @@ ANALYZE df_je_a;
 ANALYZE df_je_b;
 SET join_collapse_limit = 1;
 SET work_mem = 64;
-SET datafusion.mode = explain;
-SET datafusion.join_estimates = bounded;
+SET vec.mode = explain;
+SET vec.join_estimates = bounded;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
-SET datafusion.join_estimates = trusted;
+SET vec.join_estimates = trusted;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 -- spill: the whole slice in DataFusion, its joins spilling within 64 kB
 EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
 SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
 SELECT count(*), sum(a.x) FROM df_je_big g RIGHT JOIN df_je_a a ON a.k = g.k WHERE g.k IS NULL;
-SET datafusion.join_estimates = bounded;
+SET vec.join_estimates = bounded;
 SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a JOIN df_je_b b ON b.k = a.k AND b.y < 3000) ON a.k = g.k;
-RESET datafusion.join_estimates;
+RESET vec.join_estimates;
 RESET work_mem;
 RESET join_collapse_limit;
 DROP TABLE df_je_big, df_je_a, df_je_b;
 
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

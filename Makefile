@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# datafusion_executor: vectorized execution backend for Apache Cloudberry,
+# vec_executor: vectorized execution backend for Apache Cloudberry,
 # built on Apache DataFusion.  Out-of-tree extension, built with PGXS:
 #
 #   make                          release build (the extension and the
@@ -33,19 +33,19 @@
 # Point PG_CONFIG at the Cloudberry installation to build against:
 #   make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
 
-MODULE_big = datafusion_executor
-OBJS = src/df_init.o src/df_runtime.o src/df_debug.o \
-	src/df_hooks.o src/df_plan_check.o src/df_translate.o src/df_exec.o \
-	src/df_paxload.o src/df_numeric.o src/df_arrow.o src/df_rewrite.o \
-	src/df_regex.o
+MODULE_big = vec_executor
+OBJS = src/vx_init.o src/vx_runtime.o src/vx_debug.o \
+	src/vx_hooks.o src/vx_plan_check.o src/vx_translate.o src/vx_exec.o \
+	src/vx_paxload.o src/vx_numeric.o src/vx_arrow.o src/vx_rewrite.o \
+	src/vx_regex.o
 
-EXTENSION = datafusion_executor
-DATA = datafusion_executor--1.0.sql
-PGFILEDESC = "datafusion_executor - vectorized execution backend on Apache DataFusion"
+EXTENSION = vec_executor
+DATA = vec_executor--1.0.sql
+PGFILEDESC = "vec_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = datafusion_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage parallel
+REGRESS = vec_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage parallel
 # The direct PAX reader is only tested when it is built.
-ifdef DF_PAX_SRC
+ifdef VX_PAX_SRC
 REGRESS += paxdirect
 endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
@@ -74,7 +74,7 @@ include $(PGXS)
 
 # PGXS does not track headers: every object takes the module's and the ABI's,
 # so that a change to a struct there rebuilds them all.
-$(OBJS): src/df_executor.h include/vec_engine.h
+$(OBJS): src/vx_executor.h include/vec_engine.h
 
 # Must come after pgxs.mk so PORTNAME is defined.  The version script keeps
 # the module's symbols local but for what PostgreSQL looks up.
@@ -83,7 +83,7 @@ SHLIB_LINK += -ldl -Wl,--version-script=exports.map
 endif
 
 # The engine is a library of its own, which the module opens at first use
-# (datafusion.engine).  Cargo builds it; it exports only vec_engine_entry.
+# (vec.engine).  Cargo builds it; it exports only vec_engine_entry.
 all: $(DF_ENGINE) $(DF_NULL_ENGINES)
 
 .PHONY: df-rust df-rust-test df-rust-clean
@@ -116,55 +116,55 @@ install-engine: $(DF_ENGINE) $(DF_NULL_ENGINES)
 EXTRA_CLEAN += $(DF_ENGINE) $(DF_NULL_ENGINES)
 
 # ---------------------------------------------------------------------------
-# Experimental direct PAX reader, datafusion_pax.so.  Its source is a patch to
+# Experimental direct PAX reader, vec_pax.so.  Its source is a patch to
 # PAX, patches/pax/*.patch, which adds a columnar scan interface
-# (access/datafusion_scan_api.cc).  Built only when DF_PAX_SRC names the
+# (access/pax_direct_api.cc).  Built only when VX_PAX_SRC names the
 # pax_storage C++ sources (contrib/pax_storage/src/cpp) of the Cloudberry tree
 # the installed pax.so was built from: they are copied to pax_build/, patched,
-# and the files the patches add are compiled into datafusion_pax.so.  The
+# and the files the patches add are compiled into vec_pax.so.  The
 # Cloudberry tree itself and the installed pax.so are left untouched.  The
 # installed PAX headers come first, they include the generated protobuf ones.
 # The library records the installed pax.so's build ID and is only used with it.
 # ---------------------------------------------------------------------------
-ifdef DF_PAX_SRC
-DF_PAX_SO := $(pkglibdir)/pax.so
-DF_PAX_BUILD_ID := $(shell readelf -n $(DF_PAX_SO) 2>/dev/null | awk '/Build ID/ {print $$3}')
-DF_PAX_PATCHES := $(sort $(wildcard patches/pax/*.patch))
-DF_PAX_TREE := pax_build/src/cpp
-DF_PAX_API_SRC := $(DF_PAX_TREE)/access/datafusion_scan_api.cc
+ifdef VX_PAX_SRC
+VX_PAX_SO := $(pkglibdir)/pax.so
+VX_PAX_BUILD_ID := $(shell readelf -n $(VX_PAX_SO) 2>/dev/null | awk '/Build ID/ {print $$3}')
+VX_PAX_PATCHES := $(sort $(wildcard patches/pax/*.patch))
+VX_PAX_TREE := pax_build/src/cpp
+VX_PAX_API_SRC := $(VX_PAX_TREE)/access/pax_direct_api.cc
 CXX ?= g++
 
-all: datafusion_pax.so
+all: vec_pax.so
 
 # The patches are against the Cloudberry tree; -p5 strips
 # a/contrib/pax_storage/src/cpp.
-pax_build/.patched: $(DF_PAX_PATCHES)
+pax_build/.patched: $(VX_PAX_PATCHES)
 	rm -rf pax_build
-	mkdir -p $(dir $(DF_PAX_TREE))
-	cp -R $(DF_PAX_SRC) $(DF_PAX_TREE)
-	for p in $(DF_PAX_PATCHES); do \
-		patch -s -p5 --forward -d $(DF_PAX_TREE) < $$p || exit 1; \
+	mkdir -p $(dir $(VX_PAX_TREE))
+	cp -R $(VX_PAX_SRC) $(VX_PAX_TREE)
+	for p in $(VX_PAX_PATCHES); do \
+		patch -s -p5 --forward -d $(VX_PAX_TREE) < $$p || exit 1; \
 	done
 	touch $@
 
 # The empty recipe makes make look at the source again once the patches
 # have rewritten it, so that one run rebuilds the library.
-$(DF_PAX_API_SRC): pax_build/.patched
+$(VX_PAX_API_SRC): pax_build/.patched
 	@:
 
 # -Bsymbolic keeps the library's own references inside it, even if a loaded
 # pax.so ever exports the same names.
-datafusion_pax.so: $(DF_PAX_API_SRC)
-	@test -n "$(DF_PAX_BUILD_ID)" || { echo "cannot read the build ID of $(DF_PAX_SO)"; exit 1; }
+vec_pax.so: $(VX_PAX_API_SRC)
+	@test -n "$(VX_PAX_BUILD_ID)" || { echo "cannot read the build ID of $(VX_PAX_SO)"; exit 1; }
 	$(CXX) -std=c++17 -O2 -fPIC -shared -fvisibility=hidden -Wall -DUSE_PAX_CATALOG \
-		-DDF_PAX_BUILD_ID='"$(DF_PAX_BUILD_ID)"' -Wl,-Bsymbolic \
-		-I$(includedir)/pax -I$(DF_PAX_TREE) -I$(includedir_server) -I$(includedir_internal) \
+		-DVX_PAX_BUILD_ID='"$(VX_PAX_BUILD_ID)"' -Wl,-Bsymbolic \
+		-I$(includedir)/pax -I$(VX_PAX_TREE) -I$(includedir_server) -I$(includedir_internal) \
 		$< -o $@
 
 install: install-pax
 .PHONY: install-pax
-install-pax: datafusion_pax.so
-	$(INSTALL_SHLIB) datafusion_pax.so '$(DESTDIR)$(pkglibdir)/'
+install-pax: vec_pax.so
+	$(INSTALL_SHLIB) vec_pax.so '$(DESTDIR)$(pkglibdir)/'
 
-EXTRA_CLEAN += datafusion_pax.so pax_build
+EXTRA_CLEAN += vec_pax.so pax_build
 endif

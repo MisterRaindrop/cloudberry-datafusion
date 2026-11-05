@@ -20,6 +20,6 @@
 -- The body runs in a utility-mode session on the coordinator; see
 -- data/exec_utility.sql.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 \! PGOPTIONS='-c gp_role=utility' psql -X -a -q -v dfmode=on -d contrib_regression -f data/exec_utility.sql 2>&1
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

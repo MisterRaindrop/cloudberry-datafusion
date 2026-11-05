@@ -1,6 +1,6 @@
 # cloudberry-datafusion
 
-`datafusion_executor` is a PostgreSQL extension that adds a vectorized
+`vec_executor` is a PostgreSQL extension that adds a vectorized
 execution backend to [Apache Cloudberry](https://github.com/apache/cloudberry),
 built on [Apache DataFusion](https://datafusion.apache.org/).
 
@@ -24,15 +24,15 @@ take its place behind the same interface.
 ```text
  PostgreSQL backend (QD or QE), main thread         engine library, own threads
  ------------------------------------------         ---------------------------
- planner/executor hooks       src/df_hooks.c
- which slices qualify         src/df_plan_check.c  <- VecCaps
- slice -> plan IR (JSON)      src/df_translate.c   -> query_start   plan, inputs
- scan: table AM or PAX        src/df_exec.c        -> query_push    Arrow arrays
+ planner/executor hooks       src/vx_hooks.c
+ which slices qualify         src/vx_plan_check.c  <- VecCaps
+ slice -> plan IR (JSON)      src/vx_translate.c   -> query_start   plan, inputs
+ scan: table AM or PAX        src/vx_exec.c        -> query_push    Arrow arrays
  receive Motion bytes                              -> query_push_ipc  IPC bytes
  hand out rows / send bytes                        <- query_poll    Arrow arrays,
                                                                     IPC bytes
- threads, vmem, spill dir     src/df_runtime.c     <- heap_bytes
- open the engine              src/df_init.c           vec_engine_<name>.so
+ threads, vmem, spill dir     src/vx_runtime.c     <- heap_bytes
+ open the engine              src/vx_init.c           vec_engine_<name>.so
 ```
 
 - **The host** (`src/`, C) runs inside the backend and alone calls into
@@ -41,7 +41,7 @@ take its place behind the same interface.
   snapshot, frames batch Motions on the interconnect, leases the engine's
   heap from the vmem tracker, and turns engine errors into `ereport`s.
 - **An engine** (`engines/<name>/`) is a library of its own,
-  `vec_engine_<name>.so`, chosen by `datafusion.engine` and opened on first
+  `vec_engine_<name>.so`, chosen by `vec.engine` and opened on first
   use.  It runs a slice's plan on its own threads over the rows it is
   given, encodes and routes the batches of a sending Motion, and spills
   within the memory it is allotted.  `engines/datafusion` (Rust, on
@@ -70,9 +70,9 @@ the error.  A panic inside Rust, on the main thread or on a worker, surfaces
 as an ordinary `ERROR` without taking the backend down.  Nothing executes
 queries yet.
 
-`datafusion.worker_threads` sets the runtime size (0 = one thread per CPU).
+`vec.worker_threads` sets the runtime size (0 = one thread per CPU).
 It takes effect when a backend first uses DataFusion.  Each query of a
-slice runs in `datafusion.slice_partitions` partitions; 0, the default,
+slice runs in `vec.slice_partitions` partitions; 0, the default,
 gives it eight times the threads over the slices of its plan that run
 together (its slice tree: an init plan's run apart) times the primaries on
 its host (segments and coordinator, as `gp_segment_configuration` has
@@ -81,7 +81,7 @@ every segment (the coordinator passes it to them), so the default is what
 follows a host's own segment count where hosts differ, or where one has
 taken over its mirrors' primaries.
 
-Milestone M2 adds the executor and EXPLAIN hooks.  `datafusion.mode` is
+Milestone M2 adds the executor and EXPLAIN hooks.  `vec.mode` is
 `off` (default), `explain` or `on`.  With `explain` or `on`, text-format
 EXPLAIN ends with one line per slice saying whether DataFusion can run it,
 and if not, why:
@@ -91,11 +91,11 @@ and if not, why:
    ->  Seq Scan on pg_class
          Filter: (relpages > 0)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
+ Vectorized: slice 0 eligible
 ```
 
 Load the library in every backend, including the segments' QEs, by adding
-`datafusion_executor` to `shared_preload_libraries`; otherwise the hooks only
+`vec_executor` to `shared_preload_libraries`; otherwise the hooks only
 exist in sessions that have called one of its functions.
 
 Milestone M3 executes eligible slices in DataFusion.  The slice's top
@@ -131,10 +131,10 @@ PostgreSQL semantics are kept where DataFusion differs:
 
 Known differences and limits:
 
-- `datafusion.worker_threads` defaults to one thread per CPU in every
+- `vec.worker_threads` defaults to one thread per CPU in every
   backend, and a query took a partition per thread, so the slices of a
   plan of many crowded the host's cores.  The partitions now follow the
-  slices running together (`datafusion.slice_partitions`): over TPC-DS at
+  slices running together (`vec.slice_partitions`): over TPC-DS at
   scale factor 1, 3 segments on 10 cores, DataFusion took 99.8 s and now
   89.7 s (medians of three runs, both planners, on a busy host; 87.7 s
   and 76.9 s in an earlier run); plans of more than 20 slices 28.1 s and
@@ -191,13 +191,13 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
   DataFusion line adds partitions, limit, peak and spill volume:
 
 ```
- DataFusion: 1 partitions, memory limit 2048 kB, peak 2625 kB, spilled 146510 kB in 72 files
+ Vectorized: 1 partitions, memory limit 2048 kB, peak 2625 kB, spilled 146510 kB in 72 files
 ```
 
 Milestone M5 runs the segments' slices.  QEs need the library loaded when
 they start: add it to `shared_preload_libraries`, or for one database
-`ALTER DATABASE ... SET session_preload_libraries = 'datafusion_executor'`.
-In a 3-segment container on 10 ARM cores with `datafusion.worker_threads =
+`ALTER DATABASE ... SET session_preload_libraries = 'vec_executor'`.
+In a 3-segment container on 10 ARM cores with `vec.worker_threads =
 2`, both planners return identical results; for example a grouped aggregate
 over a 30-million-row distributed table (partial aggregate on the segments in
 DataFusion, final aggregate on PostgreSQL) took 0.27 s instead of 1.31 s,
@@ -223,15 +223,15 @@ parallel mode, 1.16 s without), and on PAX 0.14 s instead of 0.20 s.
 
 ### Direct PAX reader
 
-`datafusion.pax_direct_read`, on by default (C4), reads PAX tables without the table AM's
+`vec.pax_direct_read`, on by default (C4), reads PAX tables without the table AM's
 row-at-a-time interface.  The main thread lists the micro-partitions
 visible to the snapshot; DataFusion's partitions then take blocks one at a
 time and decode the needed columns themselves, through PAX's own reader
-classes, in a small separate library, `datafusion_pax.so`.
+classes, in a small separate library, `vec_pax.so`.
 
 Its source is a patch to PAX, `patches/pax/0001-pax-columnar-scan-api.patch`,
-which adds a columnar scan interface (`access/datafusion_scan_api.{h,cc}`):
-one exported C function, `datafusion_pax_scan_api()`, returning a versioned
+which adds a columnar scan interface (`access/pax_direct_api.{h,cc}`):
+one exported C function, `pax_direct_scan_api()`, returning a versioned
 table of functions; every other symbol stays local, and the library links
 with `-Bsymbolic`, so nothing clashes with PAX or PostgreSQL.  The build
 copies the PAX sources to `pax_build/`, applies the patches there and
@@ -240,13 +240,13 @@ pax.so is modified.  The same patch could later go upstream into PAX.
 
 That code calls PAX's internal C++ classes, not a published API:
 
-- It is built only with `make DF_PAX_SRC=<cloudberry>/contrib/pax_storage/src/cpp`,
+- It is built only with `make VX_PAX_SRC=<cloudberry>/contrib/pax_storage/src/cpp`,
   against the installed PAX headers plus the sources of the same tree, and
   needs the protobuf headers of the version pax.so links and GNU `patch`.
 - It records the installed pax.so's ELF build ID.  At run time the extension
   compares it with the running pax.so and, if they differ or the library
   does not load, warns once per backend and reads through the table AM.  An
-  extension built without it (no `DF_PAX_SRC`) reads PAX through the table
+  extension built without it (no `VX_PAX_SRC`) reads PAX through the table
   AM and says so in the server log only.  The library is loaded only once a
   slice reads a PAX table.
 - Cloudberry's parallel mode keeps the table AM path.
@@ -269,7 +269,7 @@ accumulates a value's first four base-10000 digits in 64 bits, and scales
 it in 64 bits within 18 digits: a 128-bit multiply per digit was most of
 it (TPC-H at scale factor 10, the numeric-heavy queries, 5-7% less time).  Other numerics come
 out in PostgreSQL's representation and are read by
-df_core::pgnum::from_pg_numeric, as df_numeric.c reads them on the main
+df_core::pgnum::from_pg_numeric, as vx_numeric.c reads them on the main
 thread (within 38 digits in i128, without allocating); the vectorized
 format's 16-byte numerics are rebuilt in that representation by the
 reader, since PAX's own conversion calls PostgreSQL's numeric functions.
@@ -292,7 +292,7 @@ Each group being decoded holds about 30 MB of a QE on TPC-H's lineitem
 (the decoded columns, half of it, and the Arrow arrays built from them),
 so a QE with 10 partitions peaks near 330 MB, against 90 MB through the
 table AM; PAX's read buffer (pax.scan_reuse_buffer_size) makes no
-difference.  `datafusion.pax_max_decoders` (C4c, 0 by default: one per
+difference.  `vec.pax_max_decoders` (C4c, 0 by default: one per
 partition) bounds the groups decoded at once for a query, the other
 partitions taking the rows decoded meanwhile.  Decoding being most of a
 scan's work, it costs time about in proportion: on one segment at scale
@@ -308,7 +308,7 @@ micro-partition per segment (TPC-H's orders at scale factor 1) was decoded
 and filtered on one thread, slower than through the table AM; on one
 segment it now takes 23 ms against 32 ms through the table AM.
 
-`datafusion.pax_decode_cache` (DC1, empty by default: off) names a
+`vec.pax_decode_cache` (DC1, empty by default: off) names a
 directory where the reader keeps each group's columns as it hands them
 out, a file per column, read back through mmap by later scans, which skip
 PAX's decompression and decoding; a relative path is in each segment's data
@@ -316,7 +316,7 @@ directory, and segments on one host may share an absolute one.  Each
 micro-partition's entries are in a directory named by its file's device,
 inode, size and modification time, so a rewritten file misses.  Entries
 are checked against the group before use (sizes, string offsets) and one
-that does not fit is removed and rebuilt.  `datafusion.pax_decode_cache_size`
+that does not fit is removed and rebuilt.  `vec.pax_decode_cache_size`
 (16 GB by default) bounds the disk space all segments using the directory
 take: one process at a time measures it and removes micro-partitions unused
 for ten minutes, least recently used first; while nothing can go, scans add
@@ -328,7 +328,7 @@ that fills it.  At scale factor 1000 the cache (700 GB, the decoded columns
 being larger than PAX's compressed files) no longer fit the 430 GB of page
 cache: reading it took 400 s against 372 s without it, 609 s to fill, and
 its files pushed PAX's out of memory.  Use it only where it fits in memory.
-`datafusion_debug_pax_cache()` reports what it did in the backend.
+`vec_debug_pax_cache()` reports what it did in the backend.
 
 Conditions on cheap columns come first (LM1).  Converting a numeric costs
 far more than copying an integer, and a scan converted every row's
@@ -410,7 +410,7 @@ and reports what it holds (that buffer, the decoded columns and null
 bitmaps, the visibility map, the rows handed out); the figure is added to
 the Rust heap and leased from the vmem tracker with it.  Measured with
 `mallinfo2` it is within a few kB of what PAX actually allocates per group
-(the file footer is not counted).  `datafusion_debug_last_pax()` and
+(the file footer is not counted).  `vec_debug_last_pax()` and
 EXPLAIN ANALYZE show what was skipped and the peak decoding memory.
 
 Selective queries over 30 million rows with `minmax_columns = 'a'`
@@ -459,7 +459,7 @@ saves.  Sending batches over the interconnect (M7b) is meant for that.
 
 ### Experimental: batches through Motions
 
-With `datafusion.motion_batches = on` (milestones M7b and M7c), a Gather or
+With `vec.motion_batches = on` (milestones M7b and M7c), a Gather or
 Redistribute Motion whose sending and receiving slices both run in
 DataFusion carries Arrow IPC batches instead of tuples; EXPLAIN marks the
 sending slice "sends Arrow batches".  Every process decides this from the plan and the synchronized
@@ -523,7 +523,7 @@ since B1 `hashbpchar`, and `hash_numeric`, whose NBASE digits a Decimal256
 value at its column's scale gives).  Each receiver gets its
 own stream.  Keys must be plain columns hashed by their type's own
 non-legacy function; random distribution, legacy and cross-type hashing
-stay on tuples.  `datafusion_debug_cdbhash_check(nrows, segments, workers)`
+stay on tuples.  `vec_debug_cdbhash_check(nrows, segments, workers)`
 routes random keys, special values mixed in, through both `cdbhash()` and
 the Rust code for every key type alone and combined, and counts the rows
 they route differently: 0 over 120 million rows (1 to 128 segments, 1 to 3
@@ -564,7 +564,7 @@ CS2: the other states (an avg's, a sum of numeric or int8) are columns of
 the Motion: DataFusion's from batches, or PostgreSQL's in tuples, which
 the C side reads into the same columns (PS1).  The combining aggregate's
 argument is followed down through the joins, Hash, Material and Result
-nodes between it and the Motion (`df_partial_path`), not from a side an
+nodes between it and the Motion (`vx_partial_path`), not from a side an
 outer join may null, crossing that one Motion, and read there as when the
 stage is right above it; the columns in between pass on.  TPC-DS Q23
 under GPORCA joins partial sums of numeric by customer before combining
@@ -601,7 +601,7 @@ below the join (a subquery's `b IS NULL`, say) would be evaluated above it
 by DataFusion and give another result for nulled rows, so such a join stays
 on PostgreSQL.  Reading the Hash side to its
 end before the other, also from the interconnect, keeps the deadlock
-properties of PostgreSQL's plans.  With `datafusion.motion_batches` the
+properties of PostgreSQL's plans.  With `vec.motion_batches` the
 Motions feeding a join carry batches too, Broadcast included (its one
 stream goes to every receiver).  A NOT IN anti join reads its outer side
 first (NJ1, below): each Motion's sending slice sends to that join's slice
@@ -610,7 +610,7 @@ DISTINCT FROM joins stay on PostgreSQL.
 
 Hash joins spill what does not fit (SHJ, below), the default.  With
 DataFusion's own hash join, which does not spill
-(`datafusion.join_estimates` other than spill), a slice qualifies only if
+(`vec.join_estimates` other than spill), a slice qualifies only if
 the Hash node's estimated size (planner rows times width plus a per-row
 allowance) fits its budget, `min(operatorMemKB, work_mem) *
 hash_mem_multiplier`, as a PostgreSQL hash table's would; EXPLAIN gives the figures otherwise.  An
@@ -664,7 +664,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 |---|---|
 | M0 | Link Rust into the extension; panic safety across FFI |
 | M1 | Tokio runtime inside a backend; signals and cancellation |
-| M2 | Executor hooks, `datafusion.mode` GUC, eligibility check |
+| M2 | Executor hooks, `vec.mode` GUC, eligibility check |
 | M3 | Heap scan on the main thread, Filter and Aggregate in DataFusion, results back to PostgreSQL |
 | M4 | Memory pool bound to `operatorMemKB`, vmem lease, SQLSTATE mapping |
 | M5 | Segment slices below a sending Motion; partial aggregates |
@@ -733,9 +733,9 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | C2b | Direct PAX reader: decoded rows shared by all partitions as they come |
 | C3 | Direct PAX reader: every PAX scan of a slice, beside other inputs |
 | C4b | Direct PAX reader: one group per read, memory bounded by the partitions |
-| C4c | datafusion.pax_max_decoders: fewer groups decoded at once, for memory |
+| C4c | vec.pax_max_decoders: fewer groups decoded at once, for memory |
 | C4 | Direct PAX reader on by default |
-| DC1 | datafusion.pax_decode_cache: decoded PAX columns cached on disk, bounded by datafusion.pax_decode_cache_size (scan interface 10) |
+| DC1 | vec.pax_decode_cache: decoded PAX columns cached on disk, bounded by vec.pax_decode_cache_size (scan interface 10) |
 | LM1 | Direct PAX reader: conditions on integer and date columns first, other columns built for the rows that pass |
 | LM2 | Direct PAX reader: then narrow numerics, then strings compared on the reader's bytes; strings built for the rows left |
 | N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |
@@ -743,7 +743,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
-| SHJ | Hash joins that spill (datafusion.join_estimates = spill, the default) |
+| SHJ | Hash joins that spill (vec.join_estimates = spill, the default) |
 | AJ1 | A hash join whose probe side (joined or aggregated, PAX only) ends within 128 K rows hashes it instead |
 | RC1 | A partitioned hash join whose build side ends within 1 M rows (64 MB) builds one table for all partitions; the probe side is not repartitioned |
 | CL1 | Strings ordered by the default collation where it is C on every node |
@@ -760,7 +760,7 @@ spill.  The planner hook keeps a Hash Join on PostgreSQL when its build
 side's estimate exceeds the Hash node's budget, but a join's estimate can
 be far off: TPC-H Q9 at scale factor 10 builds on partsupp joined with
 lineitem, estimated at 40 rows and holding about a million per segment.
-`datafusion.join_estimates = bounded` therefore takes a build
+`vec.join_estimates = bounded` therefore takes a build
 side coming from a join to hold up to as many rows as its largest input
 (any node below it, across Motions); strict keeps every such join on
 PostgreSQL, trusted believes the planner.  Over TPC-H, bounded made every
@@ -768,7 +768,7 @@ run complete and match PostgreSQL, at a cost: 12.9 s instead of 10.8 at
 scale factor 1, 109 s instead of 77 at scale factor 10 (where Q9 failed),
 against 207 s on PostgreSQL.  A hash join that spills would remove it.
 
-SHJ: hash joins spill.  With `datafusion.join_estimates = spill`, the
+SHJ: hash joins spill.  With `vec.join_estimates = spill`, the
 default, a hash join runs in DataFusion whatever the size of its build
 side, and a slice no longer stays on PostgreSQL for it; a NOT IN anti join
 (null-aware) and a nested loop are checked as with trusted.  Each hash join
@@ -1044,7 +1044,7 @@ redistributing by them.  A scan now reads those two system columns
 an int8, the block number shifted left by 16 bits with the offset below,
 ordered as tids are; the C side makes ItemPointerData of it again.  A
 Redistribute by tid hashes as hashtid does: hash_any of the block number's
-halves and the offset, in memory order, which datafusion_debug_cdbhash_check
+halves and the offset, in memory order, which vec_debug_cdbhash_check
 checks.  A tid constant, other system columns, and a statement that carries
 ctid to its result for WHERE CURRENT OF stay on PostgreSQL.
 
@@ -1103,9 +1103,9 @@ against 318-357 ms.
 CL1: where the default collation is C (or POSIX, by libc, or C.UTF-8 by
 CU1) on every node,
 ordering by it no longer depends on the node.  The coordinator asks once
-per session, before its first query with `datafusion.mode` on is planned
+per session, before its first query with `vec.mode` on is planned
 for EXPLAIN or dispatched, querying `pg_database` on every segment, and
-sets the internal `datafusion.cluster_collation_c` accordingly (a value
+sets the internal `vec.cluster_collation_c` accordingly (a value
 set by hand is put back); the segments' running processes get the SET,
 those started later every synchronized setting.  Each process's checker
 then reads the same value, and the Motions of such slices carry batches:
@@ -1173,7 +1173,7 @@ against 1.02 s.
 RX1: `regexp_replace(s, pattern, replacement)` with a constant pattern and
 replacement, under a deterministic collation, runs in DataFusion when the
 pattern is one whose match the engine reads as PostgreSQL does
-(`src/df_regex.c` says which): it ends in `$`, has no alternation, no
+(`src/vx_regex.c` says which): it ends in `$`, has no alternation, no
 non-greedy quantifiers and no escapes of letters (`\d`, `\w`, ...), and its
 capturing groups are at the top level, neither quantified nor nested.
 PostgreSQL's ARE engine takes the leftmost match, and splits it among the
@@ -1211,7 +1211,7 @@ cdbhash calls `hashtext` with the default collation, which is always
 deterministic, so it is `hash_any` of the value's bytes, which
 `df_core::cdbhash::hash_bytes` transcribes (the little-endian byte path,
 equal to the word path; big-endian builds keep such Motions on tuples).
-`datafusion_debug_cdbhash_check` routes random strings of every tail
+`vec_debug_cdbhash_check` routes random strings of every tail
 length, multibyte characters included, alone and with other keys.  Joining
 two 2-million-row tables on a text key, both sides redistributed as
 batches, took 0.32 s against 0.93 s in PostgreSQL (LEFT JOIN 0.25 s
@@ -1288,7 +1288,7 @@ to 38, instead of Decimal256's 32, and the receiver widens them back.
 NaN and the infinities go as the narrow type's largest, next largest
 and smallest integers, which no value of those digits reaches.  Both
 ends find the digits from the Motion's column as numeric precision is
-followed (`df_numeric_ps`), and they are part of its signature.  A
+followed (`vx_numeric_ps`), and they are part of its signature.  A
 Redistribute hashes the values before they are narrowed.  Under the
 Postgres planner TPC-DS Q64 is a chain of fifteen joins, each behind a
 Redistribute Motion of some 170 000 rows, that waits on the
@@ -1335,7 +1335,7 @@ gave it its display scale.  A numeric
 constant compared with it may have up to 76 digits.
 
 WT1: a numeric value received through a tuple Motion is read into all 76
-digits of Decimal256 (df_numeric_value_wide), not only the 38 of int128:
+digits of Decimal256 (vx_numeric_value_wide), not only the 38 of int128:
 TPC-H Q22 under GPORCA broadcasts an avg PostgreSQL computes on the
 coordinator, held at scale 40 by the slices receiving it.  Values within
 38 digits keep the int128 path.
@@ -1345,7 +1345,7 @@ coordinator, held at scale 40 by the slices receiving it.  Values within
 A column declared `numeric(p, s)` with p <= 38 (N2) holds values whose
 display scale is s, so each is an integer times 10^-s: it travels as
 `Decimal256(76, s)` (Decimal128 in N2), read on the main thread from
-PostgreSQL's representation (`df_numeric.c`, without a copy for short
+PostgreSQL's representation (`vx_numeric.c`, without a copy for short
 headers) and written back through `numeric_in`.  NaN, which such a column
 may hold, is `i256::MAX`, above every 76-digit value: PostgreSQL sorts NaN above all
 numbers and NaN equals NaN, so comparisons, min/max, grouping and join keys
@@ -1362,7 +1362,7 @@ any was NaN.
 | `sum`, `avg` | of at most 66 digits, so that sums stay within 76; avg is `numeric_div(sum, count)` on the C side, as `numeric_avg` |
 
 The planner hook finds precision and scale from the column's declared type
-through every reference above it (`df_numeric_ps`), including a partial
+through every reference above it (`vx_numeric_ps`), including a partial
 aggregate's result below a Motion, and bounds arithmetic by the digits its
 operands may have, not by their values, so nothing can overflow at run
 time.  That is why numeric travels as Decimal256: `price * (1 - disc) * (1
@@ -1540,7 +1540,7 @@ whole-slice runs 1558 -> 1572, queries wholly in DataFusion 84 -> 89 of
 206 executions, results unchanged apart from Q71's ties (205/206).
 
 A comparison whose sides have no common scale within 76 digits is
-exact instead (df_numcmp_needed): an avg is carried at the largest scale
+exact instead (vx_numcmp_needed): an avg is carried at the largest scale
 numeric_avg may pick (40 for a sum of scale 2), and a quotient by one may
 need 84 digits after the point, so `CASE WHEN avg_sales > 0 THEN
 abs(sales - avg_sales) / avg_sales END > 0.1` (TPC-DS Q47, Q53, Q57,
@@ -2046,7 +2046,7 @@ as in TPC-H's Q17 (`l_quantity < (SELECT 0.2 * avg(l_quantity) FROM
 lineitem WHERE l_partkey = p_partkey)`), is planned as a join with the
 aggregate of the whole inner table grouped by that key; the outer query
 then keeps the few keys that pass its conditions on part.  With
-datafusion.mode = on, the extension's planner hook (SQ1, src/df_rewrite.c)
+vec.mode = on, the extension's planner hook (SQ1, src/vx_rewrite.c)
 first adds `l_partkey IN (SELECT p_partkey FROM part WHERE <the outer
 query's conditions on part>)` to the subquery, which the planner turns
 into a semi join below the aggregate.  The results are the same: a row of
@@ -2057,7 +2057,7 @@ of a WHERE clause whose FROM list holds the outer relation itself (no
 outer join), matched by a hash- or merge-joinable equality of one type,
 and takes the other top-level conjuncts that only read that relation
 (uncorrelated subqueries included) and have no volatile functions.
-`datafusion.subquery_key_filter` turns it off.  At scale factor 10 with
+`vec.subquery_key_filter` turns it off.  At scale factor 10 with
 the PostgreSQL planner, Q17 took 0.61 s instead of 5.0 s and Q20 0.36 s
 instead of 0.84 s; GPORCA aggregates before the semi join and gains
 little.
@@ -2131,7 +2131,7 @@ Requires a Cloudberry installation (for `pg_config` and server headers; the
 headers include OpenSSL's, so install the OpenSSL development package) and a
 Rust toolchain; the version is pinned in `engines/datafusion/rust-toolchain.toml`.
 
-`make install` installs the extension, `datafusion_executor.so`, and the
+`make install` installs the extension, `vec_executor.so`, and the
 engine, `vec_engine_datafusion.so`, built with it; each extension build
 takes only an engine of its own ABI version.
 
@@ -2161,7 +2161,7 @@ reads (the engine copies it) and releases each result batch once it has
 handed out its rows.
 
 An engine is a library of its own, `$libdir/vec_engine_<name>.so`, that
-exports only `vec_engine_entry`.  `datafusion.engine` (superuser, default
+exports only `vec_engine_entry`.  `vec.engine` (superuser, default
 `datafusion`, sent to the segments) names it; a backend opens it with
 `RTLD_LOCAL` when it first needs it, so the engine's symbols and the
 libraries it brings stay apart from PostgreSQL's, PAX's and other
@@ -2180,11 +2180,11 @@ Motions, direct PAX reads).  A slice that needs what the engine lacks stays
 on PostgreSQL, and EXPLAIN says so (`engine X lacks joins`).  DataFusion
 declares everything.  `engines/null` builds `vec_engine_null.so`, an
 engine that runs nothing, which the regression tests load
-(`datafusion.engine = 'null'`) to check that every slice then stays on
+(`vec.engine = 'null'`) to check that every slice then stays on
 PostgreSQL with its results, together with a copy that claims another ABI
 version.  Two settings exist for the tests only:
-`datafusion.debug_features_off` treats engine features (`VEC_F_*` bits) as
-missing, and `datafusion.debug_result_offset` has an engine with test
+`vec.debug_features_off` treats engine features (`VEC_F_*` bits) as
+missing, and `vec.debug_result_offset` has an engine with test
 functions give its result batches at an offset.
 
 ## License

@@ -15,19 +15,19 @@
 -- specific language governing permissions and limitations
 -- under the License.
 --
--- Executor and EXPLAIN hooks (M2): datafusion.mode, slice eligibility and
+-- Executor and EXPLAIN hooks (M2): vec.mode, slice eligibility and
 -- routing.  Coordinator-only catalog tables give single-slice plans with
 -- no Motion, the only shape that qualifies before Motion support.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 SET optimizer = off;
 
 -- off (the default): EXPLAIN is unchanged.
-SHOW datafusion.mode;
+SHOW vec.mode;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0;
 
 -- explain: one line per slice.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0;
 EXPLAIN (COSTS OFF) SELECT relnatts, sum(relpages), max(reltuples)
 FROM pg_class WHERE relhasindex AND relpages >= 0 GROUP BY relnatts;
@@ -53,26 +53,26 @@ EXPLAIN (COSTS OFF, FORMAT JSON) SELECT count(*) FROM pg_class WHERE relpages > 
 
 -- explain mode never routes anything.
 SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 
 -- on: eligible slices are routed (still executed by PostgreSQL until M3),
 -- and give the same results.
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 SELECT count(*) > 0 AS ok FROM pg_class WHERE relname > 'a';
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 INSERT INTO df_hooks_t SELECT i, i, i FROM generate_series(1, 100) i;
 SELECT sum(b), count(*) FROM df_hooks_t WHERE c > 50;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 EXPLAIN (COSTS OFF) SELECT count(*) FROM pg_class WHERE relpages > 0;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 
 -- An error while a routed slice runs drops its record with the query; the
 -- next query is routed normally.
 SELECT count(*) FROM pg_class WHERE relpages / 0 > 0;
 SELECT count(*) > 0 AS ok FROM pg_class WHERE relpages >= 0;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 
 -- A cursor runs its slice once per FETCH.
 BEGIN;
@@ -82,7 +82,7 @@ FETCH 1 FROM df_cur \gset
 FETCH 1 FROM df_cur \gset
 CLOSE df_cur;
 COMMIT;
-SELECT datafusion_debug_takeovers();
+SELECT vec_debug_takeovers();
 
 -- Not tested here: an updatable cursor (e.g. a plain SELECT over pg_class)
 -- carries the system columns ctid and gp_segment_id for WHERE CURRENT OF and
@@ -91,5 +91,5 @@ SELECT datafusion_debug_takeovers();
 -- the takeover count flaky.
 
 DROP TABLE df_hooks_t;
-RESET datafusion.mode;
-DROP EXTENSION datafusion_executor;
+RESET vec.mode;
+DROP EXTENSION vec_executor;

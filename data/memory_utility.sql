@@ -18,7 +18,7 @@
 -- Body of the memory test, run in utility mode on the coordinator by
 -- sql/memory.sql (a coordinator-local table gives a single-slice plan).
 --
-LOAD 'datafusion_executor';
+LOAD 'vec_executor';
 CREATE TABLE df_m4 AS SELECT i AS a, i % 7 AS b FROM generate_series(1, 300000) i;
 INSERT INTO df_m4 SELECT i, 0 FROM generate_series(1, 5) i;
 
@@ -26,19 +26,19 @@ INSERT INTO df_m4 SELECT i, 0 FROM generate_series(1, 5) i;
 -- so PostgreSQL and DataFusion both spill.  PostgreSQL first, then
 -- DataFusion: the rows must match.  The budget runs on one partition.
 SET work_mem = '1MB';
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
 SELECT partitions, memory_limit_kb, spilled_kb > 0 AS spilled, spills > 0 AS spills
-FROM datafusion_debug_last_run();
+FROM vec_debug_last_run();
 
 -- A budget the groups fit in: no spill.
 SET work_mem = '64MB';
 SELECT a, count(*), sum(b) FROM df_m4 GROUP BY a HAVING count(*) > 1;
-SELECT memory_limit_kb, spilled_kb, spills FROM datafusion_debug_last_run();
+SELECT memory_limit_kb, spilled_kb, spills FROM vec_debug_last_run();
 
 -- The backend's vmem lease covers Rust's heap.
-SELECT leased_bytes >= heap_bytes AS covered FROM datafusion_debug_vmem();
+SELECT leased_bytes >= heap_bytes AS covered FROM vec_debug_vmem();
 
 DROP TABLE df_m4;

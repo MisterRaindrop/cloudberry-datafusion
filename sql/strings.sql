@@ -21,15 +21,15 @@
 -- under the C collation.  Whether the database's default collation is C is
 -- each node's own, so a slice that depends on it decides per node and its
 -- Motions carry tuples, but for those read by a part of it that does not
--- depend on it.  Each query runs with datafusion.mode off, then
+-- depend on it.  Each query runs with vec.mode off, then
 -- on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 
@@ -52,7 +52,7 @@ ANALYZE df_st;
 ANALYZE df_st2;
 ANALYZE df_st_big;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t = 'k42' AND v <> 'v1';
 EXPLAIN (COSTS OFF) SELECT min(t COLLATE "C"), max(v COLLATE "C") FROM df_st WHERE t COLLATE "C" > 'k4';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE u < 'b';
@@ -69,7 +69,7 @@ EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
 EXPLAIN (COSTS OFF) SELECT t, count(*) FROM df_st GROUP BY t;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st b ON a.t = b.t;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
 SELECT id, t, v FROM df_st WHERE id < 0 ORDER BY id;
 SELECT id FROM df_st WHERE t = E'quo"te\\back\nline' OR t = '中文字符' OR t = '' OR v = E'tab\there'
@@ -96,7 +96,7 @@ SELECT count(*), count(DISTINCT n) FROM (SELECT t, count(*) AS n FROM df_st_big 
 -- A value the segments' slice hands out, checked on the client.
 SELECT t AS big FROM df_st_big WHERE id = 1500 \gset
 SELECT length(:'big'), md5(:'big');
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
 SELECT id, t, v FROM df_st WHERE id < 0 ORDER BY id;
 SELECT id FROM df_st WHERE t = E'quo"te\\back\nline' OR t = '中文字符' OR t = '' OR v = E'tab\there'
@@ -133,11 +133,11 @@ SELECT s, p, n FROM
   unnest(ARRAY['', 'a', ',', 'aa', '😀', NULL]) p,
   unnest(ARRAY[-2147483648, -2, 0, 3, 2147483647, NULL]::int4[]) n;
 ANALYZE df_sf;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 2), lower(s COLLATE "C") FROM df_sf;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE concat(s, n) = s;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE md5(s) = s;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
   replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
 FROM df_sf WHERE n = 3 ORDER BY id;
@@ -147,7 +147,7 @@ SELECT s, btrim(s), btrim(s, 'a😀'), ltrim(s, ' a'), rtrim(s), reverse(s), rep
   lower(s COLLATE "C"), upper(s COLLATE "C")
 FROM df_sf WHERE p = '' AND n = 0 ORDER BY id;
 SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
   replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
 FROM df_sf WHERE n = 3 ORDER BY id;
@@ -181,14 +181,14 @@ INSERT INTO df_cm SELECT -p.i, t.w, upper(t.w), lower(t.w) FROM df_cm_cp p,
   unnest(ARRAY['straße ẞ', 'ǆ ǅ Ǆ', 'ᾀ ᾈ ΐ ΰ', 'İ ı i I', 'Σσς', 'ﬀ ŉ ǰ', 'Ω K Å', 'ƛ ɤ ᲊ',
                '中文 😀 abcXYZ', '']) WITH ORDINALITY AS t(w, n) WHERE p.i = t.n;
 ANALYZE df_cm;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <> l;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) AS rows, count(*) FILTER (WHERE upper(c) <> u) AS upper_differs,
   count(*) FILTER (WHERE lower(c) <> l) AS lower_differs FROM df_cm;
 SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <> l;
 SELECT count(*) FROM df_cm WHERE i < 0 AND upper(c || c) = u || u AND lower(c || 'X') = l || 'x';
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_cm_cp, df_cm;
 
 -- Strings handed out row by row through a cursor (rows arrive from the
@@ -217,11 +217,11 @@ INSERT INTO df_bp2 SELECT 'SEG' || i, i FROM generate_series(0, 6) i;
 INSERT INTO df_bp2 VALUES ('ab', 100), (E'ab\t', 101);
 ANALYZE df_bp;
 ANALYZE df_bp2;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2') GROUP BY f, c;
 EXPLAIN (COSTS OFF) SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n;
 EXPLAIN (COSTS OFF) SELECT max(c) FROM df_bp;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
 SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
 SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
@@ -231,7 +231,7 @@ SELECT id, c, '|' || c || '|' AS t, length(c), octet_length(c), concat(c, '|') F
 WHERE id % 1000 < 8 ORDER BY c COLLATE "C" DESC NULLS LAST, id LIMIT 12;
 SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n ORDER BY b.n;
 SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df_bp GROUP BY 1 ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
 SELECT count(*) FROM df_bp WHERE c LIKE 'SEG%' OR c LIKE 'ab';
 SELECT count(*) FROM df_bp WHERE c LIKE 'ab        ';
@@ -257,7 +257,7 @@ ANALYZE df_bg5;
 ANALYZE df_bg10;
 ANALYZE df_bgn;
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
 SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
 SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
@@ -266,7 +266,7 @@ SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
 SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
 SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
 SELECT count(DISTINCT a) FROM df_bgn;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
 SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
 SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
@@ -276,7 +276,7 @@ SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
 SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
 SELECT count(DISTINCT a) FROM df_bgn;
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
 SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
 SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
@@ -285,7 +285,7 @@ SELECT a::text, count(*) FROM df_bgn GROUP BY a ORDER BY a::text COLLATE "C";
 SELECT count(DISTINCT a), count(DISTINCT b), count(*) FROM df_bg5;
 SELECT count(DISTINCT a) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s;
 SELECT count(DISTINCT a) FROM df_bgn;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
 SELECT a, b, count(*) FROM df_bg5 GROUP BY ROLLUP (a, b) ORDER BY a COLLATE "C", b COLLATE "C", 3;
 SELECT a::text, count(*) FROM (SELECT a FROM df_bg5 UNION ALL SELECT a FROM df_bg10) s
@@ -309,14 +309,14 @@ INSERT INTO df_cp2 SELECT (ARRAY['k1', 'k22', '日本', 'k 4', ''])[1 + i % 5], 
 ANALYZE df_cp;
 ANALYZE df_cp2;
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
 SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
 GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
 SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
 GROUP BY s ORDER BY s::text COLLATE "C";
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
 SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
@@ -324,14 +324,14 @@ GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
 SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
 GROUP BY s ORDER BY s::text COLLATE "C";
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
 SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
 GROUP BY x.w, y.n ORDER BY x.w COLLATE "C", y.n;
 SELECT s::text, count(*) FROM (SELECT a AS s FROM df_cp UNION ALL SELECT w FROM df_cp) u
 GROUP BY s ORDER BY s::text COLLATE "C";
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
 SELECT x.w, octet_length(x.w), y.n, count(*) FROM df_cp x JOIN df_cp2 y ON x.w = y.k
@@ -347,11 +347,11 @@ CREATE TABLE df_lc (id int4, f char(1), s char(1), q numeric(15,2)) DISTRIBUTED 
 INSERT INTO df_lc SELECT i, chr(65 + i % 3), chr(70 + i % 2), (i % 50) + 0.25
 FROM generate_series(1, 30000) i;
 ANALYZE df_lc;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
 DROP TABLE df_lc;
 
@@ -365,7 +365,7 @@ INSERT INTO df_rx VALUES (1, 'ab'), (2, 'xab'), (3, 'abab'), (4, 'aaa'),
   (5, 'http://www.example.com/path?q=1'), (6, 'https://www./'), (7, 'ftp://a.b/c'),
   (8, 'http://a.b'), (9, E'http://wwwa.ру/п\n/x'), (10, ''), (11, NULL), (12, '😀a😀/');
 ANALYZE df_rx;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '^a?(?:ab)?(.*)$', '\1') = '';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a|b$', '') = '';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a+?$', '') = '';
@@ -373,14 +373,14 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '(a)+$', 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '\w$', '') = '';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a', '') = '';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a$', '', 'g') = '';
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
   regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
   regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
   regexp_replace(s, '(.)(/?)$', '<\&|\2|\1|\3|\\|\x|\') AS c,
   regexp_replace(s, '[^a-c/]{1,2}([a😀]*)/?$', '{\1}') AS d
 FROM df_rx GROUP BY id, s ORDER BY id;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
   regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
   regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
@@ -392,4 +392,4 @@ DROP TABLE df_rx;
 DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

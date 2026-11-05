@@ -16,7 +16,7 @@
 // under the License.
 
 //! RX1: regexp_replace(text, text, text) as PostgreSQL computes it, for the
-//! regular expressions src/df_regex.c lets through.  The C side cuts the
+//! regular expressions src/vx_regex.c lets through.  The C side cuts the
 //! expression into segments at its top-level capturing groups; the match is
 //! the leftmost (it ends at the end of the value: the expression ends in $),
 //! and each segment in turn ends as late as the rest still allows
@@ -46,7 +46,7 @@ fn internal(message: String) -> DataFusionError {
     DataFusionError::Internal(format!("regexp_replace: {message}"))
 }
 
-/// A part of the expression, as df_regex.c sends it.
+/// A part of the expression, as vx_regex.c sends it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Segment {
     pub re: String,
@@ -62,7 +62,7 @@ fn push_literal(out: &mut String, c: char) {
     out.push(c);
 }
 
-/// A segment in the syntax of regex-syntax: the subset df_regex.c takes
+/// A segment in the syntax of regex-syntax: the subset vx_regex.c takes
 /// reads the same there but for the quoting of literals; '.' matches a
 /// newline as in PostgreSQL (the caller sets the s flag).
 fn translate(re: &str) -> Result<String> {

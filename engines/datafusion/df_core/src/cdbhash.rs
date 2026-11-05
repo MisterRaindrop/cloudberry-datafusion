@@ -27,7 +27,7 @@
 //! Only the non-legacy hash functions of the supported types are here, each
 //! a transcription of PostgreSQL's (hashfunc.c, hashfn.c).  A mismatch
 //! would send rows to the wrong segment, so the C side checks this module
-//! against cdbhash() value by value (datafusion_debug_cdbhash_check).
+//! against cdbhash() value by value (vec_debug_cdbhash_check).
 
 use datafusion::arrow::array::{Array, ArrayRef, AsArray};
 use datafusion::arrow::datatypes::{

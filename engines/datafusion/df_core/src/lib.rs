@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Engine side of datafusion_executor.  Nothing in this crate knows about
+//! Engine side of vec_executor.  Nothing in this crate knows about
 //! PostgreSQL or C; `df_ffi` is the only bridge.
 
 pub mod cdbhash;

@@ -17,14 +17,14 @@
  * specific language governing permissions and limitations
  * under the License.
  *
- * df_arrow.c
+ * vx_arrow.c
  *	  Batches as Arrow arrays, as they cross the engine ABI (vec_engine.h).
  *
  * The host lends the engine its batches: struct arrays over the buffers it
  * fills, which the engine copies and never releases.  The engine hands back
- * result batches the host reads row by row (DfOutCol) and then releases.
+ * result batches the host reads row by row (VxOutCol) and then releases.
  *
- * src/df_arrow.c
+ * src/vx_arrow.c
  *
  *-------------------------------------------------------------------------
  */
@@ -32,16 +32,16 @@
 
 #include "catalog/pg_type_d.h"
 
-#include "df_executor.h"
+#include "vx_executor.h"
 
 /* A lent array or schema: whoever holds it never releases it. */
 static void
-df_arrow_lent_array(struct ArrowArray *a)
+vx_arrow_lent_array(struct ArrowArray *a)
 {
 }
 
 static void
-df_arrow_lent_schema(struct ArrowSchema *s)
+vx_arrow_lent_schema(struct ArrowSchema *s)
 {
 }
 
@@ -50,7 +50,7 @@ df_arrow_lent_schema(struct ArrowSchema *s)
  * vec_engine.h lays each type out.
  */
 const char *
-df_arrow_format(Oid type, int scale)
+vx_arrow_format(Oid type, int scale)
 {
 	switch (type)
 	{
@@ -76,16 +76,16 @@ df_arrow_format(Oid type, int scale)
 		case BPCHAROID:
 			return "u";
 		case NUMERICOID:
-			return psprintf("d:%d,%d,256", DF_NUMERIC_MAX_EXPR_PRECISION, scale);
+			return psprintf("d:%d,%d,256", VX_NUMERIC_MAX_EXPR_PRECISION, scale);
 		default:
-			elog(ERROR, "datafusion: no Arrow layout for type %u", type);
+			elog(ERROR, "vec_executor: no Arrow layout for type %u", type);
 	}
 	return NULL;				/* keep compiler quiet */
 }
 
 /* A struct schema of 'n' nullable columns of 'formats', lent. */
 void
-df_arrow_struct_schema(struct ArrowSchema *s, int n, const char *const *formats)
+vx_arrow_struct_schema(struct ArrowSchema *s, int n, const char *const *formats)
 {
 	struct ArrowSchema *cols = palloc0(sizeof(struct ArrowSchema) * Max(n, 1));
 	struct ArrowSchema **children = palloc0(sizeof(struct ArrowSchema *) * Max(n, 1));
@@ -96,7 +96,7 @@ df_arrow_struct_schema(struct ArrowSchema *s, int n, const char *const *formats)
 		cols[i].format = formats[i];
 		cols[i].name = psprintf("c%d", i);
 		cols[i].flags = ARROW_FLAG_NULLABLE;
-		cols[i].release = df_arrow_lent_schema;
+		cols[i].release = vx_arrow_lent_schema;
 		children[i] = &cols[i];
 	}
 	memset(s, 0, sizeof(*s));
@@ -104,15 +104,15 @@ df_arrow_struct_schema(struct ArrowSchema *s, int n, const char *const *formats)
 	s->name = "";
 	s->n_children = n;
 	s->children = children;
-	s->release = df_arrow_lent_schema;
+	s->release = vx_arrow_lent_schema;
 }
 
 /*
  * A struct array of 'n' columns, lent, with room for each column's buffers;
- * set its length, and each column with df_arrow_set_column, before lending.
+ * set its length, and each column with vx_arrow_set_column, before lending.
  */
 void
-df_arrow_struct_array(struct ArrowArray *a, int n)
+vx_arrow_struct_array(struct ArrowArray *a, int n)
 {
 	struct ArrowArray *cols = palloc0(sizeof(struct ArrowArray) * Max(n, 1));
 	struct ArrowArray **children = palloc0(sizeof(struct ArrowArray *) * Max(n, 1));
@@ -122,7 +122,7 @@ df_arrow_struct_array(struct ArrowArray *a, int n)
 	for (i = 0; i < n; i++)
 	{
 		cols[i].buffers = &buffers[1 + 3 * i];
-		cols[i].release = df_arrow_lent_array;
+		cols[i].release = vx_arrow_lent_array;
 		children[i] = &cols[i];
 	}
 	memset(a, 0, sizeof(*a));
@@ -130,7 +130,7 @@ df_arrow_struct_array(struct ArrowArray *a, int n)
 	a->buffers = buffers;
 	a->n_children = n;
 	a->children = children;
-	a->release = df_arrow_lent_array;
+	a->release = vx_arrow_lent_array;
 }
 
 /*
@@ -139,7 +139,7 @@ df_arrow_struct_array(struct ArrowArray *a, int n)
  * its 'offsets' (length + 1), 'values' being then its bytes.
  */
 void
-df_arrow_set_column(struct ArrowArray *col, int64 length, int64 null_count,
+vx_arrow_set_column(struct ArrowArray *col, int64 length, int64 null_count,
 					const uint8 *valid, const void *values, const int32 *offsets)
 {
 	col->length = length;
@@ -164,7 +164,7 @@ df_arrow_set_column(struct ArrowArray *col, int64 length, int64 null_count,
  * bytes of each of its values, 0 for a bool (a bitmap) or -1 for a string.
  */
 void
-df_arrow_out_column(DfOutCol *out, const struct ArrowArray *batch, int c, int width)
+vx_arrow_out_column(VxOutCol *out, const struct ArrowArray *batch, int c, int width)
 {
 	const struct ArrowArray *col = batch->children[c];
 	int64		off = batch->offset + col->offset;
@@ -175,12 +175,12 @@ df_arrow_out_column(DfOutCol *out, const struct ArrowArray *batch, int c, int wi
 	if (width < 0)
 	{
 		if (col->n_buffers != 3)
-			elog(ERROR, "datafusion: result column %d is not a string", c);
+			elog(ERROR, "vec_executor: result column %d is not a string", c);
 		out->offsets = (const int32 *) col->buffers[1] + off;
 		out->values = col->buffers[2];
 	}
 	else if (col->n_buffers != 2)
-		elog(ERROR, "datafusion: result column %d has %d buffers", c, (int) col->n_buffers);
+		elog(ERROR, "vec_executor: result column %d has %d buffers", c, (int) col->n_buffers);
 	else if (width == 0)
 		out->values = col->buffers[1];
 	else

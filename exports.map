@@ -21,7 +21,7 @@
     Pg_magic_func;
     _PG_init;
     pg_finfo_*;
-    datafusion_*;
+    vec_*;
   local:
     *;
 };

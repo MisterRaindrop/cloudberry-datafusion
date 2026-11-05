@@ -132,7 +132,7 @@ pub fn spin(seconds: f64, ntasks: usize, panic_in_worker: bool) -> Result<Task, 
             workers.push(tokio::spawn(async move {
                 let _active = ActiveGuard::new();
                 if panic_in_worker && i == 0 {
-                    panic!("datafusion_debug_worker_panic requested");
+                    panic!("vec_debug_worker_panic requested");
                 }
                 loop {
                     if flag.load(Ordering::SeqCst) {
@@ -213,7 +213,7 @@ mod tests {
         runtime::init(2).unwrap();
         let t = spin(30.0, 3, true).unwrap();
         match wait_ready(&t) {
-            Outcome::Panicked(msg) => assert_eq!(msg, "datafusion_debug_worker_panic requested"),
+            Outcome::Panicked(msg) => assert_eq!(msg, "vec_debug_worker_panic requested"),
             other => panic!("unexpected {other:?}"),
         }
         // The runtime keeps working after a worker panicked.

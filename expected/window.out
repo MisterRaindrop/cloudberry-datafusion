@@ -20,14 +20,14 @@
 -- up to the current row.  DataFusion sorts the rows by the partition and
 -- order keys itself, in the order PostgreSQL sorts them by.  avg of numeric
 -- and of integers (WIN2), as numeric_avg divides the frame's sum by its
--- count, with its display scale.  Each query runs with datafusion.mode off,
+-- count, with its display scale.  Each query runs with vec.mode off,
 -- then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 -- g and a with NULLs, a with ties; f with -0, 0 and NaN; m with NaN; c of
 -- one value padded two ways, as an expression without a length makes it.
 CREATE TABLE df_w (k int, g int, a int, b int8, n numeric(10,2), m numeric(10,2),
@@ -44,7 +44,7 @@ ANALYZE df_w;
 -- sorts them by its keys; a window below a join is a node of the plan; the
 -- top WindowAgg leaves out the rows that fail its run condition.
 SET optimizer = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w ORDER BY 1, 2, 3;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -61,9 +61,9 @@ EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
@@ -88,10 +88,10 @@ EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g
                                              ->  Seq Scan on df_w
                                                    Filter: (a < 3)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (23 rows)
 
 EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
@@ -120,9 +120,9 @@ EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a
                                        ->  Seq Scan on df_w df_w_1
                                              Filter: (k < 40)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (26 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
@@ -143,9 +143,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDE
                                  Hash Key: df_w.g
                                  ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (18 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w ORDER BY 3, 1, 2;
@@ -164,9 +164,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS UNBOUNDED PRECEDING) s FROM df_w) x WHERE s > 10 ORDER BY g, k LIMIT 20;
@@ -187,12 +187,12 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, sum(a) OVER (PARTITION BY g ORDE
                                        Hash Key: df_w.g
                                        ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (18 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
  g | a | k  | rank | dense_rank | row_number 
 ---+---+----+------+------------+------------
@@ -821,7 +821,7 @@ SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTI
 ---+---
 (0 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
  g | a | k  | rank | dense_rank | row_number 
 ---+---+----+------+------------+------------
@@ -1452,7 +1452,7 @@ SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTI
 
 -- GPORCA's plans
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM df_w ORDER BY 1, 2, 3;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -1469,9 +1469,9 @@ EXPLAIN (COSTS OFF) SELECT g, a, k, rank() OVER (PARTITION BY g ORDER BY a) FROM
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g) FROM df_w WHERE a < 3 GROUP BY g, a ORDER BY 1, 2;
@@ -1497,10 +1497,10 @@ EXPLAIN (COSTS OFF) SELECT g, a, sum(n) * 100 / sum(sum(n)) OVER (PARTITION BY g
                                                    ->  Seq Scan on df_w
                                                          Filter: (a < 3)
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (24 rows)
 
 EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a, k) r FROM df_w WHERE k < 40) x JOIN (SELECT k, rank() OVER (ORDER BY b DESC) r FROM df_w WHERE k < 40) y ON x.r = y.r ORDER BY 1;
@@ -1528,9 +1528,9 @@ EXPLAIN (COSTS OFF) SELECT x.k, x.r, y.r FROM (SELECT k, rank() OVER (ORDER BY a
                                  ->  Seq Scan on df_w df_w_1
                                        Filter: (k < 40)
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (25 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY a DESC, k) r FROM df_w) s WHERE r <= 3 ORDER BY 1, 3, 2;
@@ -1551,9 +1551,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDE
                                  Hash Key: g
                                  ->  Seq Scan on df_w
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (18 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1 FROM df_w ORDER BY 3, 1, 2;
@@ -1572,12 +1572,12 @@ EXPLAIN (COSTS OFF) SELECT g, k, avg(n) OVER (PARTITION BY g ORDER BY k) * 2 + 1
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: GPORCA
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
  g | a | k  | rank | dense_rank | row_number 
 ---+---+----+------+------------+------------
@@ -2206,7 +2206,7 @@ SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTI
 ---+---
 (0 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT g, a, k, rank() OVER w, dense_rank() OVER w, row_number() OVER (PARTITION BY g ORDER BY a, k) FROM df_w WHERE k <= 30 WINDOW w AS (PARTITION BY g ORDER BY a) ORDER BY 1, 2, 3;
  g | a | k  | rank | dense_rank | row_number 
 ---+---+----+------+------------+------------
@@ -2839,7 +2839,7 @@ SELECT x.g, x.a FROM (SELECT g, a, sum(n) s1, sum(m) s2, avg(sum(n)) OVER (PARTI
 -- functions, min and max of floats (of -0 and 0, PostgreSQL's keep the
 -- later), other frames, FILTER; a run condition below the top WindowAgg.
 SET optimizer = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, avg(f) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -2855,9 +2855,9 @@ EXPLAIN (COSTS OFF) SELECT g, avg(f) OVER (PARTITION BY g) FROM df_w ORDER BY 1,
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window function avg of double precision
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window function avg of double precision
+ Vectorized: slice 2 eligible
 (15 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, ntile(3) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
@@ -2874,9 +2874,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, ntile(3) OVER (PARTITION BY g ORDER BY k) FROM 
                      Hash Key: g
                      ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window function ntile
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window function ntile
+ Vectorized: slice 2 eligible
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, lag(k) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
@@ -2893,9 +2893,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, lag(k) OVER (PARTITION BY g ORDER BY k) FROM df
                      Hash Key: g
                      ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window function lag
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window function lag
+ Vectorized: slice 2 eligible
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, max(f) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
@@ -2912,9 +2912,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, max(f) OVER (PARTITION BY g ORDER BY k) FROM df
                      Hash Key: g
                      ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window function max of double precision
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window function max of double precision
+ Vectorized: slice 2 eligible
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM df_w ORDER BY 1, 2;
@@ -2931,9 +2931,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, sum(a) OVER (PARTITION BY g ORDER BY k ROWS BET
                      Hash Key: g
                      ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window frame other than from the first row of the partition to the current row or the last
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window frame other than from the first row of the partition to the current row or the last
+ Vectorized: slice 2 eligible
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, count(*) FILTER (WHERE a > 3) OVER (PARTITION BY g) FROM df_w ORDER BY 1, 2;
@@ -2951,9 +2951,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, count(*) FILTER (WHERE a > 3) OVER (PARTITION B
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: FILTER clause on window function count
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: FILTER clause on window function count
+ Vectorized: slice 2 eligible
 (15 rows)
 
 EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDER BY k) r, count(*) OVER (PARTITION BY g ORDER BY k, a) c FROM df_w) x WHERE c < 3 ORDER BY 1, 2;
@@ -2976,9 +2976,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM (SELECT g, k, rank() OVER (PARTITION BY g ORDE
                                  Hash Key: df_w.g
                                  ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: run condition of a WindowAgg below another
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: run condition of a WindowAgg below another
+ Vectorized: slice 2 eligible
 (20 rows)
 
 -- A window over whole partitions holds all its rows, within work_mem by
@@ -2999,9 +2999,9 @@ EXPLAIN (COSTS OFF) SELECT g, k, t, n, m, f, b, sum(a) OVER (PARTITION BY g) FRO
                            Hash Key: g
                            ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: window over whole partitions of about 88 kB exceeds its 64 kB
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: window over whole partitions of about 88 kB exceeds its 64 kB
+ Vectorized: slice 2 eligible
 (15 rows)
 
 EXPLAIN (COSTS OFF) SELECT g, k, t, n, m, f, b, sum(a) OVER (PARTITION BY g ORDER BY k) FROM df_w ORDER BY 1, 2;
@@ -3018,13 +3018,13 @@ EXPLAIN (COSTS OFF) SELECT g, k, t, n, m, f, b, sum(a) OVER (PARTITION BY g ORDE
                      Hash Key: g
                      ->  Seq Scan on df_w
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (14 rows)
 
 RESET work_mem;
-RESET datafusion.mode;
+RESET vec.mode;
 DROP TABLE df_w;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

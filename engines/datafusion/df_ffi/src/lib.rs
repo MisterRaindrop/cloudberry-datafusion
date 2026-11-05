@@ -135,7 +135,7 @@ where
 
 /// Panics on purpose, so tests can check that a panic surfaces as an ERROR.
 extern "C" fn debug_panic(err: *mut VecError) -> i32 {
-    guard(err, || panic!("datafusion_debug_panic requested"))
+    guard(err, || panic!("vec_debug_panic requested"))
 }
 
 /// CM1: set the case maps of the backend's LC_CTYPE: `nupper` and `nlower`
@@ -893,7 +893,7 @@ mod tests {
         let status = (unsafe { &*engine().debug }.panic)(&mut err);
         assert_eq!(status, VEC_PANIC);
         assert_eq!(text(&err.sqlstate), "XX000");
-        assert_eq!(text(&err.message), "datafusion_debug_panic requested");
+        assert_eq!(text(&err.message), "vec_debug_panic requested");
     }
 
     /// Start a query of `ir` over one input of `schema`, through the table.

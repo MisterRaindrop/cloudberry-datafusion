@@ -18,13 +18,13 @@
 -- Cloudberry's parallel mode (M6): several QEs per segment share a parallel
 -- scan through the table AM, and each runs DataFusion on its part.  The
 -- costs below force parallel plans on small tables.  Each query runs with
--- datafusion.mode off, then on; the results must match.
+-- vec.mode off, then on; the results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 1;
+SET vec.worker_threads = 1;
 SET enable_parallel = on;
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
@@ -41,7 +41,7 @@ DELETE FROM df_par_heap WHERE a % 1000 = 7;
 DELETE FROM df_par_pax WHERE a % 1000 = 7;
 ANALYZE df_par_heap;
 ANALYZE df_par_pax;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 50;
                      QUERY PLAN                     
 ----------------------------------------------------
@@ -51,8 +51,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 5
                ->  Parallel Seq Scan on df_par_heap
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
@@ -70,12 +70,12 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
                            Group Key: e
                            ->  Parallel Seq Scan on df_par_pax
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (15 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
  count | count |    sum     |  max  |   sum   
 -------+-------+------------+-------+---------
@@ -106,7 +106,7 @@ SELECT a, b, c FROM df_par_heap WHERE a % 50000 = 0 OR a % 1000 = 7;
  150000 | 1500000 | 37500
 (4 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), max(c), sum(e) FROM df_par_heap WHERE e < 50;
  count | count |    sum     |  max  |   sum   
 -------+-------+------------+-------+---------
@@ -148,11 +148,11 @@ SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
                ->  Parallel Seq Scan on df_par_pax (never executed)
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: 1 partitions, memory limit 32768 kB, peak 0 kB, spilled 0 kB in 0 files
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: 1 partitions, memory limit 32768 kB, peak 0 kB, spilled 0 kB in 0 files
 (9 rows)
 
 DROP TABLE df_par_heap, df_par_pax;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

@@ -19,16 +19,16 @@
 -- aggregation spills instead of failing, and Rust's heap is leased from
 -- Cloudberry's vmem tracker.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 \! PGOPTIONS='-c gp_role=utility' psql -X -a -q -d contrib_regression -f data/memory_utility.sql 2>&1
 
 -- Cloudberry enforces vmem limits on QEs.  A 1 TB lease exceeds
 -- gp_vmem_protect_limit and fails like an allocation would; afterwards the
 -- lease bookkeeping is intact and ordinary leases succeed.
 \set VERBOSITY sqlstate
-SELECT datafusion_debug_vmem_lease(1::int8 << 40) FROM gp_dist_random('gp_id');
+SELECT vec_debug_vmem_lease(1::int8 << 40) FROM gp_dist_random('gp_id');
 \set VERBOSITY default
-SELECT gp_segment_id, datafusion_debug_vmem_lease(64::int8 << 20) >= 64::int8 << 20 AS leased
+SELECT gp_segment_id, vec_debug_vmem_lease(64::int8 << 20) >= 64::int8 << 20 AS leased
 FROM gp_dist_random('gp_id');
 
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

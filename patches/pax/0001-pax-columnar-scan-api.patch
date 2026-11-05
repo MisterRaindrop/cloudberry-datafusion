@@ -1,11 +1,11 @@
 From 65d6e751863f670ad7f5890f3faa8b6b33a2a704 Mon Sep 17 00:00:00 2001
 From: MisterRaindrop <p_xiaoyu.liu@synxdata.com>
 Date: Mon, 5 Oct 2026 17:05:43 +0800
-Subject: [PATCH] pax: add a columnar scan interface for datafusion_executor
+Subject: [PATCH] pax: add a columnar scan interface for vec_executor
 
 Expose PAX's micro-partition listing and column decoding through one
-exported C function table, datafusion_pax_scan_api(), so that the
-datafusion_executor extension can read PAX blocks column by column on its
+exported C function table, pax_direct_scan_api(), so that the
+vec_executor extension can read PAX blocks column by column on its
 worker threads instead of row by row through the table AM.  Every other
 symbol is local, so nothing can clash with PAX or PostgreSQL.
 
@@ -19,17 +19,17 @@ memory it holds (read buffer, decoded columns, visibility map, handed-out
 rows) so that the caller can account for it.  block_groups lets callers
 spread the groups of one block over several threads.
 ---
- .../src/cpp/access/datafusion_scan_api.cc     | 512 ++++++++++++++++++
- .../src/cpp/access/datafusion_scan_api.h      | 128 +++++
+ .../src/cpp/access/pax_direct_api.cc     | 512 ++++++++++++++++++
+ .../src/cpp/access/pax_direct_api.h      | 128 +++++
  2 files changed, 640 insertions(+)
- create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
- create mode 100644 contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
+ create mode 100644 contrib/pax_storage/src/cpp/access/pax_direct_api.cc
+ create mode 100644 contrib/pax_storage/src/cpp/access/pax_direct_api.h
 
-diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
+diff --git a/contrib/pax_storage/src/cpp/access/pax_direct_api.cc b/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
 new file mode 100644
 index 0000000..c4e1a7d
 --- /dev/null
-+++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
++++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
 @@ -0,0 +1,1005 @@
 +/*-------------------------------------------------------------------------
 + *
@@ -50,16 +50,16 @@ index 0000000..c4e1a7d
 + * specific language governing permissions and limitations
 + * under the License.
 + *
-+ * datafusion_scan_api.cc
++ * pax_direct_api.cc
 + *	  Read PAX micro-partitions column by column on the caller's threads,
 + *	  bypassing the table AM's row-at-a-time interface.  See
-+ *	  datafusion_scan_api.h for the interface and its threading contract.
++ *	  pax_direct_api.h for the interface and its threading contract.
 + *
-+ * datafusion_executor compiles this file into its own library and loads it
++ * vec_executor compiles this file into its own library and loads it
 + * after PostgreSQL has loaded pax.so (RTLD_GLOBAL); the PAX classes used
 + * here bind to that pax.so.  They are internal classes, not a published
 + * API, so the library must run with the very pax.so whose headers it was
-+ * built with: DF_PAX_BUILD_ID records that pax.so's GNU build ID, and the
++ * built with: VX_PAX_BUILD_ID records that pax.so's GNU build ID, and the
 + * caller compares it with the running one.
 + *
 + * Memory: PAX's reader allocates with malloc.  read_block passes PAX a read
@@ -71,14 +71,14 @@ index 0000000..c4e1a7d
 + * the vectorized format's strings) until the group is done; uncompressed
 + * columns that point into the read buffer are counted twice.
 + *
-+ * contrib/pax_storage/src/cpp/access/datafusion_scan_api.cc
++ * contrib/pax_storage/src/cpp/access/pax_direct_api.cc
 + *
 + *-------------------------------------------------------------------------
 + */
 +
 +#include "comm/cbdb_api.h"
 +
-+#include "access/datafusion_scan_api.h"
++#include "access/pax_direct_api.h"
 +
 +#include <algorithm>
 +#include <cstring>
@@ -101,13 +101,13 @@ index 0000000..c4e1a7d
 +#include "storage/pax_buffer.h"
 +#include "storage/paxc_define.h"
 +
-+#ifndef DF_PAX_BUILD_ID
-+#define DF_PAX_BUILD_ID ""
++#ifndef VX_PAX_BUILD_ID
++#define VX_PAX_BUILD_ID ""
 +#endif
 +
 +namespace {
 +
-+struct DfBlock {
++struct VxBlock {
 +  std::string file;
 +  std::string visimap;
 +  bool toast;
@@ -115,8 +115,8 @@ index 0000000..c4e1a7d
 +  std::vector<uint32_t> groups; // otherwise the groups to read
 +};
 +
-+struct DfScan {
-+  std::vector<DfBlock> blocks;
++struct VxScan {
++  std::vector<VxBlock> blocks;
 +  int natts;
 +  std::vector<int> cols;     // 0-based table columns to hand out
 +  std::vector<int> widths;   // their value widths in bytes
@@ -124,7 +124,7 @@ index 0000000..c4e1a7d
 +  int read_col;              // column decoded when none is handed out
 +  std::vector<bool> late;    // per handed-out column: left to read_rows
 +  size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
-+  DatafusionPaxScanInfo info;
++  PaxDirectScanInfo info;
 +};
 +
 +// A numeric of the vectorized format (comm/vec_numeric.cc), 16 bytes: the
@@ -175,7 +175,7 @@ index 0000000..c4e1a7d
 +  for (auto d = digits.rbegin(); d != digits.rend(); ++d) put16(*d);
 +}
 +
-+// Numerics read at a scale (DatafusionPaxScanApi.begin): 16 or 32
++// Numerics read at a scale (PaxDirectScanApi.begin): 16 or 32
 +// little-endian bytes (the column's width), the value times 10^scale,
 +// sign-extended from 128 bits; NaN and the infinities as DataFusion's
 +// numeric marks them (pgnum.rs): the largest integer, one less, the least.
@@ -353,7 +353,7 @@ index 0000000..c4e1a7d
 +}
 +
 +std::unique_ptr<pax::MicroPartitionReader> OpenReader(
-+    const DfBlock &block, std::vector<bool> &&proj,
++    const VxBlock &block, std::vector<bool> &&proj,
 +    std::shared_ptr<pax::DataBuffer<char>> read_buffer) {
 +  auto fs = pax::Singleton<pax::LocalFileSystem>::GetInstance();
 +  pax::MicroPartitionReader::ReaderOptions options;
@@ -373,7 +373,7 @@ index 0000000..c4e1a7d
 +// it goes out of scope, exceptions included.
 +class Ledger {
 + public:
-+  Ledger(DatafusionPaxAccount account, void *ctx)
++  Ledger(PaxDirectAccount account, void *ctx)
 +      : account_(account), ctx_(ctx) {}
 +  ~Ledger() { Set(0); }
 +  void Set(int64_t held) {
@@ -382,7 +382,7 @@ index 0000000..c4e1a7d
 +  }
 +
 + private:
-+  DatafusionPaxAccount account_;
++  PaxDirectAccount account_;
 +  void *ctx_;
 +  int64_t held_ = 0;
 +};
@@ -391,7 +391,7 @@ index 0000000..c4e1a7d
 +                struct List *qual, const int *cols, const int *widths,
 +                const int *scales, int ncols, char *err, size_t errlen) {
 +  try {
-+    auto scan = std::make_unique<DfScan>();
++    auto scan = std::make_unique<VxScan>();
 +    scan->natts = RelationGetNumberOfAttributes(rel);
 +    scan->cols.assign(cols, cols + ncols);
 +    scan->widths.assign(widths, widths + ncols);
@@ -399,7 +399,7 @@ index 0000000..c4e1a7d
 +    scan->read_col = ncols > 0 ? cols[0] : 0;
 +    scan->late.assign(ncols, false);
 +    scan->read_buffer_size = pax::pax_scan_reuse_buffer_size;
-+    scan->info = DatafusionPaxScanInfo{0, 0, 0, 0};
++    scan->info = PaxDirectScanInfo{0, 0, 0, 0};
 +
 +    // The same min/max skipping as PAX's scan: whole micro-partitions by
 +    // the statistics in the auxiliary table, then groups by those in the
@@ -425,7 +425,7 @@ index 0000000..c4e1a7d
 +          continue;
 +        }
 +      }
-+      DfBlock block{meta.GetFileName(), meta.GetVisibilityBitmapFile(),
++      VxBlock block{meta.GetFileName(), meta.GetVisibilityBitmapFile(),
 +                    meta.GetExistToast(), true, {}};
 +      if (filter) {
 +        std::vector<bool> proj(scan->natts, false);
@@ -459,19 +459,19 @@ index 0000000..c4e1a7d
 +}
 +
 +int ScanNBlocks(void *scan) {
-+  return static_cast<int>(static_cast<DfScan *>(scan)->blocks.size());
++  return static_cast<int>(static_cast<VxScan *>(scan)->blocks.size());
 +}
 +
-+void ScanInfo(void *scan, DatafusionPaxScanInfo *out) {
-+  *out = static_cast<DfScan *>(scan)->info;
++void ScanInfo(void *scan, PaxDirectScanInfo *out) {
++  *out = static_cast<VxScan *>(scan)->info;
 +}
 +
-+void ScanEnd(void *scan) { delete static_cast<DfScan *>(scan); }
++void ScanEnd(void *scan) { delete static_cast<VxScan *>(scan); }
 +
 +int BlockGroups(void *scan_arg, int index, char *err, size_t errlen) {
-+  auto scan = static_cast<DfScan *>(scan_arg);
++  auto scan = static_cast<VxScan *>(scan_arg);
 +  try {
-+    const DfBlock &block = scan->blocks.at(index);
++    const VxBlock &block = scan->blocks.at(index);
 +    if (!block.all_groups) return static_cast<int>(block.groups.size());
 +    // Only the footer is read: no group of the read column is decoded.
 +    std::vector<bool> proj(scan->natts, false);
@@ -566,13 +566,13 @@ index 0000000..c4e1a7d
 +  return true;
 +}
 +
-+// DatafusionPaxFetch: fixed-width column k of the chunk, of the chunk rows
++// PaxDirectFetch: fixed-width column k of the chunk, of the chunk rows
 +// 'rows' (all if NULL).
 +int FetchColumn(void *chunk_arg, int k, const uint32_t *rows, uint32_t nrows,
-+                DatafusionPaxColumn *out) {
++                PaxDirectColumn *out) {
 +  auto ch = static_cast<Chunk *>(chunk_arg);
 +  try {
-+    if (k == DATAFUSION_PAX_LOCATOR) {
++    if (k == PAX_DIRECT_LOCATOR) {
 +      const size_t n = rows ? nrows : ch->j1 - ch->j0;
 +      ch->locs->resize(std::max<size_t>(n, 1));
 +      ch->loc_nulls->assign(std::max<size_t>(n, 1), 0);
@@ -658,16 +658,16 @@ index 0000000..c4e1a7d
 +// (positions in the group) unless 'all_kept', in chunks.  'colv' holds the
 +// group's column of each handed-out column, null for one this read does
 +// not decode.  'base' is what the reader holds besides the chunks.
-+int EmitGroup(const DfScan *scan, int index, uint32_t g,
++int EmitGroup(const VxScan *scan, int index, uint32_t g,
 +              const std::vector<pax::PaxColumn *> &colv, size_t rows,
 +              const std::vector<uint32_t> &keep, bool all_kept, Ledger &ledger,
-+              int64_t base, DatafusionPaxEmit emit, void *ctx, char *err,
++              int64_t base, PaxDirectEmit emit, void *ctx, char *err,
 +              size_t errlen) {
 +  const size_t ncols = scan->cols.size();
 +  std::vector<std::vector<char>> values(ncols);
 +  std::vector<std::vector<uint8_t>> nulls(ncols);
 +  std::vector<std::vector<int32_t>> offsets(ncols);
-+  std::vector<DatafusionPaxColumn> out(ncols);
++  std::vector<PaxDirectColumn> out(ncols);
 +  std::vector<int64_t> locs;
 +  std::vector<uint8_t> loc_nulls;
 +
@@ -793,7 +793,7 @@ index 0000000..c4e1a7d
 +      // a column to fetch or one not decoded
 +      static const char kNoBytes = 0;
 +      if (!cols[k].active || cols[k].width > 0) {
-+        out[k] = DatafusionPaxColumn{nullptr, nullptr, nullptr};
++        out[k] = PaxDirectColumn{nullptr, nullptr, nullptr};
 +        continue;
 +      }
 +      out[k].values = values[k].empty() ? &kNoBytes : values[k].data();
@@ -827,20 +827,20 @@ index 0000000..c4e1a7d
 +}
 +
 +// A locator holds the block in bits 40-62, the group in bits 24-39 and the
-+// row of the group in bits 0-23 (DATAFUSION_PAX_LOCATOR).
++// row of the group in bits 0-23 (PAX_DIRECT_LOCATOR).
 +constexpr int64_t kLocatorBlocks = int64_t{1} << 23;
 +constexpr int64_t kLocatorGroups = int64_t{1} << 16;
 +constexpr int64_t kLocatorRows = int64_t{1} << 24;
 +
 +int ReadBlock(void *scan_arg, int index, int first, int count,
-+              DatafusionPaxEmit emit, DatafusionPaxAccount account, void *ctx,
++              PaxDirectEmit emit, PaxDirectAccount account, void *ctx,
 +              char *err, size_t errlen) {
-+  auto scan = static_cast<DfScan *>(scan_arg);
++  auto scan = static_cast<VxScan *>(scan_arg);
 +  try {
 +    // Declared first, so that it is destroyed last: everything it counts is
 +    // freed by then.
 +    Ledger ledger(account, ctx);
-+    const DfBlock &block = scan->blocks.at(index);
++    const VxBlock &block = scan->blocks.at(index);
 +    auto fs = pax::Singleton<pax::LocalFileSystem>::GetInstance();
 +    const size_t ncols = scan->cols.size();
 +    const bool locators =
@@ -938,7 +938,7 @@ index 0000000..c4e1a7d
 +}
 +
 +int Late(void *scan_arg, const int *ks, int nks, char *err, size_t errlen) {
-+  auto scan = static_cast<DfScan *>(scan_arg);
++  auto scan = static_cast<VxScan *>(scan_arg);
 +  for (int i = 0; i < nks; i++) {
 +    if (ks[i] < 0 || static_cast<size_t>(ks[i]) >= scan->cols.size()) {
 +      SetError(err, errlen, "PAX late columns", "no such column");
@@ -956,12 +956,12 @@ index 0000000..c4e1a7d
 +}
 +
 +int ReadRows(void *scan_arg, int index, int group_no, const uint32_t *rows,
-+             uint32_t nrows, DatafusionPaxEmit emit, DatafusionPaxAccount account,
++             uint32_t nrows, PaxDirectEmit emit, PaxDirectAccount account,
 +             void *ctx, char *err, size_t errlen) {
-+  auto scan = static_cast<DfScan *>(scan_arg);
++  auto scan = static_cast<VxScan *>(scan_arg);
 +  try {
 +    Ledger ledger(account, ctx);
-+    const DfBlock &block = scan->blocks.at(index);
++    const VxBlock &block = scan->blocks.at(index);
 +    const size_t ncols = scan->cols.size();
 +    std::vector<bool> proj(scan->natts, false);
 +    bool any = false;
@@ -1017,9 +1017,9 @@ index 0000000..c4e1a7d
 +  return -1;
 +}
 +
-+const DatafusionPaxScanApi kScanApi = {
-+    DATAFUSION_PAX_SCAN_API_VERSION,
-+    DF_PAX_BUILD_ID,
++const PaxDirectScanApi kScanApi = {
++    PAX_DIRECT_SCAN_API_VERSION,
++    VX_PAX_BUILD_ID,
 +    ScanBegin,
 +    ScanNBlocks,
 +    ScanInfo,
@@ -1032,15 +1032,15 @@ index 0000000..c4e1a7d
 +
 +}  // namespace
 +
-+extern "C" __attribute__((visibility("default"))) const DatafusionPaxScanApi *
-+datafusion_pax_scan_api(void) {
++extern "C" __attribute__((visibility("default"))) const PaxDirectScanApi *
++pax_direct_scan_api(void) {
 +  return &kScanApi;
 +}
-diff --git a/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
+diff --git a/contrib/pax_storage/src/cpp/access/pax_direct_api.h b/contrib/pax_storage/src/cpp/access/pax_direct_api.h
 new file mode 100644
 index 0000000..03b0fd2
 --- /dev/null
-+++ b/contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
++++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.h
 @@ -0,0 +1,165 @@
 +/*-------------------------------------------------------------------------
 + *
@@ -1061,11 +1061,11 @@ index 0000000..03b0fd2
 + * specific language governing permissions and limitations
 + * under the License.
 + *
-+ * datafusion_scan_api.h
++ * pax_direct_api.h
 + *	  C interface for reading PAX micro-partitions column by column, for
-+ *	  the datafusion_executor extension.
++ *	  the vec_executor extension.
 + *
-+ * The only exported symbol is datafusion_pax_scan_api(), which returns a
++ * The only exported symbol is pax_direct_scan_api(), which returns a
 + * table of functions; everything else stays local to the library, so the
 + * names cannot clash with PAX or PostgreSQL.  A caller checks 'version'
 + * before using the table.
@@ -1085,7 +1085,7 @@ index 0000000..03b0fd2
 + * No exception crosses these functions: failures come back as NULL or -1
 + * with a message.
 + *
-+ * contrib/pax_storage/src/cpp/access/datafusion_scan_api.h
++ * contrib/pax_storage/src/cpp/access/pax_direct_api.h
 + *
 + *-------------------------------------------------------------------------
 + */
@@ -1098,7 +1098,7 @@ index 0000000..03b0fd2
 +extern "C" {
 +#endif
 +
-+#define DATAFUSION_PAX_SCAN_API_VERSION 9
++#define PAX_DIRECT_SCAN_API_VERSION 9
 +
 +struct List;
 +struct RelationData;
@@ -1113,48 +1113,48 @@ index 0000000..03b0fd2
 + * numeric column's are the bytes of its values (without varlena headers,
 + * char(n) with its padding, a numeric as PostgreSQL's representation), row
 + * i at offsets[i]..offsets[i + 1], nrows + 1 offsets. */
-+typedef struct DatafusionPaxColumn {
++typedef struct PaxDirectColumn {
 +  const void *values;
 +  const uint8_t *nulls;
 +  const int32_t *offsets;
-+} DatafusionPaxColumn;
++} PaxDirectColumn;
 +
 +/* Fixed-width column 'col' of the rows 'chunk' holds, or of those of them
 + * at the positions 'rows' (ascending, 'nrows' of them; all rows if NULL):
 + * conversions happen here, for the rows asked for only.  'out' stays valid
 + * until the next fetch of the same column or until 'emit' returns.
 + * Returns 0, or -1 (read_block then fails with the reason).
-+ * 'col' DATAFUSION_PAX_LOCATOR gives the rows' locators, int64 values none
++ * 'col' PAX_DIRECT_LOCATOR gives the rows' locators, int64 values none
 + * NULL, which read_rows takes: the block in bits 40-62, the group of the
 + * block in bits 24-39 and the row's position in the group in bits 0-23. */
-+#define DATAFUSION_PAX_LOCATOR (-1)
++#define PAX_DIRECT_LOCATOR (-1)
 +
-+typedef int (*DatafusionPaxFetch)(void *chunk, int col, const uint32_t *rows,
-+                                  uint32_t nrows, DatafusionPaxColumn *out);
++typedef int (*PaxDirectFetch)(void *chunk, int col, const uint32_t *rows,
++                                  uint32_t nrows, PaxDirectColumn *out);
 +
 +/* Called with a group's visible rows, at most 8192 at a time (fewer when
 + * their strings take more than 64 MB); non-zero stops the read.  The string
 + * columns are in 'cols'; a fixed-width column's entry has NULL pointers and
 + * is had from 'fetch' with 'chunk', during the call. */
-+typedef int (*DatafusionPaxEmit)(void *ctx, uint32_t nrows,
-+                                 const DatafusionPaxColumn *cols,
-+                                 DatafusionPaxFetch fetch, void *chunk);
++typedef int (*PaxDirectEmit)(void *ctx, uint32_t nrows,
++                                 const PaxDirectColumn *cols,
++                                 PaxDirectFetch fetch, void *chunk);
 +
 +/* Called with the change in bytes the reader holds (decoded columns, read
 + * buffer, visibility map, handed-out rows); the deltas of one read_block
 + * call add up to zero by the time it returns. */
-+typedef void (*DatafusionPaxAccount)(void *ctx, int64_t delta);
++typedef void (*PaxDirectAccount)(void *ctx, int64_t delta);
 +
 +/* What begin's min/max skipping did. */
-+typedef struct DatafusionPaxScanInfo {
++typedef struct PaxDirectScanInfo {
 +  int64_t files;          /* micro-partitions visible to the snapshot */
 +  int64_t files_skipped;  /* skipped by their statistics */
 +  int64_t groups;         /* groups examined in the remaining files */
 +  int64_t groups_skipped; /* skipped by their statistics */
-+} DatafusionPaxScanInfo;
++} PaxDirectScanInfo;
 +
-+typedef struct DatafusionPaxScanApi {
-+  uint32_t version; /* DATAFUSION_PAX_SCAN_API_VERSION */
++typedef struct PaxDirectScanApi {
++  uint32_t version; /* PAX_DIRECT_SCAN_API_VERSION */
 +  /* GNU build ID of the pax.so this table was built against, in hex. */
 +  const char *pax_build_id;
 +
@@ -1171,13 +1171,13 @@ index 0000000..03b0fd2
 +                 struct List *qual, const int *cols, const int *widths,
 +                 const int *scales, int ncols, char *err, size_t errlen);
 +  int (*nblocks)(void *scan);
-+  void (*info)(void *scan, DatafusionPaxScanInfo *out);
++  void (*info)(void *scan, PaxDirectScanInfo *out);
 +  /* Decode groups first .. first + count - 1 of block 'index' (all from
 +   * 'first' if count < 0; see block_groups) and call 'emit' once per group,
 +   * 'account' as the memory held changes; both get 'ctx'.  Returns 0, or -1
 +   * with a message (also when 'emit' returns non-zero). */
 +  int (*read_block)(void *scan, int index, int first, int count,
-+                    DatafusionPaxEmit emit, DatafusionPaxAccount account,
++                    PaxDirectEmit emit, PaxDirectAccount account,
 +                    void *ctx, char *err, size_t errlen);
 +  void (*end)(void *scan);
 +  /* The number of groups of block 'index' left to read once min/max
@@ -1197,12 +1197,12 @@ index 0000000..03b0fd2
 +   * group (ascending, 'nrows' of them, from locators), as read_block does
 +   * but with the late columns only.  Any thread, like read_block. */
 +  int (*read_rows)(void *scan, int index, int group, const uint32_t *rows,
-+                   uint32_t nrows, DatafusionPaxEmit emit,
-+                   DatafusionPaxAccount account, void *ctx, char *err,
++                   uint32_t nrows, PaxDirectEmit emit,
++                   PaxDirectAccount account, void *ctx, char *err,
 +                   size_t errlen);
-+} DatafusionPaxScanApi;
++} PaxDirectScanApi;
 +
-+const DatafusionPaxScanApi *datafusion_pax_scan_api(void);
++const PaxDirectScanApi *pax_direct_scan_api(void);
 +
 +#ifdef __cplusplus
 +}

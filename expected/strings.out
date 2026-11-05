@@ -21,15 +21,15 @@
 -- under the C collation.  Whether the database's default collation is C is
 -- each node's own, so a slice that depends on it decides per node and its
 -- Motions carry tuples, but for those read by a part of it that does not
--- depend on it.  Each query runs with datafusion.mode off, then
+-- depend on it.  Each query runs with vec.mode off, then
 -- on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 CREATE COLLATION df_ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
@@ -50,7 +50,7 @@ INSERT INTO df_st_big SELECT i, repeat(md5(i::text), 300 + i % 7) FROM generate_
 ANALYZE df_st;
 ANALYZE df_st2;
 ANALYZE df_st_big;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t = 'k42' AND v <> 'v1';
                                   QUERY PLAN                                   
 -------------------------------------------------------------------------------
@@ -60,8 +60,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t = 'k42' AND v <> 'v1';
                ->  Seq Scan on df_st
                      Filter: (((v)::text <> 'v1'::text) AND (t = 'k42'::text))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT min(t COLLATE "C"), max(v COLLATE "C") FROM df_st WHERE t COLLATE "C" > 'k4';
@@ -73,8 +73,8 @@ EXPLAIN (COSTS OFF) SELECT min(t COLLATE "C"), max(v COLLATE "C") FROM df_st WHE
                ->  Seq Scan on df_st
                      Filter: ((t)::text > 'k4'::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE u < 'b';
@@ -86,8 +86,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE u < 'b';
                ->  Seq Scan on df_st
                      Filter: (u < 'b'::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator < on text under a collation other than C
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator < on text under a collation other than C
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT min(u) FROM df_st;
@@ -98,8 +98,8 @@ EXPLAIN (COSTS OFF) SELECT min(u) FROM df_st;
          ->  Partial Aggregate
                ->  Seq Scan on df_st
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: aggregate min of text under a collation other than C
- DataFusion: slice 1 not eligible: aggregate min of text under a collation other than C
+ Vectorized: slice 0 not eligible: aggregate min of text under a collation other than C
+ Vectorized: slice 1 not eligible: aggregate min of text under a collation other than C
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
@@ -111,8 +111,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE ci = 'abc';
                ->  Seq Scan on df_st
                      Filter: (ci = 'abc'::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator = on text under a nondeterministic collation
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator = on text under a nondeterministic collation
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE '%9';
@@ -124,8 +124,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE 'k1%' AND v NOT LIKE
                ->  Seq Scan on df_st
                      Filter: ((t ~~ 'k1%'::text) AND ((v)::text !~~ '%9'::text))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 -- PostgreSQL raises an error only on rows that reach the dangling escape.
@@ -138,8 +138,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t LIKE E'k1\\';
                ->  Seq Scan on df_st
                      Filter: (t ~~ 'k1\'::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: LIKE pattern ending with an escape character
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: LIKE pattern ending with an escape character
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x' AND char_length(v) > 2;
@@ -151,8 +151,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st WHERE t || 'x' = 'k1x' AND char_l
                ->  Seq Scan on df_st
                      Filter: ((char_length((v)::text) > 2) AND ((t || 'x'::text) = 'k1x'::text))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
@@ -168,9 +168,9 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st2 b ON a.t = b.vt;
                            ->  Broadcast Motion 3:3  (slice2; segments: 3)
                                  ->  Seq Scan on df_st2 b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
 EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
@@ -180,8 +180,8 @@ EXPLAIN (COSTS OFF) SELECT t FROM df_st_big WHERE id = 1500;
    ->  Seq Scan on df_st_big
          Filter: (id = 1500)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
 (6 rows)
 
 -- Redistributed by text and varchar keys as batches (hashtext through
@@ -198,9 +198,9 @@ EXPLAIN (COSTS OFF) SELECT t, count(*) FROM df_st GROUP BY t;
                      Group Key: t
                      ->  Seq Scan on df_st
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st b ON a.t = b.t;
@@ -219,13 +219,13 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_st a JOIN df_st b ON a.t = b.t;
                                  Hash Key: b.t
                                  ->  Seq Scan on df_st b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (17 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
  count | count | count 
 -------+-------+-------
@@ -373,7 +373,7 @@ SELECT length(:'big'), md5(:'big');
    9664 | 42590384552ce5ebf03a0a287b9cbb57
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(t), count(v) FROM df_st WHERE t = 'k42' OR v = 'v7';
  count | count | count 
 -------+-------+-------
@@ -530,15 +530,15 @@ SELECT s, p, n FROM
   unnest(ARRAY['', 'a', ',', 'aa', '😀', NULL]) p,
   unnest(ARRAY[-2147483648, -2, 0, 3, 2147483647, NULL]::int4[]) n;
 ANALYZE df_sf;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT s || p, concat(s, p), substr(s, n), split_part(s, p, 2), lower(s COLLATE "C") FROM df_sf;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
  Gather Motion 3:1  (slice1; segments: 3)
    ->  Seq Scan on df_sf
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
 (5 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE concat(s, n) = s;
@@ -549,8 +549,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE concat(s, n) = s;
          ->  Seq Scan on df_sf
                Filter: (concat(s, n) = s)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function concat() of integer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function concat() of integer
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE md5(s) = s;
@@ -561,11 +561,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_sf WHERE md5(s) = s;
          ->  Seq Scan on df_sf
                Filter: (md5(s) = s)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function md5()
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function md5()
 (7 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
   replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
 FROM df_sf WHERE n = 3 ORDER BY id;
@@ -680,7 +680,7 @@ SELECT count(*) FROM df_sf WHERE n <> 0 AND split_part(s, ',', n) = 'b';
      0
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT s, p, n, char_length(s), octet_length(s), s || p, concat(s, NULL::text, p), strpos(s, p),
   replace(s, p, '#'), starts_with(s, p), split_part(s, p, 2), split_part(s, p, -1)
 FROM df_sf WHERE n = 3 ORDER BY id;
@@ -822,7 +822,7 @@ INSERT INTO df_cm SELECT -p.i, t.w, upper(t.w), lower(t.w) FROM df_cm_cp p,
   unnest(ARRAY['straße ẞ', 'ǆ ǅ Ǆ', 'ᾀ ᾈ ΐ ΰ', 'İ ı i I', 'Σσς', 'ﬀ ŉ ǰ', 'Ω K Å', 'ƛ ɤ ᲊ',
                '中文 😀 abcXYZ', '']) WITH ORDINALITY AS t(w, n) WHERE p.i = t.n;
 ANALYZE df_cm;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <> l;
                             QUERY PLAN                            
 ------------------------------------------------------------------
@@ -832,11 +832,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_cm WHERE upper(c) <> u OR lower(c) <
                ->  Seq Scan on df_cm
                      Filter: ((upper(c) <> u) OR (lower(c) <> l))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) AS rows, count(*) FILTER (WHERE upper(c) <> u) AS upper_differs,
   count(*) FILTER (WHERE lower(c) <> l) AS lower_differs FROM df_cm;
   rows   | upper_differs | lower_differs 
@@ -856,7 +856,7 @@ SELECT count(*) FROM df_cm WHERE i < 0 AND upper(c || c) = u || u AND lower(c ||
     10
 (1 row)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_cm_cp, df_cm;
 -- Strings handed out row by row through a cursor (rows arrive from the
 -- segments in any order, so they are all alike).
@@ -895,7 +895,7 @@ INSERT INTO df_bp2 SELECT 'SEG' || i, i FROM generate_series(0, 6) i;
 INSERT INTO df_bp2 VALUES ('ab', 100), (E'ab\t', 101);
 ANALYZE df_bp;
 ANALYZE df_bp2;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2') GROUP BY f, c;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -909,9 +909,9 @@ EXPLAIN (COSTS OFF) SELECT f, c, count(*) FROM df_bp WHERE c IN ('ab', 'SEG2') G
                      ->  Seq Scan on df_bp
                            Filter: (c = ANY ('{ab,SEG2}'::bpchar[]))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
 EXPLAIN (COSTS OFF) SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k GROUP BY b.n;
@@ -931,10 +931,10 @@ EXPLAIN (COSTS OFF) SELECT b.n, count(*) FROM df_bp a JOIN df_bp2 b ON a.c = b.k
                                  ->  Broadcast Motion 3:3  (slice3; segments: 3)
                                        ->  Seq Scan on df_bp2 b
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (18 rows)
 
 EXPLAIN (COSTS OFF) SELECT max(c) FROM df_bp;
@@ -945,11 +945,11 @@ EXPLAIN (COSTS OFF) SELECT max(c) FROM df_bp;
          ->  Partial Aggregate
                ->  Seq Scan on df_bp
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: aggregate max of character
- DataFusion: slice 1 not eligible: aggregate max of character
+ Vectorized: slice 0 not eligible: aggregate max of character
+ Vectorized: slice 1 not eligible: aggregate max of character
 (7 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
  count 
 -------
@@ -1033,7 +1033,7 @@ SELECT substring(w::text from 1 for 8) AS s, count(DISTINCT c), count(*) FROM df
  NATION_9 |     4 |   800
 (10 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM df_bp WHERE c = 'SEG1' OR c = 'ab      ';
  count 
 -------
@@ -1132,7 +1132,7 @@ ANALYZE df_bg5;
 ANALYZE df_bg10;
 ANALYZE df_bgn;
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
    a    | octet_length | count |   sum    
 --------+--------------+-------+----------
@@ -1201,7 +1201,7 @@ SELECT count(DISTINCT a) FROM df_bgn;
      2
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
    a    | octet_length | count |   sum    
 --------+--------------+-------+----------
@@ -1271,7 +1271,7 @@ SELECT count(DISTINCT a) FROM df_bgn;
 (1 row)
 
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
    a    | octet_length | count |   sum    
 --------+--------------+-------+----------
@@ -1340,7 +1340,7 @@ SELECT count(DISTINCT a) FROM df_bgn;
      2
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, octet_length(a), count(*), sum(v) FROM df_bg5 GROUP BY a ORDER BY a COLLATE "C";
    a    | octet_length | count |   sum    
 --------+--------------+-------+----------
@@ -1423,7 +1423,7 @@ INSERT INTO df_cp2 SELECT (ARRAY['k1', 'k22', '日本', 'k 4', ''])[1 + i % 5], 
 ANALYZE df_cp;
 ANALYZE df_cp2;
 SET optimizer = on;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
     a    | c | octet_length | blank | count |   sum    
@@ -1477,7 +1477,7 @@ GROUP BY s ORDER BY s::text COLLATE "C";
          |  2857
 (11 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
     a    | c | octet_length | blank | count |   sum    
@@ -1532,7 +1532,7 @@ GROUP BY s ORDER BY s::text COLLATE "C";
 (11 rows)
 
 SET optimizer = off;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
     a    | c | octet_length | blank | count |   sum    
@@ -1586,7 +1586,7 @@ GROUP BY s ORDER BY s::text COLLATE "C";
          |  2857
 (11 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, c, octet_length(a), a LIKE '% ' AS blank, count(*), sum(id) FROM df_cp
 GROUP BY a, c ORDER BY a COLLATE "C", c COLLATE "C";
     a    | c | octet_length | blank | count |   sum    
@@ -1648,7 +1648,7 @@ CREATE TABLE df_lc (id int4, f char(1), s char(1), q numeric(15,2)) DISTRIBUTED 
 INSERT INTO df_lc SELECT i, chr(65 + i % 3), chr(70 + i % 2), (i % 50) + 0.25
 FROM generate_series(1, 30000) i;
 ANALYZE df_lc;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -1664,12 +1664,12 @@ EXPLAIN (COSTS OFF) SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f,
                            Group Key: f, s
                            ->  Seq Scan on df_lc
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (15 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
  f | s |    sum    |         avg         | count 
 ---+---+-----------+---------------------+-------
@@ -1681,7 +1681,7 @@ SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
  C | G | 126250.00 | 25.2500000000000000 |  5000
 (6 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT f, s, sum(q), avg(q), count(*) FROM df_lc GROUP BY f, s ORDER BY f, s;
  f | s |    sum    |         avg         | count 
 ---+---+-----------+---------------------+-------
@@ -1704,7 +1704,7 @@ INSERT INTO df_rx VALUES (1, 'ab'), (2, 'xab'), (3, 'abab'), (4, 'aaa'),
   (5, 'http://www.example.com/path?q=1'), (6, 'https://www./'), (7, 'ftp://a.b/c'),
   (8, 'http://a.b'), (9, E'http://wwwa.ру/п\n/x'), (10, ''), (11, NULL), (12, '😀a😀/');
 ANALYZE df_rx;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '^a?(?:ab)?(.*)$', '\1') = '';
                                         QUERY PLAN                                         
 -------------------------------------------------------------------------------------------
@@ -1713,8 +1713,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '^a?(?:ab
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, '^a?(?:ab)?(.*)$'::text, '\1'::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a|b$', '') = '';
@@ -1725,8 +1725,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a|b$', '
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, 'a|b$'::text, ''::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace() alternation
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace() alternation
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a+?$', '') = '';
@@ -1737,8 +1737,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a+?$', '
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, 'a+?$'::text, ''::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace() a non-greedy quantifier
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace() a non-greedy quantifier
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '(a)+$', '') = '';
@@ -1749,8 +1749,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '(a)+$', 
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, '(a)+$'::text, ''::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace() a quantified capturing group
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace() a quantified capturing group
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '\w$', '') = '';
@@ -1761,8 +1761,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, '\w$', ''
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, '\w$'::text, ''::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace() an escape other than of punctuation
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace() an escape other than of punctuation
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a', '') = '';
@@ -1773,8 +1773,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a', '') 
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, 'a'::text, ''::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace() a regular expression not ending in $
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace() a regular expression not ending in $
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a$', '', 'g') = '';
@@ -1785,11 +1785,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_rx WHERE regexp_replace(s, 'a$', '',
          ->  Seq Scan on df_rx
                Filter: (regexp_replace(s, 'a$'::text, ''::text, 'g'::text) = ''::text)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: function regexp_replace()
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: function regexp_replace()
 (7 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
   regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
   regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
@@ -1813,7 +1813,7 @@ FROM df_rx GROUP BY id, s ORDER BY id;
  12 | [😀a😀/]                          | [|😀a😀/]                          | 😀a😀/      | 😀a<😀/|/|😀||\|\x|\                        | {a😀}
 (12 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, regexp_replace(s, '^a?(?:ab)?(.*)$', '[\1]') AS a,
   regexp_replace(s, '^(?:ab)?(a?)(.*)$', '[\1|\2]') AS b,
   regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS host,
@@ -1841,4 +1841,4 @@ DROP TABLE df_rx;
 DROP TABLE df_st, df_st2, df_st_big, df_sf, df_bp, df_bp2;
 DROP COLLATION df_ci;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

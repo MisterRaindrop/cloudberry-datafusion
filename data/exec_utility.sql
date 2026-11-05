@@ -18,11 +18,11 @@
 -- Body of the exec test, run in utility mode on the coordinator by
 -- sql/exec.sql.  A table created in utility mode lives on the coordinator
 -- only, so its plans have one slice and no Motion, which is what DataFusion
--- runs today.  The same file runs with datafusion.mode off and on, and the
+-- runs today.  The same file runs with vec.mode off and on, and the
 -- outputs must match apart from the mode and the final takeover count.
 --
-LOAD 'datafusion_executor';
-SET datafusion.mode = :dfmode;
+LOAD 'vec_executor';
+SET vec.mode = :dfmode;
 
 CREATE TABLE df_m3 (a int4, b int8, c float8, d bool, e int2, f float4);
 INSERT INTO df_m3
@@ -112,4 +112,4 @@ DROP TABLE df_m3;
 DROP TABLE df_m3_neg;
 DROP TABLE df_m3_float;
 
-SELECT datafusion_debug_takeovers() AS takeovers;
+SELECT vec_debug_takeovers() AS takeovers;

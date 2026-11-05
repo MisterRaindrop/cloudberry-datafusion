@@ -15,8 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# datafusion_executor extension
+# vec_executor extension
 comment = 'vectorized execution backend on Apache DataFusion'
 default_version = '1.0'
-module_pathname = '$libdir/datafusion_executor'
+module_pathname = '$libdir/vec_executor'
 relocatable = true

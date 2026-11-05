@@ -16,19 +16,19 @@
 -- under the License.
 --
 -- Gather Motions between two DataFusion slices carrying Arrow IPC batches
--- (M7b, datafusion.motion_batches), and Redistribute Motions routing them
+-- (M7b, vec.motion_batches), and Redistribute Motions routing them
 -- by Cloudberry's distribution hash (M7c), and split avg passing
 -- DataFusion's state through them (M7d).  The senders encode their
 -- results and send the bytes as tuple chunks of their own type; the
--- receivers decode them.  Each query runs with datafusion.mode off, then on;
+-- receivers decode them.  Each query runs with vec.mode off, then on;
 -- the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_bat (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_bat SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
@@ -39,24 +39,24 @@ ANALYZE df_bat;
 
 -- Which Motions carry batches: only a Gather whose receiving slice runs in
 -- DataFusion too.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat WHERE e < 50;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
 SET gp_enable_multiphase_agg = off;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
-SET datafusion.motion_batches = off;
+SET vec.motion_batches = off;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 
 -- Single-stage aggregates on the coordinator over every row, gathered as
 -- batches.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
 SELECT count(*), sum(a), max(c), min(e) FROM df_bat WHERE a IS NULL OR a < 1000;
 SELECT e, count(*), sum(a), min(c) FROM df_bat WHERE e >= 95 OR e IS NULL GROUP BY e;
 SELECT count(*), sum(a), max(c) FROM df_bat WHERE a = 5;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_bat;
 SELECT count(*), sum(a), max(c), min(e) FROM df_bat WHERE a IS NULL OR a < 1000;
 SELECT e, count(*), sum(a), min(c) FROM df_bat WHERE e >= 95 OR e IS NULL GROUP BY e;
@@ -66,9 +66,9 @@ SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat_empty;
 RESET gp_enable_multiphase_agg;
 
 -- Partial states gathered as batches and combined on the coordinator.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), min(c), max(b) FROM df_bat WHERE e < 50;
 
 -- Several senders per segment in Cloudberry's parallel mode.
@@ -77,9 +77,9 @@ SET enable_parallel = on;
 SET max_parallel_workers_per_gather = 2;
 ALTER TABLE df_bat SET (parallel_workers = 2);
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_bat;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(a), max(c) FROM df_bat;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(a), max(c) FROM df_bat;
 RESET enable_parallel;
 RESET max_parallel_workers_per_gather;
@@ -100,13 +100,13 @@ RESET gp_enable_multiphase_agg;
 -- Redistribute Motions (M7c).  The Rust transcription of cdbhash routes
 -- every row as cdbhash() does, for every key type, alone and combined, in
 -- and out of parallel mode.
-SELECT datafusion_debug_cdbhash_check(100000, 3, 1) AS mismatches,
-       datafusion_debug_cdbhash_check(100000, 7, 2) AS mismatches_parallel;
-SET datafusion.mode = explain;
+SELECT vec_debug_cdbhash_check(100000, 3, 1) AS mismatches,
+       vec_debug_cdbhash_check(100000, 7, 2) AS mismatches_parallel;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
 -- A key the planner has no statistics for: every row is redistributed.
 EXPLAIN (COSTS OFF) SELECT a % 1000, count(*), sum(a) FROM df_bat GROUP BY a % 1000;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
 WHERE e >= 95 OR e IS NULL GROUP BY e;
 SELECT d, e, count(*), sum(a) FROM df_bat WHERE e > 90 OR e IS NULL GROUP BY d, e;
@@ -114,7 +114,7 @@ SELECT c, count(*) FROM df_bat WHERE a < 20 OR a IS NULL GROUP BY c;
 SELECT b, count(*), sum(a) FROM df_bat GROUP BY b HAVING count(*) > 1;
 SELECT a % 1000 AS k, count(*), sum(a) FROM df_bat GROUP BY a % 1000 HAVING min(a) < 5;
 SELECT e, count(*) FROM df_bat_empty GROUP BY e;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), count(a), sum(a), min(c), max(b) FROM df_bat
 WHERE e >= 95 OR e IS NULL GROUP BY e;
 SELECT d, e, count(*), sum(a) FROM df_bat WHERE e > 90 OR e IS NULL GROUP BY d, e;
@@ -129,9 +129,9 @@ SET enable_parallel = on;
 SET max_parallel_workers_per_gather = 2;
 SET enable_groupagg = off;
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_bat GROUP BY e;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), sum(a), max(c) FROM df_bat WHERE e < 5 GROUP BY e;
 RESET enable_parallel;
 RESET max_parallel_workers_per_gather;
@@ -146,20 +146,20 @@ INSERT INTO df_bat_avg SELECT i, (i % 977) / 8.0, i / 4.0, (i % 100)::int2
 FROM generate_series(1, 200000) i;
 INSERT INTO df_bat_avg VALUES (NULL, NULL, NULL, NULL), (200001, NULL, NULL, 7);
 ANALYZE df_bat_avg;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
 EXPLAIN (COSTS OFF) SELECT e, avg(c) FROM df_bat_avg GROUP BY e;
-SET datafusion.motion_batches = off;
+SET vec.motion_batches = off;
 EXPLAIN (COSTS OFF) SELECT avg(c), avg(f) FROM df_bat_avg;
-SET datafusion.motion_batches = on;
+SET vec.motion_batches = on;
 EXPLAIN (COSTS OFF) SELECT avg(a) FROM df_bat_avg;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
 SELECT avg(c), avg(f) FROM df_bat_avg WHERE a IS NULL;
 SELECT avg(c), avg(f) FROM df_bat_avg WHERE a < 0;
 SELECT e, avg(c), avg(f), count(*) FROM df_bat_avg WHERE e > 95 OR e IS NULL OR e = 7 GROUP BY e;
 SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT avg(c), avg(f), count(*), sum(a), min(c) FROM df_bat_avg;
 SELECT avg(c), avg(f) FROM df_bat_avg WHERE a IS NULL;
 SELECT avg(c), avg(f) FROM df_bat_avg WHERE a < 0;
@@ -168,4 +168,4 @@ SELECT e, avg(f) FROM df_bat_avg WHERE e < 50 GROUP BY e HAVING avg(c) > 25000;
 
 DROP TABLE df_bat, df_bat_empty, df_bat_avg;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

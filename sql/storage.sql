@@ -19,13 +19,13 @@
 -- through the table AM interface on the main thread; column stores read only
 -- the columns the scan uses.  Each table has deleted rows, so the AMs'
 -- visibility information is exercised.  Each query runs with
--- datafusion.mode off, then on; the results must match.
+-- vec.mode off, then on; the results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 
 CREATE TABLE df_m6_heap (a int4, b int8, c float8, e int2) USING heap DISTRIBUTED BY (a);
 CREATE TABLE df_m6_ao (a int4, b int8, c float8, e int2) USING ao_row DISTRIBUTED BY (a);
@@ -41,24 +41,24 @@ DELETE FROM df_m6_ao WHERE a % 1000 = 7;
 DELETE FROM df_m6_aocs WHERE a % 1000 = 7;
 DELETE FROM df_m6_pax WHERE a % 1000 = 7;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_ao WHERE a > 10;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_aocs WHERE a > 10;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_pax WHERE a > 10;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_ao WHERE e < 50;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_aocs WHERE e < 50;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_pax WHERE e < 50;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_ao WHERE e < 50;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_aocs WHERE e < 50;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(b) FROM df_m6_pax WHERE e < 50;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), sum(a) FROM df_m6_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
 SELECT a, b, c FROM df_m6_aocs WHERE a % 25000 = 0 OR a % 1000 = 7;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), sum(a) FROM df_m6_pax WHERE e >= 97 OR e IS NULL GROUP BY e;
 SELECT a, b, c FROM df_m6_aocs WHERE a % 25000 = 0 OR a % 1000 = 7;
 
@@ -68,4 +68,4 @@ SELECT count(*), sum(a) FROM df_m6_pax WHERE e < 50;
 
 DROP TABLE df_m6_heap, df_m6_ao, df_m6_aocs, df_m6_pax;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

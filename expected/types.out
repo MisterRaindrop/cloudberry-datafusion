@@ -22,13 +22,13 @@
 -- and infinities, and comparisons across types stay on PostgreSQL, but for
 -- a date against a timestamp constant (DT1), such as the folded
 -- "d < date '1994-01-01' + interval '1' year", which compares dates.  Each
--- query runs with datafusion.mode off, then on; the two results must match.
+-- query runs with vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 SET TimeZone = 'UTC';
@@ -47,7 +47,7 @@ CREATE TABLE df_ty2 AS SELECT id * 2 AS id, d, t, ts, tz FROM df_ty
 DISTRIBUTED BY (id);
 ANALYZE df_ty;
 ANALYZE df_ty2;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:00+08';
                                          QUERY PLAN                                          
 ---------------------------------------------------------------------------------------------
@@ -57,8 +57,8 @@ EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:
                ->  Seq Scan on df_ty
                      Filter: (tz > 'Tue Apr 30 16:00:00 2024 UTC'::timestamp with time zone)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
@@ -70,8 +70,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
                ->  Seq Scan on df_ty
                      Filter: ((d - 1) > '01-01-2001'::date)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
@@ -82,8 +82,8 @@ EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
          ->  Partial Aggregate
                ->  Seq Scan on df_ty
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator - on date and date
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator - on date and date
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE ts > '2010-01-01'::date;
@@ -95,8 +95,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE ts > '2010-01-01'::date;
                ->  Seq Scan on df_ty
                      Filter: (ts > '01-01-2010'::date)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > on timestamp without time zone and date
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > on timestamp without time zone and date
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE tz > ts;
@@ -108,11 +108,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE tz > ts;
                ->  Seq Scan on df_ty
                      Filter: (tz > ts)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > on timestamp with time zone and timestamp without time zone
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > on timestamp with time zone and timestamp without time zone
 (8 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
     min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
 -----------+----------+----------+----------+-----------+----------+-----------+----------+--------
@@ -150,7 +150,7 @@ SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d O
  09-27-2002 |    25 | Fri Mar 17 14:00:00 2000 | Fri Aug 21 00:00:00 2026 UTC
 (4 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
     min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
 -----------+----------+----------+----------+-----------+----------+-----------+----------+--------
@@ -199,7 +199,7 @@ CREATE TABLE df_ty3 (id int4, d date) DISTRIBUTED BY (id);
 INSERT INTO df_ty3 VALUES (1, '-infinity'), (2, 'infinity'), (3, '4713-01-01 BC'),
   (4, '0044-03-15 BC'), (5, '1993-12-31'), (6, '1994-01-01'), (7, '1994-01-02'),
   (8, '294276-12-31'), (9, '294277-01-01'), (10, '5874897-12-31'), (11, NULL);
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + interval '1' year;
                                         QUERY PLAN                                         
 -------------------------------------------------------------------------------------------
@@ -209,8 +209,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + int
                ->  Seq Scan on df_ty
                      Filter: (d < 'Sun Jan 01 00:00:00 1995'::timestamp without time zone)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
@@ -222,8 +222,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
                ->  Seq Scan on df_ty
                      Filter: (d < ts)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator < on date and timestamp without time zone
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator < on date and timestamp without time zone
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
@@ -235,11 +235,11 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <
                ->  Seq Scan on df_ty3
                      Filter: (d <> 'Sun Jan 02 01:00:00 1994'::timestamp without time zone)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
  count 
 -------
@@ -294,7 +294,7 @@ SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity
      9 |  53 | 381
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
  count 
 -------
@@ -361,7 +361,7 @@ INSERT INTO df_ty4 SELECT i, date '1992-01-01' + (i * 7919) % 2600 FROM generate
 INSERT INTO df_ty4 VALUES (-1, '-infinity'), (-2, 'infinity'), (-3, '4714-11-24 BC'),
   (-4, '0001-12-31 BC'), (-5, '0001-01-01'), (-6, '5874897-12-31'), (-7, '2000-02-29'),
   (-8, NULL), (-9, 'infinity');
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -374,9 +374,9 @@ EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1
                      Group Key: EXTRACT(year FROM d)
                      ->  Seq Scan on df_ty4
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
@@ -387,8 +387,8 @@ EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
          ->  Partial Aggregate
                ->  Seq Scan on df_ty4
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining aggregate sum without batch Motions
- DataFusion: slice 1 not eligible: aggregate sum of a numeric that may be infinite
+ Vectorized: slice 0 not eligible: combining aggregate sum without batch Motions
+ Vectorized: slice 1 not eligible: aggregate sum of a numeric that may be infinite
 (7 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 1995.5;
@@ -400,8 +400,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 199
                ->  Seq Scan on df_ty4
                      Filter: (EXTRACT(year FROM d) > 1995.5)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 not eligible: operator > rescaling a numeric that may be infinite
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > rescaling a numeric that may be infinite
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
@@ -413,11 +413,11 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01'
                ->  Seq Scan on df_ty4
                      Filter: ((id > 0) AND ((d + 45) > '01-01-1996'::date))
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
      y     | count 
 -----------+-------
@@ -505,7 +505,7 @@ SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
 ERROR:  date out of range  (seg0 slice1 172.17.0.3:40000 pid=19683)
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
 ERROR:  date out of range  (seg1 slice1 172.17.0.3:40001 pid=19685)
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
      y     | count 
 -----------+-------
@@ -605,7 +605,7 @@ INSERT INTO df_ty5 VALUES (-1, '-infinity', 0, ''), (-2, 'infinity', 0, ''),
   (-3, '4713-11-24 00:00 BC', 0, ''), (-4, '294276-12-31 23:59:59.999999', 0, ''),
   (-5, '1999-12-31 23:59:59.999999', 0, ''), (-6, '2000-01-01 00:00', 0, ''),
   (-7, '0001-12-31 23:30 BC', 0, ''), (-8, NULL, 0, ''), (-9, '1969-07-20 20:17:40', 0, '');
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s;
                                               QUERY PLAN                                              
 ------------------------------------------------------------------------------------------------------
@@ -618,9 +618,9 @@ EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_t
                      Group Key: g, EXTRACT(minute FROM t), s
                      ->  Seq Scan on df_ty5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;
@@ -635,9 +635,9 @@ EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY
                      Group Key: EXTRACT(second FROM t)
                      ->  Seq Scan on df_ty5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
- DataFusion: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 2 not eligible: GROUP BY key of numeric of unknown precision
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_ty5 GROUP BY 1;
@@ -652,12 +652,12 @@ EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_t
                      Group Key: EXTRACT(hour FROM (t)::timestamp with time zone)
                      ->  Seq Scan on df_ty5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: GROUP BY key of numeric of unknown precision
- DataFusion: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 2 not eligible: GROUP BY key of numeric of unknown precision
 (12 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
  m | count 
 ---+-------
@@ -734,7 +734,7 @@ SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty
  -Infinity | Infinity |  3009
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
  m | count 
 ---+-------
@@ -814,8 +814,8 @@ SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty
 DROP TABLE df_ty5;
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
                                   QUERY PLAN                                  
 ------------------------------------------------------------------------------
@@ -832,10 +832,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
                                  Hash Key: a.ts
                                  ->  Seq Scan on df_ty a
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
- DataFusion: slice 3 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (17 rows)
 
 EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_ty GROUP BY d;
@@ -850,12 +850,12 @@ EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_ty GROUP BY d;
                      Group Key: d
                      ->  Seq Scan on df_ty
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
  count | count 
 -------+-------
@@ -892,7 +892,7 @@ SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.
   2002
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
  count | count 
 -------+-------
@@ -935,7 +935,7 @@ SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.
 CREATE TABLE df_ct (a int, b text) DISTRIBUTED BY (a);
 INSERT INTO df_ct SELECT i, 'x' || i FROM generate_series(1, 3000) i;
 DELETE FROM df_ct WHERE a % 7 = 0;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
                             QUERY PLAN                            
 ------------------------------------------------------------------
@@ -946,9 +946,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
                      Hash Key: ctid
                      ->  Seq Scan on df_ct
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible, sends Arrow batches
- DataFusion: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (10 rows)
 
 EXPLAIN (COSTS OFF) SELECT a FROM df_ct WHERE ctid > '(0,5)';
@@ -960,11 +960,11 @@ HINT:  To uniquely identify a row within a distributed table, use the "gp_segmen
    ->  Seq Scan on df_ct
          Filter: (ctid > '(0,5)'::tid)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 not eligible: constant of type tid
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: constant of type tid
 (6 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
  gp_segment_id | ctid  | a  
 ---------------+-------+----
@@ -996,7 +996,7 @@ HINT:  To uniquely identify a row within a distributed table, use the "gp_segmen
   3474
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
  gp_segment_id | ctid  | a  
 ---------------+-------+----
@@ -1028,8 +1028,8 @@ HINT:  To uniquely identify a row within a distributed table, use the "gp_segmen
   3474
 (1 row)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_ct;
 DROP TABLE df_ty, df_ty2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

@@ -25,15 +25,15 @@
 -- grouping by the argument, runs as two aggregates (D2), and a
 -- GroupAggregate whose order no one reads runs hashed, without its Sort;
 -- below a sorted Motion it runs hashed and sorts by the Motion's keys.
--- Each query runs with datafusion.mode off, then on; the two results must
+-- Each query runs with vec.mode off, then on; the two results must
 -- match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_di (id int, a int, b int8, f float8, n numeric(10,2), t text) DISTRIBUTED BY (id);
 INSERT INTO df_di SELECT i,
@@ -46,7 +46,7 @@ INSERT INTO df_di SELECT i,
 FROM generate_series(1, 30000) i;
 ANALYZE df_di;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 -- one argument, split at its distribution (batches carry the partial counts)
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
 -- distinct by id, the distribution key: each segment counts its own
@@ -67,7 +67,7 @@ EXPLAIN (COSTS OFF) SELECT count(a ORDER BY a) FROM df_di;
 -- ORDER BY: a Sort over the two aggregates (S1, D2)
 EXPLAIN (COSTS OFF) SELECT a, count(DISTINCT b) FROM df_di GROUP BY a ORDER BY a;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
 SELECT count(DISTINCT id), sum(DISTINCT id), avg(DISTINCT id) FROM df_di;
 SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE id % 4 = 1;
@@ -86,7 +86,7 @@ SELECT count(DISTINCT a), count(DISTINCT b), count(DISTINCT f), count(DISTINCT t
   sum(DISTINCT n), avg(DISTINCT a), max(f) FROM df_di WHERE id > 5;
 SELECT id % 3 AS k, count(DISTINCT a), count(DISTINCT b), count(*), sum(n) FROM df_di GROUP BY 1 ORDER BY 1;
 SELECT count(DISTINCT a), count(DISTINCT b), count(*), sum(b) FROM df_di WHERE id < 0;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), min(a), max(a) FROM df_di;
 SELECT count(DISTINCT id), sum(DISTINCT id), avg(DISTINCT id) FROM df_di;
 SELECT count(DISTINCT b), sum(DISTINCT b) FROM df_di WHERE id % 4 = 1;
@@ -108,4 +108,4 @@ SELECT count(DISTINCT a), count(DISTINCT b), count(*), sum(b) FROM df_di WHERE i
 
 DROP TABLE df_di;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

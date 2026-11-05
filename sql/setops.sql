@@ -30,13 +30,13 @@
 -- the Append) are read from their streams; an input the planner proves
 -- empty (a Result with a one-time filter, OF1) gives no rows, or an Agg's
 -- one row on the segment its filter picks.  Each query runs with
--- datafusion.mode off, then on; the two results must match.
+-- vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_u1 (k int, g int, a numeric(7,2), b int8, t text, c char(4)) DISTRIBUTED BY (k);
 CREATE TABLE df_u2 (k int, g int, a numeric(12,4), b int4, t varchar(10), c char(4)) DISTRIBUTED BY (k);
@@ -49,7 +49,7 @@ ANALYZE df_u2;
 ANALYZE df_up;
 
 SET optimizer = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT g, a FROM df_u1 UNION ALL SELECT g, a FROM df_u2) u GROUP BY u.g ORDER BY 1;
 EXPLAIN (COSTS OFF) SELECT u.k, u.t, x.g FROM (SELECT k, t FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
@@ -68,7 +68,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(x), sum(y) FROM (SELECT g x, k % 4 y FR
 SET enable_hashagg = off;
 EXPLAIN (COSTS OFF) SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT g, sum(a) FROM df_u2 GROUP BY g) u GROUP BY g ORDER BY 2, 1;
 RESET enable_hashagg;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
 SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
 SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
@@ -90,7 +90,7 @@ SELECT g, sum(s) FROM (SELECT g, sum(a) s FROM df_u1 GROUP BY g UNION ALL SELECT
 RESET enable_hashagg;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
 SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
 SELECT g, sum(q), count(q) FROM (SELECT g, a / 3 q FROM df_u1 WHERE a <> 'NaN' UNION ALL SELECT g, a FROM df_u2 UNION ALL SELECT g, k * 1.5 FROM df_u1) u GROUP BY g ORDER BY 1;
@@ -115,9 +115,9 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
 
 -- GPORCA's plans
 SET optimizer = on;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
 SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
 SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
@@ -131,7 +131,7 @@ SELECT count(*) FROM (SELECT k % 30 x, g FROM df_u1 WHERE k % 11 <> 0 INTERSECT 
 SELECT count(*), count(c) FROM (SELECT g, c FROM df_u1 INTERSECT SELECT g + 1, c FROM df_u2) s;
 SELECT u.g, count(*), sum(u.a) FROM (SELECT x.g, x.a FROM df_u1 x JOIN df_u2 y ON x.g = y.k UNION ALL SELECT y.g, y.a FROM df_u2 y JOIN df_u1 x ON y.g = x.k) u GROUP BY u.g ORDER BY 1;
 SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u GROUP BY u.t ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT u.g, count(*), sum(u.a), sum(u.b), count(u.t) FROM (SELECT g, a, b, t FROM df_u1 UNION ALL SELECT g, a, b, t FROM df_u2) u GROUP BY u.g ORDER BY 1;
 SELECT u.k, u.t, u.a, x.g FROM (SELECT k, t, a FROM df_u1 WHERE k < 50 UNION ALL SELECT k, t, a FROM df_u2 WHERE k < 50) u JOIN df_u1 x ON x.k = u.k + 1 ORDER BY 1, 2, 3;
 SELECT k, a FROM (SELECT k, a FROM df_u1 WHERE k % 400 = 1 UNION ALL SELECT k, a FROM df_u2 WHERE k % 300 = 2) u ORDER BY a, k;
@@ -155,19 +155,19 @@ SELECT u.t, count(*) FROM (SELECT t FROM df_u1 UNION ALL SELECT t FROM df_u2) u 
 -- Gather's keys, then limited: one row per group, so no ties.
 SET optimizer = off;
 SET enable_hashagg = off;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 60;
 EXPLAIN (COSTS OFF) SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
 EXPLAIN (COSTS OFF) SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT x.k FROM df_u1 x JOIN (SELECT DISTINCT g, a FROM df_u1) d ON x.k = d.g;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
 SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 20);
 SELECT DISTINCT g, k % 50 FROM df_u1 WHERE k % 10 = 0 ORDER BY 1, 2;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT x.k, x.g, d.t, d.c FROM df_u1 x JOIN (SELECT DISTINCT g, k % 50 m, t, c FROM df_u1 WHERE k < 300) d ON x.k = d.m + d.g WHERE x.k < 12 ORDER BY 1, 3, 4;
 SELECT count(*), count(t), count(c) FROM (SELECT DISTINCT g + 1, t, c FROM df_u1) s;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT DISTINCT k % 5 FROM df_u1 WHERE g = 3 AND k < 10);
@@ -182,19 +182,19 @@ CREATE TABLE df_uq (k int, m int, f int, mf char(50), p char(50)) DISTRIBUTED BY
 INSERT INTO df_uq SELECT i, i % 1000, i % 9, 'mf' || (i % 990),
   CASE WHEN i % 1009 = 0 THEN NULL ELSE 'p' || (i * 7 % 18000) END FROM generate_series(1, 18000) i;
 ANALYZE df_uq;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
   AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
   AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
 EXPLAIN (COSTS OFF) SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
   AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
 SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
   AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p DESC NULLS FIRST LIMIT 7 OFFSET 2;
 SELECT DISTINCT p, f FROM df_uq WHERE m < 30 ORDER BY p NULLS FIRST, f DESC LIMIT 6 OFFSET 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
   AND (SELECT count(*) FROM df_uq i WHERE i.mf = o.mf AND i.f IN (1, 5)) > 0 ORDER BY p LIMIT 10;
 SELECT DISTINCT p FROM df_uq o WHERE m BETWEEN 700 AND 714
@@ -206,16 +206,16 @@ SET optimizer = on;
 
 -- AS1: GPORCA's Assert over a scalar subquery's rows, at most one: every
 -- row passes, or the slice raises PostgreSQL's error (P0003).
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k = 3);
 SELECT count(*) FROM df_u1 WHERE g = (SELECT g FROM df_u2 WHERE k < 5);
-RESET datafusion.mode;
+RESET vec.mode;
 
 DROP TABLE df_u1, df_u2, df_up, df_uq;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

@@ -20,21 +20,21 @@
 -- the rows.  Partial aggregates produce PostgreSQL transition states that a
 -- Finalize Aggregate combines (since M7a in DataFusion as well, see
 -- receive.sql).  Each query runs with
--- datafusion.mode off, then on; the two results must match.
+-- vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
+CREATE EXTENSION vec_executor;
 -- QEs load the library when they connect.
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 CREATE TABLE df_m5 (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_m5 SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2
 FROM generate_series(1, 200000) i;
 INSERT INTO df_m5 VALUES (NULL, NULL, NULL, NULL, NULL);
 ANALYZE df_m5;
 -- Which slices qualify.
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_m5 WHERE e < 50;
                    QUERY PLAN                   
 ------------------------------------------------
@@ -44,8 +44,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_m5 WHERE e < 50;
                ->  Seq Scan on df_m5
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_m5 GROUP BY e;
@@ -60,9 +60,9 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_m5 GROUP BY e;
                      Group Key: e
                      ->  Seq Scan on df_m5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT a, b FROM df_m5 WHERE a % 50000 = 0;
@@ -72,8 +72,8 @@ EXPLAIN (COSTS OFF) SELECT a, b FROM df_m5 WHERE a % 50000 = 0;
    ->  Seq Scan on df_m5
          Filter: ((a % 50000) = 0)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
- DataFusion: slice 1 eligible
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
 (6 rows)
 
 EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_m5;
@@ -84,19 +84,19 @@ EXPLAIN (COSTS OFF) SELECT avg(c) FROM df_m5;
          ->  Partial Aggregate
                ->  Seq Scan on df_m5
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 not eligible: combining aggregate avg without batch Motions
- DataFusion: slice 1 not eligible: partial aggregate avg without batch Motions
+ Vectorized: slice 0 not eligible: combining aggregate avg without batch Motions
+ Vectorized: slice 1 not eligible: partial aggregate avg without batch Motions
 (7 rows)
 
 -- Partial plain aggregate on the segments, finalized on the coordinator.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
  count  | count  |    sum     |   sum   | min  |  max  |   max   
 --------+--------+------------+---------+------+-------+---------
  100000 | 100000 | 9997650000 | 2450000 | 0.25 | 50000 | 2000000
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHERE e < 50;
  count  | count  |    sum     |   sum   | min  |  max  |   max   
 --------+--------+------------+---------+------+-------+---------
@@ -104,7 +104,7 @@ SELECT count(*), count(a), sum(a), sum(e), min(c), max(c), max(b) FROM df_m5 WHE
 (1 row)
 
 -- Partial grouped aggregate, redistributed, finalized on the segments.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
@@ -116,7 +116,7 @@ SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP B
  97 |  2000 | 200094000 | 24.25
 (6 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP BY e;
  e  | count |    sum    |  min  
 ----+-------+-----------+-------
@@ -129,7 +129,7 @@ SELECT e, count(*), sum(a), min(c) FROM df_m5 WHERE e >= 95 OR e IS NULL GROUP B
 (6 rows)
 
 -- Grouping by the distribution key: one stage on the segments.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
    a    | count |   sum   
 --------+-------+---------
@@ -141,7 +141,7 @@ SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY 
  200000 |     1 | 2000000
 (6 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY a;
    a    | count |   sum   
 --------+-------+---------
@@ -154,7 +154,7 @@ SELECT a, count(*), sum(b) FROM df_m5 WHERE a % 40000 = 0 OR a IS NULL GROUP BY 
 (6 rows)
 
 -- A filter and projection, gathered.
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
    a    |    b    | ?column? | ?column? 
 --------+---------+----------+----------
@@ -164,7 +164,7 @@ SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
  150000 | 1500000 |    75000 |        1
 (4 rows)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT a, b, c * 2, e + 1 FROM df_m5 WHERE a % 50000 = 0;
    a    |    b    | ?column? | ?column? 
 --------+---------+----------+----------
@@ -185,23 +185,23 @@ SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
                ->  Seq Scan on df_m5 (never executed)
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: 2 partitions, memory limit 32768 kB, peak 129 kB, spilled 0 kB in 0 files
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: 2 partitions, memory limit 32768 kB, peak 129 kB, spilled 0 kB in 0 files
 (9 rows)
 
 -- Each query runs in 8 * worker threads / (slices running together *
 -- primaries on the host) partitions, at least 1: on the coordinator, a
 -- primary of its host with the 3 segments, of the 2 slices of a plain
 -- aggregate's plan, 2 of the 2 threads; of the 3 of a join's, 1.
--- datafusion.slice_partitions fixes them, up to the threads.
+-- vec.slice_partitions fixes them, up to the threads.
 SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
  count  |    sum     
 --------+------------
  100000 | 9997650000
 (1 row)
 
-SELECT partitions FROM datafusion_debug_last_run();
+SELECT partitions FROM vec_debug_last_run();
  partitions 
 ------------
           2
@@ -213,39 +213,39 @@ SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
  198000
 (1 row)
 
-SELECT partitions FROM datafusion_debug_last_run();
+SELECT partitions FROM vec_debug_last_run();
  partitions 
 ------------
           1
 (1 row)
 
-SET datafusion.slice_partitions = 8;
+SET vec.slice_partitions = 8;
 SELECT count(*) FROM df_m5 x JOIN df_m5 y ON x.a = y.e;
  count  
 --------
  198000
 (1 row)
 
-SELECT partitions FROM datafusion_debug_last_run();
+SELECT partitions FROM vec_debug_last_run();
  partitions 
 ------------
           2
 (1 row)
 
-SET datafusion.slice_partitions = 1;
+SET vec.slice_partitions = 1;
 SELECT count(*), sum(a) FROM df_m5 WHERE e < 50;
  count  |    sum     
 --------+------------
  100000 | 9997650000
 (1 row)
 
-SELECT partitions FROM datafusion_debug_last_run();
+SELECT partitions FROM vec_debug_last_run();
  partitions 
 ------------
           1
 (1 row)
 
-RESET datafusion.slice_partitions;
+RESET vec.slice_partitions;
 -- AP2: a partial aggregate may produce a group more than once (the
 -- aggregate above combines them, as after a Streaming Partial
 -- HashAggregate whose memory is full), so DataFusion runs it as a partial
@@ -272,12 +272,12 @@ FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_a
                                  Group Key: k
                                  ->  Seq Scan on df_ap2
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
 (14 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
 FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
  count |  sum   |     sum      |    sum    |     sum     
@@ -285,7 +285,7 @@ FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_a
  60000 | 600000 | 180000300000 | 225003750 | 34200030000
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(n), sum(s), sum(lo), sum(hi)
 FROM (SELECT k, count(*) AS n, sum(v) AS s, min(f) AS lo, max(a) AS hi FROM df_ap2 GROUP BY k) g;
  count |  sum   |     sum      |    sum    |     sum     
@@ -314,13 +314,13 @@ FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000
                                        Hash Key: ((k % 100)), ((a % 200000))
                                        ->  Seq Scan on df_ap2
  Optimizer: GPORCA
- DataFusion: slice 0 eligible
- DataFusion: slice 1 eligible
- DataFusion: slice 2 eligible
- DataFusion: slice 3 eligible
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+ Vectorized: slice 3 eligible
 (17 rows)
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), sum(s), sum(n), sum(d)
 FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
  count |     sum      |  sum   |  sum   
@@ -328,7 +328,7 @@ FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000
    100 | 180000300000 | 600000 | 200000
 (1 row)
 
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), sum(s), sum(n), sum(d)
 FROM (SELECT k % 100 AS g, sum(v) AS s, count(*) AS n, count(DISTINCT a % 200000) AS d FROM df_ap2 GROUP BY 1) t;
  count |     sum      |  sum   |  sum   
@@ -360,4 +360,4 @@ SELECT count(*) FROM df_m5 WHERE a % 7 = 0;
 
 DROP TABLE df_m5;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

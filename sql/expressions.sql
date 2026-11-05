@@ -19,14 +19,14 @@
 -- simple), COALESCE and NULLIF (as CASE, so that later arguments only run
 -- where PostgreSQL runs them), IS [NOT] DISTINCT FROM; casts (E2).  NULLs follow SQL's
 -- three-valued logic as in PostgreSQL.  Each query runs with
--- datafusion.mode off, then on; the two results must match.
+-- vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
-SET datafusion.motion_batches = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
 
 CREATE TABLE df_ex (id int, a int, b int8, f float8, t text, d date, n numeric(10,2), m numeric(10,2))
 DISTRIBUTED BY (id);
@@ -36,12 +36,12 @@ INSERT INTO df_ex SELECT i, CASE WHEN i % 13 = 0 THEN NULL ELSE i % 10 END, i % 
 FROM generate_series(1, 50000) i;
 ANALYZE df_ex;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE a IN (1, 3) AND t NOT IN ('k1') AND coalesce(b, 0) > 1;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE a > ALL ('{0}');
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ex WHERE CASE WHEN n > 1 THEN n ELSE 0 END > 0.5;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(a) FROM df_ex WHERE a IN (1, 3, 5);
 SELECT (a IN (1, NULL)) IS NULL AS isn, a IN (1, NULL) AS r, count(*) FROM df_ex GROUP BY 1, 2 ORDER BY 1, 2;
 SELECT (a NOT IN (1, NULL)) IS NULL AS isn, a NOT IN (1, NULL) AS r, count(*) FROM df_ex GROUP BY 1, 2 ORDER BY 1, 2;
@@ -59,7 +59,7 @@ SELECT count(*), sum(nullif(a, 3)), count(nullif(t, 'k1')) FROM df_ex;
 SELECT count(*) FROM df_ex WHERE a IS NOT DISTINCT FROM NULL OR t IS NOT DISTINCT FROM 'k2';
 SELECT count(*) FROM df_ex WHERE n IS DISTINCT FROM m;
 SELECT coalesce(n, m) AS v, count(*) FROM df_ex GROUP BY 1 ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(a) FROM df_ex WHERE a IN (1, 3, 5);
 SELECT (a IN (1, NULL)) IS NULL AS isn, a IN (1, NULL) AS r, count(*) FROM df_ex GROUP BY 1, 2 ORDER BY 1, 2;
 SELECT (a NOT IN (1, NULL)) IS NULL AS isn, a NOT IN (1, NULL) AS r, count(*) FROM df_ex GROUP BY 1, 2 ORDER BY 1, 2;
@@ -94,12 +94,12 @@ INSERT INTO df_cs VALUES
   (-5, 1, -40000, -3000000000, -0.5, 1e300, '294276-12-31', '294276-12-31 23:59:59', -2.5),
   (-6, 2, 3, 4, 3.5, 1e-300, '2000-01-01', '1999-12-31 23:59:59.999999', 0.0005);
 ANALYZE df_cs;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
@@ -111,9 +111,9 @@ CREATE TABLE df_cs_f8 (id int, n numeric(38,20)) DISTRIBUTED BY (id);
 INSERT INTO df_cs_f8 VALUES (1, 0.00000000000000000001), (2, 0.00009007199254740992),
   (3, 0.00009007199254740993), (4, -900719925474.0993), (5, 123456789012345678.12345678901234567891),
   (6, -0.1), (7, 3.3), (8, 0);
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT id, max(n::float8) FROM df_cs_f8 GROUP BY id ORDER BY id;
 -- PostgreSQL's errors, with their SQLSTATEs
 \set VERBOSITY sqlstate
@@ -135,7 +135,7 @@ INSERT INTO df_fl SELECT i,
   CASE i % 4 WHEN 0 THEN '-0'::float4 WHEN 1 THEN 'NaN' WHEN 2 THEN '-NaN' END
 FROM generate_series(1, 1200) i;
 ANALYZE df_fl;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END) AS z, sum(CASE WHEN f < 0 THEN 1 ELSE 0 END) AS neg,
   sum(CASE WHEN f > 1e308 THEN 1 ELSE 0 END) AS big, sum(CASE WHEN f = 'NaN' THEN 1 ELSE 0 END) AS nan,
   sum(CASE WHEN g = 'NaN' THEN 1 ELSE 0 END) AS gnan, sum(CASE WHEN f IN (0, 'NaN') THEN 1 ELSE 0 END) AS inl,
@@ -146,7 +146,7 @@ SELECT g, count(*) FROM df_fl GROUP BY g ORDER BY 2, 1;
 SELECT count(*) FROM (SELECT f FROM df_fl GROUP BY f) s;
 SELECT max(f), max(g), min(g) FROM df_fl WHERE k % 6 <> 1;
 SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END) AS z, sum(CASE WHEN f < 0 THEN 1 ELSE 0 END) AS neg,
   sum(CASE WHEN f > 1e308 THEN 1 ELSE 0 END) AS big, sum(CASE WHEN f = 'NaN' THEN 1 ELSE 0 END) AS nan,
   sum(CASE WHEN g = 'NaN' THEN 1 ELSE 0 END) AS gnan, sum(CASE WHEN f IN (0, 'NaN') THEN 1 ELSE 0 END) AS inl,
@@ -164,13 +164,13 @@ INSERT INTO df_fl2 SELECT i, CASE i % 4 WHEN 0 THEN 'Infinity'::float8 WHEN 1 TH
   WHEN 2 THEN CASE WHEN i % 8 = 2 THEN 'NaN'::float8 ELSE 1 END END,
   CASE i % 4 WHEN 0 THEN 'Infinity'::float4 WHEN 1 THEN '-Infinity' END
 FROM generate_series(1, 4000) i;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
 SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1 ORDER BY 1;
 SELECT k % 3 AS p, min(f), max(f), count(f) FROM df_fl2 WHERE k % 4 >= 2 GROUP BY 1 ORDER BY 1;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT sum(CASE WHEN f = 0 THEN 1 ELSE 0 END), count(nullif(f, 'NaN')) FROM df_fl;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
 EXPLAIN (COSTS OFF) SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1;
@@ -178,4 +178,4 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE
 
 DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;

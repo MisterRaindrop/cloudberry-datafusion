@@ -22,13 +22,13 @@
 -- and infinities, and comparisons across types stay on PostgreSQL, but for
 -- a date against a timestamp constant (DT1), such as the folded
 -- "d < date '1994-01-01' + interval '1' year", which compares dates.  Each
--- query runs with datafusion.mode off, then on; the two results must match.
+-- query runs with vec.mode off, then on; the two results must match.
 --
-CREATE EXTENSION datafusion_executor;
-ALTER DATABASE contrib_regression SET session_preload_libraries = 'datafusion_executor';
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
 SET optimizer = off;
-SET datafusion.worker_threads = 2;
+SET vec.worker_threads = 2;
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 SET TimeZone = 'UTC';
@@ -49,21 +49,21 @@ DISTRIBUTED BY (id);
 ANALYZE df_ty;
 ANALYZE df_ty2;
 
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:00+08';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
 EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE ts > '2010-01-01'::date;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE tz > ts;
 
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
 SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
 SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
 SELECT id, d, t, ts, tz FROM df_ty
 WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER BY id;
 SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
 SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
 SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
@@ -81,11 +81,11 @@ CREATE TABLE df_ty3 (id int4, d date) DISTRIBUTED BY (id);
 INSERT INTO df_ty3 VALUES (1, '-infinity'), (2, 'infinity'), (3, '4713-01-01 BC'),
   (4, '0044-03-15 BC'), (5, '1993-12-31'), (6, '1994-01-01'), (7, '1994-01-02'),
   (8, '294276-12-31'), (9, '294277-01-01'), (10, '5874897-12-31'), (11, NULL);
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + interval '1' year;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
 EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
@@ -95,7 +95,7 @@ SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d = timestamp '1994-01-
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-12-31 23:59:59.999999';
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
 SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
@@ -118,12 +118,12 @@ INSERT INTO df_ty4 SELECT i, date '1992-01-01' + (i * 7919) % 2600 FROM generate
 INSERT INTO df_ty4 VALUES (-1, '-infinity'), (-2, 'infinity'), (-3, '4714-11-24 BC'),
   (-4, '0001-12-31 BC'), (-5, '0001-01-01'), (-6, '5874897-12-31'), (-7, '2000-02-29'),
   (-8, NULL), (-9, 'infinity');
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 1995.5;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
 SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
 SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
@@ -133,7 +133,7 @@ SELECT id, d + 30, 7 + d, d - 365 FROM df_ty4 WHERE id < 0 AND id NOT IN (-3, -6
 SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
 SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
 SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
 SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
@@ -156,18 +156,18 @@ INSERT INTO df_ty5 VALUES (-1, '-infinity', 0, ''), (-2, 'infinity', 0, ''),
   (-3, '4713-11-24 00:00 BC', 0, ''), (-4, '294276-12-31 23:59:59.999999', 0, ''),
   (-5, '1999-12-31 23:59:59.999999', 0, ''), (-6, '2000-01-01 00:00', 0, ''),
   (-7, '0001-12-31 23:30 BC', 0, ''), (-8, NULL, 0, ''), (-9, '1969-07-20 20:17:40', 0, '');
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s;
 EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_ty5 GROUP BY 1;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
 SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
 SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
   extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
 SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
 SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
 SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
 SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
@@ -178,18 +178,18 @@ DROP TABLE df_ty5;
 
 -- Redistributed by date and time keys (cdbhash: hashint4 for date,
 -- time_hash and timestamp_hash for the others), as batches.
-SET datafusion.motion_batches = on;
-SET datafusion.mode = explain;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
 EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_ty GROUP BY d;
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
 SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
 SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
 SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
 SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
 SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
 SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
 SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
@@ -203,20 +203,20 @@ SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.
 CREATE TABLE df_ct (a int, b text) DISTRIBUTED BY (a);
 INSERT INTO df_ct SELECT i, 'x' || i FROM generate_series(1, 3000) i;
 DELETE FROM df_ct WHERE a % 7 = 0;
-SET datafusion.mode = explain;
+SET vec.mode = explain;
 EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
 EXPLAIN (COSTS OFF) SELECT a FROM df_ct WHERE ctid > '(0,5)';
-SET datafusion.mode = off;
+SET vec.mode = off;
 SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
 SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
 SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
-SET datafusion.mode = on;
+SET vec.mode = on;
 SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
 SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
 SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
-SET datafusion.mode = off;
+SET vec.mode = off;
 DROP TABLE df_ct;
 
 DROP TABLE df_ty, df_ty2;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
-DROP EXTENSION datafusion_executor;
+DROP EXTENSION vec_executor;
