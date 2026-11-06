@@ -1,6 +1,7 @@
 # Adding an engine
 
-DataFusion is the only engine today.  This document is for whoever adds a
+DataFusion is the only engine today.  This document describes the
+interface between the extension and its engine, and is for whoever adds a
 second one: what an engine implements, what the host still assumes about
 the engine it talks to, and the designs agreed for the parts that must
 change first.  None of it changes the DataFusion path; the changes it
@@ -11,6 +12,57 @@ The engine most likely to come next is Velox.  It is C++, and an engine
 added to this extension must not bring a Rust toolchain into its build:
 everything a non-Rust engine needs is a specification plus a test, never a
 Rust library to link.
+
+## The engine ABI
+
+The extension reaches the engine only through the table of functions
+`vec_engine_entry` returns (`include/vec_engine.h`); DataFusion's is in
+`engines/datafusion/df_ffi`.  No function in it calls into PostgreSQL or lets a panic
+escape; each reports failure as a status code plus a SQLSTATE and message
+in the caller's `VecError`. The C side raises the `ereport` after the call
+returns, so PostgreSQL's `longjmp` never unwinds through Rust frames.
+Plans reach the engine as the IR of `docs/ir.md`, and rows as Arrow
+arrays by the Arrow C Data Interface: the extension lends each batch it
+reads (the engine copies it) and releases each result batch once it has
+handed out its rows.
+
+An engine is a library of its own, `$libdir/vec_engine_<name>.so`, that
+exports only `vec_engine_entry`.  `vec.engine` (superuser, default
+`datafusion`, sent to the segments) names it; a backend opens it with
+`RTLD_LOCAL` when it first needs it, so the engine's symbols and the
+libraries it brings stay apart from PostgreSQL's, PAX's and other
+extensions', and keeps it: once a session has used an engine the setting
+can no longer change.  An engine of another ABI version is refused, with
+both versions in the error.  The extension blocks every signal while it
+opens the engine and while the engine starts its runtime or a query, so
+threads it starts then never take the signals PostgreSQL acts on.  The
+stream of a batch Motion starts with a signature of the engine's name and
+the IR version, among the rest, so both ends must run the same engine.
+
+An engine declares what it runs in its table (`VecCaps`): the IR versions
+it reads, how it takes numeric, and coarse features (joins, sorts, window
+functions, grouping sets, set operations, locale collations, batch
+Motions, direct PAX reads).  A slice that needs what the engine lacks stays
+on PostgreSQL, and EXPLAIN says so (`engine X lacks joins`).  DataFusion
+declares everything.  `engines/null` builds `vec_engine_null.so`, an
+engine that runs nothing, which the regression tests load
+(`vec.engine = 'null'`) to check that every slice then stays on
+PostgreSQL with its results, together with a copy that claims another ABI
+version.  Two settings exist for the tests only:
+`vec.debug_features_off` treats engine features (`VEC_F_*` bits) as
+missing, and `vec.debug_result_offset` has an engine with test
+functions give its result batches at an offset.
+
+An engine's own settings are not the host's: `vec.engine_options`, a list
+`name=value, ...` that the host passes to `query_start` unread (engine ABI
+6), and the engine fails the query on a name or value it does not take.
+DataFusion's are `key_filters` (on by default: KF1, a hash join's build
+side filters its probe side's PAX scans) and `partial_agg_skip_ratio`
+(0.2 by default: SK1, the groups per row above which a partial
+aggregation passes its rows on as they are).  They were the GUCs
+`datafusion.key_filters` and `datafusion.partial_agg_skip_ratio`.
+
+still assumes of DataFusion, and the designs for changing it.
 
 ## What an engine implements
 
