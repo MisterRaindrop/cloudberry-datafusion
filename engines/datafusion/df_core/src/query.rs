@@ -971,12 +971,12 @@ fn aggregate(v: &Value, input: &DFSchema, over: Option<&Expr>) -> Result<Expr, S
         // aggregate in Query::start_with.
         "count_merge" => sum(need(arg)?),
         // The sum of the sums; the counts are a second aggregate (`aggregate_extra`).
-        "avg_merge" => sum(need(arg)?),
+        "avg_merge" => sum_of(need(arg)?, input),
         // sum_numeric: PostgreSQL's sum(int8) and avg(int)'s sum, exact, as
         // numeric.  sum_decimal: sum of numeric(p, s), NaN if any is
         // (pgnum::PgSumDecimal).
         "min" | "max" if v.get("collate").is_some() => collated_min_max(v, need(arg)?)?,
-        _ => aggregate_of(name, need(arg)?)?,
+        _ => aggregate_of(name, need(arg)?, input)?,
     })
 }
 
@@ -1001,10 +1001,20 @@ fn collated_min_max(v: &Value, a: Expr) -> Result<Expr, String> {
     Ok(crate::pgcoll::PgCollMinMax::udaf(max, loc).call(vec![a]))
 }
 
-/// Aggregate `name` (as in `aggregate`) of `a`.
-fn aggregate_of(name: &str, a: Expr) -> Result<Expr, String> {
+/// sum of `a` over `input`: of floats, FO1's, which raises PostgreSQL's
+/// overflow error.
+fn sum_of(a: Expr, input: &DFSchema) -> Expr {
+    if is_float_expr(&a, input) {
+        crate::pgfagg::PgFloatAgg::udaf(crate::pgfagg::FloatAgg::Sum).call(vec![a])
+    } else {
+        sum(a)
+    }
+}
+
+/// Aggregate `name` (as in `aggregate`) of `a` over `input`.
+fn aggregate_of(name: &str, a: Expr, input: &DFSchema) -> Result<Expr, String> {
     Ok(match name {
-        "sum" => sum(a),
+        "sum" => sum_of(a, input),
         "sum_numeric" => sum(Expr::Cast(datafusion::logical_expr::Cast::new(
             Box::new(a),
             crate::pgnum::numeric_type(0),
@@ -1012,6 +1022,9 @@ fn aggregate_of(name: &str, a: Expr) -> Result<Expr, String> {
         "sum_decimal" => crate::pgnum::PgSumDecimal::udaf().call(vec![a]),
         "min" => min(a),
         "max" => max(a),
+        "avg" if is_float_expr(&a, input) => {
+            crate::pgfagg::PgFloatAgg::udaf(crate::pgfagg::FloatAgg::Avg).call(vec![a])
+        }
         "avg" => avg(a),
         // a column every row of the group has alike (one the groups
         // determine, as RowIdExpr's do): any of them
@@ -2775,7 +2788,7 @@ fn build_node(
                         }
                         "avg" => {
                             let x = arg.ok_or("avg needs an argument")?;
-                            inner_aggs.push(filtered(sum(x.clone()))?.alias(&p));
+                            inner_aggs.push(filtered(sum_of(x.clone(), &input_schema))?.alias(&p));
                             inner_aggs.push(filtered(count(x))?.alias(format!("{p}_n")));
                             post[i] = Post::AvgDivide;
                         }
@@ -2816,13 +2829,13 @@ fn build_node(
                         datafusion::functions_aggregate::expr_fn::first_value(p, vec![]).alias(&a),
                     ),
                     "avg" => {
-                        agg_exprs.push(sum(p).alias(&a));
+                        agg_exprs.push(sum_of(p, b.schema()).alias(&a));
                         agg_exprs.push(sum(pn).alias(format!("{a}_n")));
                     }
                     "sum_decimal" => {
                         agg_exprs.push(crate::pgnum::PgSumDecimal::udaf().call(vec![p]).alias(&a))
                     }
-                    _ => agg_exprs.push(sum(p).alias(&a)),
+                    _ => agg_exprs.push(sum_of(p, b.schema()).alias(&a)),
                 }
                 continue;
             }
@@ -3208,7 +3221,9 @@ impl Query {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        if inputs.len() != sources.len() || inputs.is_empty() {
+        // No inputs at all is a plan over empty Results only (OF1), as
+        // the Postgres planner makes for `WHERE false`.
+        if inputs.len() != sources.len() {
             return Err(internal(format!(
                 "{} inputs, {} sources",
                 inputs.len(),

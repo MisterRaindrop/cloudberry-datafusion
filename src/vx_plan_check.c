@@ -2859,6 +2859,8 @@ vx_check_expr(Node *node, VxCheckContext *cxt)
 	static const char *const aggregates[] =
 	{"count", "sum", "min", "max", "avg", "stddev_samp", "stddev", "stddev_pop",
 	"var_samp", "variance", "var_pop", NULL};
+	static const char *const stddev_aggregates[] =
+	{"stddev_samp", "stddev", "stddev_pop", "var_samp", "variance", "var_pop", NULL};
 
 	if (node == NULL)
 		return false;
@@ -3096,6 +3098,11 @@ vx_check_expr(Node *node, VxCheckContext *cxt)
 					vx_reject(cxt, "aggregate %s of %s or in stages", name,
 							  format_type_be(list_length(agg->aggargtypes) == 1 ?
 											 linitial_oid(agg->aggargtypes) : InvalidOid));
+				else if (vx_name_in(name, stddev_aggregates) && !vx_stddev_agg(agg, NULL, NULL))
+					/* STD1: the engine computes these only as vx_stddev_agg allows */
+					vx_reject(cxt, "aggregate %s of %s, or with DISTINCT, FILTER or ORDER BY",
+							  name, format_type_be(list_length(agg->aggargtypes) == 1 ?
+												   linitial_oid(agg->aggargtypes) : InvalidOid));
 				else if (vx_stddev_agg(agg, NULL, NULL) && agg->aggsplit == AGGSPLIT_SIMPLE)
 					return cxt->failed || vx_check_expr((Node *) agg->args, cxt);
 				else if (vx_stddev_agg(agg, NULL, NULL))

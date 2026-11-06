@@ -176,6 +176,36 @@ EXPLAIN (COSTS OFF) SELECT g, count(*) FROM df_fl GROUP BY g;
 EXPLAIN (COSTS OFF) SELECT k % 4 AS p, min(f), max(f), min(g), max(g) FROM df_fl2 GROUP BY 1;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE a.k < 100 AND b.k < 100;
 
-DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2;
+-- FO1: sum and avg of floats raise PostgreSQL's overflow error where
+-- finite values add up to an infinity, in one stage and where partial sums
+-- meet; an infinite value is no overflow.
+CREATE TABLE df_fo (k int, g int, f float8, h float4) DISTRIBUTED BY (k);
+INSERT INTO df_fo SELECT i, i % 3, CASE WHEN i % 1000 = 0 THEN 1e308 ELSE i END, i
+FROM generate_series(1, 20000) i;
+ANALYZE df_fo;
+SET vec.mode = off;
+SELECT g, sum(f) FROM df_fo GROUP BY g ORDER BY g;
+SELECT sum(f) FROM df_fo;
+SELECT avg(f) FROM df_fo;
+SELECT g, avg(f), avg(h) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+SELECT sum(CASE WHEN k % 1000 = 7 THEN 'Infinity'::float8 ELSE f END), sum(h) FROM df_fo WHERE k % 1000 <> 0;
+SET vec.mode = on;
+SELECT g, sum(f) FROM df_fo GROUP BY g ORDER BY g;
+SELECT sum(f) FROM df_fo;
+SELECT avg(f) FROM df_fo;
+SELECT g, avg(f), avg(h) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+SELECT sum(CASE WHEN k % 1000 = 7 THEN 'Infinity'::float8 ELSE f END), sum(h) FROM df_fo WHERE k % 1000 <> 0;
+-- OF1: an aggregate over a Result the planner proved empty, alone in its
+-- slice (no input at all)
+SELECT count(*), sum(f), avg(f) FROM df_fo WHERE false;
+SELECT count(*) FROM df_fo WHERE k NOT IN (1, 2, NULL);
+-- STD1: stddev and variance of floats stay on PostgreSQL
+SELECT g, round(stddev(f)::numeric, 6), round(var_pop(h)::numeric, 3) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(f) FROM df_fo GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT count(*), sum(f), avg(f) FROM df_fo WHERE false;
+EXPLAIN (COSTS OFF) SELECT k, stddev(f) FROM df_fo GROUP BY k;
+
+DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2, df_fo;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

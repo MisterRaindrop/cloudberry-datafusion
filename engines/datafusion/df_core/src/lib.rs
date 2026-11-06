@@ -27,6 +27,7 @@ pub mod numwidth;
 pub mod pgcast;
 pub mod pgcoll;
 pub mod pgdate;
+pub mod pgfagg;
 pub mod pgfloat;
 pub mod pgfunc;
 pub mod pgnum;

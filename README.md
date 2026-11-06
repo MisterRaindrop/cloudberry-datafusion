@@ -65,6 +65,10 @@ Known differences and limits:
   partial sums in a different order.
 - When values that compare equal fall into one group, such as `-0` and `0`
   in a `float8` column, the value shown for the group may differ.
+- `avg` of `float4` or `float8` raises PostgreSQL's overflow error only
+  when the sum overflows.  PostgreSQL also raises it when its running sum
+  of squares overflows, which values beyond about 1e154 can cause even
+  when the average itself is finite.
 - `EXPLAIN ANALYZE` counts rows for a slice's top node only.
 - Sorts by text run in the engine only under a C collation (or C.UTF-8);
   under another collation they stay on PostgreSQL.

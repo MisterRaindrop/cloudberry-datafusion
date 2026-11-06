@@ -300,7 +300,7 @@ SET vec.mode = off;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
-ERROR:  smallint out of range  (seg1 slice1 172.17.0.3:40001 pid=3844)
+ERROR:  smallint out of range  (seg1 slice1 172.17.0.2:40001 pid=88138)
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
       sum      |    sum     |    sum     | count 
 ---------------+------------+------------+-------
@@ -311,7 +311,7 @@ SET vec.mode = on;
 SELECT id, i2::int8, i4::float8, i8::float4, f4::float8, i4::int2, f8::int4, f4::int2, d::timestamp,
   ts::date, n::int4, n::float8, n::numeric(10,1)
 FROM df_cs WHERE id IN (-6, -4, -3) OR id % 9973 = 0 ORDER BY id;
-ERROR:  smallint out of range  (seg0 slice1 172.17.0.3:40000 pid=3843)
+ERROR:  smallint out of range  (seg1 slice1 172.17.0.2:40001 pid=88138)
 SELECT sum(i4::int8 * 1000), sum(n::float8), sum((i4 + 0.5)::int4), count(*) FROM df_cs WHERE id > 0;
       sum      |    sum     |    sum     | count 
 ---------------+------------+------------+-------
@@ -572,6 +572,118 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE
  Vectorized: slice 3 eligible, sends Arrow batches
 (19 rows)
 
-DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2;
+-- FO1: sum and avg of floats raise PostgreSQL's overflow error where
+-- finite values add up to an infinity, in one stage and where partial sums
+-- meet; an infinite value is no overflow.
+CREATE TABLE df_fo (k int, g int, f float8, h float4) DISTRIBUTED BY (k);
+INSERT INTO df_fo SELECT i, i % 3, CASE WHEN i % 1000 = 0 THEN 1e308 ELSE i END, i
+FROM generate_series(1, 20000) i;
+ANALYZE df_fo;
+SET vec.mode = off;
+SELECT g, sum(f) FROM df_fo GROUP BY g ORDER BY g;
+ERROR:  value out of range: overflow  (seg0 slice2 172.17.0.2:40000 pid=88224)
+SELECT sum(f) FROM df_fo;
+ERROR:  value out of range: overflow  (seg0 slice1 172.17.0.2:40000 pid=88136)
+SELECT avg(f) FROM df_fo;
+ERROR:  value out of range: overflow  (seg0 slice1 172.17.0.2:40000 pid=88136)
+SELECT g, avg(f), avg(h) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+ g |   avg    |   avg    
+---+----------+----------
+ 0 | 10000.05 | 10000.05
+ 1 |    10000 |    10000
+ 2 |  9999.95 |  9999.95
+(3 rows)
+
+SELECT sum(CASE WHEN k % 1000 = 7 THEN 'Infinity'::float8 ELSE f END), sum(h) FROM df_fo WHERE k % 1000 <> 0;
+   sum    |      sum      
+----------+---------------
+ Infinity | 1.9979923e+08
+(1 row)
+
+SET vec.mode = on;
+SELECT g, sum(f) FROM df_fo GROUP BY g ORDER BY g;
+ERROR:  value out of range: overflow  (seg1 slice2 172.17.0.2:40001 pid=88225)
+SELECT sum(f) FROM df_fo;
+ERROR:  value out of range: overflow  (seg0 slice1 172.17.0.2:40000 pid=88136)
+SELECT avg(f) FROM df_fo;
+ERROR:  value out of range: overflow  (seg0 slice1 172.17.0.2:40000 pid=88136)
+SELECT g, avg(f), avg(h) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+ g |   avg    |   avg    
+---+----------+----------
+ 0 | 10000.05 | 10000.05
+ 1 |    10000 |    10000
+ 2 |  9999.95 |  9999.95
+(3 rows)
+
+SELECT sum(CASE WHEN k % 1000 = 7 THEN 'Infinity'::float8 ELSE f END), sum(h) FROM df_fo WHERE k % 1000 <> 0;
+   sum    |      sum      
+----------+---------------
+ Infinity | 1.9979923e+08
+(1 row)
+
+-- OF1: an aggregate over a Result the planner proved empty, alone in its
+-- slice (no input at all)
+SELECT count(*), sum(f), avg(f) FROM df_fo WHERE false;
+ count | sum | avg 
+-------+-----+-----
+     0 |     |    
+(1 row)
+
+SELECT count(*) FROM df_fo WHERE k NOT IN (1, 2, NULL);
+ count 
+-------
+     0
+(1 row)
+
+-- STD1: stddev and variance of floats stay on PostgreSQL
+SELECT g, round(stddev(f)::numeric, 6), round(var_pop(h)::numeric, 3) FROM df_fo WHERE k % 1000 <> 0 GROUP BY g ORDER BY g;
+ g |    round    |    round     
+---+-------------+--------------
+ 0 | 5773.891437 | 33332816.648
+ 1 | 5773.982381 | 33333866.700
+ 2 | 5773.891437 | 33332816.648
+(3 rows)
+
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, sum(f) FROM df_fo GROUP BY g;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g
+               ->  Streaming Partial HashAggregate
+                     Group Key: g
+                     ->  Seq Scan on df_fo
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*), sum(f), avg(f) FROM df_fo WHERE false;
+             QUERY PLAN              
+-------------------------------------
+ Aggregate
+   ->  Result
+         One-Time Filter: false
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+(5 rows)
+
+EXPLAIN (COSTS OFF) SELECT k, stddev(f) FROM df_fo GROUP BY k;
+                                                  QUERY PLAN                                                  
+--------------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  HashAggregate
+         Group Key: k
+         ->  Seq Scan on df_fo
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: aggregate stddev of double precision, or with DISTINCT, FILTER or ORDER BY
+(7 rows)
+
+DROP TABLE df_ex, df_cs, df_cs_f8, df_fl, df_fl2, df_fo;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;
