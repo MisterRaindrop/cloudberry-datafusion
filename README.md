@@ -61,17 +61,38 @@ The full list, with what stays on PostgreSQL and why, is in
 
 Known differences and limits:
 
-- Floating-point sums can differ in the last bits, because the engine adds
-  partial sums in a different order.
-- When values that compare equal fall into one group, such as `-0` and `0`
-  in a `float8` column, the value shown for the group may differ.
+- `sum` and `avg` of `float4` or `float8` can differ in the last digits,
+  because the engine adds the values in a different order.
 - `avg` of `float4` or `float8` raises PostgreSQL's overflow error only
   when the sum overflows.  PostgreSQL also raises it when its running sum
   of squares overflows, which values beyond about 1e154 can cause even
   when the average itself is finite.
-- `EXPLAIN ANALYZE` counts rows for a slice's top node only.
+- `sum` of `float8` over values that are all `-0` returns `0`;
+  PostgreSQL returns `-0`.
+- When values that compare equal fall into one group (`GROUP BY`,
+  `DISTINCT`, `INTERSECT`), such as `-0` and `0` in a `float4` or `float8`
+  column, the value shown for the group may differ.
+- With `LIMIT` and no `ORDER BY`, the engine may evaluate expressions on
+  rows past the limit, so a query can fail (for example with "division by
+  zero") where PostgreSQL stops before reaching the bad row.
+- A `WHERE` condition that can fail (a division, an overflow, a cast) may
+  be skipped on rows that a cheaper condition of the same `WHERE` already
+  rejects, so a query that fails on PostgreSQL can return rows instead.
+  The opposite, failing where PostgreSQL does not, has not been seen.
+- In a UTF-8 database whose `LC_CTYPE` is `C`, `upper()` and `lower()`
+  under the default collation change only ASCII letters and leave other
+  characters as they are; PostgreSQL raises "invalid multibyte character
+  for locale" (22021) for non-ASCII input.
+- `EXPLAIN ANALYZE` counts rows for a slice's top node only; the nodes
+  below it show as never executed.
 - Sorts by text run in the engine only under a C collation (or C.UTF-8);
   under another collation they stay on PostgreSQL.
+- Rows without an `ORDER BY`, and rows tied on the `ORDER BY` keys, may
+  come back in a different order or, with `LIMIT`, be different rows.
+  PostgreSQL does not guarantee either.
+- Cloudberry's workfile limits (`gp_workfile_limit_per_query`,
+  `gp_workfile_limit_files_per_query`) do not count the engine's spill
+  files.
 
 ## Architecture
 
