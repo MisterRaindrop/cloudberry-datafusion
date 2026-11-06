@@ -126,8 +126,8 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
   partitions (at least 2 MB each) instead of starving all of them.
 - **Vmem.** A counting allocator tracks every byte Rust allocates in the
   backend.  Between waits the main thread leases that amount plus
-  budget/8 of headroom from Cloudberry's vmem tracker, and gives back the
-  unused part when a query ends.  On QEs, where Cloudberry enforces vmem
+  budget/8 of headroom (from 1 MB to 64 MB) from Cloudberry's vmem
+  tracker, and gives back the unused part when a query ends.  On QEs, where Cloudberry enforces vmem
   limits, a refused lease fails the query with the same error as a refused
   allocation (`Out of memory`, SQLSTATE 53500).
 - **EXPLAIN ANALYZE.** The top node's Instrumentation carries the peak pool

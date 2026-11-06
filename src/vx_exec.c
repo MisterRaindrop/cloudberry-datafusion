@@ -118,8 +118,16 @@
 #define VX_BATCH_MAGIC		"DFARROW1"
 #define VX_BATCH_HEAD		16
 
-/* The vmem lease runs ahead of Rust's heap by budget/8, at least this much. */
+/*
+ * The vmem lease runs ahead of Rust's heap by budget/8, within these.  The
+ * cap keeps a large budget from reserving what it never allocates: a slice
+ * without hash tables or sorts has work_mem for a budget, which the
+ * resource group's memory_quota does not bound, and its lease counts in the
+ * group's and the runaway cleaner's figures.  Threads that allocate more
+ * between two waits leave the lease behind until the next one.
+ */
 #define VX_MIN_HEADROOM		(1024 * 1024)
+#define VX_MAX_HEADROOM		(64 * 1024 * 1024)
 
 uint64		vx_runs_completed = 0;
 VecQueryStats vx_last_run;
@@ -2100,7 +2108,7 @@ vx_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	}
 	x->estate = estate;
 	x->memory_limit = vx_slice_memory(root);
-	x->headroom = Max(x->memory_limit / 8, VX_MIN_HEADROOM);
+	x->headroom = Min(Max(x->memory_limit / 8, VX_MIN_HEADROOM), VX_MAX_HEADROOM);
 	x->slices_together = vx_slices_together(queryDesc->plannedstmt,
 											LocallyExecutingSliceIndex(estate));
 	x->host_segments = vx_host_segments();
