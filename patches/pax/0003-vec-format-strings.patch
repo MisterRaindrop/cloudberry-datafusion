@@ -1,0 +1,103 @@
+--- a/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
++++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
+@@ -73,6 +73,7 @@
+ #include "comm/singleton.h"
+ #include "exceptions/CException.h"
+ #include "storage/columns/pax_columns.h"
++#include "storage/columns/pax_vec_column.h"
+ #include "storage/filter/pax_filter.h"
+ #include "storage/filter/pax_sparse_filter.h"
+ #include "storage/local_file_system.h"
+@@ -485,6 +486,11 @@
+   bool dense;
+   bool bits;
+   bool vec_numeric;
++  // a string of the vectorized format, read from its buffer: GetDatum
++  // copies every value into a new allocation to restore the varlena
++  // header, and char(n)'s GetBuffer another to restore the padding
++  pax::PaxVecNonFixedColumn *vec_str;
++  size_t bpchar_n;  // char(n) of the vectorized format: n, else 0
+   int width;
+   int scale;
+   // dense columns with nulls: the value index of each row
+@@ -513,6 +519,23 @@
+             pax::PaxColumnTypeInMem::kTypeVecBitPacked;
+   st.vec_numeric = col->GetPaxColumnTypeInMem() ==
+                    pax::PaxColumnTypeInMem::kTypeVecDecimal;
++  st.vec_str = nullptr;
++  st.bpchar_n = 0;
++  if (!st.dense) {
++    const auto t = col->GetPaxColumnTypeInMem();
++    if (t == pax::PaxColumnTypeInMem::kTypeNonFixed ||
++        t == pax::PaxColumnTypeInMem::kTypeVecBpChar) {
++      st.vec_str = static_cast<pax::PaxVecNonFixedColumn *>(col);
++      if (t == pax::PaxColumnTypeInMem::kTypeVecBpChar) {
++        const auto &attrs = col->GetAttributes();
++        auto it = attrs.find("CHAR_N_KEY");  // pax_vec_bpchar_column.cc
++        if (it == attrs.end())
++          st.vec_str = nullptr;  // GetDatum reports it
++        else
++          st.bpchar_n = static_cast<size_t>(atoll(it->second.c_str()));
++      }
++    }
++  }
+   if (st.bm && st.dense) {
+     st.index.resize(rows);
+     uint32_t i = 0;
+@@ -520,7 +543,23 @@
+       st.index[r] = i;
+       if (st.bm->Test(static_cast<uint32>(r))) i++;
+     }
++  }
++}
++
++// Appends value i of vectorized-format string column 'st' to 'out';
++// false for a toasted value, which goes through GetDatum.
++inline bool AppendVecString(const ColState &st, size_t i, std::vector<char> &out,
++                            size_t *len) {
++  if (st.vec_str->IsToast(i)) return false;
++  auto b = st.vec_str->pax::PaxVecNonFixedColumn::GetBuffer(i);
++  out.insert(out.end(), b.first, b.first + b.second);
++  size_t n = b.second;
++  if (n < st.bpchar_n) {
++    out.insert(out.end(), st.bpchar_n - n, ' ');
++    n = st.bpchar_n;
+   }
++  *len = n;
++  return true;
+ }
+ 
+ // The chunk 'emit' is handed: rows j0 .. j1 - 1 of the group's kept rows
+@@ -1149,8 +1188,10 @@
+       const bool present = !st.bm || st.bm->Test(static_cast<uint32>(r));
+       const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
+       if (present) {
++        size_t n;
+         if (st.vec_numeric) {
+           AppendVecNumeric(st.buf + i * 16, vals);
++        } else if (st.vec_str && AppendVecString(st, i, vals, &n)) {
+         } else {
+           const struct varlena *v = reinterpret_cast<const struct varlena *>(
+               DatumGetPointer(st.col->GetDatum(i)));
+@@ -1417,6 +1458,21 @@
+           offsets[k].push_back(static_cast<int32_t>(values[k].size()));
+           continue;
+         }
++        size_t vlen;
++        if (st.vec_str && AppendVecString(st, i, values[k], &vlen)) {
++          offsets[k].push_back(static_cast<int32_t>(values[k].size()));
++          bytes += vlen;
++          if (bytes >= kChunkBytes && j + 1 < j1) {
++            j1 = j + 1;
++            for (size_t q = 0; q < k; q++)
++              if (cols[q].active && cols[q].width <= 0) {
++                offsets[q].resize(j1 - j0 + 1);
++                values[q].resize(static_cast<size_t>(offsets[q].back()));
++              }
++            break;
++          }
++          continue;
++        }
+         // A string or a numeric: its bytes without the varlena header.
+         // GetDatum decodes PAX's toast (compressed inline or in the toast
+         // file, with PAX's own pglz/lz4) and, in the vectorized format,
