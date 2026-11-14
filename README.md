@@ -146,9 +146,9 @@ take its place behind the same interface.
   package).
 - A Rust toolchain; the version is pinned in
   `engines/datafusion/rust-toolchain.toml` (rustup picks it up).
-  DataFusion is a commit of a fork of apache/datafusion with
+  DataFusion is the commit of apache/datafusion's main that merged
   apache/datafusion#26264 (`engines/datafusion/Cargo.toml`), which cargo
-  fetches from GitHub.
+  fetches from GitHub; no release has that fix yet.
 - For the direct PAX reader (optional): the Cloudberry source tree the
   installed `pax.so` was built from, the protobuf headers of the version
   `pax.so` links, and GNU `patch`.

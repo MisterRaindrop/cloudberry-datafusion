@@ -1785,7 +1785,7 @@ DataFusion: ten partitions sort under the slice's 65 MB, partitions that
 end their input early merge their spilled runs with as many buffers as the
 pool grants, and a partition still sorting then finds no memory left
 (DataFusion 55.2.0; apache/datafusion#25804, finding 9).  A plain sort
-does the same under 64 MB.  apache/datafusion#26264 proposes the fix; on
+does the same under 64 MB.  apache/datafusion#26264 fixes it; on
 DataFusion's main with it (see Build) both finish, with the rows
 PostgreSQL gives: 2.1 s against 9.0 s, and 3.0 s against 6.4 s.
 

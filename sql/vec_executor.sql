@@ -17,7 +17,8 @@
 
 CREATE EXTENSION vec_executor;
 
-SELECT vec_version() ~ '^datafusion [0-9]+\.[0-9]+\.[0-9]+$' AS version_ok;
+-- A release, or a development version of main such as 57.0.0-dev.
+SELECT vec_version() ~ '^datafusion [0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' AS version_ok;
 
 -- A panic inside Rust must surface as an ordinary ERROR and leave the
 -- backend usable.
