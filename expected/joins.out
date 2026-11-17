@@ -3093,6 +3093,73 @@ SELECT count(*) FROM df_ja WHERE a IN (SELECT k FROM df_jb WHERE k IS NOT NULL A
 (1 row)
 
 RESET optimizer;
+-- SO1: a Sort and its Limit DataFusion pushes below an outer join, to the
+-- side whose order the join keeps, with the fetch on the join.  The
+-- spilling join kept neither (unmatched rows came last), so the segments'
+-- streams were not sorted and the merge above took the wrong rows.
+CREATE TABLE df_jso (id int, k int) DISTRIBUTED BY (id);
+INSERT INTO df_jso SELECT i, CASE WHEN i % 3 = 0 THEN i + 1000 ELSE i % 50 END FROM generate_series(1, 3000) i;
+CREATE TABLE df_jsod (k int, w int) DISTRIBUTED BY (k);
+INSERT INTO df_jsod SELECT i, i FROM generate_series(0, 60) i;
+ANALYZE df_jso;
+ANALYZE df_jsod;
+SET vec.mode = off;
+SELECT a.id, b.w FROM df_jso a LEFT JOIN df_jsod b ON a.k = b.k ORDER BY 1 LIMIT 12;
+ id | w  
+----+----
+  1 |  1
+  2 |  2
+  3 |   
+  4 |  4
+  5 |  5
+  6 |   
+  7 |  7
+  8 |  8
+  9 |   
+ 10 | 10
+ 11 | 11
+ 12 |   
+(12 rows)
+
+SET vec.mode = on;
+SET optimizer = off;
+SELECT a.id, b.w FROM df_jso a LEFT JOIN df_jsod b ON a.k = b.k ORDER BY 1 LIMIT 12;
+ id | w  
+----+----
+  1 |  1
+  2 |  2
+  3 |   
+  4 |  4
+  5 |  5
+  6 |   
+  7 |  7
+  8 |  8
+  9 |   
+ 10 | 10
+ 11 | 11
+ 12 |   
+(12 rows)
+
+SET optimizer = on;
+SELECT a.id, b.w FROM df_jso a LEFT JOIN df_jsod b ON a.k = b.k ORDER BY 1 LIMIT 12;
+ id | w  
+----+----
+  1 |  1
+  2 |  2
+  3 |   
+  4 |  4
+  5 |  5
+  6 |   
+  7 |  7
+  8 |  8
+  9 |   
+ 10 | 10
+ 11 | 11
+ 12 |   
+(12 rows)
+
+RESET optimizer;
+DROP TABLE df_jso, df_jsod;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

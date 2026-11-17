@@ -248,7 +248,12 @@ impl SpillHashJoins {
             }
             PartitionMode::Auto => false,
         };
-        if join.null_aware || !own {
+        // SO1: DataFusion's join keeps the probe side's order, which it may
+        // have sorted below it for a parent (a Sort pushed down, with a
+        // fetch on the join in place of the Limit above); the spilling join
+        // keeps neither the order (unmatched rows come last, spilled ones
+        // later) nor the fetch
+        if join.null_aware || !own || plan.fetch().is_some() || plan.output_ordering().is_some() {
             return Ok(plan);
         }
         let collect_rows = if relied { 0 } else { self.collect_rows };
