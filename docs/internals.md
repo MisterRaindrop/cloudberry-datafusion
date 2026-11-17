@@ -686,6 +686,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |
 | LM3 | Direct PAX reader: fixed-width columns converted when fetched, for the rows the cheap conditions leave (scan interface 8, engine ABI 4) |
 | LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
+| PV1 | PAX's vectorized format: char(n) padded to n characters, not to PAX's bytes (direct reader and table AM scans) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |
 | SHJ | Hash joins that spill (vec.join_estimates = spill, the default) |
@@ -1069,10 +1070,30 @@ string functions not listed below stay on PostgreSQL for now, as do `char(n)`, `
 other encodings.  The direct PAX reader hands out strings too (C1), as
 offsets and bytes like the main thread's batches: char(n) keeps its
 padding, PAX's toast is decoded on the worker with PAX's own pglz/lz4, and
-files of the vectorized format (no headers, char(n) trimmed) go through
-the column's GetDatum, which restores both.  A group whose strings take
-more than 64 MB is handed out in several pieces, so that Arrow's int32
-offsets cannot overflow.
+files of the vectorized format (no headers, char(n) trimmed) are read
+from the column's buffer, with the headers left out and char(n) padded
+by the reader; only toasted values go through the column's GetDatum.
+A group whose strings take more than 64 MB is handed out in several
+pieces, so that Arrow's int32 offsets cannot overflow.
+
+PV1: PAX's vectorized format pads char(n) wrongly when a value has
+multibyte characters.  It stores each value without its trailing blanks
+and records as n the bytes of the first value of a group
+(PaxVecBpCharColumn::Append), then pads every value to those bytes
+(GetBuffer, GetDatum): with `'ab'` first, `'中文'` of char(4) comes back
+as 6 bytes instead of 8, and with `'中文'` first, `'ab'` as 8 bytes
+instead of 4.  PostgreSQL compares char(n) without the blanks, so only
+`octet_length` and the like show it there; but a slice groups a table's
+char(n) column by its bytes (B1), expecting every value padded to n, so
+equal values of different groups fell into different groups.  The direct
+reader and the main thread's scans of PAX tables now pad each value to n
+characters again, from the column's type modifier; an ASCII value, the
+usual case, has as many characters as bytes and costs one pass over its
+bytes (TPC-H Q19 on porc_vec lineitem at scale factor 10: 0.51 s before,
+0.53 s).  The results are then those of a heap table, and `octet_length`
+of such a value differs from PostgreSQL reading PAX, which is wrong.
+The decoded-column cache names n in a char(n) column's entries, so
+entries written before are not read.
 
 `LIKE` and `NOT LIKE` (L1) run through `df_core::pgstr`, a transcription
 of PostgreSQL's matcher for UTF-8 (`UTF8_MatchText`): `%`, `_` as one

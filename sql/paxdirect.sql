@@ -81,6 +81,33 @@ SELECT b, count(*) FROM df_pd_str WHERE b < 'b' COLLATE "C" OR b IS NULL GROUP B
 SELECT count(*), count(t), sum(length(t)), sum(octet_length(b)) FROM df_pd_vec;
 SELECT id, t, b, octet_length(b) FROM df_pd_vec WHERE id BETWEEN 5 AND 13 ORDER BY id;
 
+-- PV1: char(n) of the vectorized format.  PAX stores each value without
+-- its trailing blanks and records as n the bytes of the first value of a
+-- group, so it pads multibyte values to the wrong length (equal values of
+-- different groups even differ).  Both the direct reader and the table AM
+-- path pad to n characters, as the heap table holds them.  PostgreSQL
+-- reads PAX's padding, so the engine check leaves those results out.
+SET pax.max_tuples_per_group = 7;
+CREATE TABLE df_pd_vbh (id int, t text, b char(4)) DISTRIBUTED BY (id);
+INSERT INTO df_pd_vbh VALUES (1, 'ab', 'ab'), (2, '中文', '中文'), (3, '', ''),
+  (4, NULL, NULL), (5, '中文字符四', '中文字符'), (6, 'x', 'a'), (7, repeat('ab', 300000), 'abcd'),
+  (8, 'é', 'é'), (9, 'ab ', 'ab  '), (10, repeat('中', 5000), '中');
+INSERT INTO df_pd_vbh SELECT id + 100, t, b FROM df_pd_vbh;
+CREATE TABLE df_pd_vb (LIKE df_pd_vbh) USING pax WITH (storage_format = porc_vec) DISTRIBUTED BY (id);
+INSERT INTO df_pd_vb SELECT * FROM df_pd_vbh;
+RESET pax.max_tuples_per_group;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
+SELECT id, length(t), octet_length(t), b, octet_length(b), length(b) FROM df_pd_vbh ORDER BY id;
+SELECT b, count(*) FROM df_pd_vbh GROUP BY b ORDER BY b COLLATE "C";
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
+SELECT id, length(t), octet_length(t), b, octet_length(b), length(b) FROM df_pd_vb ORDER BY id /* differs on PostgreSQL: PV1 */;
+SELECT b, count(*) FROM df_pd_vb GROUP BY b ORDER BY b COLLATE "C" /* differs on PostgreSQL: PV1 */;
+SET vec.pax_direct_read = off;
+SELECT id, length(t), octet_length(t), b, octet_length(b), length(b) FROM df_pd_vb ORDER BY id /* differs on PostgreSQL: PV1 */;
+SELECT b, count(*) FROM df_pd_vb GROUP BY b ORDER BY b COLLATE "C" /* differs on PostgreSQL: PV1 */;
+
 -- numeric(p, s) (C2): handed out in PostgreSQL's representation and read
 -- like the main thread's numerics; the vectorized format's 16-byte values
 -- (an integer, its display scale, NaN and infinity tags) are rebuilt as
@@ -328,6 +355,6 @@ SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = 
 SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET vec.motion_batches;
 
-DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3, df_pd_lt, df_pd_vlt;
+DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_vbh, df_pd_vb, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3, df_pd_lt, df_pd_vlt;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

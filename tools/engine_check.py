@@ -23,9 +23,11 @@ usage: engine_check.py [--engine NAME] [--baseline NAME] [--out DIR] test ...
 Runs each regression test (sql/<test>.sql) twice through psql, once with
 vec.engine = NAME and once with the baseline engine, by default null,
 which runs nothing, so that every query stays on PostgreSQL.  Then it
-compares the two outputs without what is meant to differ: EXPLAIN's plans
-and the results of the vec_debug_* test functions.  What is left must be
-the same rows and the same errors.
+compares the two outputs without what is meant to differ: EXPLAIN's plans,
+the results of the vec_debug_* test functions, and those of statements
+marked /* differs on PostgreSQL: ... */, where PostgreSQL's own result is
+wrong (PV1: PAX's vectorized format pads char(n) by bytes).  What is left
+must be the same rows and the same errors.
 
 The expected files of the regression tests are DataFusion's, plans and
 all; this check needs none, so it works for any engine.  The tests that
@@ -58,7 +60,8 @@ def comparable(lines, source):
 
     Lines the SQL file holds are psql's echo of the statements; the lines
     after a statement up to the next echo are its output, dropped when the
-    statement is an EXPLAIN or calls a vec_debug_* function."""
+    statement is an EXPLAIN, calls a vec_debug_* function or is marked
+    as differing on PostgreSQL."""
     src = {l.strip() for l in source if l.strip()}
     out, stmt, skip = [], "", False
     rows = None                 # the rows of a result table being read
@@ -67,7 +70,8 @@ def comparable(lines, source):
             if not stmt or stmt.rstrip().endswith(";"):
                 stmt = ""
             stmt += " " + line.strip()
-            skip = bool(re.search(r"\bEXPLAIN\b|\bvec_debug_\w+|\bvec_version\b", stmt, re.I))
+            skip = bool(re.search(r"\bEXPLAIN\b|\bvec_debug_\w+|\bvec_version\b"
+                                  r"|/\* differs on PostgreSQL\b", stmt, re.I))
             out.append(line)
             continue
         if skip:

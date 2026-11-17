@@ -90,6 +90,10 @@ Known differences and limits:
 - Rows without an `ORDER BY`, and rows tied on the `ORDER BY` keys, may
   come back in a different order or, with `LIMIT`, be different rows.
   PostgreSQL does not guarantee either.
+- In PAX tables of `storage_format = porc_vec`, PAX pads `char(n)` values
+  with multibyte characters to the wrong length; the engine pads them to
+  n characters, as a heap table holds them, so `octet_length` of such a
+  value differs from what PostgreSQL reads from PAX.
 - Cloudberry's workfile limits (`gp_workfile_limit_per_query`,
   `gp_workfile_limit_files_per_query`) do not count the engine's spill
   files.

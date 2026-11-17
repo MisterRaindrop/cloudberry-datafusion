@@ -83,6 +83,7 @@
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "libpq/pqformat.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
 #include "utils/array.h"
@@ -159,6 +160,15 @@ typedef struct VxInput
 	PlanState  *reader;			/* else the Shared Scan reader we pull */
 	TableScanDesc scandesc;
 	int			maxattno;		/* highest column read */
+
+	/*
+	 * PV1: of a scan of a PAX table, each char(n) column's n, else 0; NULL
+	 * when there is none.  PAX's vectorized format records as n the bytes
+	 * of the first value it wrote, and pads every value to those bytes, so
+	 * a value of multibyte characters can come back padded to the wrong
+	 * length; it is padded again to n characters, as PostgreSQL stores it.
+	 */
+	int		   *bpchar_n;
 
 	/*
 	 * PS1: from a Motion of tuples, the tuple column behind each column read
@@ -729,6 +739,54 @@ vx_exec_receive(VxExec *x, VxInput *in, bool *pushed, bool *full)
 	*pushed = true;
 }
 
+/* PV1: in->bpchar_n of input 'in', which scans table 'rel'. */
+static void
+vx_input_bpchar_n(VxInput *in, Relation rel)
+{
+	char	   *amname = get_am_name(rel->rd_rel->relam);
+	int			c;
+
+	if (amname == NULL || strcmp(amname, "pax") != 0)
+		return;
+	for (c = 0; c < in->spec->ncols; c++)
+	{
+		int			att = in->spec->attnos[c] - 1;
+		Form_pg_attribute a;
+
+		if (att < 0 || in->spec->types[c] != BPCHAROID)
+			continue;
+		a = TupleDescAttr(RelationGetDescr(rel), att);
+		if (a->atttypmod <= (int32) VARHDRSZ)
+			continue;
+		if (in->bpchar_n == NULL)
+			in->bpchar_n = palloc0(sizeof(int) * in->spec->ncols);
+		in->bpchar_n[c] = a->atttypmod - VARHDRSZ;
+	}
+}
+
+/*
+ * PV1: the bytes char(n) value 'p' of 'len' bytes takes padded to 'n'
+ * characters; sets *kept to its bytes without trailing blanks (a blank
+ * never ends a character of more than one byte).  An ASCII value has as
+ * many characters as bytes in every server encoding.
+ */
+static Size
+vx_bpchar_padded(const char *p, Size len, int n, Size *kept)
+{
+	Size		k = len;
+	Size		i;
+	int			chars;
+
+	while (k > 0 && p[k - 1] == ' ')
+		k--;
+	*kept = k;
+	for (i = 0; i < k; i++)
+		if (IS_HIGHBIT_SET(p[i]))
+			break;
+	chars = i == k ? (int) k : pg_mbstrlen_with_len(p, (int) k);
+	return k + (chars < n ? (Size) (n - chars) : 0);
+}
+
 /* Does input 'in' scan a PAX table the direct reader may read? */
 static bool
 vx_input_scans_pax(VxInput *in)
@@ -1023,6 +1081,7 @@ vx_exec_begin(VxExec *x)
 		else
 			in->scandesc = table_beginscan(rel, x->estate->es_snapshot, 0, NULL);
 		in->scan->ss.ss_currentScanDesc = in->scandesc; /* ExecEndSeqScan closes it */
+		vx_input_bpchar_n(in, rel);
 	}
 }
 
@@ -1275,13 +1334,17 @@ vx_exec_fill(VxExec *x, VxInput *in)
 							struct varlena *v = (struct varlena *) DatumGetPointer(d);
 							struct varlena *p = pg_detoast_datum_packed(v);
 							Size		len = VARSIZE_ANY_EXHDR(p);
+							Size		kept = len;
 
+							if (in->bpchar_n && in->bpchar_n[c] > 0)
+								len = vx_bpchar_padded(VARDATA_ANY(p), len, in->bpchar_n[c], &kept);
 							if (end + len > in->incap[c])
 							{
 								in->incap[c] = Max(in->incap[c] * 2, end + len);
 								in->invalues[c] = repalloc_huge(in->invalues[c], in->incap[c]);
 							}
-							memcpy(in->invalues[c] + end, VARDATA_ANY(p), len);
+							memcpy(in->invalues[c] + end, VARDATA_ANY(p), kept);
+							memset(in->invalues[c] + end + kept, ' ', len - kept);
 							if (p != v)
 								pfree(p);
 							end += len;
