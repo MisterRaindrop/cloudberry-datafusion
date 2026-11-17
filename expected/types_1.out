@@ -1,0 +1,1035 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+--
+-- Date and time types: date, time, timestamp and timestamptz travel as
+-- PostgreSQL stores them (days or microseconds from 2000-01-01, time from
+-- midnight), infinities included.  Comparing two values of one type and
+-- min/max are integer comparisons; arithmetic, which checks for overflow
+-- and infinities, and comparisons across types stay on PostgreSQL, but for
+-- a date against a timestamp constant (DT1), such as the folded
+-- "d < date '1994-01-01' + interval '1' year", which compares dates.  Each
+-- query runs with vec.mode off, then on; the two results must match.
+--
+CREATE EXTENSION vec_executor;
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
+\c
+SET optimizer = off;
+SET vec.worker_threads = 2;
+SET enable_nestloop = off;
+SET enable_mergejoin = off;
+SET TimeZone = 'UTC';
+CREATE TABLE df_ty (id int4, d date, t time, ts timestamp, tz timestamptz) DISTRIBUTED BY (id);
+INSERT INTO df_ty SELECT i, date '2000-01-01' + (i % 4000) - 2000,
+  time '00:00' + (i % 86400) * interval '1 second',
+  timestamp '1999-12-31 12:00' + i * interval '37 minutes',
+  timestamptz '2024-03-10 01:00 America/New_York' + i * interval '13 minutes'
+FROM generate_series(1, 100000) i;
+INSERT INTO df_ty VALUES
+  (-1, 'infinity', '24:00', 'infinity', 'infinity'),
+  (-2, '-infinity', '00:00', '-infinity', '-infinity'),
+  (-3, NULL, NULL, NULL, NULL),
+  (-4, '4713-01-01 BC', '23:59:59.999999', '294276-12-31 23:59:59.999999', '4714-11-24 00:00:00+00 BC');
+CREATE TABLE df_ty2 AS SELECT id * 2 AS id, d, t, ts, tz FROM df_ty
+DISTRIBUTED BY (id);
+ANALYZE df_ty;
+ANALYZE df_ty2;
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:00+08';
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (tz > 'Tue Apr 30 16:00:00 2024 UTC'::timestamp with time zone)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: ((d - 1) > '01-01-2001'::date)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
+                          QUERY PLAN                           
+---------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator - on date and date
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE ts > '2010-01-01'::date;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (ts > '01-01-2010'::date)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > on timestamp without time zone and date
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE tz > ts;
+                                                QUERY PLAN                                                
+----------------------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (tz > ts)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > on timestamp with time zone and timestamp without time zone
+(8 rows)
+
+SET vec.mode = off;
+SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
+    min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
+-----------+----------+----------+----------+-----------+----------+-----------+----------+--------
+ -infinity | infinity | 00:00:00 | 24:00:00 | -infinity | infinity | -infinity | infinity | 100003
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
+ count 
+-------
+  9125
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
+ count 
+-------
+     1
+(1 row)
+
+SELECT id, d, t, ts, tz FROM df_ty
+WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER BY id;
+ id |       d       |        t        |                ts                 |               tz                
+----+---------------+-----------------+-----------------------------------+---------------------------------
+ -4 | 01-01-4713 BC | 23:59:59.999999 | Sun Dec 31 23:59:59.999999 294276 | Mon Nov 24 00:00:00 4714 UTC BC
+ -3 |               |                 |                                   | 
+ -2 | -infinity     | 00:00:00        | -infinity                         | -infinity
+ -1 | infinity      | 24:00:00        | infinity                          | infinity
+(4 rows)
+
+SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
+     d      | count |           min            |             max              
+------------+-------+--------------------------+------------------------------
+ 07-11-1994 |    25 | Wed Apr 12 06:40:00 2000 | Sun Aug 30 00:40:00 2026 UTC
+ 04-06-1997 |    25 | Wed Jan 26 04:40:00 2000 | Sun Aug 02 22:40:00 2026 UTC
+ 01-01-2000 |    25 | Sun Feb 20 21:20:00 2000 | Tue Aug 11 23:20:00 2026 UTC
+ 09-27-2002 |    25 | Fri Mar 17 14:00:00 2000 | Fri Aug 21 00:00:00 2026 UTC
+(4 rows)
+
+SET vec.mode = on;
+SELECT min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz), count(d) FROM df_ty;
+    min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    | count  
+-----------+----------+----------+----------+-----------+----------+-----------+----------+--------
+ -infinity | infinity | 00:00:00 | 24:00:00 | -infinity | infinity | -infinity | infinity | 100003
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE d >= '2001-01-01' AND d < '2002-01-01';
+ count 
+-------
+  9125
+(1 row)
+
+SELECT count(*) FROM df_ty WHERE ts > '2005-06-01 10:00' AND tz <= '2024-05-01 00:00+08' AND t <> '12:00';
+ count 
+-------
+     1
+(1 row)
+
+SELECT id, d, t, ts, tz FROM df_ty
+WHERE d = 'infinity' OR ts = '-infinity' OR d IS NULL OR d < '0001-01-01' ORDER BY id;
+ id |       d       |        t        |                ts                 |               tz                
+----+---------------+-----------------+-----------------------------------+---------------------------------
+ -4 | 01-01-4713 BC | 23:59:59.999999 | Sun Dec 31 23:59:59.999999 294276 | Mon Nov 24 00:00:00 4714 UTC BC
+ -3 |               |                 |                                   | 
+ -2 | -infinity     | 00:00:00        | -infinity                         | -infinity
+ -1 | infinity      | 24:00:00        | infinity                          | infinity
+(4 rows)
+
+SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d ORDER BY d;
+     d      | count |           min            |             max              
+------------+-------+--------------------------+------------------------------
+ 07-11-1994 |    25 | Wed Apr 12 06:40:00 2000 | Sun Aug 30 00:40:00 2026 UTC
+ 04-06-1997 |    25 | Wed Jan 26 04:40:00 2000 | Sun Aug 02 22:40:00 2026 UTC
+ 01-01-2000 |    25 | Sun Feb 20 21:20:00 2000 | Tue Aug 11 23:20:00 2026 UTC
+ 09-27-2002 |    25 | Fri Mar 17 14:00:00 2000 | Fri Aug 21 00:00:00 2026 UTC
+(4 rows)
+
+-- Arithmetic stays on PostgreSQL, and fails there as it should.
+SELECT max(d - date '2000-01-01') FROM df_ty WHERE id >= -1;
+ERROR:  cannot subtract infinite dates  (seg2 slice1 172.18.0.2:7004 pid=10916)
+-- A date against a timestamp constant compares dates (DT1): the constant
+-- rounded up for < and >=, down for <= and >; = and <> on a constant
+-- within a day are constant.  Dates past the timestamp range sort after
+-- every finite timestamp, before infinity.
+CREATE TABLE df_ty3 (id int4, d date) DISTRIBUTED BY (id);
+INSERT INTO df_ty3 VALUES (1, '-infinity'), (2, 'infinity'), (3, '4713-01-01 BC'),
+  (4, '0044-03-15 BC'), (5, '1993-12-31'), (6, '1994-01-01'), (7, '1994-01-02'),
+  (8, '294276-12-31'), (9, '294277-01-01'), (10, '5874897-12-31'), (11, NULL);
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + interval '1' year;
+                                        QUERY PLAN                                         
+-------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (d < 'Sun Jan 01 00:00:00 1995'::timestamp without time zone)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
+                                      QUERY PLAN                                      
+--------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty
+                     Filter: (d < ts)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator < on date and timestamp without time zone
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+                                         QUERY PLAN                                         
+--------------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty3
+                     Filter: (d <> 'Sun Jan 02 01:00:00 1994'::timestamp without time zone)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+(8 rows)
+
+SET vec.mode = off;
+SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
+ count 
+-------
+  2250
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
+ count | sum | sum 
+-------+-----+-----
+     5 |  19 |  87
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
+ count | sum | sum 
+-------+-----+-----
+     4 |  13 |  51
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '1994-01-01 12:00' < d;
+ count | sum | sum 
+-------+-----+-----
+     5 |  36 | 298
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '0044-03-15 12:00 BC' >= d;
+ count | sum | sum 
+-------+-----+-----
+     3 |   8 |  26
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d = timestamp '1994-01-01' OR d = timestamp '1994-01-02 01:00';
+ count | sum | sum 
+-------+-----+-----
+     1 |   6 |  36
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+ count | sum | sum 
+-------+-----+-----
+    10 |  55 | 385
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-12-31 23:59:59.999999';
+ count | sum | sum 
+-------+-----+-----
+     3 |  21 | 185
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
+ count | sum | sum 
+-------+-----+-----
+     9 |  53 | 381
+(1 row)
+
+SET vec.mode = on;
+SELECT count(*) FROM df_ty WHERE d >= date '2001-01-01' AND d < date '2001-01-01' + interval '3' month;
+ count 
+-------
+  2250
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp '1994-01-01 00:00:00.000001';
+ count | sum | sum 
+-------+-----+-----
+     5 |  19 |  87
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <= timestamp '1993-12-31 23:59:59';
+ count | sum | sum 
+-------+-----+-----
+     4 |  13 |  51
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '1994-01-01 12:00' < d;
+ count | sum | sum 
+-------+-----+-----
+     5 |  36 | 298
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE timestamp '0044-03-15 12:00 BC' >= d;
+ count | sum | sum 
+-------+-----+-----
+     3 |   8 |  26
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d = timestamp '1994-01-01' OR d = timestamp '1994-01-02 01:00';
+ count | sum | sum 
+-------+-----+-----
+     1 |   6 |  36
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <> timestamp '1994-01-02 01:00';
+ count | sum | sum 
+-------+-----+-----
+    10 |  55 | 385
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d > timestamp '294276-12-31 23:59:59.999999';
+ count | sum | sum 
+-------+-----+-----
+     3 |  21 | 185
+(1 row)
+
+SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d < timestamp 'infinity' AND d >= timestamp '-infinity';
+ count | sum | sum 
+-------+-----+-----
+     9 |  53 | 381
+(1 row)
+
+DROP TABLE df_ty3;
+-- extract(year | quarter | month | day from date) as numeric of scale 0
+-- (DT2).  The year of an infinite date is ±Infinity, which DataFusion
+-- groups, sorts, compares at scale 0 and returns, but arithmetic, sums,
+-- casts and rescaling comparisons on it stay on PostgreSQL.  A date plus
+-- or minus days (DT3) as date_pli and date_mii: an infinite date stays,
+-- one beyond the dates PostgreSQL holds is 22008.
+CREATE TABLE df_ty4 (id int4, d date) DISTRIBUTED BY (id);
+INSERT INTO df_ty4 SELECT i, date '1992-01-01' + (i * 7919) % 2600 FROM generate_series(1, 3000) i;
+INSERT INTO df_ty4 VALUES (-1, '-infinity'), (-2, 'infinity'), (-3, '4714-11-24 BC'),
+  (-4, '0001-12-31 BC'), (-5, '0001-01-01'), (-6, '5874897-12-31'), (-7, '2000-02-29'),
+  (-8, NULL), (-9, 'infinity');
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: (EXTRACT(year FROM d))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (EXTRACT(year FROM d))
+               ->  Streaming Partial HashAggregate
+                     Group Key: EXTRACT(year FROM d)
+                     ->  Seq Scan on df_ty4
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty4
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: combining aggregate sum without batch Motions
+ Vectorized: slice 1 not eligible: aggregate sum of a numeric that may be infinite
+(7 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE extract(year from d) > 1995.5;
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty4
+                     Filter: (EXTRACT(year FROM d) > 1995.5)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 not eligible: operator > rescaling a numeric that may be infinite
+(8 rows)
+
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Seq Scan on df_ty4
+                     Filter: ((id > 0) AND ((d + 45) > '01-01-1996'::date))
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible
+(8 rows)
+
+SET vec.mode = off;
+SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
+     y     | count 
+-----------+-------
+ -Infinity |     1
+     -4714 |     1
+        -1 |     1
+         1 |     1
+      1992 |   424
+      1993 |   423
+      1994 |   421
+      1995 |   421
+      1996 |   421
+      1997 |   420
+      1998 |   421
+      1999 |    49
+      2000 |     1
+   5874897 |     1
+  Infinity |     2
+           |     1
+(16 rows)
+
+SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
+ q | m  | count 
+---+----+-------
+ 1 |  1 |   290
+ 1 |  2 |   241
+ 1 |  3 |   249
+ 2 |  4 |   244
+ 2 |  5 |   253
+ 2 |  6 |   239
+ 3 |  7 |   250
+ 3 |  8 |   251
+ 3 |  9 |   245
+ 4 | 10 |   248
+ 4 | 11 |   242
+ 4 | 12 |   253
+   |    |     4
+(13 rows)
+
+SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract 
+----+-----------+---------+---------
+ -9 |  Infinity |         |        
+ -8 |           |         |        
+ -7 |      2000 |       2 |      29
+ -6 |   5874897 |      12 |      31
+ -5 |         1 |       1 |       1
+ -4 |        -1 |      12 |      31
+ -3 |     -4714 |      11 |      24
+ -2 |  Infinity |         |        
+ -1 | -Infinity |         |        
+(9 rows)
+
+SELECT min(extract(year from d)), max(extract(year from d)), count(*) FROM df_ty4;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
+ count 
+-------
+  1262
+(1 row)
+
+SELECT id, d + 30, 7 + d, d - 365 FROM df_ty4 WHERE id < 0 AND id NOT IN (-3, -6) ORDER BY id;
+ id |  ?column?  |  ?column?  |   ?column?    
+----+------------+------------+---------------
+ -9 | infinity   | infinity   | infinity
+ -8 |            |            | 
+ -7 | 03-30-2000 | 03-07-2000 | 03-01-1999
+ -5 | 01-31-0001 | 01-08-0001 | 01-02-0001 BC
+ -4 | 01-30-0001 | 01-07-0001 | 01-01-0001 BC
+ -2 | infinity   | infinity   | infinity
+ -1 | -infinity  | -infinity  | -infinity
+(7 rows)
+
+SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+ count 
+-------
+  1363
+(1 row)
+
+SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
+ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10914)
+SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
+ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10915)
+SET vec.mode = on;
+SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
+     y     | count 
+-----------+-------
+ -Infinity |     1
+     -4714 |     1
+        -1 |     1
+         1 |     1
+      1992 |   424
+      1993 |   423
+      1994 |   421
+      1995 |   421
+      1996 |   421
+      1997 |   420
+      1998 |   421
+      1999 |    49
+      2000 |     1
+   5874897 |     1
+  Infinity |     2
+           |     1
+(16 rows)
+
+SELECT extract(quarter from d) AS q, extract(month from d) AS m, count(*) FROM df_ty4 GROUP BY 1, 2 ORDER BY 1, 2;
+ q | m  | count 
+---+----+-------
+ 1 |  1 |   290
+ 1 |  2 |   241
+ 1 |  3 |   249
+ 2 |  4 |   244
+ 2 |  5 |   253
+ 2 |  6 |   239
+ 3 |  7 |   250
+ 3 |  8 |   251
+ 3 |  9 |   245
+ 4 | 10 |   248
+ 4 | 11 |   242
+ 4 | 12 |   253
+   |    |     4
+(13 rows)
+
+SELECT id, extract(year from d), extract(month from d), extract(day from d) FROM df_ty4 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract 
+----+-----------+---------+---------
+ -9 |  Infinity |         |        
+ -8 |           |         |        
+ -7 |      2000 |       2 |      29
+ -6 |   5874897 |      12 |      31
+ -5 |         1 |       1 |       1
+ -4 |        -1 |      12 |      31
+ -3 |     -4714 |      11 |      24
+ -2 |  Infinity |         |        
+ -1 | -Infinity |         |        
+(9 rows)
+
+SELECT min(extract(year from d)), max(extract(year from d)), count(*) FROM df_ty4;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+SELECT count(*) FROM df_ty4 WHERE extract(year from d) BETWEEN 1995 AND 1997;
+ count 
+-------
+  1262
+(1 row)
+
+SELECT id, d + 30, 7 + d, d - 365 FROM df_ty4 WHERE id < 0 AND id NOT IN (-3, -6) ORDER BY id;
+ id |  ?column?  |  ?column?  |   ?column?    
+----+------------+------------+---------------
+ -9 | infinity   | infinity   | infinity
+ -8 |            |            | 
+ -7 | 03-30-2000 | 03-07-2000 | 03-01-1999
+ -5 | 01-31-0001 | 01-08-0001 | 01-02-0001 BC
+ -4 | 01-30-0001 | 01-07-0001 | 01-01-0001 BC
+ -2 | infinity   | infinity   | infinity
+ -1 | -infinity  | -infinity  | -infinity
+(7 rows)
+
+SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
+ count 
+-------
+  1363
+(1 row)
+
+SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
+ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10914)
+SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
+ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10915)
+DROP TABLE df_ty4;
+-- extract(year | quarter | month | day | hour | minute from timestamp)
+-- (ET1), timestamps without time zone: before 2000 the day rounds down
+-- (timestamp2tm), the year of an infinite timestamp is ±Infinity and its
+-- other fields NULL.  Seconds and time zones stay on PostgreSQL.
+CREATE TABLE df_ty5 (id int4, t timestamp, g int4, s text) DISTRIBUTED BY (id);
+INSERT INTO df_ty5 SELECT i, timestamp '1999-12-30 22:00' + (i * 7919 % 200000) * interval '61.5 seconds',
+  i % 7, (ARRAY['', 'a', 'bb'])[i % 3 + 1] FROM generate_series(1, 3000) i;
+INSERT INTO df_ty5 VALUES (-1, '-infinity', 0, ''), (-2, 'infinity', 0, ''),
+  (-3, '4713-11-24 00:00 BC', 0, ''), (-4, '294276-12-31 23:59:59.999999', 0, ''),
+  (-5, '1999-12-31 23:59:59.999999', 0, ''), (-6, '2000-01-01 00:00', 0, ''),
+  (-7, '0001-12-31 23:30 BC', 0, ''), (-8, NULL, 0, ''), (-9, '1969-07-20 20:17:40', 0, '');
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: g, (EXTRACT(minute FROM t)), s
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: g, (EXTRACT(minute FROM t)), s
+               ->  Streaming Partial HashAggregate
+                     Group Key: g, EXTRACT(minute FROM t), s
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: (EXTRACT(second FROM t))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (EXTRACT(second FROM t))
+               ->  Streaming Partial HashAggregate
+                     Group Key: EXTRACT(second FROM t)
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+(12 rows)
+
+EXPLAIN (COSTS OFF) SELECT extract(hour from t::timestamptz), count(*) FROM df_ty5 GROUP BY 1;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: (EXTRACT(hour FROM (t)::timestamp with time zone))
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: (EXTRACT(hour FROM (t)::timestamp with time zone))
+               ->  Streaming Partial HashAggregate
+                     Group Key: EXTRACT(hour FROM (t)::timestamp with time zone)
+                     ->  Seq Scan on df_ty5
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: GROUP BY key of numeric of unknown precision
+ Vectorized: slice 2 not eligible: GROUP BY key of numeric of unknown precision
+(12 rows)
+
+SET vec.mode = off;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+ m | count 
+---+-------
+ 0 |    52
+ 1 |    47
+ 2 |    52
+ 3 |    49
+ 4 |    51
+(5 rows)
+
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+ g | m  | s  | count 
+---+----+----+-------
+ 0 | 59 |    |     5
+ 4 |  4 | a  |     5
+ 4 | 36 | bb |     5
+ 5 | 53 |    |     5
+ 0 |  0 |    |     4
+ 0 |  2 |    |     4
+ 0 |  2 | bb |     4
+ 0 |  7 |    |     4
+ 0 |  8 | a  |     4
+ 0 | 15 | a  |     4
+(10 rows)
+
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract | extract | extract | extract 
+----+-----------+---------+---------+---------+---------+---------
+ -9 |      1969 |       3 |       7 |      20 |      20 |      17
+ -8 |           |         |         |         |         |        
+ -7 |        -1 |       4 |      12 |      31 |      23 |      30
+ -6 |      2000 |       1 |       1 |       1 |       0 |       0
+ -5 |      1999 |       4 |      12 |      31 |      23 |      59
+ -4 |    294276 |       4 |      12 |      31 |      23 |      59
+ -3 |     -4713 |       4 |      11 |      24 |       0 |       0
+ -2 |  Infinity |         |         |         |         |        
+ -1 | -Infinity |         |         |         |         |        
+(9 rows)
+
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+ h  | count |  sum   
+----+-------+--------
+  0 |   131 | 199154
+  1 |   126 | 183893
+  2 |   125 | 192034
+  3 |   124 | 183861
+  4 |   128 | 190716
+  5 |   124 | 183859
+  6 |   126 | 194149
+  7 |   124 | 180027
+  8 |   120 | 182541
+  9 |   129 | 196129
+ 10 |   123 | 180814
+ 11 |   126 | 193099
+ 12 |   124 | 187610
+ 13 |   128 | 190512
+ 14 |   121 | 176913
+ 15 |   128 | 200143
+ 16 |   125 | 182301
+ 17 |   122 | 184155
+ 18 |   125 | 188963
+ 19 |   126 | 189332
+ 20 |   126 | 184127
+ 21 |   124 | 190391
+ 22 |   128 | 188941
+ 23 |   123 | 177802
+    |     3 |    -11
+(25 rows)
+
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+SET vec.mode = on;
+SELECT extract(minute from t) AS m, count(*) FROM df_ty5 GROUP BY 1 ORDER BY 1 LIMIT 5;
+ m | count 
+---+-------
+ 0 |    52
+ 1 |    47
+ 2 |    52
+ 3 |    49
+ 4 |    51
+(5 rows)
+
+SELECT g, extract(minute from t) AS m, s, count(*) FROM df_ty5 GROUP BY g, m, s ORDER BY count(*) DESC, g, m, s LIMIT 10;
+ g | m  | s  | count 
+---+----+----+-------
+ 0 | 59 |    |     5
+ 4 |  4 | a  |     5
+ 4 | 36 | bb |     5
+ 5 | 53 |    |     5
+ 0 |  0 |    |     4
+ 0 |  2 |    |     4
+ 0 |  2 | bb |     4
+ 0 |  7 |    |     4
+ 0 |  8 | a  |     4
+ 0 | 15 | a  |     4
+(10 rows)
+
+SELECT id, extract(year from t), extract(quarter from t), extract(month from t), extract(day from t),
+  extract(hour from t), extract(minute from t) FROM df_ty5 WHERE id < 0 ORDER BY id;
+ id |  extract  | extract | extract | extract | extract | extract 
+----+-----------+---------+---------+---------+---------+---------
+ -9 |      1969 |       3 |       7 |      20 |      20 |      17
+ -8 |           |         |         |         |         |        
+ -7 |        -1 |       4 |      12 |      31 |      23 |      30
+ -6 |      2000 |       1 |       1 |       1 |       0 |       0
+ -5 |      1999 |       4 |      12 |      31 |      23 |      59
+ -4 |    294276 |       4 |      12 |      31 |      23 |      59
+ -3 |     -4713 |       4 |      11 |      24 |       0 |       0
+ -2 |  Infinity |         |         |         |         |        
+ -1 | -Infinity |         |         |         |         |        
+(9 rows)
+
+SELECT extract(hour from t) AS h, count(*), sum(id) FROM df_ty5 GROUP BY 1 ORDER BY 1;
+ h  | count |  sum   
+----+-------+--------
+  0 |   131 | 199154
+  1 |   126 | 183893
+  2 |   125 | 192034
+  3 |   124 | 183861
+  4 |   128 | 190716
+  5 |   124 | 183859
+  6 |   126 | 194149
+  7 |   124 | 180027
+  8 |   120 | 182541
+  9 |   129 | 196129
+ 10 |   123 | 180814
+ 11 |   126 | 193099
+ 12 |   124 | 187610
+ 13 |   128 | 190512
+ 14 |   121 | 176913
+ 15 |   128 | 200143
+ 16 |   125 | 182301
+ 17 |   122 | 184155
+ 18 |   125 | 188963
+ 19 |   126 | 189332
+ 20 |   126 | 184127
+ 21 |   124 | 190391
+ 22 |   128 | 188941
+ 23 |   123 | 177802
+    |     3 |    -11
+(25 rows)
+
+SELECT min(extract(year from t)), max(extract(year from t)), count(*) FROM df_ty5;
+    min    |   max    | count 
+-----------+----------+-------
+ -Infinity | Infinity |  3009
+(1 row)
+
+DROP TABLE df_ty5;
+-- Redistributed by date and time keys (cdbhash: hashint4 for date,
+-- time_hash and timestamp_hash for the others), as batches.
+SET vec.motion_batches = on;
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+                                  QUERY PLAN                                  
+------------------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Hash Join
+                     Hash Cond: (a.ts = b.ts)
+                     ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                           Hash Key: a.ts
+                           ->  Seq Scan on df_ty a
+                     ->  Hash
+                           ->  Redistribute Motion 3:3  (slice3; segments: 3)
+                                 Hash Key: b.ts
+                                 ->  Seq Scan on df_ty2 b
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
+(17 rows)
+
+EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_ty GROUP BY d;
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Finalize HashAggregate
+         Group Key: d
+         ->  Redistribute Motion 3:3  (slice2; segments: 3)
+               Hash Key: d
+               ->  Streaming Partial HashAggregate
+                     Group Key: d
+                     ->  Seq Scan on df_ty
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
+(12 rows)
+
+SET vec.mode = off;
+SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
+ count | count 
+-------+-------
+  4004 |     2
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
+ count  | count 
+--------+-------
+ 100004 |     1
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
+ count |  sum  
+-------+-------
+ 13601 | 27202
+(1 row)
+
+SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+ count  |    min    
+--------+-----------
+ 100003 | -infinity
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
+ count  | count  
+--------+--------
+ 246654 | 166650
+(1 row)
+
+SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
+ count 
+-------
+  2002
+(1 row)
+
+SET vec.mode = on;
+SELECT count(*), count(DISTINCT n) FROM (SELECT d, count(*) AS n FROM df_ty GROUP BY d) s;
+ count | count 
+-------+-------
+  4004 |     2
+(1 row)
+
+SELECT count(*), count(DISTINCT n) FROM (SELECT tz, count(*) AS n FROM df_ty GROUP BY tz) s;
+ count  | count 
+--------+-------
+ 100004 |     1
+(1 row)
+
+SELECT count(*), sum(n) FROM (SELECT t, count(*) AS n FROM df_ty GROUP BY t HAVING count(*) > 1) s;
+ count |  sum  
+-------+-------
+ 13601 | 27202
+(1 row)
+
+SELECT count(*), min(a.ts) FROM df_ty a JOIN df_ty2 b ON a.ts = b.ts;
+ count  |    min    
+--------+-----------
+ 100003 | -infinity
+(1 row)
+
+SELECT count(*), count(b.id) FROM df_ty a LEFT JOIN df_ty2 b ON a.d = b.d AND b.id % 30 = 0;
+ count  | count  
+--------+--------
+ 246654 | 166650
+(1 row)
+
+SELECT count(*) FROM df_ty a WHERE EXISTS (SELECT 1 FROM df_ty2 b WHERE b.t = a.t AND b.id < 2000);
+ count 
+-------
+  2002
+(1 row)
+
+-- ctid and gp_segment_id of a scan (TID1: GPORCA dedupes a semi join's
+-- side by them, TPC-H Q21), ctid carried as block << 16 | offset; a tid
+-- constant stays on PostgreSQL.
+CREATE TABLE df_ct (a int, b text) DISTRIBUTED BY (a);
+INSERT INTO df_ct SELECT i, 'x' || i FROM generate_series(1, 3000) i;
+DELETE FROM df_ct WHERE a % 7 = 0;
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather Motion 3:1  (slice1; segments: 3)
+         ->  Partial Aggregate
+               ->  Redistribute Motion 3:3  (slice2; segments: 3)
+                     Hash Key: ctid
+                     ->  Seq Scan on df_ct
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+(10 rows)
+
+EXPLAIN (COSTS OFF) SELECT a FROM df_ct WHERE ctid > '(0,5)';
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+                                              QUERY PLAN                                              
+------------------------------------------------------------------------------------------------------
+ Gather Motion 3:1  (slice1; segments: 3)
+   ->  Seq Scan on df_ct
+         Filter: (ctid > '(0,5)'::tid)
+ Optimizer: Postgres query optimizer
+ Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
+ Vectorized: slice 1 not eligible: constant of type tid
+(6 rows)
+
+SET vec.mode = off;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+ gp_segment_id | ctid  | a  
+---------------+-------+----
+             0 | (0,1) |  2
+             0 | (0,2) |  3
+             0 | (0,3) |  4
+             0 | (0,5) |  8
+             1 | (0,1) |  1
+             2 | (0,1) |  5
+             2 | (0,2) |  6
+             2 | (0,3) |  9
+             2 | (0,4) | 10
+             2 | (0,5) | 11
+(10 rows)
+
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+ count | count |  min  
+-------+-------+-------
+  2572 |  1003 | (0,1)
+(1 row)
+
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+NOTICE:  SELECT uses system-defined column "y.ctid" without the necessary companion column "y.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+ count 
+-------
+  3474
+(1 row)
+
+SET vec.mode = on;
+SELECT gp_segment_id, ctid, a FROM df_ct WHERE a < 12 ORDER BY 1, 2;
+ gp_segment_id | ctid  | a  
+---------------+-------+----
+             0 | (0,1) |  2
+             0 | (0,2) |  3
+             0 | (0,3) |  4
+             0 | (0,5) |  8
+             1 | (0,1) |  1
+             2 | (0,1) |  5
+             2 | (0,2) |  6
+             2 | (0,3) |  9
+             2 | (0,4) | 10
+             2 | (0,5) | 11
+(10 rows)
+
+SELECT count(*), count(DISTINCT ctid), min(ctid) FROM df_ct;
+ count | count |  min  
+-------+-------+-------
+  2572 |  1003 | (0,1)
+(1 row)
+
+SELECT count(*) FROM (SELECT ctid c FROM df_ct) x JOIN df_ct y ON y.ctid = x.c AND y.a % 2 = 0;
+NOTICE:  SELECT uses system-defined column "y.ctid" without the necessary companion column "y.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+NOTICE:  SELECT uses system-defined column "df_ct.ctid" without the necessary companion column "df_ct.gp_segment_id"
+HINT:  To uniquely identify a row within a distributed table, use the "gp_segment_id" column together with the "ctid" column.
+ count 
+-------
+  3474
+(1 row)
+
+SET vec.mode = off;
+DROP TABLE df_ct;
+DROP TABLE df_ty, df_ty2;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
+DROP EXTENSION vec_executor;
