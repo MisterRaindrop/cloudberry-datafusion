@@ -35,8 +35,10 @@
 #ifdef __GLIBC__
 #include <malloc.h>
 #endif
+#include <dirent.h>
 #include <pthread.h>
 #include <signal.h>
+#include <unistd.h>
 #include <wctype.h>
 
 #include "catalog/pg_tablespace_d.h"
@@ -80,9 +82,61 @@ vx_runtime_atexit(int code, Datum arg)
 	}
 	if (vx_spill_path[0] != '\0')
 	{
-		(void) rmtree(vx_spill_path, true);
+		/*
+		 * A task that does not reach a yield point outlives the shutdown's
+		 * wait and can still create a spill file while the directory is
+		 * removed (a final hash aggregation spilling after its query was
+		 * cancelled: "Directory not empty").  Try again for a while; what is
+		 * left after that, the next backend that uses the engine removes
+		 * (vx_spill_sweep).
+		 */
+		for (int i = 0; i < 5; i++)
+		{
+			if (rmtree(vx_spill_path, true))
+				break;
+			pg_usleep(100 * 1000L);
+		}
 		vx_spill_path[0] = '\0';
 	}
+}
+
+/*
+ * Remove the spill directories of backends that no longer exist, in
+ * 'parent'.  A backend removes its own when it exits, but not what a task
+ * still running at exit created after that (see vx_runtime_atexit).  A
+ * directory whose process id is in use again belongs to that process, or is
+ * reused by it, and stays.
+ */
+static void
+vx_spill_sweep(const char *parent)
+{
+	char		prefix[64];
+	size_t		len;
+	DIR		   *dir;
+	struct dirent *de;
+
+	snprintf(prefix, sizeof(prefix), "%s_vec_", PG_TEMP_FILE_PREFIX);
+	len = strlen(prefix);
+	dir = AllocateDir(parent);
+	if (dir == NULL)
+		return;
+	while ((de = ReadDirExtended(dir, parent, LOG)) != NULL)
+	{
+		char	   *end;
+		long		pid;
+		char		path[MAXPGPATH];
+
+		if (strncmp(de->d_name, prefix, len) != 0)
+			continue;
+		pid = strtol(de->d_name + len, &end, 10);
+		if (*end != '\0' || pid <= 0 || pid == MyProcPid)
+			continue;
+		if (kill((pid_t) pid, 0) == 0 || errno != ESRCH)
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", parent, de->d_name);
+		(void) rmtree(path, true);
+	}
+	FreeDir(dir);
 }
 
 /*
@@ -101,6 +155,7 @@ vx_spill_dir(void)
 
 	TempTablespacePath(parent, DEFAULTTABLESPACE_OID);
 	(void) MakePGDirectory(parent);	/* usually exists already */
+	vx_spill_sweep(parent);
 	snprintf(vx_spill_path, sizeof(vx_spill_path), "%s/%s/%s_vec_%d",
 			 DataDir, parent, PG_TEMP_FILE_PREFIX, (int) MyProcPid);
 	if (MakePGDirectory(vx_spill_path) < 0 && errno != EEXIST)
