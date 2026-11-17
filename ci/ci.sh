@@ -64,6 +64,7 @@ CBDB=${2:-}
 case "$step" in
 cloudberry)
 	S=$CBDB/devops/build/automation/cloudberry/scripts
+	mkdir -p "$CBDB/build-logs"	# the scripts log there, but do not create it
 	SRC_DIR=$CBDB BUILD_DESTINATION=$GPHOME_DIR "$S/configure-cloudberry.sh"
 	SRC_DIR=$CBDB BUILD_DESTINATION=$GPHOME_DIR "$S/build-cloudberry.sh"
 	;;
