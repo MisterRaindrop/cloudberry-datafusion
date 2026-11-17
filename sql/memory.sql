@@ -36,6 +36,10 @@ FROM gp_dist_random('gp_id');
 -- manager's own errors (53000), as PostgreSQL's hash aggregation over the
 -- same limit does.  Nothing is left in the account after a failure, a
 -- success, or a subtransaction rolled back.
+-- Every segment loads the extension, so that their slices spill in the
+-- engine.
+ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
+\c
 CREATE TABLE df_wf AS SELECT i AS k, i % 100 AS g, repeat('x', 40) AS pad
 FROM generate_series(1, 1000000) i DISTRIBUTED BY (g);
 SET vec.mode = on;
@@ -68,5 +72,6 @@ FROM gp_toolkit.gp_workfile_usage_per_segment;
 RESET statement_mem;
 RESET vec.mode;
 DROP TABLE df_wf;
+ALTER DATABASE contrib_regression RESET session_preload_libraries;
 
 DROP EXTENSION vec_executor;
