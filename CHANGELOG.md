@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-11-17)
 
 The first release: a pure extension that runs the slices of Apache
 Cloudberry plans it can in a vectorized engine (Apache DataFusion), and
