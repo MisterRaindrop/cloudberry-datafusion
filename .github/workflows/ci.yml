@@ -1,0 +1,164 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+# Builds Apache Cloudberry (cached by commit), starts a demo cluster in
+# Cloudberry's build container, builds the extension, the engines and the
+# direct PAX reader, and runs the regression tests, the engine check and
+# the Rust tests.  The steps are ci/ci.sh's.
+#
+# The weekly run takes Cloudberry's latest main even without a push here,
+# so that a change there the PAX patches or the hooks no longer fit shows.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      cloudberry_ref:
+        description: 'apache/cloudberry branch, tag or commit'
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
+      options: >-
+        --user root
+        -h cdw
+        -v /usr/share:/host_usr_share
+        -v /usr/local:/host_usr_local
+        -v /opt:/host_opt
+
+    steps:
+      - name: Free disk space
+        run: |
+          rm -rf /host_opt/hostedtoolcache /host_usr_local/lib/android \
+                 /host_usr_share/dotnet /host_opt/ghc /host_usr_local/.ghcup \
+                 /host_usr_share/swift /host_usr_local/share/powershell \
+                 /host_usr_local/share/chromium /host_usr_share/miniconda \
+                 /host_opt/az /host_usr_share/sbt || true
+          df -h /
+
+      - name: Check out vec_executor
+        uses: actions/checkout@v7
+        with:
+          path: vec_executor
+
+      - name: Find the Cloudberry commit
+        id: cbdb
+        run: |
+          ref='${{ github.event.inputs.cloudberry_ref || 'main' }}'
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            sha=$ref
+          else
+            sha=$(git ls-remote https://github.com/apache/cloudberry "$ref" | head -1 | cut -f1)
+          fi
+          test -n "$sha"
+          echo "Cloudberry $ref: $sha" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      # Restored and saved explicitly, before the demo cluster puts its data
+      # directories under gpAux/gpdemo.
+      - name: Restore the Cloudberry build
+        id: cbdb-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/cloudberry-db
+            cloudberry/gpAux/gpdemo
+            cloudberry/contrib/pax_storage/src/cpp
+          key: cloudberry-rocky9-${{ steps.cbdb.outputs.sha }}
+
+      - name: Check out Cloudberry
+        if: steps.cbdb-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: apache/cloudberry
+          ref: ${{ steps.cbdb.outputs.sha }}
+          path: cloudberry
+          submodules: true
+
+      - name: Prepare the container
+        run: |
+          su - gpadmin -c /tmp/init_system.sh
+          chown -R gpadmin:gpadmin "$GITHUB_WORKSPACE"
+          if [ -d /usr/local/cloudberry-db ]; then chown -R gpadmin:gpadmin /usr/local/cloudberry-db; fi
+
+      - name: Build Cloudberry
+        if: steps.cbdb-cache.outputs.cache-hit != 'true'
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh cloudberry cloudberry"
+
+      - name: Save the Cloudberry build
+        if: steps.cbdb-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /usr/local/cloudberry-db
+            cloudberry/gpAux/gpdemo
+            cloudberry/contrib/pax_storage/src/cpp
+          key: cloudberry-rocky9-${{ steps.cbdb.outputs.sha }}
+
+      - name: Restore the Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/gpadmin/.cargo/registry
+            /home/gpadmin/.cargo/git
+            vec_executor/engines/datafusion/target
+          key: cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}
+          restore-keys: cargo-rocky9-
+
+      - name: Install Rust
+        run: |
+          chown -R gpadmin:gpadmin /home/gpadmin "$GITHUB_WORKSPACE"
+          su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh rust"
+
+      - name: Start a demo cluster
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh cluster cloudberry"
+
+      - name: Build vec_executor
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh build cloudberry"
+
+      - name: Test
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh test cloudberry"
+
+      - name: Keep the test output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-output
+          path: |
+            vec_executor/regression.diffs
+            vec_executor/regression.out
+            vec_executor/results
+            vec_executor/results-engine
+            cloudberry/gpAux/gpdemo/datadirs/qddir/demoDataDir-1/log
+          if-no-files-found: ignore
