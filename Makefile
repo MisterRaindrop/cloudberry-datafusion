@@ -50,6 +50,9 @@ REGRESS += paxdirect
 endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 
+# 'make' alone builds; the targets defined before PGXS's would come first.
+.DEFAULT_GOAL := all
+
 # Level 0 of checking an engine (docs/engines.md): the regression tests'
 # rows with vec.engine = $(ENGINE) against PostgreSQL's (the null engine).
 ENGINE ?= datafusion
