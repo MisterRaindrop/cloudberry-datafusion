@@ -162,9 +162,24 @@ pub fn to_pg_error(e: &DataFusionError) -> PgError {
             return PgError::new("53200", "out of memory")
                 .with_detail(format!("DataFusion: {msg}"));
         }
+        if let Some(code) = err.downcast_ref::<std::io::Error>().and_then(file_access_sqlstate) {
+            return PgError::new(code, format!("datafusion error: {e}"));
+        }
         cur = err.source();
     }
     PgError::internal(format!("datafusion error: {e}"))
+}
+
+/// The SQLSTATE PostgreSQL's errcode_for_file_access() gives an I/O error
+/// (a spill file that cannot be created or written), for the errors a
+/// client can act on: out of disk space or of file descriptors.  Others
+/// stay internal errors.
+fn file_access_sqlstate(e: &std::io::Error) -> Option<&'static str> {
+    match e.raw_os_error()? {
+        libc::ENOSPC => Some("53100"),                 // disk_full
+        libc::EMFILE | libc::ENFILE => Some("53000"), // insufficient_resources
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -387,6 +402,17 @@ mod tests {
     fn err_of(r: Result<ArrayRef, ArrowError>) -> PgError {
         let e = DataFusionError::ArrowError(Box::new(r.unwrap_err()), None);
         to_pg_error(&e)
+    }
+
+    #[test]
+    fn spill_io_errors() {
+        let io = |n| DataFusionError::IoError(std::io::Error::from_raw_os_error(n));
+        assert_eq!(to_pg_error(&io(libc::ENOSPC)).sqlstate, "53100");
+        assert_eq!(to_pg_error(&io(libc::EMFILE)).sqlstate, "53000");
+        assert_eq!(to_pg_error(&io(libc::EIO)).sqlstate, "XX000");
+        // as DataFusion wraps it when a spill file cannot be written
+        let nested = DataFusionError::External(Box::new(io(libc::ENOSPC)));
+        assert_eq!(to_pg_error(&nested).sqlstate, "53100");
     }
 
     #[test]
