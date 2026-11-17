@@ -428,7 +428,7 @@ SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
 SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM vec_debug_pax_cache();
  hits | fills 
 ------+-------
-    7 |     1
+    8 |     0
 (1 row)
 
 -- one micro-partition: one directory of entries

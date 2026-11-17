@@ -266,7 +266,11 @@ that does not fit is removed and rebuilt.  `vec.pax_decode_cache_size`
 take: one process at a time measures it and removes micro-partitions unused
 for ten minutes, least recently used first; while nothing can go, scans add
 nothing, since evicting for a working set bigger than the cache would make
-every scan miss.  Both are superuser settings.  On TPC-H at scale factor
+every scan miss.  Until a process knows the size, its threads wait for
+the one measuring it rather than add nothing: they used to leave out the
+groups they read meanwhile, so the next scan filled them instead of
+reading them (paxdirect's cache case failed about one run in 40).  Both
+are superuser settings.  On TPC-H at scale factor
 100 (32 segments, data in memory, 85 GB of cache) the 22 queries took
 36.2 s from the cache against 39.2 s without it, and 49-58 s for the run
 that fills it.  At scale factor 1000 the cache (700 GB, the decoded columns

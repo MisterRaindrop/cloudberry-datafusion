@@ -10,7 +10,7 @@
   *
   * contrib/pax_storage/src/cpp/access/pax_direct_api.cc
   *
-@@ -47,9 +48,23 @@
+@@ -47,9 +48,24 @@
  
  #include "access/pax_direct_api.h"
  
@@ -24,6 +24,7 @@
 +
  #include <algorithm>
 +#include <atomic>
++#include <condition_variable>
 +#include <cerrno>
 +#include <climits>
 +#include <cstdio>
@@ -34,7 +35,7 @@
  #include <string>
  #include <vector>
  
-@@ -92,6 +107,10 @@
+@@ -92,6 +108,10 @@
    std::vector<bool> late;    // per handed-out column: left to read_rows
    size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
    PaxDirectScanInfo info;
@@ -45,7 +46,7 @@
  };
  
  // A numeric of the vectorized format (comm/vec_numeric.cc), 16 bytes: the
-@@ -470,8 +489,40 @@
+@@ -470,8 +490,40 @@
    int scale;
    // dense columns with nulls: the value index of each row
    std::vector<uint32_t> index;
@@ -86,7 +87,7 @@
  // The chunk 'emit' is handed: rows j0 .. j1 - 1 of the group's kept rows
  // ('keep' lists them unless all are).  Its fixed-width columns are
  // converted when the consumer fetches them, for the rows it asks for: those
-@@ -566,6 +617,43 @@
+@@ -566,6 +618,43 @@
      const size_t n = rows ? nrows : ch->j1 - ch->j0;
      auto &nulls = (*ch->nulls)[k];
      auto &values = (*ch->values)[k];
@@ -130,12 +131,10 @@
      // A column without nulls of a group without deleted rows: the stored
      // values themselves when all rows are wanted.
      if (!st.bm && ch->all_kept && !st.bits && st.scale < 0) {
-@@ -619,8 +707,628 @@
-   }
-   ch->failed = true;
+@@ -621,6 +710,636 @@
    return -1;
-+}
-+
+ }
+ 
 +// DC1: a cache of decoded columns, as files read through mmap, under the
 +// directory vec.pax_decode_cache names (cache_config).  A group's
 +// column is kept as read_block hands it out, a slot a row: fixed-width
@@ -372,6 +371,7 @@
 +  int64_t written = 0;     // bytes this process wrote since
 +  int64_t checked = 0;     // when .sweep was last read
 +  bool sweeping = false;   // a thread of this process sweeps
++  std::condition_variable swept;  // signalled when it is done
 +};
 +CacheUse g_use;
 +
@@ -488,6 +488,14 @@
 +  }
 +  const int64_t share = std::max<int64_t>(scan->cache_limit / 512, int64_t{16} << 20);
 +  bytes = (bytes + 4095) / 4096 * 4096;
++  // While the size is unknown, wait for the thread that sweeps: refusing
++  // would leave out the groups other threads read meanwhile (C1b reads a
++  // micro-partition's groups in parallel), and the next scan would fill
++  // them instead of reading them.
++  if (g_use.total < 0 && g_use.sweeping) {
++    g_use.swept.wait(lock, [] { return !g_use.sweeping; });
++    if (g_use.dir != scan->cache_dir) return false;
++  }
 +  if ((g_use.total < 0 || g_use.written >= share) && !g_use.sweeping) {
 +    g_use.sweeping = true;
 +    const std::string dir = g_use.dir;
@@ -501,13 +509,14 @@
 +      g_use.when = rec.when;
 +      g_use.written = 0;
 +    }
++    g_use.swept.notify_all();
 +  }
 +  if (g_use.total < 0 || g_use.total + g_use.written + bytes > scan->cache_limit)
 +    return false;
 +  g_use.written += bytes;
 +  return true;
- }
- 
++}
++
 +// Marks micro-partition directory 'key' used, once a minute at most.
 +void TouchKey(const std::string &key) {
 +  struct stat st;
@@ -759,7 +768,7 @@
  // Hands out rows of one decoded group, of 'nrows' rows: those 'keep' lists
  // (positions in the group) unless 'all_kept', in chunks.  'colv' holds the
  // group's column of each handed-out column, null for one this read does
-@@ -629,8 +1337,10 @@
+@@ -629,8 +1348,10 @@
                const std::vector<pax::PaxColumn *> &colv, size_t rows,
                const std::vector<uint32_t> &keep, bool all_kept, Ledger &ledger,
                int64_t base, PaxDirectEmit emit, void *ctx, char *err,
@@ -771,7 +780,7 @@
    std::vector<std::vector<char>> values(ncols);
    std::vector<std::vector<uint8_t>> nulls(ncols);
    std::vector<std::vector<int32_t>> offsets(ncols);
-@@ -653,38 +1363,25 @@
+@@ -653,38 +1374,25 @@
    for (size_t k = 0; k < ncols; k++) {
      ColState &st = cols[k];
      pax::PaxColumn *col = colv[k];
@@ -820,7 +829,7 @@
                          per_chunk * 5 / 4);
      }
      nulls[k].resize(std::min(nkept, kChunkRows));
-@@ -697,7 +1394,7 @@
+@@ -697,7 +1405,7 @@
      size_t j1 = std::min(nkept, j0 + kChunkRows);
      for (size_t k = 0; k < ncols; k++) {
        ColState &st = cols[k];
@@ -829,14 +838,10 @@
        uint8_t *nl = nulls[k].data();
        values[k].clear();
        offsets[k].assign(1, 0);
-@@ -744,8 +1441,35 @@
-               values[q].resize(static_cast<size_t>(offsets[q].back()));
-             }
-           break;
-+        }
-+      }
-+    }
-+
+@@ -748,6 +1456,33 @@
+       }
+     }
+ 
 +    // DC1: cached strings, once the chunk's end is known; all rows kept,
 +    // their bytes are handed out where the cache has them
 +    for (size_t k = 0; k < ncols; k++) {
@@ -851,10 +856,10 @@
 +        for (size_t j = j0; j < j1; j++) {
 +          nl[j - j0] = st.cnulls ? st.cnulls[j] : 0;
 +          offsets[k].push_back(static_cast<int32_t>(st.coffs[j + 1] - from));
-         }
++        }
 +        in_place[k] = st.cvals + from;
 +        continue;
-       }
++      }
 +      for (size_t j = j0; j < j1; j++) {
 +        const size_t r = row_of(j);
 +        nl[j - j0] = st.cnulls ? st.cnulls[r] : 0;
@@ -862,10 +867,12 @@
 +                         st.cvals + st.coffs[r + 1]);
 +        offsets[k].push_back(static_cast<int32_t>(values[k].size()));
 +      }
-     }
- 
++    }
++
      auto held = [&]() {
-@@ -763,7 +1487,9 @@
+       int64_t h = static_cast<int64_t>(keep.capacity() * 4 + locs.capacity() * 9);
+       for (size_t k = 0; k < ncols; k++)
+@@ -763,7 +1498,9 @@
          out[k] = PaxDirectColumn{nullptr, nullptr, nullptr};
          continue;
        }
@@ -876,7 +883,7 @@
        out[k].nulls = nulls[k].data();
        out[k].offsets = offsets[k].data();
      }
-@@ -833,19 +1559,85 @@
+@@ -833,19 +1570,85 @@
        visimap_bytes = static_cast<int64_t>(len);
      }
  
@@ -967,7 +974,7 @@
        auto group = reader->ReadGroup(g);
        auto &columns = *group->GetAllColumns();
        const size_t rows = group->GetRows();
-@@ -889,10 +1681,12 @@
+@@ -889,10 +1692,12 @@
          }
        }
        if (EmitGroup(scan, index, static_cast<uint32_t>(g), colv, rows, keep,
@@ -982,7 +989,7 @@
      return 0;
    } catch (cbdb::CException &e) {
      SetError(err, errlen, "cannot read PAX micro-partition", e.What().c_str());
-@@ -970,7 +1764,7 @@
+@@ -970,7 +1775,7 @@
          static_cast<int64_t>(read_buffer->Capacity()) + DecodedBytes(colv);
      ledger.Set(base);
      if (EmitGroup(scan, index, static_cast<uint32_t>(group_no), colv, nrows_group,
@@ -991,7 +998,7 @@
        return -1;
      reader->Close();
      return 0;
-@@ -995,6 +1789,8 @@
+@@ -995,6 +1800,8 @@
      BlockGroups,
      Late,
      ReadRows,

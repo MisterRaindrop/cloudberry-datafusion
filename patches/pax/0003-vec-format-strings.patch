@@ -1,6 +1,6 @@
 --- a/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
 +++ b/contrib/pax_storage/src/cpp/access/pax_direct_api.cc
-@@ -73,6 +73,7 @@
+@@ -74,6 +74,7 @@
  #include "comm/singleton.h"
  #include "exceptions/CException.h"
  #include "storage/columns/pax_columns.h"
@@ -8,7 +8,7 @@
  #include "storage/filter/pax_filter.h"
  #include "storage/filter/pax_sparse_filter.h"
  #include "storage/local_file_system.h"
-@@ -83,6 +84,10 @@
+@@ -84,6 +85,10 @@
  #include "storage/pax_buffer.h"
  #include "storage/paxc_define.h"
  
@@ -19,7 +19,7 @@
  #ifndef VX_PAX_BUILD_ID
  #define VX_PAX_BUILD_ID ""
  #endif
-@@ -103,6 +108,7 @@
+@@ -104,6 +109,7 @@
    std::vector<int> cols;     // 0-based table columns to hand out
    std::vector<int> widths;   // their value widths in bytes
    std::vector<int> scales;   // a numeric's scale when read fixed-width, or -1
@@ -27,7 +27,7 @@
    int read_col;              // column decoded when none is handed out
    std::vector<bool> late;    // per handed-out column: left to read_rows
    size_t read_buffer_size;   // pax.scan_reuse_buffer_size, in bytes
-@@ -382,6 +388,12 @@
+@@ -383,6 +389,12 @@
      scan->cols.assign(cols, cols + ncols);
      scan->widths.assign(widths, widths + ncols);
      scan->scales.assign(scales, scales + ncols);
@@ -40,7 +40,7 @@
      scan->read_col = ncols > 0 ? cols[0] : 0;
      scan->late.assign(ncols, false);
      scan->read_buffer_size = pax::pax_scan_reuse_buffer_size;
-@@ -485,6 +497,20 @@
+@@ -486,6 +498,20 @@
    bool dense;
    bool bits;
    bool vec_numeric;
@@ -61,7 +61,7 @@
    int width;
    int scale;
    // dense columns with nulls: the value index of each row
-@@ -498,7 +524,7 @@
+@@ -499,7 +525,7 @@
  };
  
  // The state of column 'col' of a group of 'rows' rows, decoded by PAX.
@@ -70,7 +70,7 @@
    // In the plain format only non-null values are stored, in row
    // order; in the vectorized format every row has a slot.  That
    // format keeps booleans bit-packed in memory, one bit per row,
-@@ -513,6 +539,26 @@
+@@ -514,6 +540,26 @@
              pax::PaxColumnTypeInMem::kTypeVecBitPacked;
    st.vec_numeric = col->GetPaxColumnTypeInMem() ==
                     pax::PaxColumnTypeInMem::kTypeVecDecimal;
@@ -97,7 +97,7 @@
    if (st.bm && st.dense) {
      st.index.resize(rows);
      uint32_t i = 0;
-@@ -523,6 +569,59 @@
+@@ -524,6 +570,59 @@
    }
  }
  
@@ -157,7 +157,7 @@
  // The chunk 'emit' is handed: rows j0 .. j1 - 1 of the group's kept rows
  // ('keep' lists them unless all are).  Its fixed-width columns are
  // converted when the consumer fetches them, for the rows it asks for: those
-@@ -787,10 +886,14 @@
+@@ -788,10 +887,14 @@
    return key + "/g" + std::to_string(g);
  }
  
@@ -175,7 +175,7 @@
  }
  
  // A cache entry mapped read-only.
-@@ -1149,14 +1252,18 @@
+@@ -1160,14 +1263,18 @@
        const bool present = !st.bm || st.bm->Test(static_cast<uint32>(r));
        const size_t i = !st.dense ? r : st.bm ? st.index[r] : r;
        if (present) {
@@ -194,7 +194,7 @@
          }
        } else {
          nl[r] = 1;
-@@ -1215,7 +1322,8 @@
+@@ -1226,7 +1333,8 @@
    for (size_t k = 0; k < scan->cols.size() && (hit || bad); k++) {
      if (scan->late[k]) continue;
      const std::string path =
@@ -204,7 +204,7 @@
      switch (maps[k].Open(path)) {
        case Mapped::kMissing:
          hit = false;
-@@ -1259,12 +1367,13 @@
+@@ -1270,12 +1378,13 @@
    for (size_t k = 0; k < scan->cols.size(); k++) {
      if (scan->late[k]) continue;
      const std::string path =
@@ -220,7 +220,7 @@
      if (!BuildEntry(st, rows, row_offset, bytes))
        bytes = SmallEntry(rows, row_offset, scan->widths[k], kUncacheable);
      if (!CacheAdmit(scan, static_cast<int64_t>(bytes.size()))) {
-@@ -1373,7 +1482,7 @@
+@@ -1384,7 +1493,7 @@
        SetCached(st, entry, rows);
        stored_bytes = st.coffs ? st.coffs[rows] : 0;
      } else {
@@ -229,7 +229,7 @@
        stored_bytes = col->GetBuffer().second;
      }
      if (st.width <= 0) {
-@@ -1417,18 +1526,38 @@
+@@ -1428,18 +1537,38 @@
            offsets[k].push_back(static_cast<int32_t>(values[k].size()));
            continue;
          }
