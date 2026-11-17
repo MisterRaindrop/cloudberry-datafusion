@@ -58,7 +58,7 @@ EXPLAIN (COSTS OFF) SELECT min(d), max(ts) FROM df_ty WHERE tz > '2024-05-01 00:
                      Filter: (tz > 'Tue Apr 30 16:00:00 2024 UTC'::timestamp with time zone)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
@@ -71,7 +71,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d - 1 > '2001-01-01';
                      Filter: ((d - 1) > '01-01-2001'::date)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT max(d - date '2000-01-01') FROM df_ty;
@@ -190,7 +190,7 @@ SELECT d, count(*), min(ts), max(tz) FROM df_ty WHERE id % 1000 = 0 GROUP BY d O
 
 -- Arithmetic stays on PostgreSQL, and fails there as it should.
 SELECT max(d - date '2000-01-01') FROM df_ty WHERE id >= -1;
-ERROR:  cannot subtract infinite dates  (seg2 slice1 172.18.0.2:7004 pid=10916)
+ERROR:  cannot subtract infinite dates  (seg2 slice1 172.18.0.2:7004 pid=10910)
 -- A date against a timestamp constant compares dates (DT1): the constant
 -- rounded up for < and >=, down for <= and >; = and <> on a constant
 -- within a day are constant.  Dates past the timestamp range sort after
@@ -210,7 +210,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < date '1994-01-01' + int
                      Filter: (d < 'Sun Jan 01 00:00:00 1995'::timestamp without time zone)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty WHERE d < ts;
@@ -236,7 +236,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id), sum(id * id) FROM df_ty3 WHERE d <
                      Filter: (d <> 'Sun Jan 02 01:00:00 1994'::timestamp without time zone)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 SET vec.mode = off;
@@ -376,7 +376,7 @@ EXPLAIN (COSTS OFF) SELECT extract(year from d), count(*) FROM df_ty4 GROUP BY 1
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT sum(extract(year from d)) FROM df_ty4;
@@ -414,7 +414,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01'
                      Filter: ((id > 0) AND ((d + 45) > '01-01-1996'::date))
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 SET vec.mode = off;
@@ -502,9 +502,9 @@ SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
 (1 row)
 
 SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
-ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10914)
+ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10908)
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
-ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10915)
+ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10909)
 SET vec.mode = on;
 SELECT extract(year from d) AS y, count(*) FROM df_ty4 GROUP BY 1 ORDER BY 1;
      y     | count 
@@ -590,9 +590,9 @@ SELECT count(*) FROM df_ty4 WHERE d + 45 > date '1996-01-01' AND id > 0;
 (1 row)
 
 SELECT id, d + 1 FROM df_ty4 WHERE id = -6;
-ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10914)
+ERROR:  date out of range  (seg0 slice1 172.18.0.2:7002 pid=10908)
 SELECT id, d - 1 FROM df_ty4 WHERE id = -3;
-ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10915)
+ERROR:  date out of range  (seg1 slice1 172.18.0.2:7003 pid=10909)
 DROP TABLE df_ty4;
 -- extract(year | quarter | month | day | hour | minute from timestamp)
 -- (ET1), timestamps without time zone: before 2000 the day rounds down
@@ -620,7 +620,7 @@ EXPLAIN (COSTS OFF) SELECT g, extract(minute from t) AS m, s, count(*) FROM df_t
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT extract(second from t), count(*) FROM df_ty5 GROUP BY 1;

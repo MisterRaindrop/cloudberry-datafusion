@@ -53,15 +53,15 @@ EXPLAIN (COSTS OFF) SELECT g, sum(b), avg(a) FROM df_nm GROUP BY g;
 
 -- two stages: PostgreSQL's serialized states, unless batch Motions carry ours
 EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
-                   QUERY PLAN                   
-------------------------------------------------
+                    QUERY PLAN                     
+---------------------------------------------------
  Finalize Aggregate
    ->  Gather Motion 3:1  (slice1; segments: 3)
          ->  Partial Aggregate
                ->  Seq Scan on df_nm
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
 SET vec.motion_batches = on;
@@ -1500,9 +1500,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x)
                      ->  Seq Scan on df_wv
  Optimizer: GPORCA
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 3 eligible, sends Arrow batches
 (16 rows)
 
 SET vec.mode = off;
@@ -4670,9 +4670,9 @@ DROP TABLE df_dk;
 -- division by zero, as PostgreSQL raises it; a guard before it in an AND
 -- keeps the rows it fails out
 SELECT k, a / 0 FROM df_dn WHERE k = 5;
-ERROR:  division by zero  (seg2 slice1 172.18.0.2:7004 pid=11215)
+ERROR:  division by zero  (seg2 slice1 172.18.0.2:7004 pid=11213)
 SELECT sum(a / b) FROM df_dn;
-ERROR:  division by zero  (seg0 slice1 172.18.0.2:7002 pid=11213)
+ERROR:  division by zero  (seg0 slice1 172.18.0.2:7002 pid=11211)
 -- AV2: an avg returning numeric that DataFusion divides (pg_avg) holds
 -- PostgreSQL's quotient at a fixed scale; numeric_avg's display scale,
 -- picked from the sum and the count, goes beside it, so it sorts in
