@@ -32,6 +32,9 @@
  */
 #include "postgres.h"
 
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <wctype.h>
@@ -55,6 +58,7 @@
 #define VX_SHUTDOWN_TIMEOUT_MS	1000
 
 int			vx_worker_threads = 0;
+int			vx_malloc_arenas = 0;
 
 /* The process that started the runtime, or 0 if none has. */
 static pid_t vx_runtime_pid = 0;
@@ -219,6 +223,42 @@ vx_signals_restore(const sigset_t *saved)
 }
 
 /*
+ * glibc's malloc and the runtime's threads (MA1).
+ *
+ * Each thread that allocates gets an arena of its own, up to eight per CPU,
+ * and keeps what it frees there.  A QE that ran the TPC-H queries on ten
+ * threads held about 220 MB with nothing of it in use and none of it leased
+ * from the vmem tracker; with eight sessions, idle QEs held as much memory
+ * as the busy ones, and the kernel's OOM killer, not the vmem tracker, ended
+ * QEs.  So after each engine query malloc_trim() returns the free pages of
+ * every arena (vx_malloc_release), which cost no measurable time.
+ *
+ * What it leaves is mostly free memory at the tops of the threads' arenas,
+ * which goes back only past the trim threshold that glibc raises up to 64 MB.
+ * Fewer arenas (vec.malloc_arenas, set before the threads start) leave less
+ * of it, at some cost in speed: at TPC-H SF100 on twenty threads, eight
+ * arenas took 2.5% longer.  The setting is the process's, so PostgreSQL's
+ * own allocations follow it too.
+ */
+static void
+vx_malloc_setup(void)
+{
+#ifdef __GLIBC__
+	if (vx_malloc_arenas > 0)
+		mallopt(M_ARENA_MAX, vx_malloc_arenas);
+#endif
+}
+
+/* Return the free memory the engine's query left in the arenas. */
+void
+vx_malloc_release(void)
+{
+#ifdef __GLIBC__
+	malloc_trim(0);
+#endif
+}
+
+/*
  * Start the runtime in this backend if it is not running yet, and return its
  * number of worker threads.
  */
@@ -244,6 +284,7 @@ vx_runtime_ensure(void)
 			 (int) vx_runtime_pid);
 
 	engine = vx_engine_load();
+	vx_malloc_setup();
 	VX_ERROR_INIT(err);
 	vx_signals_block(&saved);
 	status = engine->runtime_init((uint32_t) vx_worker_threads, &workers, &err);

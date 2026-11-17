@@ -240,6 +240,7 @@ slice saying whether the engine runs it, and if not, why:
 | `vec.subquery_key_filter` | `on` | Rewrite correlated aggregate subqueries to aggregate only the keys the outer query keeps |
 | `vec.join_estimates` | `spill` | How a hash join's build side size is checked: `spill`, `trusted`, `bounded`, `strict` |
 | `vec.worker_threads` | `0` | Superuser.  Engine threads per backend; 0 = one per CPU |
+| `vec.malloc_arenas` | `0` | Superuser.  Most glibc malloc arenas in a backend that uses the engine; 0 = glibc's default (eight per CPU).  Fewer keep less freed memory in idle backends (8: about a fifth less) and cost some speed (8: 2.5% at TPC-H SF100) |
 | `vec.slice_partitions` | `0` | Partitions per slice; 0 = from the threads, the slices running together and the primaries on the host |
 | `vec.engine` | `datafusion` | Superuser.  Engine library, `$libdir/vec_engine_<name>.so` |
 | `vec.engine_options` | empty | The engine's own settings, `name=value, ...`; DataFusion's: `key_filters` (on/off), `partial_agg_skip_ratio` (0 to 1) |
@@ -247,7 +248,11 @@ slice saying whether the engine runs it, and if not, why:
 Memory: a slice's budget is what Cloudberry gives the node it replaces
 (`statement_mem`, `work_mem`, `hash_mem_multiplier`); the engine spills to
 the backend's temporary directory beyond it, and its allocations are
-leased from the vmem tracker, so `gp_vmem_protect_limit` applies.
+leased from the vmem tracker, so `gp_vmem_protect_limit` applies.  What
+the engine frees goes back to the system after each query
+(`malloc_trim`), so idle sessions do not hold it outside the tracker's
+view.  Set `gp_vmem_protect_limit` so that the segments of a host fit its
+memory: beyond that, the kernel's OOM killer acts before the tracker does.
 
 ## Testing
 

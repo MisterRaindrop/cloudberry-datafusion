@@ -59,6 +59,7 @@ extern int	vx_join_estimates;
 
 /* GUC vec.worker_threads */
 extern int	vx_worker_threads;
+extern int	vx_malloc_arenas;
 
 /* GUC vec.engine */
 extern char *vx_engine_name;
@@ -542,6 +543,7 @@ extern bool vx_ctype_is_c(Oid collation);
 extern const char *vx_spill_dir(void);
 extern void vx_vmem_sync(int64 headroom);
 extern void vx_vmem_trim(void);
+extern void vx_malloc_release(void);
 extern int64 vx_vmem_leased_bytes(void);
 extern int32 vx_task_wait_interruptible(VecTask *task, VecError *err);
 

@@ -115,6 +115,17 @@ _PG_init(void)
 							GUC_GPDB_NEED_SYNC,
 							NULL, NULL, NULL);
 
+	DefineCustomIntVariable("vec.malloc_arenas",
+							"Most malloc arenas a backend that uses the engine has (glibc).",
+							"0 leaves glibc's default, eight per CPU.  Fewer keep less "
+							"freed memory in idle backends, at some cost in speed.  "
+							"Takes effect when a backend first uses the engine.",
+							&vx_malloc_arenas,
+							0, 0, 1024,
+							PGC_SUSET,
+							GUC_GPDB_NEED_SYNC,
+							NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("vec.pax_direct_read",
 							 "Reads PAX tables column by column on the engine's threads.",
 							 "Bypasses the table access method's row-at-a-time interface "

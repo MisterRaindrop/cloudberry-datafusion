@@ -129,6 +129,23 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
   tracker, and gives back the unused part when a query ends.  On QEs, where Cloudberry enforces vmem
   limits, a refused lease fails the query with the same error as a refused
   allocation (`Out of memory`, SQLSTATE 53500).
+- **Freed memory (MA1).** The lease follows live bytes; what glibc keeps
+  after they are freed is in no account.  Each engine thread gets a malloc
+  arena of its own (glibc allows eight per CPU) and keeps what it frees
+  there.  A QE that had run the TPC-H queries on ten threads held about
+  220 MB with nothing live (one session's 19 QEs: 2.9 GB, against 0.3 GB
+  without the engine); eight sessions at SF10 on a 23 GB host had idle QEs
+  holding as much as the busy ones, and the kernel's OOM killer ended QEs
+  five times in ten minutes, which restarted the segments.  So the backend
+  calls `malloc_trim(0)` after each engine query: the same QEs then held
+  1.2 GB, the eight sessions ran without an OOM kill (5.1 GB still
+  available at the lowest), and TPC-H SF100 took as long (117.2 s against
+  117.1 s).  What is left is mostly free memory at the tops of the
+  threads' arenas, returned only past a trim threshold that glibc raises
+  up to 64 MB.  `vec.malloc_arenas` caps the arenas (default 0, glibc's
+  own): 8 left 0.95 GB and took 2.5% longer at SF100 on twenty threads.
+  Fixing the thresholds as well (4 MB mmap, 8 MB trim) left 0.45 GB but
+  took 6% longer, so it is not done.
 - **Workfiles (WF1).** The engine's spill files are workfiles of the
   query: on every poll the main thread reads what the engine holds now
   (`query_spill_usage`, engine ABI 7: the bytes and number of DataFusion's

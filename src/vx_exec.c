@@ -463,6 +463,7 @@ vx_exec_release(void *arg)
 		vx_engine->query_free(x->query);
 		x->query = NULL;
 		vx_vmem_trim();
+		vx_malloc_release();
 	}
 	for (link = &vx_execs; *link != NULL; link = &(*link)->next)
 	{
@@ -2008,6 +2009,7 @@ vx_exec_next(VxExec *x)
 				vx_engine->query_free(x->query);
 				x->query = NULL;
 				vx_vmem_trim();
+				vx_malloc_release();
 			}
 		}
 		else if (status == VEC_DONE)
