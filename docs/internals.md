@@ -1966,6 +1966,14 @@ and now 0.66 s, Q23b 1.84 and 0.85, Q95 1.27 and 0.55, Q22 0.94 and 0.68,
 Q36 0.64 and 0.23, Q67 1.67 and 1.48.  Where the producer's input is only
 joins, little changes: TPC-DS Q18's chain of six Redistribute joins under
 GPORCA, now through batch Motions, took 0.36 s and now 0.39 s.
+
+A subtree below PostgreSQL's nodes that holds a Shared Scan producer is
+run the same way: PostgreSQL runs the producer, DataFusion the producer's
+input in a subtree of its own, and the batch decision sees the Motions
+there.  Only the slice as a whole did so; under a Sort by a text column,
+in a database whose default collation is not C, GPORCA's Sequence ran as
+such a subtree, its producer's input stayed on PostgreSQL, and the slice
+below sent it batches ("received tuple chunk of unrecognized type").
 A UNION ALL as the producer's input runs in DataFusion as a whole,
 which may interleave its inputs' rows: what the readers' parents may
 read of the store's order is an order a node of the input makes (a

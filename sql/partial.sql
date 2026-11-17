@@ -236,5 +236,37 @@ SET optimizer = off;
 DROP TABLE df_rs;
 
 DROP TABLE df_pt, df_pt2;
+
+-- A subtree below PostgreSQL's nodes that holds a Shared Scan producer:
+-- PostgreSQL runs the producer, DataFusion its input below, which reads
+-- the batch Motion under it.  GPORCA's Sequence under a Sort by a text
+-- column, in a database whose default collation is not C, used to leave
+-- that input to PostgreSQL while the sending slice sent batches
+-- ("received tuple chunk of unrecognized type").
+CREATE DATABASE df_pt_icu TEMPLATE template0 ENCODING 'UTF8'
+  LOCALE_PROVIDER icu ICU_LOCALE 'und' LC_COLLATE 'C' LC_CTYPE 'C';
+ALTER DATABASE df_pt_icu SET session_preload_libraries = 'vec_executor';
+\c df_pt_icu
+CREATE TABLE df_pt (id int, k int, v int8, t text) DISTRIBUTED BY (id);
+INSERT INTO df_pt SELECT i, i % 13, i * 7, 'k' || (i % 31) FROM generate_series(1, 30000) i;
+CREATE TABLE df_pt2 (id int, w int) DISTRIBUTED BY (id);
+INSERT INTO df_pt2 SELECT i, i % 5 FROM generate_series(1, 40) i;
+ANALYZE df_pt;
+ANALYZE df_pt2;
+SET optimizer = on;
+SET vec.worker_threads = 2;
+SET vec.motion_batches = on;
+SET vec.mode = explain;
+EXPLAIN (COSTS OFF) WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+SET vec.mode = off;
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+SET vec.mode = on;
+WITH c AS (SELECT a.t, count(*) AS n, sum(a.v) AS s FROM df_pt a JOIN df_pt2 b ON a.id = b.id * 700 GROUP BY a.t)
+SELECT x.t, x.n, y.s FROM c x JOIN c y ON x.t = y.t ORDER BY 1;
+\c contrib_regression
+DROP DATABASE df_pt_icu;
+
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

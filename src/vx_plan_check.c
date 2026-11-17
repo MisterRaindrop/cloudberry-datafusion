@@ -2350,6 +2350,8 @@ vx_plan_name(Plan *plan)
 			return "ModifyTable";
 		case T_ShareInputScan:
 			return "Shared Scan";
+		case T_Sequence:
+			return "Sequence";
 		case T_Motion:
 			switch (((Motion *) plan)->motionType)
 			{
@@ -7608,43 +7610,73 @@ vx_slice_runs_in_engine_b(PlannedStmt *stmt, int index, Bitmapset *batches)
  * run more of the slice in DataFusion (such as a Sort above it by the
  * default collation, where that is C), which reads the Motion too.
  */
+static bool vx_points_read_batches(PlannedStmt *stmt, List *points, Motion *motion,
+								   Bitmapset *batches);
+
+/*
+ * Does DataFusion, running the subtree 'compute', read 'motion' below it?
+ * PostgreSQL runs the subtree's Shared Scan producers first, and the
+ * inputs of those in subtrees of their own (T2, vx_attach_producers): a
+ * Motion below a producer is read there, if at all.
+ */
+static bool
+vx_subtree_reads_batches(PlannedStmt *stmt, Plan *compute, Motion *motion, Bitmapset *batches)
+{
+	List	   *producers = vx_slice_producers(compute);
+	List	   *points = NIL;
+	bool		produced = false;
+	ListCell   *lc;
+
+	foreach(lc, producers)
+		produced = produced || vx_plan_contains(lfirst(lc), (Plan *) motion);
+	if (!produced)
+		return true;
+	foreach(lc, producers)
+		vx_find_attach(stmt, lfirst(lc), batches, true, &points);
+	return vx_points_read_batches(stmt, points, motion, batches);
+}
+
+/* T2: does one of 'points', the one holding 'motion', read its batches? */
+static bool
+vx_points_read_batches(PlannedStmt *stmt, List *points, Motion *motion, Bitmapset *batches)
+{
+	ListCell   *lc;
+
+	foreach(lc, points)
+	{
+		VxAttach   *a = lfirst(lc);
+		char		reason[256];
+
+		/* below PostgreSQL's nodes, the output is tuples */
+		if (vx_plan_contains(a->plan, (Plan *) motion))
+			return vx_try_translate(stmt, a->plan, &a->tails, true, reason, sizeof(reason)) &&
+				vx_subtree_reads_batches(stmt, a->plan, motion, batches);
+	}
+	return false;
+}
+
 static bool
 vx_slice_reads_batches(PlannedStmt *stmt, int index, Motion *motion, Bitmapset *batches)
 {
 	Motion	   *sender;
 	Plan	   *compute;
 	List	   *points = NIL;
-	ListCell   *lc;
 
 	if (index < 0 || index >= stmt->numSlices || vx_is_init_plan_slice(stmt, index))
 		return false;
 	sender = findSenderMotion(stmt, index);
 	compute = sender ? outerPlan((Plan *) sender) : stmt->planTree;
 	if (vx_slice_runs_in_engine(stmt, index, batches))
-	{
-		/* PostgreSQL runs its Shared Scan producers, their inputs below (T2) */
-		List	   *producers = vx_slice_producers(compute);
-		bool		produced = false;
+		return vx_subtree_reads_batches(stmt, compute, motion, batches);
 
-		foreach(lc, producers)
-			produced = produced || vx_plan_contains(lfirst(lc), (Plan *) motion);
-		if (!produced)
-			return true;
-		foreach(lc, producers)
-			vx_find_attach(stmt, lfirst(lc), batches, true, &points);
-	}
-	else
-		vx_find_attach(stmt, compute, batches, true, &points);
-	foreach(lc, points)
-	{
-		VxAttach   *a = lfirst(lc);
-		char		reason[256];
-
-		/* T2: below PostgreSQL's nodes, the output is tuples */
-		if (vx_plan_contains(a->plan, (Plan *) motion))
-			return vx_try_translate(stmt, a->plan, &a->tails, true, reason, sizeof(reason));
-	}
-	return false;
+	/*
+	 * T2: the subtree holding the Motion, and below its Shared Scan
+	 * producers as for a whole slice: a subtree such as GPORCA's Sequence
+	 * under a Sort by a text column (no C collation) used to be taken as
+	 * reading a Motion below its producer, which PostgreSQL then read.
+	 */
+	vx_find_attach(stmt, compute, batches, true, &points);
+	return vx_points_read_batches(stmt, points, motion, batches);
 }
 
 /*

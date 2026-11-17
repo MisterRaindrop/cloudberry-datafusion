@@ -163,7 +163,11 @@ vx_attach_points(QueryDesc *queryDesc, PlanState *top, int slice_index, List *po
 		char		reason[256];
 
 		if (ps != NULL && vx_exec_attach(queryDesc, ps, NULL, &a->tails, reason, sizeof(reason)))
+		{
 			attached++;
+			/* below the subtree's Shared Scan producers, as for a slice */
+			vx_attach_producers(queryDesc, ps, slice_index);
+		}
 		else
 			elog(DEBUG1, "vec_executor: a subtree of slice %d stays on the PostgreSQL executor: %s",
 				 slice_index, ps ? reason : "no executor state");
