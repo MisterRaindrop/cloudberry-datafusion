@@ -67,7 +67,8 @@ use datafusion::logical_expr::expr::Case;
 use datafusion::logical_expr::expr::WindowFunction;
 use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{
-    binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, GroupingSet, LogicalPlanBuilder,
+    binary_expr, when, Expr, ExprFunctionExt, ExprSchemable, Extension, GroupingSet, LogicalPlan,
+    LogicalPlanBuilder,
     Operator, WindowFrame, WindowFrameBound, WindowFrameUnits, WindowFunctionDefinition,
 };
 use datafusion::physical_expr::{create_physical_expr, PhysicalExpr};
@@ -1200,6 +1201,8 @@ fn session_state(
         .with_config(config)
         .with_runtime_env(runtime_env)
         .with_default_features()
+        // EA1: the default planner, which also plans taps
+        .with_query_planner(Arc::new(crate::tap::TapQueryPlanner))
         .build();
     let rules: Vec<_> = state
         .optimizers()
@@ -2602,8 +2605,33 @@ fn pax_prefilter(
 }
 
 /// The logical plan of a node of the spec.  `tables` holds each input's
-/// table, taken by the node that reads it.
+/// table, taken by the node that reads it.  A node marked `"tap": id`
+/// (EA1, under EXPLAIN ANALYZE) is wrapped in a tap that counts its rows.
 fn build_node(
+    node: &Value,
+    tables: &mut Vec<Option<StreamingTable>>,
+) -> Result<LogicalPlanBuilder, String> {
+    let b = build_node_kind(node, tables)?;
+    let Some(ids) = node.get("tap") else {
+        return Ok(b);
+    };
+    let ids = ids
+        .as_array()
+        .ok_or("plan spec: tap")?
+        .iter()
+        .map(|v| v.as_i64().map(|i| i as i32).ok_or("plan spec: tap"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let input = b.build().map_err(|e| e.to_string())?;
+    Ok(LogicalPlanBuilder::from(LogicalPlan::Extension(Extension {
+        node: Arc::new(crate::tap::TapNode {
+            input,
+            stat: crate::tap::TapStat::new(ids),
+        }),
+    })))
+}
+
+/// build_node without the tap.
+fn build_node_kind(
     node: &Value,
     tables: &mut Vec<Option<StreamingTable>>,
 ) -> Result<LogicalPlanBuilder, String> {
@@ -3105,6 +3133,18 @@ pub struct Query {
     pax_shared: Option<Arc<PaxShared>>,
     /// the PAX scans of the query, ended as it is released (`PaxScan::close`)
     pax_scans: Vec<Arc<PaxScan>>,
+    /// when it started, in tap::now_ns
+    started_ns: u64,
+}
+
+/// What a tap counted (EA1): rows of plan node `id`, and seconds from the
+/// query's start to its first batch and to its end (None: not reached).
+#[derive(Debug, Clone, Copy)]
+pub struct NodeStats {
+    pub id: i32,
+    pub rows: u64,
+    pub first: Option<f64>,
+    pub end: Option<f64>,
 }
 
 /// Memory and spill figures of a query, for EXPLAIN ANALYZE.
@@ -3612,6 +3652,22 @@ impl Query {
             let n = |name: &str| l.get(name).and_then(Value::as_u64).map(|n| n as usize);
             b = b.limit(n("skip").unwrap_or(0), n("fetch")).map_err(df)?;
         }
+        // EA1: the slice's Limit, Sort and the nodes above its plan count
+        // its output rows
+        if let Some(ids) = spec.get("tap_out") {
+            let ids = ids
+                .as_array()
+                .ok_or_else(|| internal("bad tap_out".into()))?
+                .iter()
+                .map(|v| v.as_i64().map(|i| i as i32).ok_or_else(|| internal("bad tap_out".into())))
+                .collect::<Result<Vec<_>, _>>()?;
+            b = LogicalPlanBuilder::from(LogicalPlan::Extension(Extension {
+                node: Arc::new(crate::tap::TapNode {
+                    input: b.build().map_err(df)?,
+                    stat: crate::tap::TapStat::new(ids),
+                }),
+            }));
+        }
         let plan = b.build().map_err(df)?;
         drop(building);
         let partial = spec
@@ -3683,6 +3739,7 @@ impl Query {
             .sort_spill_reservation_bytes
             .min(memory_limit / (4 * partitions * consumers.max(1)))
             .max(64 << 10);
+        let started_ns = crate::tap::now_ns();
         let pool = Arc::new(TrackingPool::new(memory_limit.max(1)));
         let ctx = SessionContext::new_with_state(
             session_state(config, pool.clone(), spill_dir).map_err(df)?,
@@ -3818,6 +3875,7 @@ impl Query {
             partitions,
             pax_shared,
             pax_scans,
+            started_ns,
         })
     }
 
@@ -3841,6 +3899,25 @@ impl Query {
             }
         }
         s
+    }
+
+    /// The rows each tapped plan node produced so far (EA1).
+    pub fn node_stats(&self) -> Vec<NodeStats> {
+        let mut taps = Vec::new();
+        if let Ok(slot) = self.physical.lock() {
+            if let Some(p) = slot.as_ref() {
+                crate::tap::collect(p, &mut taps);
+            }
+        }
+        let secs = |ns: u64| ns.saturating_sub(self.started_ns) as f64 / 1e9;
+        let mut out = Vec::new();
+        for t in &taps {
+            let (rows, first, end) = t.read();
+            for &id in &t.ids {
+                out.push(NodeStats { id, rows, first: first.map(secs), end: end.map(secs) });
+            }
+        }
+        out
     }
 
     /// The spill files the plan holds now: their bytes and number.  Every

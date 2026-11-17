@@ -237,6 +237,20 @@ typedef struct VecQueryStats
 	uint64_t	pax_decode_peak;	/* peak bytes PAX's reader held */
 } VecQueryStats;
 
+/*
+ * What the engine saw of one PostgreSQL plan node of the slice whose IR it
+ * marked "tap" (EA1, under EXPLAIN ANALYZE): its rows, and seconds from the
+ * query's start to its first row and to its end, negative if not reached.
+ */
+typedef struct VecNodeStats
+{
+	int32_t		plan_node_id;
+	uint32_t	pad;
+	uint64_t	rows;
+	double		first;
+	double		end;
+} VecNodeStats;
+
 /* What the host gives the engine. */
 typedef struct VecHost
 {
@@ -386,6 +400,13 @@ typedef struct VecEngine
 	 * not count.  The host calls it on every poll: it must not block.
 	 */
 	void		(*query_spill_usage) (VecQuery *query, uint64_t *bytes, uint64_t *files);
+
+	/*
+	 * The nodes marked "tap" in the IR (EA1): fills up to 'max' of 'out',
+	 * returns how many there are.  An engine that ignores the marks
+	 * returns 0.
+	 */
+	uint32_t	(*query_node_stats) (VecQuery *query, VecNodeStats *out, uint32_t max);
 	/* Stop the query and release it; never blocks. */
 	void		(*query_free) (VecQuery *query);
 

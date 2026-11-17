@@ -88,6 +88,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "nodes/nodeFuncs.h"
 #include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -250,6 +251,8 @@ typedef struct VxExec
 	int			wf_cap;
 	uint64		wf_bytes;
 	SubTransactionId wf_subid;	/* where the first was opened */
+
+	instr_time	started;		/* EA1: when the query started */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
 	VxPaxScanInfo pax_info;
 	bool		input_done;		/* every input is done */
@@ -564,6 +567,86 @@ vx_slice_memory(PlanState *root)
 	return (int64) bytes;
 }
 
+/* EA1: what vx_fill_node walks the slice with. */
+typedef struct VxNodeFill
+{
+	VxExec	   *x;
+	VecNodeStats *stats;
+	uint32		n;
+} VxNodeFill;
+
+/* EA1: an engine figure as an instr_time (ticks are nanoseconds). */
+static instr_time
+vx_secs_instr(double secs)
+{
+	instr_time	t;
+
+	INSTR_TIME_SET_ZERO(t);
+	if (secs > 0)
+		t.ticks = (int64) (secs * 1e9);
+	return t;
+}
+
+/*
+ * EA1: give node 'ps' of the slice, and those below it up to the Motions
+ * it receives from, the engine's figures of their plan node ids: rows,
+ * time to the first row and to the end, as one cycle that InstrEndLoop
+ * closes when EXPLAIN collects it.  The slice's top node, when it hands
+ * out tuples, is counted by PostgreSQL itself.
+ */
+static bool
+vx_fill_node(PlanState *ps, void *arg)
+{
+	VxNodeFill *f = (VxNodeFill *) arg;
+	uint32		i;
+
+	if (ps == NULL || IsA(ps, MotionState))
+		return false;
+	if (ps->instrument != NULL && !(ps == f->x->root && f->x->send == NULL))
+	{
+		for (i = 0; i < f->n; i++)
+		{
+			VecNodeStats *s = &f->stats[i];
+			Instrumentation *instr = ps->instrument;
+
+			if (s->plan_node_id != ps->plan->plan_node_id)
+				continue;
+			instr->running = true;
+			INSTR_TIME_SET_ZERO(instr->starttime);
+			instr->tuplecount = s->rows;
+			instr->firsttuple = s->first > 0 ? s->first : 0;
+			instr->counter = vx_secs_instr(s->end > 0 ? s->end : s->first);
+			if (INSTR_TIME_IS_ZERO(instr->firststart))
+				instr->firststart = f->x->started;
+			break;
+		}
+	}
+	return planstate_tree_walker(ps, vx_fill_node, arg);
+}
+
+/* EA1: the engine's figures of the slice's nodes, under EXPLAIN ANALYZE. */
+static void
+vx_fill_nodes(VxExec *x)
+{
+	VxNodeFill	f;
+	uint32		max = 256;
+
+	if (x->root->instrument == NULL)
+		return;
+	f.x = x;
+	f.stats = palloc(sizeof(VecNodeStats) * max);
+	f.n = vx_engine->query_node_stats(x->query, f.stats, max);
+	if (f.n > max)
+	{
+		max = f.n;
+		f.stats = repalloc(f.stats, sizeof(VecNodeStats) * max);
+		f.n = vx_engine->query_node_stats(x->query, f.stats, max);
+	}
+	f.n = Min(f.n, max);
+	vx_fill_node(x->root, &f);
+	pfree(f.stats);
+}
+
 /* The query produced all its rows: keep its figures. */
 static void
 vx_exec_finished(VxExec *x)
@@ -577,6 +660,7 @@ vx_exec_finished(VxExec *x)
 		vx_last_pax_scan = x->pax_info;
 	vx_runs_completed++;
 
+	vx_fill_nodes(x);
 	if (x->root->instrument)
 	{
 		x->root->instrument->workmemused = (double) s.memory_peak;
@@ -1163,6 +1247,7 @@ vx_exec_begin(VxExec *x)
 	/* From here on the query owns the PAX scans, even if this fails. */
 	VX_ERROR_INIT(err);
 	vx_signals_block(&saved);
+	INSTR_TIME_SET_CURRENT(x->started);
 	status = vx_engine->query_start(&args, &out_schema, &x->query, &err);
 	vx_signals_restore(&saved);
 	if (status != VEC_OK)
@@ -2122,7 +2207,9 @@ vx_exec_attach(QueryDesc *queryDesc, PlanState *root, MotionState *send,
 	vx_numeric_stmt = queryDesc->plannedstmt;
 	PG_TRY();
 	{
-		ok = vx_translate_slice(root->plan, tails, send == NULL, &x->spec, reason, reasonlen);
+		/* EA1: under EXPLAIN ANALYZE, the engine counts each node's rows */
+		ok = vx_translate_slice(root->plan, tails, send == NULL, estate->es_instrument != 0,
+								&x->spec, reason, reasonlen);
 	}
 	PG_FINALLY();
 	{

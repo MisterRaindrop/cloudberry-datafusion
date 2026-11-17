@@ -321,8 +321,8 @@ extern VecQueryStats vx_last_run;	/* figures of the latest one */
 
 /* vx_translate.c */
 extern const char *vx_type_tag(Oid type);
-extern bool vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *spec,
-							   char *reason, size_t reasonlen);
+extern bool vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, bool taps,
+							   VxSliceSpec *spec, char *reason, size_t reasonlen);
 
 /*
  * vx_paxload.c: the experimental direct PAX reader, vec_pax.so, built

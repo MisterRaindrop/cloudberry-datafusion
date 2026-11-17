@@ -61,6 +61,12 @@ An engine reports the spill files a query holds now, their bytes and
 number, through `query_spill_usage` (engine ABI 7); the host counts them
 toward Cloudberry's workfile limits on every poll, so it must be cheap and
 must not block.  An engine that does not spill reports zeros.
+
+Under EXPLAIN ANALYZE the IR marks nodes with `"tap"` (docs/ir.md); an
+engine that counts their rows returns them, with the time to each node's
+first row and to its end, through `query_node_stats` (engine ABI 7), and
+the host shows them at each node.  An engine that ignores the marks
+returns none, and the nodes below the slice's top show as never executed.
 DataFusion's are `key_filters` (on by default: KF1, a hash join's build
 side filters its probe side's PAX scans) and `partial_agg_skip_ratio`
 (0.2 by default: SK1, the groups per row above which a partial

@@ -36,4 +36,8 @@ s/gp_execution_segment\(\) = \d+/gp_execution_segment() = N/
 m/^ Vectorized: \d+ partitions, memory limit \d+ kB, peak \d+ kB, spilled \d+ kB in \d+ files$/
 s/^ Vectorized: \d+ partitions, memory limit \d+ kB, peak \d+ kB, spilled \d+ kB in \d+ files$/ Vectorized: # partitions, memory limit # kB, peak # kB, spilled # kB in # files/
 
+# A parallel scan's rows depend on which parallel QE read most (EA1).
+m/Parallel Seq Scan on \w+ \(actual rows=\d+ loops=\d+\)/
+s/\(actual rows=\d+ loops=\d+\)/(actual rows=N loops=N)/
+
 -- end_matchsubs

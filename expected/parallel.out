@@ -145,7 +145,7 @@ SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
  Finalize Aggregate (actual rows=1 loops=1)
    ->  Gather Motion 6:1  (slice1; segments: 6) (actual rows=6 loops=1)
          ->  Partial Aggregate (actual rows=1 loops=1)
-               ->  Parallel Seq Scan on df_par_pax (never executed)
+               ->  Parallel Seq Scan on df_par_pax (actual rows=0 loops=1)
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible

@@ -105,8 +105,7 @@ Known differences and limits:
   one PostgreSQL shows.
 - Floating-point sums can differ in the last bits, because DataFusion adds
   partial sums in a different order.
-- `EXPLAIN ANALYZE` counts rows for the slice's top node only; the nodes
-  below it show as never executed.
+- `EXPLAIN ANALYZE` shows the engine's rows at each node (EA1, below).
 - DataFusion's spill files live in the backend's temporary directory and
   count toward Cloudberry's workfile limits (WF1, below).
 
@@ -144,6 +143,28 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
   polls the engine may write a little past a limit.  The stand-ins close
   as the query ends, is stopped, or its (sub)transaction aborts (in the
   abort callback, before the resource owner closes temporary files).
+- **EXPLAIN ANALYZE per node (EA1).** Under EXPLAIN ANALYZE
+  (`es_instrument`) the host marks the IR of each plan node with its plan
+  node id, `"tap": [id, ...]`: several ids when nodes pass their child's
+  rows on as they are, as a Hash does; the envelope's `"tap_out"` names
+  the Limit, Sort and other nodes above the plan.  The engine wraps each
+  marked node in a tap (df_core::tap), which counts the rows its node
+  produced and notes when the first batch and the end came; when the
+  slice ends, `query_node_stats` (engine ABI 7) returns them and the host
+  puts them in each node's Instrumentation as one cycle, which
+  InstrEndLoop closes as Cloudberry collects the statistics.  The slice's
+  top node, when it hands out tuples, PostgreSQL counts itself.  A tap
+  lets projections through but not filters or limits, so it counts what
+  its node would; the engine's other rewrites across taps are lost, so
+  the plan can run a little differently under EXPLAIN ANALYZE, and plans
+  without it are untouched.  The rows are the engine's: a partial
+  aggregate runs per partition and sends more groups up, a node
+  PostgreSQL would rescan shows all its rows in one loop, and rows
+  redistributed by row number (RowIdExpr) spread over the segments
+  differently.  On TPC-H at scale factor 1 (both planners) every node
+  of the plans both executors run alike shows PostgreSQL's rows but for
+  those; over TPC-DS (206 runs) 3 of 8606 nodes still show as never
+  executed.
 - **EXPLAIN ANALYZE.** The top node's Instrumentation carries the peak pool
   use and, after spilling, the memory that would have avoided it, so
   Cloudberry's slice statistics show `Work_mem: ... max, ... wanted`.  A
@@ -705,6 +726,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | LM3 | Direct PAX reader: fixed-width columns converted when fetched, for the rows the cheap conditions leave (scan interface 8, engine ABI 4) |
 | LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
 | WF1 | The engine's spill files count toward Cloudberry's workfile limits and views (engine ABI 7) |
+| EA1 | EXPLAIN ANALYZE: the rows and times of each node the engine runs (IR "tap", engine ABI 7) |
 | PV1 | PAX's vectorized format: char(n) padded to n characters, not to PAX's bytes (direct reader and table AM scans) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |

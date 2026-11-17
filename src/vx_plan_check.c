@@ -7534,7 +7534,7 @@ vx_try_translate(PlannedStmt *stmt, Plan *root, const VxTails *tails, bool tuple
 	vx_numeric_stmt = stmt;
 	PG_TRY();
 	{
-		ok = vx_translate_slice(root, tails, tuples, &spec, reason, reasonlen);
+		ok = vx_translate_slice(root, tails, tuples, false, &spec, reason, reasonlen);
 	}
 	PG_FINALLY();
 	{

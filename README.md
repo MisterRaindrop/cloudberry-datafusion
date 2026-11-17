@@ -83,8 +83,14 @@ Known differences and limits:
   under the default collation change only ASCII letters and leave other
   characters as they are; PostgreSQL raises "invalid multibyte character
   for locale" (22021) for non-ASCII input.
-- `EXPLAIN ANALYZE` counts rows for a slice's top node only; the nodes
-  below it show as never executed.
+- `EXPLAIN ANALYZE` shows the rows the engine produced at each node, which
+  differ from PostgreSQL's where the engine works differently: a partial
+  aggregate runs per partition (more groups go up), a node PostgreSQL
+  would rescan (a Nested Loop's inner side) shows all its rows in one
+  loop, and rows redistributed by row number land on other segments.
+  Times are from the slice's start to the node's first row and to its
+  end.  The engine's plan under `EXPLAIN ANALYZE` keeps PostgreSQL's
+  nodes apart, so it can run a little differently.
 - Sorts by text run in the engine only under a C collation (or C.UTF-8);
   under another collation they stay on PostgreSQL.
 - Rows without an `ORDER BY`, and rows tied on the `ORDER BY` keys, may

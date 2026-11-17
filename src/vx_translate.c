@@ -115,6 +115,10 @@ typedef struct VxBuilder
 								 * (vx_emit_outputs) */
 	Bitmapset  *sort_values;	/* the values the slice sorts its output by */
 	List	   *correlated;		/* VxCorrelated, of the SubPlans joined (SC1) */
+	bool		taps;			/* EA1: mark each node with its plan node id */
+	Bitmapset  *tapped;			/* the ids marked */
+	StringInfo	tap_out;		/* the output of the last mark */
+	int			tap_end;		/* where it ended there */
 	bool		failed;
 	char	   *reason;
 	size_t		reasonlen;
@@ -132,6 +136,7 @@ static void vx_emit_numcmp(VxBuilder *b, StringInfo out, const char *op, Node *l
 static bool vx_is_mixed_sum(Plan *ctx, Node *node);
 static Plan *vx_level_ctx(VxBuilder *b, VxLevel level);
 static void vx_emit_node(VxBuilder *b, StringInfo out, Plan *plan);
+static void vx_emit_tap(VxBuilder *b, StringInfo out, int id);
 static void vx_emit_agg_calls(VxBuilder *b, StringInfo aggs, Agg *aggnode, List *aggrefs,
 							  List *aggfns);
 static VxNamedAgg *vx_named_of(VxBuilder *b, Agg *agg);
@@ -3218,14 +3223,42 @@ static void
 vx_emit_node(VxBuilder *b, StringInfo out, Plan *plan)
 {
 	if (b->failed || !vx_numbers_rows(plan))
-	{
 		vx_emit_plan_node(b, out, plan);
-		return;
+	else
+	{
+		appendStringInfoString(out, "{\"rowid\":{\"input\":");
+		vx_emit_plan_node(b, out, plan);
+		appendStringInfo(out, ",\"name\":\"rowid%d\",\"base\":" INT64_FORMAT "}}",
+						 plan->plan_node_id, vx_rowid_base());
 	}
-	appendStringInfoString(out, "{\"rowid\":{\"input\":");
-	vx_emit_plan_node(b, out, plan);
-	appendStringInfo(out, ",\"name\":\"rowid%d\",\"base\":" INT64_FORMAT "}}",
-					 plan->plan_node_id, vx_rowid_base());
+	if (b->taps && !b->failed)
+		vx_emit_tap(b, out, plan->plan_node_id);
+}
+
+/*
+ * EA1: mark the node just emitted, which ends 'out', with plan node 'id'
+ * ("tap": [id]), once per id.  A node that only passes its child's rows on
+ * emits nothing of its own: the child's object, marked already, then ends
+ * where its mark did, and takes this id too.
+ */
+static void
+vx_emit_tap(VxBuilder *b, StringInfo out, int id)
+{
+	if (bms_is_member(id, b->tapped) || out->len == 0 || out->data[out->len - 1] != '}')
+		return;
+	if (out == b->tap_out && out->len == b->tap_end && out->data[out->len - 2] == ']')
+	{
+		out->len -= 2;
+		appendStringInfo(out, ",%d]}", id);
+	}
+	else
+	{
+		out->len -= 1;
+		appendStringInfo(out, ",\"tap\":[%d]}", id);
+	}
+	b->tapped = bms_add_member(b->tapped, id);
+	b->tap_out = out;
+	b->tap_end = out->len;
 }
 
 /*
@@ -4016,8 +4049,8 @@ vx_agg_partial(Agg *agg, Plan *top)
  * false, with a reason, if something cannot be expressed.
  */
 bool
-vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *spec,
-				   char *reason, size_t reasonlen)
+vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, bool taps,
+				   VxSliceSpec *spec, char *reason, size_t reasonlen)
 {
 	VxBuilder	b;
 	StringInfoData node,
@@ -4082,6 +4115,8 @@ vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *s
 	b.reason = reason;
 	b.reasonlen = reasonlen;
 	b.tuples = tuples;
+	b.taps = taps;
+	b.tap_end = -1;
 	memset(spec, 0, sizeof(*spec));
 	initStringInfo(&group);
 	initStringInfo(&having);
@@ -4235,11 +4270,31 @@ vx_translate_slice(Plan *root, const VxTails *tails, bool tuples, VxSliceSpec *s
 							 limit == NULL && sort == NULL && vx_agg_partial(b.agg, top) ?
 							 ",\"partial\":true" : "");
 			node = a;
+			if (b.taps && !b.failed)
+				vx_emit_tap(&b, &node, b.agg->plan.plan_node_id);
 		}
 		spec->batch_rows = Min(VX_BATCH_MAX_ROWS,
 							   Max(VX_BATCH_MIN_ROWS, VX_BATCH_BYTES / Max(vx_slice_width(root), 1)));
-		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d}",
+		appendStringInfo(&json, "],\"plan\":%s,\"output\":%s%s,\"batch_rows\":%d",
 						 node.data, outputs.data, sortlimit.data, spec->batch_rows);
+		if (b.taps && top != root)
+		{
+			/*
+			 * EA1: the nodes above the plan, Limit, Sort and those passing
+			 * rows on, all count the slice's output rows
+			 */
+			Plan	   *p = top;
+			int			k = 0;
+
+			appendStringInfoString(&json, ",\"tap_out\":[");
+			while (p != NULL && p != root)
+			{
+				appendStringInfo(&json, "%s%d", k++ > 0 ? "," : "", p->plan_node_id);
+				p = IsA(p, Sequence) ? (Plan *) llast(((Sequence *) p)->subplans) : outerPlan(p);
+			}
+			appendStringInfoChar(&json, ']');
+		}
+		appendStringInfoChar(&json, '}');
 	}
 
 	spec->json = json.data;

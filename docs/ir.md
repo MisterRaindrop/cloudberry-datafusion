@@ -55,7 +55,8 @@ engine; the IR version stayed 1.
   "batch_rows": n,                         optional
   "trim":   [k, ...],                      optional, Motion senders only
   "narrow": [[k, digits], ...],            optional, Motion senders only
-  "route":  <route> }                      optional, Motion senders only
+  "route":  <route>,                       optional, Motion senders only
+  "tap_out": [id, ...] }                   optional, EXPLAIN ANALYZE only
 ```
 
 - `output`: the slice's result columns, in order, each converted to its
@@ -71,6 +72,9 @@ engine; the IR version stayed 1.
 - `batch_rows`: rows per result batch the host wants, at most 8192; a hint.
 - `trim`, `narrow`, `route`: how a slice that sends through a Motion lays
   out its Arrow IPC streams; see [Motion output](#motion-output).
+- `tap_out`: under EXPLAIN ANALYZE, the plan node ids of the nodes above
+  `plan` (Limit, Sort, nodes passing rows on), which all count the rows
+  of the output after `sort` and `limit`; see `tap` under [Nodes](#nodes).
 
 ## Inputs
 
@@ -114,6 +118,13 @@ Column `k` of input `j` is `{"col": k, "input": j}` in expressions
         | {"rowid":     {"input": <node>, "name": s, "base": n}}
         | {"empty":     {}}
 ```
+
+Under EXPLAIN ANALYZE any node may also carry `"tap": [id, ...]`, the
+plan node ids of the PostgreSQL nodes whose rows are its rows (several
+when nodes pass their child's rows on as they are).  An engine counts the
+rows of such a node and reports them with `query_node_stats`; one that
+does not may ignore the key.  Code that walks the IR by its node keys
+does not see it.
 
 ### input
 

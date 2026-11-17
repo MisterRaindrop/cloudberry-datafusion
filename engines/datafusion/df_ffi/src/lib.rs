@@ -667,6 +667,34 @@ extern "C" fn query_spill_usage(query: *mut VecQuery, bytes: *mut u64, files: *m
     }
 }
 
+/// What a tap saw of one plan node (EA1).
+#[repr(C)]
+pub struct VecNodeStats {
+    pub plan_node_id: i32,
+    pub pad: u32,
+    pub rows: u64,
+    pub first: f64,
+    pub end: f64,
+}
+
+extern "C" fn query_node_stats(query: *mut VecQuery, out: *mut VecNodeStats, max: u32) -> u32 {
+    // SAFETY: `query` is live; `out` has room for `max`.
+    let q = unsafe { &(*query).0 };
+    let stats = catch_unwind(AssertUnwindSafe(|| q.node_stats())).unwrap_or_default();
+    for (i, s) in stats.iter().take(max as usize).enumerate() {
+        unsafe {
+            *out.add(i) = VecNodeStats {
+                plan_node_id: s.id,
+                pad: 0,
+                rows: s.rows,
+                first: s.first.unwrap_or(-1.0),
+                end: s.end.unwrap_or(-1.0),
+            };
+        }
+    }
+    stats.len() as u32
+}
+
 /// Stop the query and release it.  Never blocks; running work is aborted.
 extern "C" fn query_free(query: *mut VecQuery) {
     if !query.is_null() {
@@ -747,6 +775,7 @@ pub struct VecEngine {
     pub query_bytes: extern "C" fn(*mut VecQuery, *mut i32, *mut *const u8, *mut usize),
     pub query_stats: extern "C" fn(*mut VecQuery, *mut VecQueryStats),
     pub query_spill_usage: extern "C" fn(*mut VecQuery, *mut u64, *mut u64),
+    pub query_node_stats: extern "C" fn(*mut VecQuery, *mut VecNodeStats, u32) -> u32,
     pub query_free: extern "C" fn(*mut VecQuery),
     pub debug: *const VecEngineDebug,
 }
@@ -810,6 +839,7 @@ pub extern "C" fn vec_engine_entry(_host_abi: u32, _host: *const VecHost) -> *co
             query_bytes,
             query_stats,
             query_spill_usage,
+            query_node_stats,
             query_free,
             debug: &DEBUG,
         }) as *const VecEngine

@@ -29,6 +29,8 @@ tokio.workspace = true
 libc.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+# EA1: DataFusion's ExtensionPlanner and QueryPlanner are async traits (tap)
+async-trait = "0.1"
 # exact comparison of numeric quotients of any digits (pgnum::PgNumCmp)
 num-bigint = "0.5"
 # LM2's LIKE on the PAX reader's bytes, not yet checked to be UTF-8
