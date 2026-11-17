@@ -72,7 +72,9 @@ cloudberry)
 cluster)
 	env_cloudberry
 	ssh -o StrictHostKeyChecking=no "$(hostname)" true
-	make create-demo-cluster --directory "$CBDB/gpAux/gpdemo"
+	# the C locale, as the development container's cluster and the expected
+	# outputs have it; gpinitsystem takes the environment's
+	LC_ALL=C LANG=C make create-demo-cluster --directory "$CBDB/gpAux/gpdemo"
 	env_cluster
 	# the development container's setting, which the memory tests assume
 	gpconfig -c gp_vmem_protect_limit -v 8192

@@ -20,8 +20,10 @@
 # direct PAX reader, and runs the regression tests, the engine check and
 # the Rust tests.  The steps are ci/ci.sh's.
 #
-# The weekly run takes Cloudberry's latest main even without a push here,
-# so that a change there the PAX patches or the hooks no longer fit shows.
+# Pushes and pull requests build the Cloudberry commit CLOUDBERRY_PIN, which
+# the expected outputs are for.  The weekly run takes Cloudberry's latest
+# main instead, so that a change there the PAX patches, the hooks or the
+# expected plans no longer fit shows; move the pin once it passes.
 
 name: CI
 
@@ -34,11 +36,14 @@ on:
   workflow_dispatch:
     inputs:
       cloudberry_ref:
-        description: 'apache/cloudberry branch, tag or commit'
-        default: main
+        description: 'apache/cloudberry branch, tag or commit (default: the pin)'
+        default: ''
 
 permissions:
   contents: read
+
+env:
+  CLOUDBERRY_PIN: 6b467e3250b6ffb3ccb4e61235635dbd6f875b0c
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -75,7 +80,10 @@ jobs:
       - name: Find the Cloudberry commit
         id: cbdb
         run: |
-          ref='${{ github.event.inputs.cloudberry_ref || 'main' }}'
+          ref='${{ github.event.inputs.cloudberry_ref }}'
+          if [ -z "$ref" ]; then
+            if [ '${{ github.event_name }}' = schedule ]; then ref=main; else ref=$CLOUDBERRY_PIN; fi
+          fi
           if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
             sha=$ref
           else
@@ -126,15 +134,19 @@ jobs:
             cloudberry/contrib/pax_storage/src/cpp
           key: cloudberry-rocky9-${{ steps.cbdb.outputs.sha }}
 
+      # Saved right after the build (below), not only when the job passes.
       - name: Restore the Rust build
-        uses: actions/cache@v4
+        id: cargo-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             /home/gpadmin/.cargo/registry
             /home/gpadmin/.cargo/git
             vec_executor/engines/datafusion/target
-          key: cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}
-          restore-keys: cargo-rocky9-
+          key: cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}-${{ hashFiles('vec_executor/engines/datafusion/**/*.rs') }}
+          restore-keys: |
+            cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}-
+            cargo-rocky9-
 
       - name: Install Rust
         run: |
@@ -146,6 +158,16 @@ jobs:
 
       - name: Build vec_executor
         run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh build cloudberry"
+
+      - name: Save the Rust build
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /home/gpadmin/.cargo/registry
+            /home/gpadmin/.cargo/git
+            vec_executor/engines/datafusion/target
+          key: cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}-${{ hashFiles('vec_executor/engines/datafusion/**/*.rs') }}
 
       - name: Test
         run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh test cloudberry"
