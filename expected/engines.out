@@ -75,7 +75,7 @@ ERROR:  vec_executor: engine null has no test functions
 \c
 SET vec.engine = 'null_abi1';
 SELECT vec_version();
-ERROR:  vec_executor: engine "null_abi1" speaks ABI version 1, this extension 6
+ERROR:  vec_executor: engine "null_abi1" speaks ABI version 1, this extension 7
 HINT:  Install the engine built with this extension.
 -- DataFusion without one feature: what needs it stays on PostgreSQL, the
 -- rest still runs in DataFusion.

@@ -56,6 +56,11 @@ functions give its result batches at an offset.
 An engine's own settings are not the host's: `vec.engine_options`, a list
 `name=value, ...` that the host passes to `query_start` unread (engine ABI
 6), and the engine fails the query on a name or value it does not take.
+
+An engine reports the spill files a query holds now, their bytes and
+number, through `query_spill_usage` (engine ABI 7); the host counts them
+toward Cloudberry's workfile limits on every poll, so it must be cheap and
+must not block.  An engine that does not spill reports zeros.
 DataFusion's are `key_filters` (on by default: KF1, a hash join's build
 side filters its probe side's PAX scans) and `partial_agg_skip_ratio`
 (0.2 by default: SK1, the groups per row above which a partial

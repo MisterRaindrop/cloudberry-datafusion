@@ -70,6 +70,7 @@
 #include "postgres.h"
 
 #include "access/tableam.h"
+#include "access/xact.h"
 #include "cdb/cdbgang.h"
 #include "cdb/cdbinterconnect.h"
 #include "cdb/cdbmotion.h"
@@ -80,18 +81,21 @@
 #include "cdb/tupchunklist.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/instrument.h"
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
+#include "storage/fd.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
 #include "utils/snapmgr.h"
+#include "utils/workfile_mgr.h"
 
 #include "vx_executor.h"
 
@@ -234,6 +238,18 @@ typedef struct VxExec
 	int			host_segments;	/* primary segments on this host */
 
 	VecQuery    *query;			/* NULL until the first row is requested */
+
+	/*
+	 * WF1: the engine's spill files in Cloudberry's workfile account, one
+	 * empty temporary file of the workfile set standing for each, the first
+	 * carrying all their bytes.  The set goes with its last file.
+	 */
+	workfile_set *wf_set;
+	File	   *wf_files;
+	int			wf_nfiles;
+	int			wf_cap;
+	uint64		wf_bytes;
+	SubTransactionId wf_subid;	/* where the first was opened */
 	bool		pax_direct;		/* reads PAX directly; pax_info is valid */
 	VxPaxScanInfo pax_info;
 	bool		input_done;		/* every input is done */
@@ -327,6 +343,110 @@ vx_check_out_schema(VxExec *x, struct ArrowSchema *schema)
 		elog(ERROR, "vec_executor: the engine's result batches: %s", bad);
 }
 
+/* WF1: close every stand-in of 'x'; the workfile manager drops their bytes. */
+static void
+vx_workfile_close(VxExec *x)
+{
+	while (x->wf_nfiles > 0)
+		FileClose(x->wf_files[--x->wf_nfiles]);
+	x->wf_set = NULL;			/* gone with its last file */
+	x->wf_bytes = 0;
+}
+
+/*
+ * WF1: on abort, close the stand-ins of the queries of the (sub)transaction
+ * before its resource owner closes its temporary files, which it does
+ * after these callbacks.
+ */
+static void
+vx_workfile_xact(XactEvent event, void *arg)
+{
+	VxExec	   *x;
+
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		for (x = vx_execs; x != NULL; x = x->next)
+			vx_workfile_close(x);
+}
+
+static void
+vx_workfile_subxact(SubXactEvent event, SubTransactionId mySubid,
+					SubTransactionId parentSubid, void *arg)
+{
+	VxExec	   *x;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		for (x = vx_execs; x != NULL; x = x->next)
+			if (x->wf_nfiles > 0 && x->wf_subid >= mySubid)
+				vx_workfile_close(x);
+}
+
+/*
+ * WF1: account the engine's spill files of 'x' as the workfiles of a set:
+ * the workfile manager applies gp_workfile_limit_per_query, _per_segment
+ * and _files_per_query to them along with the other operators' of the
+ * query, raising its own errors, and gp_toolkit's views show them.  It
+ * sees them as often as the main thread polls, so the engine may write a
+ * little past a limit before the query fails.
+ */
+static void
+vx_workfile_sync(VxExec *x)
+{
+	static bool callbacks = false;
+	uint64		bytes = 0;
+	uint64		nfiles = 0;
+	int			files;
+
+	if (x->query == NULL)
+		return;
+	vx_engine->query_spill_usage(x->query, &bytes, &nfiles);
+	files = (int) Min(nfiles, (uint64) INT_MAX);
+	if (bytes > 0 && files == 0)
+		files = 1;				/* the first carries the bytes */
+	if (files > x->wf_nfiles)
+	{
+		if (!callbacks)
+		{
+			RegisterXactCallback(vx_workfile_xact, NULL);
+			RegisterSubXactCallback(vx_workfile_subxact, NULL);
+			callbacks = true;
+		}
+		PrepareTempTablespaces();
+		while (x->wf_nfiles < files)
+		{
+			File		f;
+
+			if (x->wf_nfiles == x->wf_cap)
+			{
+				int			cap = Max(8, x->wf_cap * 2);
+
+				x->wf_files = x->wf_files == NULL ?
+					MemoryContextAlloc(x->estate->es_query_cxt, sizeof(File) * cap) :
+					repalloc(x->wf_files, sizeof(File) * cap);
+				x->wf_cap = cap;
+			}
+			if (x->wf_set == NULL)
+			{
+				x->wf_set = workfile_mgr_create_set("vec_executor", "vec_executor", false);
+				x->wf_subid = GetCurrentSubTransactionId();
+			}
+			f = OpenTemporaryFile(false, "vec_executor");
+			x->wf_files[x->wf_nfiles++] = f;
+			FileSetIsWorkfile(f);
+			RegisterFileWithSet(f, x->wf_set);	/* may raise the files limit */
+		}
+	}
+	if (bytes != x->wf_bytes && x->wf_nfiles > 0)
+	{
+		UpdateWorkFileSize(x->wf_files[0], bytes);	/* may raise a size limit */
+		x->wf_bytes = bytes;
+	}
+	if (files == 0)
+		vx_workfile_close(x);
+	else
+		while (x->wf_nfiles > files)
+			FileClose(x->wf_files[--x->wf_nfiles]);
+}
+
 static void
 vx_exec_release(void *arg)
 {
@@ -334,6 +454,7 @@ vx_exec_release(void *arg)
 	VxExec	  **link;
 
 	vx_release_out(x);
+	vx_workfile_close(x);
 	if (x->query != NULL)
 	{
 		vx_engine->query_free(x->query);
@@ -1791,6 +1912,7 @@ vx_exec_next(VxExec *x)
 				 */
 				x->send->stopRequested = true;
 				x->done = true;
+				vx_workfile_close(x);
 				vx_engine->query_free(x->query);
 				x->query = NULL;
 				vx_vmem_trim();
@@ -1800,6 +1922,7 @@ vx_exec_next(VxExec *x)
 		{
 			x->done = true;
 			vx_exec_finished(x);
+			vx_workfile_close(x);
 			if (x->send)
 			{
 				SendEndOfStream(x->estate->motionlayer_context,
@@ -1812,6 +1935,8 @@ vx_exec_next(VxExec *x)
 			vx_raise_query(status, &err);
 
 		vx_vmem_sync(x->headroom);
+		if (!x->done)
+			vx_workfile_sync(x);
 		CHECK_FOR_INTERRUPTS();
 	}
 }

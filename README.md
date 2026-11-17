@@ -94,9 +94,9 @@ Known differences and limits:
   with multibyte characters to the wrong length; the engine pads them to
   n characters, as a heap table holds them, so `octet_length` of such a
   value differs from what PostgreSQL reads from PAX.
-- Cloudberry's workfile limits (`gp_workfile_limit_per_query`,
-  `gp_workfile_limit_files_per_query`) do not count the engine's spill
-  files.
+- The engine's spill files count toward Cloudberry's workfile limits as
+  the main thread polls, so a query may write a little past a limit before
+  it fails.
 
 ## Architecture
 

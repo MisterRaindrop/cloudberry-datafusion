@@ -31,4 +31,42 @@ SELECT vec_debug_vmem_lease(1::int8 << 40) FROM gp_dist_random('gp_id');
 SELECT gp_segment_id, vec_debug_vmem_lease(64::int8 << 20) >= 64::int8 << 20 AS leased
 FROM gp_dist_random('gp_id');
 
+-- WF1: the engine's spill files count toward Cloudberry's workfile limits,
+-- with the other workfiles of the query, and fail it with the workfile
+-- manager's own errors (53000), as PostgreSQL's hash aggregation over the
+-- same limit does.  Nothing is left in the account after a failure, a
+-- success, or a subtransaction rolled back.
+CREATE TABLE df_wf AS SELECT i AS k, i % 100 AS g, repeat('x', 40) AS pad
+FROM generate_series(1, 1000000) i DISTRIBUTED BY (g);
+SET vec.mode = on;
+SET statement_mem = '2MB';
+\set VERBOSITY sqlstate
+SET gp_workfile_limit_per_query = 1024;
+SELECT count(*) FROM (SELECT k, count(*) FROM df_wf GROUP BY k) s;
+RESET gp_workfile_limit_per_query;
+-- a hash join, which spills to several files on PostgreSQL too (its hash
+-- aggregation keeps them in one)
+SET gp_workfile_limit_files_per_query = 1;
+SELECT count(*) FROM df_wf a JOIN df_wf b USING (k);
+RESET gp_workfile_limit_files_per_query;
+SET vec.mode = off;
+SET gp_workfile_limit_per_query = 1024;
+SELECT count(*) FROM (SELECT k, count(*) FROM df_wf GROUP BY k) s;
+RESET gp_workfile_limit_per_query;
+SET vec.mode = on;
+BEGIN;
+SAVEPOINT a;
+SET LOCAL gp_workfile_limit_per_query = 1024;
+SELECT count(*) FROM (SELECT k, count(*) FROM df_wf GROUP BY k) s;
+ROLLBACK TO a;
+SELECT count(*) FROM (SELECT k, count(*) FROM df_wf GROUP BY k) s;
+COMMIT;
+\set VERBOSITY default
+SELECT count(*) FROM (SELECT k, count(*) FROM df_wf GROUP BY k) s;
+SELECT coalesce(sum(size), 0) AS size, coalesce(sum(numfiles), 0) AS files
+FROM gp_toolkit.gp_workfile_usage_per_segment;
+RESET statement_mem;
+RESET vec.mode;
+DROP TABLE df_wf;
+
 DROP EXTENSION vec_executor;

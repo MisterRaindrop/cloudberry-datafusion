@@ -123,6 +123,13 @@ null_query_bytes(VecQuery *query, int32_t *route, const uint8_t **data, size_t *
 }
 
 static void
+null_query_spill_usage(VecQuery *query, uint64_t *bytes, uint64_t *files)
+{
+	*bytes = 0;
+	*files = 0;
+}
+
+static void
 null_query_stats(VecQuery *query, VecQueryStats *out)
 {
 	memset(out, 0, sizeof(*out));
@@ -150,6 +157,7 @@ static const VecEngine null_engine = {
 	.query_result = null_query_result,
 	.query_bytes = null_query_bytes,
 	.query_stats = null_query_stats,
+	.query_spill_usage = null_query_spill_usage,
 	.query_free = null_query_free,
 	.debug = NULL,
 };

@@ -107,8 +107,8 @@ Known differences and limits:
   partial sums in a different order.
 - `EXPLAIN ANALYZE` counts rows for the slice's top node only; the nodes
   below it show as never executed.
-- DataFusion's spill files live in the backend's temporary directory but
-  are not yet counted by Cloudberry's workfile limits.
+- DataFusion's spill files live in the backend's temporary directory and
+  count toward Cloudberry's workfile limits (WF1, below).
 
 Milestone M4 puts DataFusion's memory under Cloudberry's control:
 
@@ -130,6 +130,20 @@ Milestone M4 puts DataFusion's memory under Cloudberry's control:
   tracker, and gives back the unused part when a query ends.  On QEs, where Cloudberry enforces vmem
   limits, a refused lease fails the query with the same error as a refused
   allocation (`Out of memory`, SQLSTATE 53500).
+- **Workfiles (WF1).** The engine's spill files are workfiles of the
+  query: on every poll the main thread reads what the engine holds now
+  (`query_spill_usage`, engine ABI 7: the bytes and number of DataFusion's
+  DiskManager's live temporary files, the spilling hash join's included)
+  and mirrors it in a workfile set named `vec_executor`, one empty
+  temporary file standing for each spill file and the first carrying all
+  their bytes.  The workfile manager then applies
+  `gp_workfile_limit_per_query`, `gp_workfile_limit_per_segment` and
+  `gp_workfile_limit_files_per_query` to them together with the query's
+  other workfiles, failing it with its own errors (53000), and
+  `gp_toolkit.gp_workfile_entries` and the usage views show them.  Between
+  polls the engine may write a little past a limit.  The stand-ins close
+  as the query ends, is stopped, or its (sub)transaction aborts (in the
+  abort callback, before the resource owner closes temporary files).
 - **EXPLAIN ANALYZE.** The top node's Instrumentation carries the peak pool
   use and, after spilling, the memory that would have avoided it, so
   Cloudberry's slice statistics show `Work_mem: ... max, ... wanted`.  A
@@ -690,6 +704,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | N6 | numeric of at most 38 digits as Decimal128 of its digits; Decimal256 beyond |
 | LM3 | Direct PAX reader: fixed-width columns converted when fetched, for the rows the cheap conditions leave (scan interface 8, engine ABI 4) |
 | LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
+| WF1 | The engine's spill files count toward Cloudberry's workfile limits and views (engine ABI 7) |
 | PV1 | PAX's vectorized format: char(n) padded to n characters, not to PAX's bytes (direct reader and table AM scans) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |

@@ -44,7 +44,7 @@ use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 compile_error!("df_ffi must be built with panic = \"unwind\"");
 
 /// Version of the ABI; keep in sync with `include/vec_engine.h`.
-pub const VEC_ENGINE_ABI: u32 = 6;
+pub const VEC_ENGINE_ABI: u32 = 7;
 
 /// Status codes; keep in sync with `include/vec_engine.h`.
 pub const VEC_OK: i32 = 0;
@@ -656,6 +656,17 @@ extern "C" fn query_stats(query: *mut VecQuery, out: *mut VecQueryStats) {
     }
 }
 
+/// The spill files the query holds now: their bytes and number (WF1).
+extern "C" fn query_spill_usage(query: *mut VecQuery, bytes: *mut u64, files: *mut u64) {
+    // SAFETY: `query` is live; `bytes` and `files` are valid.
+    let q = unsafe { &(*query).0 };
+    let (b, f) = catch_unwind(AssertUnwindSafe(|| q.spill_usage())).unwrap_or((0, 0));
+    unsafe {
+        *bytes = b;
+        *files = f;
+    }
+}
+
 /// Stop the query and release it.  Never blocks; running work is aborted.
 extern "C" fn query_free(query: *mut VecQuery) {
     if !query.is_null() {
@@ -735,6 +746,7 @@ pub struct VecEngine {
     pub query_result: extern "C" fn(*mut VecQuery, *mut FFI_ArrowArray) -> i32,
     pub query_bytes: extern "C" fn(*mut VecQuery, *mut i32, *mut *const u8, *mut usize),
     pub query_stats: extern "C" fn(*mut VecQuery, *mut VecQueryStats),
+    pub query_spill_usage: extern "C" fn(*mut VecQuery, *mut u64, *mut u64),
     pub query_free: extern "C" fn(*mut VecQuery),
     pub debug: *const VecEngineDebug,
 }
@@ -797,6 +809,7 @@ pub extern "C" fn vec_engine_entry(_host_abi: u32, _host: *const VecHost) -> *co
             query_result,
             query_bytes,
             query_stats,
+            query_spill_usage,
             query_free,
             debug: &DEBUG,
         }) as *const VecEngine

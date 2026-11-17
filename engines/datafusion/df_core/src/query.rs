@@ -55,7 +55,7 @@ use datafusion::catalog::streaming::StreamingTable;
 use datafusion::common::{DFSchema, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::error::DataFusionError;
-use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::disk_manager::{DiskManager, DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::{SessionState, SessionStateBuilder};
@@ -3098,6 +3098,8 @@ pub struct Query {
     current_bytes: Vec<u8>,
     current_route: i32,
     pool: Arc<TrackingPool>,
+    /// where the plan's operators spill (`spill_usage`)
+    disk: Arc<DiskManager>,
     physical: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>>,
     partitions: usize,
     pax_shared: Option<Arc<PaxShared>>,
@@ -3685,6 +3687,7 @@ impl Query {
         let ctx = SessionContext::new_with_state(
             session_state(config, pool.clone(), spill_dir).map_err(df)?,
         );
+        let disk = ctx.runtime_env().disk_manager.clone();
         let (out_tx, out_rx) = mpsc::channel(CHANNEL_DEPTH);
         let physical_slot: Arc<Mutex<Option<Arc<dyn ExecutionPlan>>>> = Arc::new(Mutex::new(None));
         let slot = physical_slot.clone();
@@ -3810,6 +3813,7 @@ impl Query {
             current_bytes: Vec::new(),
             current_route: NO_ROUTE,
             pool,
+            disk,
             physical: physical_slot,
             partitions,
             pax_shared,
@@ -3837,6 +3841,14 @@ impl Query {
             }
         }
         s
+    }
+
+    /// The spill files the plan holds now: their bytes and number.  Every
+    /// operator spills through the session's DiskManager, the spilling hash
+    /// join too (its SpillManagers take the runtime environment).
+    pub fn spill_usage(&self) -> (u64, u64) {
+        let p = self.disk.spilling_progress();
+        (p.current_bytes, p.active_files_count as u64)
     }
 
     pub fn num_inputs(&self) -> usize {

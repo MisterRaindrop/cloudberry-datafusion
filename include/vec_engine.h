@@ -57,7 +57,7 @@
 #include <stdint.h>
 
 /* Version of this ABI: host and engine must agree exactly. */
-#define VEC_ENGINE_ABI	6
+#define VEC_ENGINE_ABI	7
 
 /* Version of the plan IR (docs/ir.md): the "ir" member of every plan. */
 #define VEC_IR_VERSION	1
@@ -379,6 +379,13 @@ typedef struct VecEngine
 	void		(*query_bytes) (VecQuery *query, int32_t *route,
 								const uint8_t **data, size_t *len);
 	void		(*query_stats) (VecQuery *query, VecQueryStats *out);
+
+	/*
+	 * The spill files the query holds now, for Cloudberry's workfile limits
+	 * (WF1): their bytes and their number; files the engine has deleted do
+	 * not count.  The host calls it on every poll: it must not block.
+	 */
+	void		(*query_spill_usage) (VecQuery *query, uint64_t *bytes, uint64_t *files);
 	/* Stop the query and release it; never blocks. */
 	void		(*query_free) (VecQuery *query);
 
