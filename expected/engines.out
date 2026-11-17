@@ -126,7 +126,7 @@ EXPLAIN (COSTS OFF) SELECT d, count(*) FROM df_en GROUP BY d;
                      ->  Seq Scan on df_en
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (12 rows)
 
 SET vec.debug_features_off = 4;	-- sorts

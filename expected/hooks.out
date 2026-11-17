@@ -156,7 +156,7 @@ EXPLAIN (COSTS OFF) SELECT sum(b) FROM df_hooks_t;
                ->  Seq Scan on df_hooks_t
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
 -- Structured formats are left untouched.

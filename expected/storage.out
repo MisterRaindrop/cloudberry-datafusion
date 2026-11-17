@@ -50,7 +50,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_ao WHERE a > 10;
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_aocs WHERE a > 10;
@@ -63,7 +63,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_aocs WHERE a > 10;
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_pax WHERE a > 10;
@@ -76,7 +76,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(e) FROM df_m6_pax WHERE a > 10;
                      Filter: (a > 10)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 SET vec.mode = off;
@@ -167,7 +167,7 @@ SELECT count(*), sum(a) FROM df_m6_pax WHERE e < 50;
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: 2 partitions, memory limit 32768 kB, peak 129 kB, spilled 0 kB in 0 files
 (9 rows)
 

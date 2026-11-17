@@ -1069,7 +1069,7 @@ EXPLAIN (COSTS OFF) SELECT a, count(*), sum(n) FROM df_go GROUP BY a ORDER BY a 
                            ->  Seq Scan on df_go
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (13 rows)
 
 EXPLAIN (COSTS OFF) SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COLLATE "C" ORDER BY a DESC NULLS LAST, t COLLATE "C" DESC LIMIT 4 OFFSET 3;
@@ -1087,7 +1087,7 @@ EXPLAIN (COSTS OFF) SELECT a, t COLLATE "C", sum(n) FROM df_go GROUP BY a, t COL
                            ->  Seq Scan on df_go
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (13 rows)
 
 EXPLAIN (COSTS OFF) SELECT g.a, x.s FROM df_go g JOIN (SELECT k, sum(n) s FROM df_go GROUP BY k) x ON x.k = g.k WHERE g.k % 1000 = 7 ORDER BY 1, 2;
@@ -1134,7 +1134,7 @@ EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (20 rows)
 
 SET vec.mode = off;
@@ -1382,7 +1382,7 @@ EXPLAIN (COSTS OFF) SELECT a, sum(n) FROM df_go GROUP BY ROLLUP (a) ORDER BY 2, 
                      ->  Seq Scan on df_go
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (13 rows)
 
 SET vec.mode = on;
@@ -1421,7 +1421,7 @@ EXPLAIN (COSTS OFF) SELECT a, t, sum(n) FROM df_go WHERE k < 300 GROUP BY GROUPI
                      Filter: (k < 300)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (11 rows)
 
 SET vec.mode = on;
@@ -1491,8 +1491,8 @@ EXPLAIN (COSTS OFF) SELECT a, count(*), sum(s) FROM (SELECT sum(n) s, count(*) x
                                  ->  Seq Scan on df_sr
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
 SET vec.mode = off;
@@ -1570,7 +1570,7 @@ EXPLAIN (COSTS OFF) SELECT a, count(*) c, count(*) + 1 AS d FROM df_rs GROUP BY 
  Optimizer: GPORCA
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (16 rows)
 
 SET vec.mode = off;

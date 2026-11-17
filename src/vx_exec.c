@@ -588,8 +588,9 @@ vx_secs_instr(double secs)
 }
 
 /*
- * EA1: give node 'ps' of the slice, and those below it up to the Motions
- * it receives from, the engine's figures of their plan node ids: rows,
+ * EA1: give node 'ps' of the slice, and those below it down to the Motions
+ * it receives from (a batch Motion's rows PostgreSQL does not count), the
+ * engine's figures of their plan node ids: rows,
  * time to the first row and to the end, as one cycle that InstrEndLoop
  * closes when EXPLAIN collects it.  The slice's top node, when it hands
  * out tuples, is counted by PostgreSQL itself.
@@ -600,7 +601,7 @@ vx_fill_node(PlanState *ps, void *arg)
 	VxNodeFill *f = (VxNodeFill *) arg;
 	uint32		i;
 
-	if (ps == NULL || IsA(ps, MotionState))
+	if (ps == NULL)
 		return false;
 	if (ps->instrument != NULL && !(ps == f->x->root && f->x->send == NULL))
 	{
@@ -621,6 +622,9 @@ vx_fill_node(PlanState *ps, void *arg)
 			break;
 		}
 	}
+	/* a Motion the slice receives: its rows are counted, not its sender's */
+	if (IsA(ps, MotionState))
+		return false;
 	return planstate_tree_walker(ps, vx_fill_node, arg);
 }
 
@@ -831,7 +835,10 @@ vx_rx_take(VxExec *x, VxInput *in, int16 motion_id, MotionNodeEntry *entry)
 					(errcode(ERRCODE_GP_INTERCONNECTION_ERROR),
 					 errmsg("vec_executor: Motion %d received tuples where batches were expected",
 							motion_id),
-					 errdetail("The sending slice on route %d did not run in the engine.", route)));
+					 errdetail("The sending slice on route %d did not run in the engine.", route),
+					 errhint("Load vec_executor on every segment, with session_preload_libraries "
+							 "(ALTER DATABASE ... SET) or shared_preload_libraries, or set "
+							 "vec.motion_batches to off.")));
 
 		data = (uint8 *) GetChunkDataPtr(item) + TUPLE_CHUNK_HEADER_SIZE;
 		len = item->chunk_length - TUPLE_CHUNK_HEADER_SIZE;

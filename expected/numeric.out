@@ -61,7 +61,7 @@ EXPLAIN (COSTS OFF) SELECT sum(b), avg(b) FROM df_nm;
                ->  Seq Scan on df_nm
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (7 rows)
 
 SET vec.motion_batches = on;
@@ -1500,9 +1500,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_wv WHERE x > (SELECT avg(x)
                      ->  Seq Scan on df_wv
  Optimizer: GPORCA
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 3 eligible, sends Arrow batches
 (16 rows)
 
 SET vec.mode = off;

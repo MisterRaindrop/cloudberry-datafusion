@@ -65,7 +65,7 @@ WHERE p_key = l_key AND p_brand = 'Brand#7' AND p_size < 30
                                              Filter: ((p_size < 30) AND (p_brand = 'Brand#7'::text))
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (24 rows)
 
 SET vec.mode = off;
@@ -157,7 +157,7 @@ WHERE p_key IN (SELECT l_key FROM df_sq_line o
                            ->  Seq Scan on df_sq_part
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (39 rows)
 
 SET vec.mode = off;
@@ -211,7 +211,7 @@ WHERE p_key = l_key AND (p_size < 3 OR l_price < 10)
                                        ->  Seq Scan on df_sq_line l2
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (20 rows)
 
 EXPLAIN (COSTS OFF)
@@ -265,7 +265,7 @@ WHERE p_size < 3
                                              Filter: (p_size < 3)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (19 rows)
 
 EXPLAIN (COSTS OFF)
@@ -323,7 +323,7 @@ WHERE p_key = l_key AND p_size < 3
                                              Filter: (p_size < 3)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (19 rows)
 
 RESET vec.subquery_key_filter;

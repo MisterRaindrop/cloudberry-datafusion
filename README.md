@@ -205,11 +205,14 @@ or for one database:
 ALTER DATABASE mydb SET session_preload_libraries = 'vec_executor';
 ```
 
+Every segment must load it: a `LOAD` or `CREATE EXTENSION` in a session
+loads it on the coordinator only, and a query whose Motions carry batches
+then fails ("received tuples where batches were expected").
+
 Then turn it on:
 
 ```sql
 SET vec.mode = on;              -- off (default), explain, on
-SET vec.motion_batches = on;    -- optional, experimental
 ```
 
 With `vec.mode = explain` or `on`, `EXPLAIN` ends with one line per
@@ -229,7 +232,7 @@ slice saying whether the engine runs it, and if not, why:
 | Setting | Default | |
 |---|---|---|
 | `vec.mode` | `off` | `off`, `explain` (only report in `EXPLAIN`), `on` (run eligible slices) |
-| `vec.motion_batches` | `off` | Experimental: Motions between two engine slices carry Arrow batches |
+| `vec.motion_batches` | `on` | Motions between two engine slices carry Arrow batches (tested on one host; not yet across hosts) |
 | `vec.pax_direct_read` | `on` | Read PAX tables column by column on the engine's threads |
 | `vec.pax_max_decoders` | `0` | PAX groups decoded at once per query; 0 = one per partition |
 | `vec.pax_decode_cache` | empty | Superuser.  Directory for a cache of decoded PAX columns; empty = no cache |

@@ -57,7 +57,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jb jb ON ja
                                  Filter: (e < 10)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (12 rows)
 
 EXPLAIN (COSTS OFF) SELECT ja.k, jb.b + jc.d FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k JOIN df_jc jc ON ja.k = jc.k;
@@ -93,8 +93,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE ja.k NOT IN (SELECT k FR
                                  ->  Seq Scan on df_jb
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
 -- Keys cast to floats run since E2 (int4 and int8 to float8 and real).
@@ -115,7 +115,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k::
                                  ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: slice 2 eligible
  Vectorized: slice 3 eligible
 (17 rows)
@@ -171,7 +171,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jb jb ON ja.k = jb.k;
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (11 rows)
 
 RESET work_mem;
@@ -367,8 +367,8 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(ja.a) FROM df_ja ja JOIN df_jr jr ON ja
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (14 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
@@ -385,8 +385,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jr jr ON ja.a = jr.r;
                                  ->  Seq Scan on df_jr jr
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (13 rows)
 
 SET vec.motion_batches = on;
@@ -519,7 +519,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(jb.b) FROM df_ja ja LEFT JOIN df_jb j
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FROM df_jb jb WHERE jb.k = ja.k);
@@ -535,7 +535,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja WHERE NOT EXISTS (SELECT 1 FRO
                            ->  Seq Scan on df_jb jb
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (11 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
@@ -553,8 +553,8 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_ja ja JOIN df_jf f ON ja.k = f.k8;
                                  ->  Seq Scan on df_jf f
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
 (14 rows)
 
 SET vec.mode = off;
@@ -2269,7 +2269,7 @@ EXPLAIN (COSTS OFF) SELECT k, avg(n) FROM df_sc GROUP BY k HAVING avg(n) > 0.9 *
  Optimizer: GPORCA
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
  Vectorized: slice 3 eligible
  Vectorized: slice 4 eligible
 (31 rows)
@@ -2297,7 +2297,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(id) FROM df_sc WHERE id < (SELECT max(i
                                                                  Filter: (k = 3)
  Optimizer: GPORCA
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: slice 2 eligible
  Vectorized: slice 3 eligible
 (23 rows)
@@ -2685,9 +2685,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a.v), sum(b.w) FROM df_mj_a a JOIN df_m
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (20 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JOIN df_mj_b b ON a.k = b.k AND a.v < b.w;
@@ -2711,9 +2711,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), sum(a.v) FROM df_mj_a a LEFT JO
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT a.k, b.w FROM df_mj_a a JOIN df_mj_b b ON a.k = b.k WHERE a.id < 50 ORDER BY a.k LIMIT 5;
@@ -2789,9 +2789,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE EXISTS (SELECT 
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (21 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SELECT 1 FROM df_mj_b b WHERE b.k = a.k AND b.w > a.v);
@@ -2815,9 +2815,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM df_mj_a a WHERE NOT EXISTS (SEL
                                  ->  Seq Scan on df_mj_b b
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (21 rows)
 
 SET vec.mode = off;
@@ -2896,9 +2896,9 @@ EXPLAIN (COSTS OFF) SELECT count(*), count(b.w), count(a.v), sum(a.v), sum(b.w) 
                                  ->  Seq Scan on df_mj_a a
  Optimizer: GPORCA
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
- Vectorized: slice 3 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
+ Vectorized: slice 2 eligible, sends Arrow batches
+ Vectorized: slice 3 eligible, sends Arrow batches
 (20 rows)
 
 SET vec.mode = off;
@@ -2998,7 +2998,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
                                              Filter: (y < 3000)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (16 rows)
 
 RESET vec.join_estimates;
@@ -3021,7 +3021,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(g.v) FROM df_je_big g JOIN (df_je_a a J
                                              Filter: (y < 3000)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (16 rows)
 
 SET vec.mode = off;

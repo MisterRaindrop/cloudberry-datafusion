@@ -205,12 +205,12 @@ _PG_init(void)
 							   NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("vec.motion_batches",
-							 "Experimental: send Arrow batches through Gather Motions between engine slices.",
+							 "Send Arrow batches through Motions between engine slices.",
 							 "When both the sending and the receiving slice of a Gather Motion run "
 							 "in the engine, the rows travel over the interconnect as Arrow IPC "
 							 "batches instead of one tuple at a time.",
 							 &vx_motion_batches,
-							 false,
+							 true,
 							 PGC_USERSET,
 							 GUC_GPDB_NEED_SYNC,
 							 NULL, NULL, NULL);

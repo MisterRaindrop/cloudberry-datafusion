@@ -28,6 +28,8 @@ ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor'
 \c
 SET optimizer = off;
 SET vec.worker_threads = 2;
+-- Tuples through the Motions: batches are tested in batches.sql.
+SET vec.motion_batches = off;
 
 CREATE TABLE df_m5 (a int4, b int8, c float8, d bool, e int2) DISTRIBUTED BY (a);
 INSERT INTO df_m5 SELECT i, i * 10, i / 4.0, i % 2 = 0, (i % 100)::int2

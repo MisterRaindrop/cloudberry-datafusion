@@ -52,7 +52,7 @@ EXPLAIN (COSTS OFF) SELECT count(*), sum(a), max(c) FROM df_par_heap WHERE e < 5
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
 (8 rows)
 
 EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
@@ -72,7 +72,7 @@ EXPLAIN (COSTS OFF) SELECT e, count(*), sum(a) FROM df_par_pax GROUP BY e;
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 not eligible: receives rows from a Gather Motion with nothing to compute on them
  Vectorized: slice 1 eligible
- Vectorized: slice 2 eligible
+ Vectorized: slice 2 eligible, sends Arrow batches
 (15 rows)
 
 SET vec.mode = off;
@@ -149,7 +149,7 @@ SELECT count(*), sum(a) FROM df_par_pax WHERE e < 50;
                      Filter: (e < 50)
  Optimizer: Postgres query optimizer
  Vectorized: slice 0 eligible
- Vectorized: slice 1 eligible
+ Vectorized: slice 1 eligible, sends Arrow batches
  Vectorized: 1 partitions, memory limit 32768 kB, peak 0 kB, spilled 0 kB in 0 files
 (9 rows)
 

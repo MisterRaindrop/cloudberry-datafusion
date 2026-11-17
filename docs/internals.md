@@ -441,9 +441,10 @@ expression key it has no statistics for: each segment then redistributes
 from and to DataFusion's batches on both sides costs more than DataFusion
 saves.  Sending batches over the interconnect (M7b) is meant for that.
 
-### Experimental: batches through Motions
+### Batches through Motions
 
-With `vec.motion_batches = on` (milestones M7b and M7c), a Gather or
+With `vec.motion_batches = on` (the default since MB1; milestones M7b and
+M7c), a Gather or
 Redistribute Motion whose sending and receiving slices both run in
 DataFusion carries Arrow IPC batches instead of tuples; EXPLAIN marks the
 sending slice "sends Arrow batches".  Every process decides this from the plan and the synchronized

@@ -7309,7 +7309,7 @@ vx_slice_producers(Plan *plan)
  * M7b: which Gather Motions carry Arrow batches
  * ---------------------------------------------------------------------
  */
-bool		vx_motion_batches = false;
+bool		vx_motion_batches = true;
 bool		vx_cluster_collation_c = false;
 
 /*
