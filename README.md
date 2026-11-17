@@ -253,7 +253,14 @@ make installcheck                          # regression tests, against a running
 make VX_PAX_SRC=... installcheck           # adds the direct PAX reader's tests
 make installcheck-engine ENGINE=datafusion # an engine's results against PostgreSQL's
 make df-rust-test                          # the engine's unit tests
+python3 tools/fuzz.py --db DB --setup      # random queries, vec.mode off against on
 ```
+
+`tools/fuzz.py` creates tables of every type the engine reads in a
+database that preloads `vec_executor`, then runs random queries (joins,
+aggregates, window functions, set operations, subqueries) under both
+planners with `vec.mode` off and on, and reports the ones whose rows
+differ or that fail only in the engine; `--seed` repeats a run.
 
 ## Documentation
 
