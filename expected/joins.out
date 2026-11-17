@@ -3061,6 +3061,38 @@ RESET vec.join_estimates;
 RESET work_mem;
 RESET join_collapse_limit;
 DROP TABLE df_je_big, df_je_a, df_je_b;
+-- JK1: a join key of no column.  A subquery whose condition can never
+-- hold leaves PostgreSQL an empty input whose key is the constant NULL;
+-- the key becomes a column of its side (DataFusion cannot tell which side
+-- a key of no column belongs to: "join key should belong to one input").
+SET optimizer = off;
+SET vec.mode = off;
+SELECT count(*), count(a) FROM df_ja WHERE a NOT IN (SELECT k FROM df_jb WHERE k IS NOT NULL AND k IS NULL);
+ count | count 
+-------+-------
+ 20001 | 20001
+(1 row)
+
+SELECT count(*) FROM df_ja WHERE a IN (SELECT k FROM df_jb WHERE k IS NOT NULL AND k IS NULL);
+ count 
+-------
+     0
+(1 row)
+
+SET vec.mode = on;
+SELECT count(*), count(a) FROM df_ja WHERE a NOT IN (SELECT k FROM df_jb WHERE k IS NOT NULL AND k IS NULL);
+ count | count 
+-------+-------
+ 20001 | 20001
+(1 row)
+
+SELECT count(*) FROM df_ja WHERE a IN (SELECT k FROM df_jb WHERE k IS NOT NULL AND k IS NULL);
+ count 
+-------
+     0
+(1 row)
+
+RESET optimizer;
 DROP TABLE df_ja, df_jb, df_jc, df_jempty, df_jdup, df_jr, df_jf;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

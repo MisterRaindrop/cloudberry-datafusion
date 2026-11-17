@@ -727,6 +727,7 @@ counting allocator was added in M4).  Grouping 2 million distinct keys with
 | LT1 | Direct PAX reader: columns only a sort's Limit of at most 100 rows needs read after it, by row locators (scan interface 9, engine ABI 5) |
 | WF1 | The engine's spill files count toward Cloudberry's workfile limits and views (engine ABI 7) |
 | EA1 | EXPLAIN ANALYZE: the rows and times of each node the engine runs (IR "tap", engine ABI 7) |
+| JK1 | A join key of no column (an empty input's NULL) as a column of its side |
 | PV1 | PAX's vectorized format: char(n) padded to n characters, not to PAX's bytes (direct reader and table AM scans) |
 | NW1 | numeric of at most 38 digits narrowed to 8 or 16 bytes between slices |
 | JE1 | Hash joins whose build side comes from a join: bounded by its largest input |

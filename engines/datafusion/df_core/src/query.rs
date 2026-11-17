@@ -2989,12 +2989,22 @@ fn build_node_kind(
             "rightanti" => JoinType::RightAnti,
             other => return Err(format!("plan spec: unsupported join type {other}")),
         };
-        let left = build_node(field(j, "left")?, tables)?;
-        let right = build_node(field(j, "right")?, tables)?
-            .build()
-            .map_err(df)?;
-        let mut lkeys = Vec::new();
-        let mut rkeys = Vec::new();
+        let mut left = build_node(field(j, "left")?, tables)?;
+        let mut right = build_node(field(j, "right")?, tables)?;
+        // JK1: a key of no column, such as the NULL of an input PostgreSQL
+        // found empty (OF1), becomes a column of its side: DataFusion
+        // cannot tell which side a key of no column belongs to
+        let keyed = |b: LogicalPlanBuilder, e: Expr| -> Result<(LogicalPlanBuilder, Expr), String> {
+            if !e.column_refs().is_empty() {
+                return Ok((b, e));
+            }
+            static KEYS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let name = format!("jk{}", KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            let mut cols: Vec<Expr> = b.schema().columns().into_iter().map(Expr::Column).collect();
+            cols.push(e.alias(name.clone()));
+            Ok((b.project(cols).map_err(df)?, col(name)))
+        };
+        let mut pairs = Vec::new();
         for pair in field(j, "on")?
             .as_array()
             .ok_or("plan spec: bad join keys")?
@@ -3004,6 +3014,17 @@ fn build_node_kind(
                 .filter(|p| p.len() == 2)
                 .ok_or("plan spec: bad join key")?;
             let (l, r) = (expr(&pair[0])?, expr(&pair[1])?);
+            let (nl, l) = keyed(left, l)?;
+            left = nl;
+            let (nr, r) = keyed(right, r)?;
+            right = nr;
+            pairs.push((l, r));
+        }
+        let left = left;
+        let right = right.build().map_err(df)?;
+        let mut lkeys = Vec::new();
+        let mut rkeys = Vec::new();
+        for (l, r) in pairs {
             // Float keys match by their PostgreSQL value (pgfloat).
             if is_float_expr(&l, left.schema()) {
                 lkeys.push(FloatFn::Key.apply(l));
