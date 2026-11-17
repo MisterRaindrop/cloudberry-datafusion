@@ -432,29 +432,29 @@ SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM vec_debug_pax_cache();
 (1 row)
 
 -- one micro-partition: one directory of entries
-SELECT count(*) FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep';
+SELECT count(*) FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */;
  count 
 -------
      1
 (1 row)
 
-SELECT :'dd' || '/df_pd_cache_dir/' || d AS mp FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' \gset
+SELECT :'dd' || '/df_pd_cache_dir/' || d AS mp FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */ \gset
 -- Column t of group 0 cut short.  Column v of group 1 with its second
 -- offset past the third: v has no NULLs, so its offsets follow the header
 -- (40 bytes) at once.
 -- (a large object is seen from the statement after the one creating it;
 -- Cloudberry refuses lo_unlink, the objects go with the database)
 SELECT lo_from_bytea(0, substr(b, 1, length(b) - 3)) AS lo
-FROM pg_read_binary_file(:'mp' || '/g0_c3_w-1_s-1') b \gset
-SELECT lo_export(:lo, :'mp' || '/g0_c3_w-1_s-1');
+FROM pg_read_binary_file(:'mp' || '/g0_c3_w-1_s-1') b /* differs on PostgreSQL: DC1's files */ \gset
+SELECT lo_export(:lo, :'mp' || '/g0_c3_w-1_s-1') /* differs on PostgreSQL: DC1's files */;
  lo_export 
 -----------
          1
 (1 row)
 
 SELECT lo_from_bytea(0, overlay(b PLACING '\xffffff7f'::bytea FROM 41 + 4 FOR 4)) AS lo
-FROM pg_read_binary_file(:'mp' || '/g1_c4_w-1_s-1') b \gset
-SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1');
+FROM pg_read_binary_file(:'mp' || '/g1_c4_w-1_s-1') b /* differs on PostgreSQL: DC1's files */ \gset
+SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1') /* differs on PostgreSQL: DC1's files */;
  lo_export 
 -----------
          1
@@ -512,7 +512,7 @@ SELECT refused - :r0 > 0 AS refused FROM vec_debug_pax_cache();
 (1 row)
 
 SELECT sum((pg_stat_file('df_pd_cache_small/' || d || '/' || f)).size) <= 1024 * 1024 AS within_limit
-FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WHERE d <> '.sweep';
+FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */;
  within_limit 
 --------------
  t

@@ -26,8 +26,11 @@ which runs nothing, so that every query stays on PostgreSQL.  Then it
 compares the two outputs without what is meant to differ: EXPLAIN's plans,
 the results of the vec_debug_* test functions, and those of statements
 marked /* differs on PostgreSQL: ... */, where PostgreSQL's own result is
-wrong (PV1: PAX's vectorized format pads char(n) by bytes).  What is left
-must be the same rows and the same errors.
+wrong (PV1: PAX's vectorized format pads char(n) by bytes) or the
+statement looks at what the engine did (DC1: the decoded-column cache's
+files).  What is left must be the same rows and the same errors.  The
+statements of the scripts a test runs in psql of its own (data/*.sql)
+count as the test's.
 
 The expected files of the regression tests are DataFusion's, plans and
 all; this check needs none, so it works for any engine.  The tests that
@@ -48,10 +51,20 @@ MASKS = [
 
 
 def run(test, engine, db):
-    env = dict(os.environ, PGOPTIONS=f"-c vec.engine={engine}", PGDATABASE=db)
-    r = subprocess.run(["psql", "-X", "-a", "-q", "-v", "ON_ERROR_STOP=0",
-                        "-f", f"sql/{test}.sql"], env=env, text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # The database's setting, which every backend reads as it starts, the
+    # segments' too: PGOPTIONS reaches the coordinator only, and a segment
+    # that loads the extension before the coordinator's value reaches it
+    # (CREATE EXTENSION) keeps the default engine for the session.
+    def setdb(sql):
+        subprocess.run(["psql", "-X", "-q", "-d", "postgres", "-c", sql], check=True)
+    setdb(f'ALTER DATABASE "{db}" SET vec.engine = \'{engine}\'')
+    try:
+        env = dict(os.environ, PGDATABASE=db)
+        r = subprocess.run(["psql", "-X", "-a", "-q", "-v", "ON_ERROR_STOP=0",
+                            "-f", f"sql/{test}.sql"], env=env, text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    finally:
+        setdb(f'ALTER DATABASE "{db}" RESET vec.engine')
     return r.stdout.splitlines()
 
 
@@ -110,6 +123,10 @@ def main():
         if test in SKIP:
             continue
         source = open(f"sql/{test}.sql").read().splitlines()
+        # the scripts it runs in psql of their own (\! psql -f data/...),
+        # whose statements are echoed too
+        for f in re.findall(r"-f\s+(data/[\w.]+\.sql)", "\n".join(source)):
+            source += open(f).read().splitlines()
         base = comparable(run(test, a.baseline, db), source)
         got = comparable(run(test, a.engine, db), source)
         diff = list(difflib.unified_diff(base, got, f"{test} ({a.baseline})",

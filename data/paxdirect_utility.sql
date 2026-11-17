@@ -143,19 +143,19 @@ SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)
 SELECT a, n, t, v FROM df_pd_cache WHERE a % 4999 = 0 ORDER BY a;
 SELECT hits - :h0 AS hits, fills - :f0 AS fills FROM vec_debug_pax_cache();
 -- one micro-partition: one directory of entries
-SELECT count(*) FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep';
-SELECT :'dd' || '/df_pd_cache_dir/' || d AS mp FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' \gset
+SELECT count(*) FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */;
+SELECT :'dd' || '/df_pd_cache_dir/' || d AS mp FROM pg_ls_dir('df_pd_cache_dir') d WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */ \gset
 -- Column t of group 0 cut short.  Column v of group 1 with its second
 -- offset past the third: v has no NULLs, so its offsets follow the header
 -- (40 bytes) at once.
 -- (a large object is seen from the statement after the one creating it;
 -- Cloudberry refuses lo_unlink, the objects go with the database)
 SELECT lo_from_bytea(0, substr(b, 1, length(b) - 3)) AS lo
-FROM pg_read_binary_file(:'mp' || '/g0_c3_w-1_s-1') b \gset
-SELECT lo_export(:lo, :'mp' || '/g0_c3_w-1_s-1');
+FROM pg_read_binary_file(:'mp' || '/g0_c3_w-1_s-1') b /* differs on PostgreSQL: DC1's files */ \gset
+SELECT lo_export(:lo, :'mp' || '/g0_c3_w-1_s-1') /* differs on PostgreSQL: DC1's files */;
 SELECT lo_from_bytea(0, overlay(b PLACING '\xffffff7f'::bytea FROM 41 + 4 FOR 4)) AS lo
-FROM pg_read_binary_file(:'mp' || '/g1_c4_w-1_s-1') b \gset
-SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1');
+FROM pg_read_binary_file(:'mp' || '/g1_c4_w-1_s-1') b /* differs on PostgreSQL: DC1's files */ \gset
+SELECT lo_export(:lo, :'mp' || '/g1_c4_w-1_s-1') /* differs on PostgreSQL: DC1's files */;
 SELECT hits AS h0, fills AS f0, bad AS b0 FROM vec_debug_pax_cache() \gset
 SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)), max(t) FROM df_pd_cache;
 SELECT hits - :h0 AS hits, fills - :f0 AS fills, bad - :b0 AS bad FROM vec_debug_pax_cache();
@@ -173,7 +173,7 @@ SELECT count(*), sum(a), sum(b), sum(n), count(t), sum(length(t)), sum(length(v)
 SET vec.mode = on;
 SELECT refused - :r0 > 0 AS refused FROM vec_debug_pax_cache();
 SELECT sum((pg_stat_file('df_pd_cache_small/' || d || '/' || f)).size) <= 1024 * 1024 AS within_limit
-FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WHERE d <> '.sweep';
+FROM pg_ls_dir('df_pd_cache_small') d, pg_ls_dir('df_pd_cache_small/' || d) f WHERE d <> '.sweep' /* differs on PostgreSQL: DC1's files */;
 -- a directory that cannot be used leaves scans without the cache
 SET vec.pax_decode_cache = '/proc/df_pd_no_cache';
 SELECT unusable AS u0 FROM vec_debug_pax_cache() \gset
