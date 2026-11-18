@@ -8477,6 +8477,7 @@ typedef struct VxSliceRoot
 
 typedef struct VxCollectContext
 {
+	plan_tree_base_prefix base; /* for plan_tree_walker */
 	VxSliceRoot *roots;
 	int			nroots;
 	int			maxroots;
@@ -8506,6 +8507,19 @@ vx_collect_motions(Node *node, void *context)
 		return false;
 	if (IsA(node, Motion))
 		vx_add_root(cxt, ((Motion *) node)->motionID, (Plan *) node, true);
+	if (IsA(node, SubPlan))
+	{
+		/*
+		 * Not into its plan: vx_explain_slices walks each of
+		 * stmt->subplans once, and plan_tree_walker would walk it again
+		 * here, from every SubPlan that refers to it
+		 */
+		SubPlan    *subplan = (SubPlan *) node;
+
+		if (vx_collect_motions(subplan->testexpr, cxt))
+			return true;
+		return vx_collect_motions((Node *) subplan->args, cxt);
+	}
 	return plan_tree_walker(node, vx_collect_motions, cxt, true);
 }
 
@@ -8534,6 +8548,7 @@ vx_explain_slices(PlannedStmt *stmt, StringInfo out)
 		}
 	}
 
+	exec_init_plan_tree_base(&cxt.base, stmt);
 	cxt.maxroots = 8;
 	cxt.nroots = 0;
 	cxt.roots = palloc(sizeof(VxSliceRoot) * cxt.maxroots);
