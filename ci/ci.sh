@@ -38,6 +38,10 @@
 #                              the Rust tests
 #   ci/ci.sh asan              the engine's unit tests under AddressSanitizer
 #                              (a nightly toolchain, installed by the step)
+#   ci/ci.sh package CBDB OUT  a binary package of what 'build' installed:
+#                              OUT/vec_executor-VERSION-cloudberry-COMMIT-
+#                              OS-ARCH.tar.gz (libraries, extension files,
+#                              install.sh, BUILD-INFO) and its .sha256
 #   ci/ci.sh soak CBDB         TPC-H at scale factor 1 (tools/tpch), then
 #                              tools/stress.py and tools/fuzz.py for a few
 #                              minutes each (SOAK_MINUTES, default 5)
@@ -66,7 +70,7 @@ env_cluster() {
 	set -u
 }
 
-step=${1:?usage: ci.sh cloudberry|cluster|rust|build|clippy|test|asan|soak [CBDB]}
+step=${1:?usage: ci.sh cloudberry|cluster|rust|build|clippy|test|asan|package|soak [CBDB [OUT]]}
 CBDB=${2:-}
 [ -z "$CBDB" ] || CBDB=$(cd "$CBDB" && pwd)
 
@@ -134,6 +138,44 @@ asan)
 	RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
 	ASAN_OPTIONS=detect_leaks=1 CARGO_TARGET_DIR="$EXT/engines/datafusion/target-asan" \
 		cargo +nightly test --workspace --target "$(rustc -vV | sed -n 's/^host: //p')"
+	;;
+package)
+	env_cloudberry
+	OUT=${3:?usage: ci.sh package CBDB OUT}
+	mkdir -p "$OUT"
+	OUT=$(cd "$OUT" && pwd)
+	cd "$EXT"
+	version=$(git describe --tags --always --dirty 2>/dev/null || echo unknown)
+	version=${version#v}
+	cbdb_commit=$(git -C "$CBDB" rev-parse HEAD 2>/dev/null || echo "${CLOUDBERRY_COMMIT:-unknown}")
+	os=$(. /etc/os-release && echo "$ID$VERSION_ID" | cut -d. -f1)
+	name=vec_executor-$version-cloudberry-${cbdb_commit:0:10}-$os-$(uname -m)
+	stage=$(mktemp -d)
+	make VX_PAX_SRC="$CBDB/contrib/pax_storage/src/cpp" install DESTDIR="$stage/root" >/dev/null
+	pkg=$stage/$name
+	mkdir -p "$pkg/lib" "$pkg/extension"
+	cp "$stage/root$(pg_config --pkglibdir)"/{vec_executor,vec_engine_datafusion,vec_engine_null}.so "$pkg/lib/"
+	if [ -f "$stage/root$(pg_config --pkglibdir)/vec_pax.so" ]; then
+		cp "$stage/root$(pg_config --pkglibdir)/vec_pax.so" "$pkg/lib/"
+	fi
+	# debug information off (480 MB of the engine's), symbols kept
+	strip --strip-debug "$pkg"/lib/*.so
+	cp "$stage/root$(pg_config --sharedir)"/extension/vec_executor* "$pkg/extension/"
+	cp "$EXT/ci/install.sh" "$EXT/LICENSE" "$pkg/"
+	cat >"$pkg/BUILD-INFO" <<-INFO
+		vec_executor $version ($(git rev-parse HEAD 2>/dev/null || echo unknown))
+		Built against Apache Cloudberry $cbdb_commit
+		  $(pg_config --version)
+		$(rustc --version)
+		$(gcc --version | head -1)
+		$(. /etc/os-release && echo "$PRETTY_NAME") $(uname -m)
+		Built $(date -u +%Y-%m-%dT%H:%M:%SZ)
+	INFO
+	tar -C "$stage" -czf "$OUT/$name.tar.gz" "$name"
+	(cd "$OUT" && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256")
+	rm -rf "$stage"
+	ls -l "$OUT/$name.tar.gz"
+	cat "$OUT/$name.tar.gz.sha256"
 	;;
 soak)
 	env_cluster

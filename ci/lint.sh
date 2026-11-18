@@ -24,7 +24,12 @@
 #                        the PAX patches (PAX's files) or the TPC-H queries
 #                        (dbgen's qgen wrote them)
 #   ci/lint.sh fmt       cargo fmt --check of the engine
-#   ci/lint.sh           both
+#   ci/lint.sh ext       the extension's SQL scripts: a script a release
+#                        (tag v*) shipped is unchanged, and the control
+#                        file's default_version is reachable: its install
+#                        script, or one of an older version and update
+#                        scripts up to it (README, Versions)
+#   ci/lint.sh           all three
 #
 set -euo pipefail
 
@@ -48,6 +53,51 @@ license() {
 	return "$missing"
 }
 
+ext() {
+	local bad=0 tag f v
+	for tag in $(git tag -l 'v*'); do
+		for f in $(git ls-tree --name-only "$tag" | grep -E '^vec_executor--.*\.sql$'); do
+			if [ ! -f "$f" ]; then
+				echo "$f: shipped in $tag, removed since"
+				bad=1
+			elif ! git show "$tag:$f" | cmp -s - "$f"; then
+				echo "$f: shipped in $tag, changed since; add an update script instead"
+				bad=1
+			fi
+		done
+	done
+	v=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" vec_executor.control)
+	# breadth-first over update scripts, from the versions that have an
+	# install script
+	local reach=" " frontier="" next from to
+	for f in vec_executor--*.sql; do
+		f=${f#vec_executor--}
+		f=${f%.sql}
+		case "$f" in *--*) ;; *) reach="$reach$f " frontier="$frontier $f" ;; esac
+	done
+	while [ -n "$frontier" ]; do
+		next=""
+		for from in $frontier; do
+			for f in vec_executor--"$from"--*.sql; do
+				[ -e "$f" ] || continue
+				to=${f#vec_executor--"$from"--}
+				to=${to%.sql}
+				case "$reach" in *" $to "*) ;; *) reach="$reach$to " next="$next $to" ;; esac
+			done
+		done
+		frontier=$next
+	done
+	case "$reach" in
+	*" $v "*) ;;
+	*)
+		echo "default_version $v: no install script and no update path to it"
+		bad=1
+		;;
+	esac
+	[ "$bad" = 0 ] && echo "extension scripts: ok (default_version $v)"
+	return "$bad"
+}
+
 fmt() {
 	(cd engines/datafusion && cargo fmt --check) && echo "cargo fmt: ok"
 }
@@ -55,14 +105,16 @@ fmt() {
 case "${1:-all}" in
 license) license ;;
 fmt) fmt ;;
+ext) ext ;;
 all)
 	rc=0
 	license || rc=1
+	ext || rc=1
 	fmt || rc=1
 	exit $rc
 	;;
 *)
-	echo "usage: ci/lint.sh [license|fmt]" >&2
+	echo "usage: ci/lint.sh [license|ext|fmt]" >&2
 	exit 2
 	;;
 esac

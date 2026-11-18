@@ -169,6 +169,12 @@ take its place behind the same interface.
 
 ## Build and install
 
+A release's assets include a binary package for the Cloudberry commit its
+CI built against (named in the file and in its `BUILD-INFO`), on Rocky
+Linux 9, x86-64.  Unpack it and run `./install.sh` (on every host, or
+once with `--hosts FILE`); it copies the libraries and extension files to
+where `pg_config` says.  For any other Cloudberry, build from source:
+
 ```sh
 make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config
 make PG_CONFIG=/usr/local/cloudberry-db/bin/pg_config install
@@ -282,6 +288,31 @@ cancels some of them with a short `statement_timeout`, terminates a
 session now and then, and checks every completed query against its
 result with `vec.mode` off; at the end no workfile, temporary file or
 busy backend may be left.
+
+CI (`.github/workflows/ci.yml`, steps in `ci/ci.sh`, runnable by hand in
+Cloudberry's build container) runs on every push and pull request:
+license headers and `cargo fmt` (`ci/lint.sh`), the build with C warnings
+as errors, `cargo clippy`, the regression tests, the engine check and the
+unit tests.  Weekly it also builds Cloudberry with assertions and runs the
+tests on it, the unit tests under AddressSanitizer, and five minutes each
+of `tools/stress.py` and `tools/fuzz.py` over TPC-H at scale factor 1.
+
+## Versions and releases
+
+A release is a tag `vX.Y.Z` with a section of its own in `CHANGELOG.md`;
+pushing the tag makes CI build, test and publish it (GitHub Release with
+the notes and the binary package).  The extension's own version, the
+`default_version` of `vec_executor.control` that `CREATE EXTENSION`
+installs, counts its SQL objects only and changes only when they do:
+then a new install script `vec_executor--NEW.sql` and an update script
+`vec_executor--OLD--NEW.sql` for `ALTER EXTENSION vec_executor UPDATE`.
+A script a release shipped is never edited (`ci/lint.sh ext` checks
+both).  The libraries are replaced on upgrade like any extension's;
+sessions load the new ones as they start.
+
+| Release | Extension version | Built against |
+|---|---|---|
+| 0.1.0 | 1.0 | Cloudberry main, `6b467e32` (CI) |
 
 ## Documentation
 

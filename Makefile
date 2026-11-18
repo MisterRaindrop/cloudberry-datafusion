@@ -40,7 +40,8 @@ OBJS = src/vx_init.o src/vx_runtime.o src/vx_debug.o \
 	src/vx_regex.o
 
 EXTENSION = vec_executor
-DATA = vec_executor--1.0.sql
+# every install and update script (README, Versions)
+DATA = $(wildcard vec_executor--*.sql)
 PGFILEDESC = "vec_executor - vectorized execution backend on Apache DataFusion"
 
 REGRESS = vec_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage insert parallel

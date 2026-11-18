@@ -29,6 +29,11 @@
 # AddressSanitizer; "release" also loads TPC-H at scale factor 1 and runs
 # tools/stress.py and tools/fuzz.py for a few minutes.
 #
+# The release variant packages what it built (ci/ci.sh package), kept as
+# the run's artifact.  A tag v* runs the same and then publishes: a GitHub
+# Release of the tag, its notes the tag's section of CHANGELOG.md, with the
+# package attached.
+#
 # Pushes and pull requests build the Cloudberry commit CLOUDBERRY_PIN, which
 # the expected outputs are for.  The weekly run takes Cloudberry's latest
 # main instead, so that a change there the PAX patches, the hooks or the
@@ -39,6 +44,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   schedule:
     - cron: '17 3 * * 1'
@@ -68,6 +74,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0      # the tags, for ci/lint.sh ext
       - name: Install rustfmt
         run: |
           cd engines/datafusion
@@ -124,6 +132,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           path: vec_executor
+          fetch-depth: 0      # the tags, which name the package
 
       - name: Find the Cloudberry commit
         id: cbdb
@@ -232,6 +241,18 @@ jobs:
         if: matrix.variant == 'release' && needs.plan.outputs.full == 'true'
         run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh soak cloudberry"
 
+      - name: Package
+        if: matrix.variant == 'release'
+        run: |
+          su - gpadmin -c "cd '$GITHUB_WORKSPACE' && CLOUDBERRY_COMMIT=${{ steps.cbdb.outputs.sha }} vec_executor/ci/ci.sh package cloudberry package"
+
+      - name: Keep the package
+        if: matrix.variant == 'release'
+        uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: package/
+
       - name: Keep the test output
         if: failure()
         uses: actions/upload-artifact@v7
@@ -245,3 +266,28 @@ jobs:
             vec_executor/results-engine
             cloudberry/gpAux/gpdemo/datadirs/qddir/demoDataDir-1/log
           if-no-files-found: ignore
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: package
+          path: package
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=${GITHUB_REF#refs/tags/}
+          ci/release-notes.sh "${tag#v}" > notes.md
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" package/* --clobber
+          else
+            gh release create "$tag" --verify-tag --title "vec_executor ${tag#v}" \
+              --notes-file notes.md package/*
+          fi

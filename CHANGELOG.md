@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Releases come with a binary package (Rocky Linux 9, x86-64, for the
+  Cloudberry commit CI builds against) and `install.sh`.
+- `tools/tpch`: the TPC-H schema, queries, loader and benchmark behind
+  `docs/benchmarks.md`, with a baseline to compare a change against.
+- CI checks license headers, formatting, compiler warnings and clippy, and
+  weekly runs the tests on Cloudberry built with assertions, the engine's
+  unit tests under AddressSanitizer, and a stress and fuzz soak.
 - The query of `INSERT ... SELECT`, `CREATE TABLE AS`, `SELECT INTO` and
   materialized views runs in the engine; the writing stays on PostgreSQL.
   At SF10, grouping lineitem into 7.9 million rows and inserting them
