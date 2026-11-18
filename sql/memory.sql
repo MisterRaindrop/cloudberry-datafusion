@@ -40,8 +40,10 @@ FROM gp_dist_random('gp_id');
 -- engine.
 ALTER DATABASE contrib_regression SET session_preload_libraries = 'vec_executor';
 \c
+-- enough groups per segment for the engine to spill at 2 MB on clusters of
+-- more segments too (ci/multihost.sh: four)
 CREATE TABLE df_wf AS SELECT i AS k, i % 100 AS g, repeat('x', 40) AS pad
-FROM generate_series(1, 1000000) i DISTRIBUTED BY (g);
+FROM generate_series(1, 2000000) i DISTRIBUTED BY (g);
 SET vec.mode = on;
 SET statement_mem = '2MB';
 \set VERBOSITY sqlstate

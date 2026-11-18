@@ -180,7 +180,10 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM df_fl a JOIN df_fl b ON a.f = b.g WHERE
 -- finite values add up to an infinity, in one stage and where partial sums
 -- meet; an infinite value is no overflow.
 CREATE TABLE df_fo (k int, g int, f float8, h float4) DISTRIBUTED BY (k);
-INSERT INTO df_fo SELECT i, i % 3, CASE WHEN i % 1000 = 0 THEN 1e308 ELSE i END, i
+-- h stays small, so that every partial sum of it is exact in float4 and
+-- the result does not depend on the order of the additions (which follows
+-- the number of segments and partitions)
+INSERT INTO df_fo SELECT i, i % 3, CASE WHEN i % 1000 = 0 THEN 1e308 ELSE i END, i % 100
 FROM generate_series(1, 20000) i;
 ANALYZE df_fo;
 SET vec.mode = off;
