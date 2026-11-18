@@ -65,9 +65,11 @@ psql -X -q -d "$DB" -v ON_ERROR_STOP=1 -f "$HERE/schema.sql"
 # One chunk: generate it in a directory of its own, COPY each table's file
 # (dbgen ends every line with '|'), remove the files.
 load_chunk() {
-	local i=$1 dir="$WORK/chunk$1"
+	local i=$1 dir="$WORK/chunk$1" part=()
+	# dbgen refuses -C 1 -S 1: one chunk is the whole scale factor
+	[ "$CHUNKS" -eq 1 ] || part=(-C "$CHUNKS" -S "$i")
 	mkdir -p "$dir"
-	(cd "$dir" && DSS_CONFIG="$DBGEN" "$DBGEN/dbgen" -q -f -s "$SF" -C "$CHUNKS" -S "$i" -b "$DBGEN/dists.dss")
+	(cd "$dir" && DSS_CONFIG="$DBGEN" "$DBGEN/dbgen" -q -f -s "$SF" "${part[@]}" -b "$DBGEN/dists.dss")
 	for f in "$dir"/*.tbl*; do
 		[ -e "$f" ] || continue
 		local t
