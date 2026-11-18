@@ -15,6 +15,27 @@ the error.  A panic inside Rust, on the main thread or on a worker, surfaces
 as an ordinary `ERROR` without taking the backend down.  Nothing executes
 queries yet.
 
+How soon a stopped query stops: the main thread waits on the runtime in
+10 ms slices and so sees a cancel, a statement timeout or a terminate
+request within one; it frees the query, which aborts the query's tasks
+without waiting for them (`query_free`), and reports the error.  Measured
+at TPC-H SF10 in the 3-segment container on 2026-11-18, with six other
+sessions running queries: Q17 stopped by `statement_timeout` returned its
+error 0.52 s after the timeout (median of 8, at most 0.69 s), and 0.51 s
+(at most 0.63 s) without the engine.  That time is Cloudberry's own; the
+engine's threads had stopped before the error arrived.  An aborted task
+stops only at its next yield point, so some work goes on after
+`query_free`.  Over 642 queries stopped in ten minutes of
+`tools/stress.py` with eight sessions, the last task of a query ended
+19 ms after the query was freed (median), 449 ms at the 99th percentile
+and 842 ms at most.  What runs on is a step of DataFusion that does not
+yield, such as sorting and writing one spill run of a hash aggregation in
+a single poll; it grows with the budget per partition.  Once, in an
+earlier run of the same test, a final hash aggregation was still creating
+spill files 2.5 s after its QE was cancelled.  Such work costs CPU and
+disk, not time to the client, and spill files that a task still running at
+backend exit leaves are removed by the next backend (SX1).
+
 `vec.worker_threads` sets the runtime size (0 = one thread per CPU).
 It takes effect when a backend first uses DataFusion.  Each query of a
 slice runs in `vec.slice_partitions` partitions; 0, the default,
