@@ -162,7 +162,10 @@ pub fn to_pg_error(e: &DataFusionError) -> PgError {
             return PgError::new("53200", "out of memory")
                 .with_detail(format!("DataFusion: {msg}"));
         }
-        if let Some(code) = err.downcast_ref::<std::io::Error>().and_then(file_access_sqlstate) {
+        if let Some(code) = err
+            .downcast_ref::<std::io::Error>()
+            .and_then(file_access_sqlstate)
+        {
             return PgError::new(code, format!("datafusion error: {e}"));
         }
         cur = err.source();
@@ -176,7 +179,7 @@ pub fn to_pg_error(e: &DataFusionError) -> PgError {
 /// stay internal errors.
 fn file_access_sqlstate(e: &std::io::Error) -> Option<&'static str> {
     match e.raw_os_error()? {
-        libc::ENOSPC => Some("53100"),                 // disk_full
+        libc::ENOSPC => Some("53100"),                // disk_full
         libc::EMFILE | libc::ENFILE => Some("53000"), // insufficient_resources
         _ => None,
     }

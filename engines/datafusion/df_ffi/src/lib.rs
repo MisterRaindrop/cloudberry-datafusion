@@ -351,7 +351,9 @@ extern "C" fn query_start(
             df_core::query::Options::default()
         } else {
             // SAFETY: as above.
-            df_core::query::Options::parse(&unsafe { CStr::from_ptr(a.engine_options) }.to_string_lossy())?
+            df_core::query::Options::parse(
+                &unsafe { CStr::from_ptr(a.engine_options) }.to_string_lossy(),
+            )?
         };
         let q = df_core::query::Query::start_options(
             &ir,

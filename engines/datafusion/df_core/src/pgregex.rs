@@ -233,7 +233,13 @@ impl Matcher {
 
     /// Where matches of reversed `dfa` anchored at the end of `s` start, from
     /// `from` on, as flags by offset from `from`.
-    fn starts(dfa: &DFA, cache: &mut Cache, s: &str, from: usize, flags: &mut Vec<bool>) -> Result<()> {
+    fn starts(
+        dfa: &DFA,
+        cache: &mut Cache,
+        s: &str,
+        from: usize,
+        flags: &mut Vec<bool>,
+    ) -> Result<()> {
         flags.clear();
         flags.resize(s.len() - from + 1, false);
         let input = Input::new(s).range(from..).anchored(Anchored::Yes);
@@ -333,7 +339,13 @@ impl PgRegexpReplace {
     }
 
     /// `s` with its match replaced, into `out`; false if nothing matches.
-    fn replace(&self, c: &mut Caches, s: &str, flags: &mut Vec<bool>, out: &mut String) -> Result<bool> {
+    fn replace(
+        &self,
+        c: &mut Caches,
+        s: &str,
+        flags: &mut Vec<bool>,
+        out: &mut String,
+    ) -> Result<bool> {
         let Some(bounds) = self.matcher.find(c, s, flags)? else {
             return Ok(false);
         };
@@ -416,25 +428,62 @@ mod tests {
 
     fn rr(segs: &[(&str, bool)], repl: &str, s: &str) -> String {
         let segs = segs.iter().map(|&(r, c)| seg(r, c)).collect();
-        PgRegexpReplace::new(segs, repl.into()).unwrap().eval(s).unwrap()
+        PgRegexpReplace::new(segs, repl.into())
+            .unwrap()
+            .eval(s)
+            .unwrap()
     }
 
     // Results of PostgreSQL 16 (regexp_replace(s, pattern, repl)).
     #[test]
     fn splits_as_postgres() {
         // '^a?(?:ab)?(.*)$': the part before the group as long as it can be
-        assert_eq!(rr(&[("^a?(?:ab)?", false), (".*", true), ("$", false)], "[\\1]", "ab"), "[]");
+        assert_eq!(
+            rr(
+                &[("^a?(?:ab)?", false), (".*", true), ("$", false)],
+                "[\\1]",
+                "ab"
+            ),
+            "[]"
+        );
         // 'a?(?:ab)?(.*)$': the leftmost match
-        assert_eq!(rr(&[("a?(?:ab)?", false), (".*", true), ("$", false)], "[\\1]", "xab"), "[xab]");
+        assert_eq!(
+            rr(
+                &[("a?(?:ab)?", false), (".*", true), ("$", false)],
+                "[\\1]",
+                "xab"
+            ),
+            "[xab]"
+        );
         // '^(a*)(a*)$'
-        assert_eq!(rr(&[("^", false), ("a*", true), ("a*", true), ("$", false)], "[\\1|\\2]", "aaa"), "[aaa|]");
+        assert_eq!(
+            rr(
+                &[("^", false), ("a*", true), ("a*", true), ("$", false)],
+                "[\\1|\\2]",
+                "aaa"
+            ),
+            "[aaa|]"
+        );
         // '^(?:ab)?(a?)(.*)$'
         assert_eq!(
-            rr(&[("^(?:ab)?", false), ("a?", true), (".*", true), ("$", false)], "[\\1|\\2]", "abab"),
+            rr(
+                &[
+                    ("^(?:ab)?", false),
+                    ("a?", true),
+                    (".*", true),
+                    ("$", false)
+                ],
+                "[\\1|\\2]",
+                "abab"
+            ),
             "[a|b]"
         );
         // ClickBench's Q29
-        let q29 = [("^https?://(?:www\\.)?", false), ("[^/]+", true), ("/.*$", false)];
+        let q29 = [
+            ("^https?://(?:www\\.)?", false),
+            ("[^/]+", true),
+            ("/.*$", false),
+        ];
         assert_eq!(rr(&q29, "\\1", "http://www.x.com/p"), "x.com");
         assert_eq!(rr(&q29, "\\1", "https://www.x.com/"), "x.com");
         assert_eq!(rr(&q29, "\\1", "https://www./"), "www.");
@@ -457,7 +506,13 @@ mod tests {
 
     #[test]
     fn literals_are_quoted() {
-        assert_eq!(translate("a\\.b[\\]&-]#x{2,3}(?:y)").unwrap(), "a\\.b[\\]\\&\\-]\\#x{2,3}(?:y)");
-        assert_eq!(rr(&[("[a-c&]+", true), ("$", false)], "<\\1>", "zz&b"), "zz<&b>");
+        assert_eq!(
+            translate("a\\.b[\\]&-]#x{2,3}(?:y)").unwrap(),
+            "a\\.b[\\]\\&\\-]\\#x{2,3}(?:y)"
+        );
+        assert_eq!(
+            rr(&[("[a-c&]+", true), ("$", false)], "<\\1>", "zz&b"),
+            "zz<&b>"
+        );
     }
 }

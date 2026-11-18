@@ -138,8 +138,11 @@ impl WriteGate {
 
 fn batch(start: i32, n: i32) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-    RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from_iter_values(start..start + n))])
-        .unwrap()
+    RecordBatch::try_new(
+        schema,
+        vec![Arc::new(Int32Array::from_iter_values(start..start + n))],
+    )
+    .unwrap()
 }
 
 /// Two writers push at once, the first held inside its first write while
@@ -165,10 +168,9 @@ fn a_spill_pool_reader_reads_every_open_file() {
     };
     let disk = Arc::new(DiskManagerBuilder::default().build().unwrap());
     let env = RuntimeEnvBuilder::new()
-        .with_disk_manager_builder(
-            DiskManagerBuilder::default()
-                .with_mode(DiskManagerMode::Custom(Arc::new(HookFactory { inner: disk, hook }))),
-        )
+        .with_disk_manager_builder(DiskManagerBuilder::default().with_mode(
+            DiskManagerMode::Custom(Arc::new(HookFactory { inner: disk, hook })),
+        ))
         .build_arc()
         .unwrap();
     let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);

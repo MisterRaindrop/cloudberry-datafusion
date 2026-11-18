@@ -20,14 +20,16 @@ use datafusion::common::{Result, ScalarValue};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature,
-    Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, EmitTo, GroupsAccumulator, Signature, Volatility,
 };
 
 use crate::pgfunc::PgError;
 
 fn overflow() -> DataFusionError {
-    DataFusionError::External(Box::new(PgError::new("22003", "value out of range: overflow")))
+    DataFusionError::External(Box::new(PgError::new(
+        "22003",
+        "value out of range: overflow",
+    )))
 }
 
 /// float8_pl: `s + v`, or PostgreSQL's error when finite values make an
@@ -52,13 +54,15 @@ fn sub(s: f64, v: f64) -> Result<f64> {
 }
 
 fn f64s(a: &ArrayRef) -> Result<&Float64Array> {
-    a.as_primitive_opt::<Float64Type>()
-        .ok_or_else(|| DataFusionError::Internal(format!("pg float aggregate of {}", a.data_type())))
+    a.as_primitive_opt::<Float64Type>().ok_or_else(|| {
+        DataFusionError::Internal(format!("pg float aggregate of {}", a.data_type()))
+    })
 }
 
 fn i64s(a: &ArrayRef) -> Result<&Int64Array> {
-    a.as_primitive_opt::<Int64Type>()
-        .ok_or_else(|| DataFusionError::Internal(format!("pg float aggregate count of {}", a.data_type())))
+    a.as_primitive_opt::<Int64Type>().ok_or_else(|| {
+        DataFusionError::Internal(format!("pg float aggregate count of {}", a.data_type()))
+    })
 }
 
 /// Is row `r` of `values` counted: not NULL, and the filter true there?
@@ -109,12 +113,20 @@ impl AggregateUDFImpl for PgFloatAgg {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        let sum = Arc::new(Field::new(format!("{}[sum]", args.name), DataType::Float64, true));
+        let sum = Arc::new(Field::new(
+            format!("{}[sum]", args.name),
+            DataType::Float64,
+            true,
+        ));
         Ok(match self.kind {
             FloatAgg::Sum => vec![sum],
             FloatAgg::Avg => vec![
                 sum,
-                Arc::new(Field::new(format!("{}[count]", args.name), DataType::Int64, true)),
+                Arc::new(Field::new(
+                    format!("{}[count]", args.name),
+                    DataType::Int64,
+                    true,
+                )),
             ],
         })
     }
@@ -338,19 +350,35 @@ mod tests {
 
     #[test]
     fn sum_overflow_is_an_error() {
-        let mut g = FloatGroups { kind: FloatAgg::Sum, sums: vec![], counts: vec![] };
+        let mut g = FloatGroups {
+            kind: FloatAgg::Sum,
+            sums: vec![],
+            counts: vec![],
+        };
         let e = g
             .update_batch(&[arr(vec![Some(1e308), Some(1e308)])], &[0, 0], None, 1)
             .unwrap_err();
         let pg = to_pg_error(&e);
-        assert_eq!((pg.sqlstate, pg.message.as_str()), ("22003", "value out of range: overflow"));
+        assert_eq!(
+            (pg.sqlstate, pg.message.as_str()),
+            ("22003", "value out of range: overflow")
+        );
     }
 
     #[test]
     fn infinite_inputs_are_not_an_overflow() {
-        let mut g = FloatGroups { kind: FloatAgg::Sum, sums: vec![], counts: vec![] };
-        g.update_batch(&[arr(vec![Some(f64::INFINITY), Some(1e308), None])], &[0, 0, 1], None, 2)
-            .unwrap();
+        let mut g = FloatGroups {
+            kind: FloatAgg::Sum,
+            sums: vec![],
+            counts: vec![],
+        };
+        g.update_batch(
+            &[arr(vec![Some(f64::INFINITY), Some(1e308), None])],
+            &[0, 0, 1],
+            None,
+            2,
+        )
+        .unwrap();
         let r = g.evaluate(EmitTo::All).unwrap();
         let r = r.as_primitive::<Float64Type>();
         assert!(r.value(0).is_infinite());
@@ -359,7 +387,11 @@ mod tests {
 
     #[test]
     fn merging_partial_sums_checks_too() {
-        let mut g = FloatGroups { kind: FloatAgg::Avg, sums: vec![], counts: vec![] };
+        let mut g = FloatGroups {
+            kind: FloatAgg::Avg,
+            sums: vec![],
+            counts: vec![],
+        };
         let counts: ArrayRef = Arc::new(Int64Array::from(vec![1, 1]));
         assert!(g
             .merge_batch(&[arr(vec![Some(1e308), Some(1e308)]), counts], &[0, 0], 1)
@@ -368,12 +400,25 @@ mod tests {
 
     #[test]
     fn avg_and_negative_zero() {
-        let mut g = FloatGroups { kind: FloatAgg::Avg, sums: vec![], counts: vec![] };
-        g.update_batch(&[arr(vec![Some(1.0), Some(2.0), None])], &[0, 0, 0], None, 1)
-            .unwrap();
+        let mut g = FloatGroups {
+            kind: FloatAgg::Avg,
+            sums: vec![],
+            counts: vec![],
+        };
+        g.update_batch(
+            &[arr(vec![Some(1.0), Some(2.0), None])],
+            &[0, 0, 0],
+            None,
+            1,
+        )
+        .unwrap();
         let r = g.evaluate(EmitTo::All).unwrap();
         assert_eq!(r.as_primitive::<Float64Type>().value(0), 1.5);
-        let mut a = FloatAcc { kind: FloatAgg::Sum, sum: 0.0, count: 0 };
+        let mut a = FloatAcc {
+            kind: FloatAgg::Sum,
+            sum: 0.0,
+            count: 0,
+        };
         a.update_batch(&[arr(vec![Some(-0.0)])]).unwrap();
         // 0.0 + -0.0 is 0.0, as DataFusion's sum gives (README)
         assert_eq!(a.evaluate().unwrap(), ScalarValue::Float64(Some(0.0)));

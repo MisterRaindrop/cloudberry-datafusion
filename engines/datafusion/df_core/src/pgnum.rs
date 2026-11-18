@@ -487,7 +487,10 @@ pub fn pg_stddev(
         return Err(beyond());
     }
     let var = pg_div(num, 0, den, 0, rscale, rscale as i8).ok_or_else(beyond)?;
-    let at_to = |v: i256| v.checked_mul(pow10((to as i32 - rscale) as u32)).ok_or_else(beyond);
+    let at_to = |v: i256| {
+        v.checked_mul(pow10((to as i32 - rscale) as u32))
+            .ok_or_else(beyond)
+    };
     if variance {
         return Ok(Some((at_to(var)?, rscale)));
     }
@@ -540,7 +543,11 @@ pub fn pg_round(v: i256, from: i8, to: i8) -> Option<i256> {
     let d = pow10((from - to) as u32);
     let (q, r) = (v / d, v % d);
     if r.wrapping_abs().checked_mul(i256::from_i128(2))? >= d {
-        q.checked_add(if v < i256::ZERO { i256::MINUS_ONE } else { i256::ONE })
+        q.checked_add(if v < i256::ZERO {
+            i256::MINUS_ONE
+        } else {
+            i256::ONE
+        })
     } else {
         Some(q)
     }
@@ -999,7 +1006,8 @@ impl Accumulator for SumDecimal {
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let flag = |n: i64, bit: u8| if n > 0 { bit } else { 0 };
-        let saw = flag(self.nans, SAW_NAN) | flag(self.pinfs, SAW_PINF) | flag(self.ninfs, SAW_NINF);
+        let saw =
+            flag(self.nans, SAW_NAN) | flag(self.pinfs, SAW_PINF) | flag(self.ninfs, SAW_NINF);
         let v = (self.values > 0).then(|| special_sum(saw).unwrap_or(self.sum));
         if let DataType::Decimal128(..) = self.data_type {
             let v = v
@@ -1121,7 +1129,10 @@ impl SumDecimalGroups {
         let values = xs.values();
         let take = |r: usize| xs.is_valid(r) && filter.is_none_or(|f| f.is_valid(r) && f.value(r));
         let dense = xs.null_count() == 0 && filter.is_none();
-        if values.iter().fold(true, |all, &v| all & (v == v as i64 as i128)) {
+        if values
+            .iter()
+            .fold(true, |all, &v| all & (v == v as i64 as i128))
+        {
             if self.narrow_rows + groups.len() as u64 > 1 << 62 {
                 self.fold_narrow();
             }
@@ -1258,7 +1269,10 @@ impl GroupsAccumulator for SumDecimalGroups {
             .collect();
         let nulls = Some(NullBuffer::from(keep));
         Ok(vec![match narrow_array(&a) {
-            Some(d) => Arc::new(Decimal128Array::new(d.values().clone(), nulls).with_data_type(self.data_type.clone())),
+            Some(d) => Arc::new(
+                Decimal128Array::new(d.values().clone(), nulls)
+                    .with_data_type(self.data_type.clone()),
+            ),
             None => Arc::new(
                 Decimal256Array::new(decimal(&a)?.values().clone(), nulls)
                     .with_data_type(self.data_type.clone()),
@@ -1311,7 +1325,11 @@ pub enum NumericFn {
     DivScale { x: i8, y: i8 },
     /// STD1: stddev or variance (pg_stddev) of a count, a sum and a sum of
     /// squares of integers, at scale `to`; NULL as PostgreSQL's.
-    Stddev { sample: bool, variance: bool, to: i8 },
+    Stddev {
+        sample: bool,
+        variance: bool,
+        to: i8,
+    },
     /// STD1: its display scale, int4.
     StddevScale { sample: bool, variance: bool },
 }
@@ -1409,7 +1427,11 @@ impl ScalarUDFImpl for PgNumeric {
         let n = args.number_rows;
         let arrow = |e: ArrowError| DataFusionError::ArrowError(Box::new(e), None);
         let stddev = match self.f {
-            NumericFn::Stddev { sample, variance, to } => Some((sample, variance, to, false)),
+            NumericFn::Stddev {
+                sample,
+                variance,
+                to,
+            } => Some((sample, variance, to, false)),
             NumericFn::StddevScale { sample, variance } => {
                 Some((sample, variance, STDDEV_MAX_SCALE, true))
             }
@@ -1429,8 +1451,15 @@ impl ScalarUDFImpl for PgNumeric {
                 let got = if counts.is_null(r) || sums.is_null(r) || squares.is_null(r) {
                     None
                 } else {
-                    pg_stddev(counts.value(r), sums.value(r), squares.value(r), sample, variance, to)
-                        .map_err(arrow)?
+                    pg_stddev(
+                        counts.value(r),
+                        sums.value(r),
+                        squares.value(r),
+                        sample,
+                        variance,
+                        to,
+                    )
+                    .map_err(arrow)?
                 };
                 values.push(got.map(|(v, _)| v));
                 scales.push(got.map(|(_, d)| d));
@@ -1529,8 +1558,13 @@ impl ScalarUDFImpl for PgNumeric {
             }
             NumericFn::Abs => {
                 // within 76 digits, far from i256::MIN
-                let a: Decimal256Array =
-                    xs.unary(|v| if v == NUMERIC_NAN { v } else { v.wrapping_abs() });
+                let a: Decimal256Array = xs.unary(|v| {
+                    if v == NUMERIC_NAN {
+                        v
+                    } else {
+                        v.wrapping_abs()
+                    }
+                });
                 Arc::new(a.with_data_type(x.data_type().clone()))
             }
             NumericFn::Round { from, to } => {
@@ -1616,7 +1650,10 @@ impl ScalarUDFImpl for PgNumeric {
                 let ys = decimal(&y)?;
                 let int = |a: &ArrayRef| {
                     a.as_primitive_opt::<Int32Type>().cloned().ok_or_else(|| {
-                        DataFusionError::Internal(format!("div: display scale of type {}", a.data_type()))
+                        DataFusionError::Internal(format!(
+                            "div: display scale of type {}",
+                            a.data_type()
+                        ))
                     })
                 };
                 let (dx, dy) = (int(&dx)?, int(&dy)?);
@@ -1641,7 +1678,8 @@ impl ScalarUDFImpl for PgNumeric {
                             None,
                         ));
                     }
-                    let d = |s: &PrimitiveArray<Int32Type>| if s.is_null(r) { 0 } else { s.value(r) };
+                    let d =
+                        |s: &PrimitiveArray<Int32Type>| if s.is_null(r) { 0 } else { s.value(r) };
                     let rscale = pg_div_rscale(a, sx, d(&dx), b, sy, d(&dy));
                     scales.push(Some(rscale));
                     if !scale_only {
@@ -1649,7 +1687,11 @@ impl ScalarUDFImpl for PgNumeric {
                             NumericFn::Div { to, .. } => to,
                             _ => unreachable!(),
                         };
-                        values.push(Some(pg_div(a, sx, b, sy, rscale, to).ok_or_else(beyond).map_err(arrow)?));
+                        values.push(Some(
+                            pg_div(a, sx, b, sy, rscale, to)
+                                .ok_or_else(beyond)
+                                .map_err(arrow)?,
+                        ));
                     }
                 }
                 match self.f {
@@ -1738,7 +1780,11 @@ impl Exact {
         if v == NUMERIC_NAN {
             return Exact::Nan;
         }
-        Exact::Num { neg: v < i256::ZERO, mag: magnitude(v), scale: scale as i32 }
+        Exact::Num {
+            neg: v < i256::ZERO,
+            mag: magnitude(v),
+            scale: scale as i32,
+        }
     }
 
     /// pg_div's quotient, without its bound on digits: rounded half away
@@ -1762,7 +1808,11 @@ impl Exact {
         if (num % &den) * 2u32 >= den {
             q += 1u32;
         }
-        Some(Exact::Num { neg: (x < i256::ZERO) != (y < i256::ZERO), mag: q, scale: rscale })
+        Some(Exact::Num {
+            neg: (x < i256::ZERO) != (y < i256::ZERO),
+            mag: q,
+            scale: rscale,
+        })
     }
 
     /// As PostgreSQL orders numeric: NaN above every number, equal to NaN.
@@ -1772,14 +1822,26 @@ impl Exact {
             (Exact::Nan, _) => Ordering::Greater,
             (_, Exact::Nan) => Ordering::Less,
             (
-                Exact::Num { neg: na, mag: ma, scale: sa },
-                Exact::Num { neg: nb, mag: mb, scale: sb },
+                Exact::Num {
+                    neg: na,
+                    mag: ma,
+                    scale: sa,
+                },
+                Exact::Num {
+                    neg: nb,
+                    mag: mb,
+                    scale: sb,
+                },
             ) => {
                 // -0 is 0
                 let na = *na && ma.bits() > 0;
                 let nb = *nb && mb.bits() > 0;
                 if na != nb {
-                    return if na { Ordering::Less } else { Ordering::Greater };
+                    return if na {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
                 }
                 let s = (*sa).max(*sb);
                 let o = (ma * ten(s - sa)).cmp(&(mb * ten(s - sb)));
@@ -1849,14 +1911,20 @@ impl ScalarUDFImpl for PgNumCmp {
                     }
                     let d = |a: &ArrayRef| -> Result<i32> {
                         let s = a.as_primitive_opt::<Int32Type>().ok_or_else(|| {
-                            DataFusionError::Internal(format!("cmp: display scale of type {}", a.data_type()))
+                            DataFusionError::Internal(format!(
+                                "cmp: display scale of type {}",
+                                a.data_type()
+                            ))
                         })?;
                         Ok(if s.is_null(r) { 0 } else { s.value(r) })
                     };
                     Exact::quotient(x.value(r), sx, d(&a[1])?, y.value(r), sy, d(&a[3])?)
                         .map(Some)
                         .ok_or_else(|| {
-                            DataFusionError::ArrowError(Box::new(crate::pgfunc::division_by_zero()), None)
+                            DataFusionError::ArrowError(
+                                Box::new(crate::pgfunc::division_by_zero()),
+                                None,
+                            )
                         })
                 }
             }
@@ -2065,7 +2133,9 @@ mod tests {
         assert!(MotionNumeric::Int64.narrow(&big).is_err());
         let n = MotionNumeric::Decimal128.narrow(&big).unwrap();
         assert_eq!(
-            widen(&MotionNumeric::Decimal128.widen(&n, 38, 4).unwrap()).unwrap().as_ref(),
+            widen(&MotionNumeric::Decimal128.widen(&n, 38, 4).unwrap())
+                .unwrap()
+                .as_ref(),
             big.as_ref()
         );
         assert_eq!(MotionNumeric::of_digits(18), Some(MotionNumeric::Int64));
@@ -2183,7 +2253,13 @@ mod tests {
         let digits = v.wrapping_abs().to_string();
         let digits = format!("{:0>width$}", digits, width = scale as usize + 1);
         let (int, frac) = digits.split_at(digits.len() - scale as usize);
-        format!("{}{}{}{}", if neg { "-" } else { "" }, int, if scale > 0 { "." } else { "" }, frac)
+        format!(
+            "{}{}{}{}",
+            if neg { "-" } else { "" },
+            int,
+            if scale > 0 { "." } else { "" },
+            frac
+        )
     }
 
     /// numeric_div's values and display scales, from PostgreSQL itself;
@@ -2220,7 +2296,11 @@ mod tests {
                 let rscale = pg_div_rscale(xc, xs + pad, xs as i32, yc, ys + pad, ys as i32);
                 let q = pg_div(xc, xs + pad, yc, ys + pad, rscale, 40).unwrap();
                 let q = q / pow10((40 - rscale) as u32);
-                assert_eq!(show(q, rscale), want, "{x} / {y} carried {pad} digits finer");
+                assert_eq!(
+                    show(q, rscale),
+                    want,
+                    "{x} / {y} carried {pad} digits finer"
+                );
             }
         }
     }
@@ -2576,8 +2656,10 @@ mod tests {
             // sums: narrow and general batches into the same groups
             let groups: Vec<usize> = (0..n).map(|_| (next() % 5) as usize).collect();
             let mut g = SumDecimalGroups::new(numeric_type(2));
-            g.update_batch(std::slice::from_ref(&xa), &groups, None, 5).unwrap();
-            g.update_batch(std::slice::from_ref(&xb), &groups, None, 5).unwrap();
+            g.update_batch(std::slice::from_ref(&xa), &groups, None, 5)
+                .unwrap();
+            g.update_batch(std::slice::from_ref(&xb), &groups, None, 5)
+                .unwrap();
             let out = g.evaluate(EmitTo::All).unwrap();
             let out = decimal(&out).unwrap();
             for k in 0..5 {
@@ -2621,7 +2703,8 @@ mod tests {
         g.update_batch(&[more], &[0, 2, 1], None, 3).unwrap();
         assert_eq!(g.wide.len(), 3);
         // and keeps up with groups that small values add afterwards
-        g.update_batch(&[dec256(vec![Some(i(7))], 2)], &[3], None, 4).unwrap();
+        g.update_batch(&[dec256(vec![Some(i(7))], 2)], &[3], None, 4)
+            .unwrap();
         let out = g.evaluate(EmitTo::All).unwrap();
         let out = decimal(&out).unwrap();
         assert_eq!(
@@ -2639,12 +2722,20 @@ mod tests {
         assert!(g.wide.is_empty());
         let out = g.evaluate(EmitTo::First(1)).unwrap();
         assert_eq!(out.as_primitive::<Decimal128Type>().value(0), 1);
-        g.update_batch(&[d128(vec![Some(big), Some(NARROW_NAN), Some(5)])], &[0, 2, 1], None, 3)
-            .unwrap();
+        g.update_batch(
+            &[d128(vec![Some(big), Some(NARROW_NAN), Some(5)])],
+            &[0, 2, 1],
+            None,
+            3,
+        )
+        .unwrap();
         let out = g.evaluate(EmitTo::All).unwrap();
         let out = out.as_primitive::<Decimal128Type>();
         assert_eq!(out.data_type(), &t);
-        assert_eq!((out.value(0), out.value(1), out.value(2)), (big, 3 + 5, NARROW_NAN));
+        assert_eq!(
+            (out.value(0), out.value(1), out.value(2)),
+            (big, 3 + 5, NARROW_NAN)
+        );
         assert!(out.is_valid(0) && out.is_valid(2));
     }
 
@@ -2664,17 +2755,31 @@ mod tests {
         for (vals, want) in cases {
             let n = vals.len();
             let mut g = SumDecimalGroups::new(numeric_type(2));
-            g.update_batch(&[dec256(vals.iter().copied().map(Some).collect(), 2)], &vec![0; n], None, 1)
-                .unwrap();
-            assert_eq!(decimal(&g.evaluate(EmitTo::All).unwrap()).unwrap().value(0), want, "{vals:?}");
+            g.update_batch(
+                &[dec256(vals.iter().copied().map(Some).collect(), 2)],
+                &vec![0; n],
+                None,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                decimal(&g.evaluate(EmitTo::All).unwrap()).unwrap().value(0),
+                want,
+                "{vals:?}"
+            );
             // narrow: Decimal128 values and sum
             let t = DataType::Decimal128(38, 2);
             let narrow: Vec<Option<i128>> = vals.iter().map(|&v| narrow_value(v)).collect();
-            let a: ArrayRef = Arc::new(Decimal128Array::from(narrow).with_data_type(DataType::Decimal128(18, 2)));
+            let a: ArrayRef =
+                Arc::new(Decimal128Array::from(narrow).with_data_type(DataType::Decimal128(18, 2)));
             let mut g = SumDecimalGroups::new(t);
             g.update_batch(&[a], &vec![0; n], None, 1).unwrap();
             let out = g.evaluate(EmitTo::All).unwrap();
-            assert_eq!(Some(out.as_primitive::<Decimal128Type>().value(0)), narrow_value(want), "{vals:?}");
+            assert_eq!(
+                Some(out.as_primitive::<Decimal128Type>().value(0)),
+                narrow_value(want),
+                "{vals:?}"
+            );
             let mut a = SumDecimal {
                 data_type: numeric_type(2),
                 sum: i256::ZERO,
@@ -2683,8 +2788,13 @@ mod tests {
                 pinfs: 0,
                 ninfs: 0,
             };
-            a.update_batch(&[dec256(vals.iter().copied().map(Some).collect(), 2)]).unwrap();
-            assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(want), 76, 2), "{vals:?}");
+            a.update_batch(&[dec256(vals.iter().copied().map(Some).collect(), 2)])
+                .unwrap();
+            assert_eq!(
+                a.evaluate().unwrap(),
+                ScalarValue::Decimal256(Some(want), 76, 2),
+                "{vals:?}"
+            );
         }
         // a frame: +Inf in it, then out of it
         let mut a = SumDecimal {
@@ -2695,10 +2805,18 @@ mod tests {
             pinfs: 0,
             ninfs: 0,
         };
-        a.update_batch(&[dec256(vec![Some(NUMERIC_PINF), Some(i(3))], 2)]).unwrap();
-        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(NUMERIC_PINF), 76, 2));
-        a.retract_batch(&[dec256(vec![Some(NUMERIC_PINF)], 2)]).unwrap();
-        assert_eq!(a.evaluate().unwrap(), ScalarValue::Decimal256(Some(i(3)), 76, 2));
+        a.update_batch(&[dec256(vec![Some(NUMERIC_PINF), Some(i(3))], 2)])
+            .unwrap();
+        assert_eq!(
+            a.evaluate().unwrap(),
+            ScalarValue::Decimal256(Some(NUMERIC_PINF), 76, 2)
+        );
+        a.retract_batch(&[dec256(vec![Some(NUMERIC_PINF)], 2)])
+            .unwrap();
+        assert_eq!(
+            a.evaluate().unwrap(),
+            ScalarValue::Decimal256(Some(i(3)), 76, 2)
+        );
     }
 
     #[test]
@@ -2735,7 +2853,8 @@ mod tests {
         assert_eq!((out.value(0), out.value(1)), (i(375), NUMERIC_NAN));
         assert!(out.is_null(2) && out.is_null(3));
         // states merge as values; a NaN state keeps the group NaN; First(n) emits the first n
-        g.update_batch(std::slice::from_ref(&x), &groups, None, 4).unwrap();
+        g.update_batch(std::slice::from_ref(&x), &groups, None, 4)
+            .unwrap();
         let st = g.state(EmitTo::All).unwrap();
         let mut m = SumDecimalGroups::new(t.clone());
         m.merge_batch(&st, &[1, 1, 0, 0], 2).unwrap();
@@ -2816,9 +2935,15 @@ mod tests {
         let r = pg_div_rscale(x, 44, 44, y, 36, 36);
         assert_eq!(r, 44);
         let q = pg_div(x, 44, y, 36, r, 44).unwrap();
-        assert_eq!(Exact::quotient(x, 44, 44, y, 36, 36).unwrap(), Exact::value(q, 44));
+        assert_eq!(
+            Exact::quotient(x, 44, 44, y, 36, 36).unwrap(),
+            Exact::value(q, 44)
+        );
         let q2 = pg_div(i(-1), 44, y, 36, r, 44).unwrap();
-        assert_eq!(Exact::quotient(i(-1), 44, 44, y, 36, 36).unwrap(), Exact::value(q2, 44));
+        assert_eq!(
+            Exact::quotient(i(-1), 44, 44, y, 36, 36).unwrap(),
+            Exact::value(q2, 44)
+        );
         // still None where the quotient itself is beyond it
         assert_eq!(pg_div(pow10(75), 0, i(1), 40, 40, 40), None);
         // a quotient beyond 76 digits: 10^60 / 10^-40 at scale 40 (the
@@ -2832,12 +2957,28 @@ mod tests {
         // NaN above every number and equal to NaN; -0 is 0
         let nan = Exact::value(NUMERIC_NAN, 2);
         assert_eq!(nan.compare(&q), Ordering::Greater);
-        assert_eq!(nan.compare(&Exact::quotient(NUMERIC_NAN, 0, 0, i(0), 0, 0).unwrap()), Ordering::Equal);
-        let neg_zero = Exact::Num { neg: true, mag: BigUint::from(0u32), scale: 3 };
-        assert_eq!(neg_zero.compare(&Exact::value(i256::ZERO, 0)), Ordering::Equal);
+        assert_eq!(
+            nan.compare(&Exact::quotient(NUMERIC_NAN, 0, 0, i(0), 0, 0).unwrap()),
+            Ordering::Equal
+        );
+        let neg_zero = Exact::Num {
+            neg: true,
+            mag: BigUint::from(0u32),
+            scale: 3,
+        };
+        assert_eq!(
+            neg_zero.compare(&Exact::value(i256::ZERO, 0)),
+            Ordering::Equal
+        );
         // values of different scales: 1.50 = 1.5, -2 < -1.99
-        assert_eq!(Exact::value(i(150), 2).compare(&Exact::value(i(15), 1)), Ordering::Equal);
-        assert_eq!(Exact::value(i(-2), 0).compare(&Exact::value(i(-199), 2)), Ordering::Less);
+        assert_eq!(
+            Exact::value(i(150), 2).compare(&Exact::value(i(15), 1)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            Exact::value(i(-2), 0).compare(&Exact::value(i(-199), 2)),
+            Ordering::Less
+        );
     }
 
     #[test]
@@ -2900,20 +3041,41 @@ mod tests {
         };
         // 1, 2, 3, 4: 1.2909944487358056, 1.6666666666666667,
         // 1.1180339887498948, 1.2500000000000000
-        assert_eq!(at(4, 10, 30, true, false, 16), Some((v(12909944487358056), 16)));
-        assert_eq!(at(4, 10, 30, true, true, 16), Some((v(16666666666666667), 16)));
-        assert_eq!(at(4, 10, 30, false, false, 16), Some((v(11180339887498948), 16)));
-        assert_eq!(at(4, 10, 30, false, true, 16), Some((v(12500000000000000), 16)));
+        assert_eq!(
+            at(4, 10, 30, true, false, 16),
+            Some((v(12909944487358056), 16))
+        );
+        assert_eq!(
+            at(4, 10, 30, true, true, 16),
+            Some((v(16666666666666667), 16))
+        );
+        assert_eq!(
+            at(4, 10, 30, false, false, 16),
+            Some((v(11180339887498948), 16))
+        );
+        assert_eq!(
+            at(4, 10, 30, false, true, 16),
+            Some((v(12500000000000000), 16))
+        );
         // 7, 7, 7: 0; 5 alone: NULL for a sample, 0 for a population
         assert_eq!(at(3, 21, 147, true, false, 16), Some((v(0), 0)));
         assert_eq!(at(1, 5, 25, true, false, 16), None);
         assert_eq!(at(1, 5, 25, false, false, 16), Some((v(0), 0)));
         // 0, 1000000: 707106.78118655, 500000000000.00000000
-        assert_eq!(at(2, 1_000_000, 1_000_000_000_000, true, false, 8), Some((v(70710678118655), 8)));
-        assert_eq!(at(2, 1_000_000, 1_000_000_000_000, true, true, 8), Some((v(50000000000000000000), 8)));
+        assert_eq!(
+            at(2, 1_000_000, 1_000_000_000_000, true, false, 8),
+            Some((v(70710678118655), 8))
+        );
+        assert_eq!(
+            at(2, 1_000_000, 1_000_000_000_000, true, true, 8),
+            Some((v(50000000000000000000), 8))
+        );
         // 2147483647, -2147483648, 0: 2147483647, 3074457344186602838
         let sxx = 2147483647i128 * 2147483647 + 2147483648i128 * 2147483648;
         assert_eq!(at(3, -1, sxx, true, false, 0), Some((v(2147483647), 0)));
-        assert_eq!(at(3, -1, sxx, false, true, 0), Some((v(3074457344186602838), 0)));
+        assert_eq!(
+            at(3, -1, sxx, false, true, 0),
+            Some((v(3074457344186602838), 0))
+        );
     }
 }

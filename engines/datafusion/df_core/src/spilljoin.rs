@@ -72,9 +72,9 @@ use datafusion::arrow::datatypes::{DataType, SchemaRef};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::hash_utils::{create_hashes, RandomState};
+use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::common::utils::memory::estimate_memory_size;
-use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::{internal_err, DataFusionError, NullEquality, Result};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
@@ -140,7 +140,11 @@ fn derived(plan: &Arc<dyn ExecutionPlan>) -> bool {
                 | "CrossJoinExec"
                 | "AggregateExec"
         );
-        Ok(if found { TreeNodeRecursion::Stop } else { TreeNodeRecursion::Continue })
+        Ok(if found {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
     });
     found
 }
@@ -154,7 +158,10 @@ fn reads_itself(plan: &Arc<dyn ExecutionPlan>, memory_leaves: bool) -> bool {
     let mut ok = true;
     let _ = plan.apply(|node| {
         if let Some(s) = node.downcast_ref::<StreamingTableExec>() {
-            ok = s.partitions().iter().all(|p| format!("{p:?}") == "PaxPartition");
+            ok = s
+                .partitions()
+                .iter()
+                .all(|p| format!("{p:?}") == "PaxPartition");
         } else if node.children().is_empty() {
             ok = matches!(node.name(), "EmptyExec" | "PlaceholderRowExec")
                 || (memory_leaves && node.name() == "DataSourceExec");
@@ -163,10 +170,18 @@ fn reads_itself(plan: &Arc<dyn ExecutionPlan>, memory_leaves: bool) -> bool {
             node.apply_expressions(&mut |e| {
                 let text = e.to_string();
                 ok = !text.contains("pg_in_set") && !text.contains("pg_scalar_subquery");
-                Ok(if ok { TreeNodeRecursion::Continue } else { TreeNodeRecursion::Stop })
+                Ok(if ok {
+                    TreeNodeRecursion::Continue
+                } else {
+                    TreeNodeRecursion::Stop
+                })
             })?;
         }
-        Ok(if ok { TreeNodeRecursion::Continue } else { TreeNodeRecursion::Stop })
+        Ok(if ok {
+            TreeNodeRecursion::Continue
+        } else {
+            TreeNodeRecursion::Stop
+        })
     });
     ok
 }
@@ -214,7 +229,11 @@ impl Default for SpillHashJoins {
 impl SpillHashJoins {
     /// `plan` with its joins replaced; `relied`: whether a node above
     /// relies on how `plan`'s rows are partitioned (RC1).
-    fn replace(&self, plan: Arc<dyn ExecutionPlan>, relied: bool) -> Result<Arc<dyn ExecutionPlan>> {
+    fn replace(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        relied: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         // A node relies on a child's partitioning when it requires one, or
         // when it passes it on to a node that relies on it; a repartition
         // or a merge makes its own.
@@ -243,9 +262,7 @@ impl SpillHashJoins {
         // only one probe partition makes it a partition of its own.
         let own = match join.mode {
             PartitionMode::Partitioned => true,
-            PartitionMode::CollectLeft => {
-                join.right.output_partitioning().partition_count() == 1
-            }
+            PartitionMode::CollectLeft => join.right.output_partitioning().partition_count() == 1,
             PartitionMode::Auto => false,
         };
         // SO1: DataFusion's join keeps the probe side's order, which it may
@@ -257,7 +274,11 @@ impl SpillHashJoins {
             return Ok(plan);
         }
         let collect_rows = if relied { 0 } else { self.collect_rows };
-        Ok(Arc::new(SpillingHashJoinExec::new(plan.clone(), self.memory_leaves, collect_rows)?))
+        Ok(Arc::new(SpillingHashJoinExec::new(
+            plan.clone(),
+            self.memory_leaves,
+            collect_rows,
+        )?))
     }
 }
 
@@ -385,11 +406,16 @@ impl Collect {
         }
         let mut read = Vec::new();
         for task in tasks {
-            read.push(task.join_unwind().await.map_err(|e| DataFusionError::External(Box::new(e)))??);
+            read.push(
+                task.join_unwind()
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))??,
+            );
         }
         let reservation = Arc::into_inner(reservation).unwrap().into_inner().unwrap();
         if !over.load(Ordering::Relaxed) {
-            let batches: Vec<RecordBatch> = read.iter().flat_map(|(b, _)| b.iter().cloned()).collect();
+            let batches: Vec<RecordBatch> =
+                read.iter().flat_map(|(b, _)| b.iter().cloned()).collect();
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let bytes: usize = batches.iter().map(get_record_batch_memory_size).sum();
             // the table and the concatenated copy, as `Run::collect` reserves
@@ -465,9 +491,16 @@ fn join_table_bytes(spec: &JoinSpec, ctx: &TaskContext, rows: usize) -> Result<u
         [(key, _)] if key.data_type(&spec.left_schema)?.is_integer() => {
             let options = &ctx.session_config().options().execution;
             let density = options.perfect_hash_join_min_key_density;
-            let range = if density > 0.0 { (rows as f64 / density) as usize } else { usize::MAX };
+            let range = if density > 0.0 {
+                (rows as f64 / density) as usize
+            } else {
+                usize::MAX
+            };
             let range = range.max(options.perfect_hash_join_small_build_threshold);
-            range.saturating_add(1).saturating_add(rows).saturating_mul(4)
+            range
+                .saturating_add(1)
+                .saturating_add(rows)
+                .saturating_mul(4)
         }
         _ => 0,
     };
@@ -554,7 +587,8 @@ impl JoinSpec {
             self.null_equality,
             false,
         )?;
-        join.swap_inputs(PartitionMode::CollectLeft)?.execute(0, ctx)
+        join.swap_inputs(PartitionMode::CollectLeft)?
+            .execute(0, ctx)
     }
 }
 
@@ -587,11 +621,15 @@ struct Held {
 
 impl HeldPool {
     fn new(parent: Arc<dyn MemoryPool>, held: MemoryReservation) -> Self {
-        let extra = MemoryConsumer::new(format!("{} in memory", held.consumer().name()))
-            .register(&parent);
+        let extra =
+            MemoryConsumer::new(format!("{} in memory", held.consumer().name())).register(&parent);
         HeldPool {
             parent,
-            state: Mutex::new(Held { held, extra, used: 0 }),
+            state: Mutex::new(Held {
+                held,
+                extra,
+                used: 0,
+            }),
         }
     }
 }
@@ -610,7 +648,9 @@ impl MemoryPool for HeldPool {
     fn grow(&self, _reservation: &MemoryReservation, additional: usize) {
         let mut state = self.state.lock().unwrap();
         state.used += additional;
-        let short = state.used.saturating_sub(state.held.size() + state.extra.size());
+        let short = state
+            .used
+            .saturating_sub(state.held.size() + state.extra.size());
         state.extra.grow(short);
     }
 
@@ -621,7 +661,8 @@ impl MemoryPool for HeldPool {
 
     fn try_grow(&self, _reservation: &MemoryReservation, additional: usize) -> Result<()> {
         let mut state = self.state.lock().unwrap();
-        let short = (state.used + additional).saturating_sub(state.held.size() + state.extra.size());
+        let short =
+            (state.used + additional).saturating_sub(state.held.size() + state.extra.size());
         // Bytes already held are the join's even when the pool's share of
         // a consumer has shrunk below them since.
         if short > 0 && state.held.try_grow(short).is_err() {
@@ -677,7 +718,11 @@ impl Filters {
         batches: &[RecordBatch],
     ) -> Result<()> {
         for (k, f) in if build { &self.probe } else { &self.build } {
-            let key = if build { &spec.on[*k].0 } else { &spec.on[*k].1 };
+            let key = if build {
+                &spec.on[*k].0
+            } else {
+                &spec.on[*k].1
+            };
             let keys = batches
                 .iter()
                 .map(|b| key.evaluate(b).and_then(|v| v.into_array(b.num_rows())))
@@ -712,7 +757,10 @@ impl SpillingHashJoinExec {
     }
 
     fn filters(&self) -> &Filters {
-        static NONE: Filters = Filters { probe: Vec::new(), build: Vec::new() };
+        static NONE: Filters = Filters {
+            probe: Vec::new(),
+            build: Vec::new(),
+        };
         self.filters.get().unwrap_or(&NONE)
     }
 
@@ -795,7 +843,11 @@ impl ExecutionPlan for SpillingHashJoinExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let join = self.join.clone().with_new_children(children)?;
-        Ok(Arc::new(SpillingHashJoinExec::new(join, self.memory_leaves, self.collect_rows)?))
+        Ok(Arc::new(SpillingHashJoinExec::new(
+            join,
+            self.memory_leaves,
+            self.collect_rows,
+        )?))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
@@ -830,12 +882,19 @@ impl ExecutionPlan for SpillingHashJoinExec {
             let mode = collect
                 .mode
                 .get_or_init(|| async {
-                    collect.start(join, &this.spec, &ctx, this.filters()).await.map_err(Arc::new)
+                    collect
+                        .start(join, &this.spec, &ctx, this.filters())
+                        .await
+                        .map_err(Arc::new)
                 })
                 .await;
             match mode {
                 Err(e) => Err(DataFusionError::Shared(e.clone())),
-                Ok(Mode::Shared { join, probes, ctx: held }) => {
+                Ok(Mode::Shared {
+                    join,
+                    probes,
+                    ctx: held,
+                }) => {
                     probes.put(partition, collect.probe.execute(partition, ctx.clone())?);
                     collected.add(1);
                     join.execute(partition, held.clone())
@@ -905,7 +964,10 @@ enum Collected {
 
 impl Run {
     fn filters(&self) -> &Filters {
-        static NONE: Filters = Filters { probe: Vec::new(), build: Vec::new() };
+        static NONE: Filters = Filters {
+            probe: Vec::new(),
+            build: Vec::new(),
+        };
         self.filters.get().unwrap_or(&NONE)
     }
 
@@ -969,7 +1031,8 @@ impl Run {
         if held.is_some() {
             // KF1: the probe side's keys, which filter the build side's
             // scans whichever side is hashed (`build_filtered`)
-            self.filters().add(&self.spec, false, Some(self.partition), &small)?;
+            self.filters()
+                .add(&self.spec, false, Some(self.partition), &small)?;
         } else {
             self.filters().fail(false);
         }
@@ -1005,12 +1068,15 @@ impl Run {
         &self,
         mut input: SendableRecordBatchStream,
         limit: usize,
-    ) -> Result<(Vec<RecordBatch>, usize, SendableRecordBatchStream, Option<MemoryReservation>)> {
-        let reservation = MemoryConsumer::new(format!(
-            "SpillingHashJoin[{}] small side",
-            self.partition
-        ))
-        .register(self.ctx.memory_pool());
+    ) -> Result<(
+        Vec<RecordBatch>,
+        usize,
+        SendableRecordBatchStream,
+        Option<MemoryReservation>,
+    )> {
+        let reservation =
+            MemoryConsumer::new(format!("SpillingHashJoin[{}] small side", self.partition))
+                .register(self.ctx.memory_pool());
         let mut batches = Vec::new();
         let mut rows = 0;
         while let Some(batch) = input.next().await {
@@ -1048,7 +1114,8 @@ impl Run {
                 // KF1: this partition's build side, whole or not
                 match &collected {
                     Collected::All(batches, _) => {
-                        self.filters().add(&self.spec, true, Some(self.partition), batches)?
+                        self.filters()
+                            .add(&self.spec, true, Some(self.partition), batches)?
                     }
                     Collected::Overflow(..) => self.filters().fail(true),
                 }
@@ -1141,11 +1208,9 @@ impl Run {
         // written as batches of a useful size.
         let mut parts: Vec<(Vec<RecordBatch>, usize, usize)> =
             (0..FANOUT).map(|_| (Vec::new(), 0, 0)).collect();
-        let reservation = MemoryConsumer::new(format!(
-            "SpillingHashJoin[{}] split",
-            self.partition
-        ))
-        .register(self.ctx.memory_pool());
+        let reservation =
+            MemoryConsumer::new(format!("SpillingHashJoin[{}] split", self.partition))
+                .register(self.ctx.memory_pool());
         let flush = |files: &mut Vec<Option<_>>,
                      part: &mut (Vec<RecordBatch>, usize, usize),
                      b: usize|
@@ -1393,7 +1458,13 @@ impl ExecutionPlan for StreamsExec {
         partition: usize,
         _ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        match self.streams.lock().unwrap().get_mut(partition).and_then(Option::take) {
+        match self
+            .streams
+            .lock()
+            .unwrap()
+            .get_mut(partition)
+            .and_then(Option::take)
+        {
             Some(stream) => Ok(stream),
             None => internal_err!("StreamsExec partition {partition} not put or executed twice"),
         }
@@ -1700,7 +1771,9 @@ mod tests {
 
     /// The rows of `plan`, as text, sorted.
     async fn rows_of(plan: Arc<dyn ExecutionPlan>, ctx: &SessionContext) -> Vec<String> {
-        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx()).await.unwrap();
+        let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+            .await
+            .unwrap();
         let mut rows = Vec::new();
         for b in &batches {
             for r in 0..b.num_rows() {
@@ -1727,12 +1800,28 @@ mod tests {
             let over = context_rc(Some(1 << 30), false, 12000, 3000);
             for i in 0..15 {
                 let (want, _) = run(&plain, i).await;
-                let plan = query(&collect, i).await.create_physical_plan().await.unwrap();
-                assert_eq!(rows_of(plan.clone(), &collect).await, want, "query {i} collected");
-                assert_eq!(collected(&plan), 4, "query {i} was not collected:\n{}",
-                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true));
+                let plan = query(&collect, i)
+                    .await
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    rows_of(plan.clone(), &collect).await,
+                    want,
+                    "query {i} collected"
+                );
+                assert_eq!(
+                    collected(&plan),
+                    4,
+                    "query {i} was not collected:\n{}",
+                    datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+                );
                 let plan = query(&over, i).await.create_physical_plan().await.unwrap();
-                assert_eq!(rows_of(plan.clone(), &over).await, want, "query {i} past the rows");
+                assert_eq!(
+                    rows_of(plan.clone(), &over).await,
+                    want,
+                    "query {i} past the rows"
+                );
                 // queries 12-14 have a build side of a few keys
                 if i < 12 {
                     assert_eq!(collected(&plan), 0, "query {i} collected past its rows");
@@ -1754,9 +1843,13 @@ mod tests {
             let collect = context_rc(Some(1 << 30), false, 12000, COLLECT_ROWS);
             for ctx in [&plain, &collect] {
                 let (join, _) = joined(ctx, 0).await;
-                let df = join.aggregate(vec![col("lk")], vec![count(lit(1))]).unwrap();
+                let df = join
+                    .aggregate(vec![col("lk")], vec![count(lit(1))])
+                    .unwrap();
                 let plan = df.create_physical_plan().await.unwrap();
-                let text = datafusion::physical_plan::displayable(plan.as_ref()).indent(true).to_string();
+                let text = datafusion::physical_plan::displayable(plan.as_ref())
+                    .indent(true)
+                    .to_string();
                 let rows = rows_of(plan.clone(), ctx).await;
                 assert_eq!(rows.len(), 4000, "{text}");
                 if std::ptr::eq(ctx, &collect) {
@@ -1792,17 +1885,23 @@ mod tests {
             let adaptive = context_with(Some(1 << 30), true, 300);
             for i in 0..15 {
                 let (want, _) = run(&plain, i).await;
-                let plan = query(&adaptive, i).await.create_physical_plan().await.unwrap();
-                let batches =
-                    datafusion::physical_plan::collect(plan.clone(), adaptive.task_ctx())
-                        .await
-                        .unwrap();
+                let plan = query(&adaptive, i)
+                    .await
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
+                let batches = datafusion::physical_plan::collect(plan.clone(), adaptive.task_ctx())
+                    .await
+                    .unwrap();
                 let mut got = Vec::new();
                 for b in &batches {
                     for r in 0..b.num_rows() {
                         let row = (0..b.num_columns())
                             .map(|c| {
-                                format!("{:?}", ScalarValue::try_from_array(b.column(c), r).unwrap())
+                                format!(
+                                    "{:?}",
+                                    ScalarValue::try_from_array(b.column(c), r).unwrap()
+                                )
                             })
                             .collect::<Vec<_>>();
                         got.push(row.join("|"));
@@ -1830,7 +1929,11 @@ mod tests {
                 let (want, _) = run(&plain, i).await;
                 let (got, _) = run(&adaptive, i).await;
                 assert_eq!(got, want, "query {i}");
-                let plan = query(&adaptive, i).await.create_physical_plan().await.unwrap();
+                let plan = query(&adaptive, i)
+                    .await
+                    .create_physical_plan()
+                    .await
+                    .unwrap();
                 let _ = datafusion::physical_plan::collect(plan.clone(), adaptive.task_ctx())
                     .await
                     .unwrap();
@@ -1874,8 +1977,12 @@ mod tests {
             let ctx = context(Some(1 << 20));
             ctx.register_table("b", distinct(102400)).unwrap();
             ctx.register_table("p", distinct(409600)).unwrap();
-            let b = ctx.table("b").await.unwrap()
-                .select(vec![col("k").alias("bk"), col("v").alias("bv")]).unwrap();
+            let b = ctx
+                .table("b")
+                .await
+                .unwrap()
+                .select(vec![col("k").alias("bk"), col("v").alias("bv")])
+                .unwrap();
             let p = ctx.table("p").await.unwrap();
             let plan = b
                 .join(p, JoinType::Inner, &["bk"], &["k"], None)
@@ -1918,9 +2025,13 @@ mod tests {
                     let ids = (b * 1024)..((b + 1) * 1024).min(rows);
                     let columns = (0..cols)
                         .map(|c| {
-                            Arc::new(Int32Array::from_iter_values(
-                                ids.clone().map(|i| if c == 0 { key(i) } else { i % 7 }),
-                            )) as _
+                            Arc::new(Int32Array::from_iter_values(ids.clone().map(|i| {
+                                if c == 0 {
+                                    key(i)
+                                } else {
+                                    i % 7
+                                }
+                            }))) as _
                         })
                         .collect();
                     RecordBatch::try_new(schema.clone(), columns).unwrap()
@@ -1931,8 +2042,11 @@ mod tests {
                 .map(|b| get_record_batch_memory_size(b) + b.num_rows() * HASH_ROW_BYTES)
                 .sum();
             let limit = collected + (rows as usize);
-            let table = || Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).unwrap());
-            let config = SessionConfig::new().with_target_partitions(1).with_batch_size(1024);
+            let table =
+                || Arc::new(MemTable::try_new(schema.clone(), vec![batches.clone()]).unwrap());
+            let config = SessionConfig::new()
+                .with_target_partitions(1)
+                .with_batch_size(1024);
             let runtime = RuntimeEnvBuilder::new()
                 .with_memory_pool(Arc::new(FairSpillPool::new(limit)))
                 .with_disk_manager_builder(
@@ -1950,8 +2064,15 @@ mod tests {
             let ctx = SessionContext::new_with_state(state);
             ctx.register_table("b", table()).unwrap();
             ctx.register_table("p", table()).unwrap();
-            let b = ctx.table("b").await.unwrap()
-                .select((0..cols).map(|c| col(format!("c{c}")).alias(format!("b{c}"))).collect::<Vec<_>>())
+            let b = ctx
+                .table("b")
+                .await
+                .unwrap()
+                .select(
+                    (0..cols)
+                        .map(|c| col(format!("c{c}")).alias(format!("b{c}")))
+                        .collect::<Vec<_>>(),
+                )
                 .unwrap();
             let p = ctx.table("p").await.unwrap();
             let plan = b
@@ -1963,7 +2084,10 @@ mod tests {
             let batches = datafusion::physical_plan::collect(plan.clone(), ctx.task_ctx())
                 .await
                 .unwrap();
-            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), rows as usize);
+            assert_eq!(
+                batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+                rows as usize
+            );
             fn spills(plan: &Arc<dyn ExecutionPlan>) -> usize {
                 let own = if plan.name() == "SpillingHashJoinExec" {
                     plan.metrics().and_then(|m| m.spill_count()).unwrap_or(0)
@@ -1983,7 +2107,10 @@ mod tests {
     fn a_build_side_fits_with_its_concatenated_copy() {
         // 8 bytes a row and 40 for the table, which takes 38 (twice as many
         // slots as rows, at its load factor), and the copy 8 more
-        assert!(join_under_a_tight_pool(8192, 2, |i| i) > 0, "the build side did not spill");
+        assert!(
+            join_under_a_tight_pool(8192, 2, |i| i) > 0,
+            "the build side did not spill"
+        );
     }
 
     /// Keys dense enough in their range make the join build an array over
@@ -1994,7 +2121,10 @@ mod tests {
         // a hash table takes 24 bytes a row (its slots barely more than the
         // rows), an array over keys 6.5 apart 30 and its copy 12 more: past
         // the 40 a row reserved
-        assert!(join_under_a_tight_pool(14000, 3, |i| i * 13 / 2) > 0, "the build side did not spill");
+        assert!(
+            join_under_a_tight_pool(14000, 3, |i| i * 13 / 2) > 0,
+            "the build side did not spill"
+        );
     }
 
     /// The join's memory comes out of the reservation first, although the
@@ -2050,7 +2180,10 @@ mod tests {
                     .map(|c| {
                         batches.iter().fold((0, 0), |(n, sum), b| {
                             let a = b.column(c).as_any().downcast_ref::<Int32Array>().unwrap();
-                            (n + a.len() - a.null_count(), sum + a.iter().flatten().map(i64::from).sum::<i64>())
+                            (
+                                n + a.len() - a.null_count(),
+                                sum + a.iter().flatten().map(i64::from).sum::<i64>(),
+                            )
                         })
                     })
                     .collect();

@@ -48,7 +48,8 @@ pub struct NumericWidth;
 
 impl AnalyzerRule for NumericWidth {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
-        plan.transform_up_with_subqueries(rewrite_plan).map(|t| t.data)
+        plan.transform_up_with_subqueries(rewrite_plan)
+            .map(|t| t.data)
     }
 
     fn name(&self) -> &str {
@@ -104,7 +105,9 @@ fn literal_digits(sv: &ScalarValue) -> Option<u8> {
         ScalarValue::Decimal256(Some(v), _, s) => {
             let n = narrow_value(*v)?;
             let d = match n {
-                crate::pgnum::NARROW_NAN | crate::pgnum::NARROW_PINF | crate::pgnum::NARROW_NINF => 1,
+                crate::pgnum::NARROW_NAN
+                | crate::pgnum::NARROW_PINF
+                | crate::pgnum::NARROW_NINF => 1,
                 n => n.unsigned_abs().checked_ilog10().map_or(1, |d| d as u8 + 1),
             };
             Some(d.max((*s).max(0) as u8)).filter(|d| *d <= 38)
@@ -136,7 +139,11 @@ fn as_type(e: Expr, from: &DataType, to: &DataType) -> Expr {
     if *from == DataType::Null {
         return e;
     }
-    PgNumeric::udf(NumericFn::As { digits: p, scale: s }).call(vec![e])
+    PgNumeric::udf(NumericFn::As {
+        digits: p,
+        scale: s,
+    })
+    .call(vec![e])
 }
 
 /// `exprs` (typed over `schema`) made one type, if they need it.
@@ -192,7 +199,12 @@ fn rewrite_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     datafusion::common::tree_node::TreeNodeRecursion::Continue,
                 )
             }
-            Expr::Between(Between { expr, negated, low, high }) => {
+            Expr::Between(Between {
+                expr,
+                negated,
+                low,
+                high,
+            }) => {
                 let (v, changed) = unify(vec![*expr, *low, *high], schema)?;
                 let mut v = v.into_iter();
                 let (x, l, h) = (v.next().unwrap(), v.next().unwrap(), v.next().unwrap());
@@ -202,7 +214,11 @@ fn rewrite_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     datafusion::common::tree_node::TreeNodeRecursion::Continue,
                 )
             }
-            Expr::InList(InList { expr, list, negated }) => {
+            Expr::InList(InList {
+                expr,
+                list,
+                negated,
+            }) => {
                 let mut all = vec![*expr];
                 all.extend(list);
                 let (mut v, changed) = unify(all, schema)?;
@@ -213,7 +229,11 @@ fn rewrite_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     datafusion::common::tree_node::TreeNodeRecursion::Continue,
                 )
             }
-            Expr::Case(Case { expr, when_then_expr, else_expr }) => {
+            Expr::Case(Case {
+                expr,
+                when_then_expr,
+                else_expr,
+            }) => {
                 let mut changed = false;
                 let (whens, thens): (Vec<Expr>, Vec<Expr>) =
                     when_then_expr.into_iter().map(|(w, t)| (*w, *t)).unzip();
@@ -244,7 +264,11 @@ fn rewrite_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
                     .map(|(w, t)| (Box::new(w), Box::new(t)))
                     .collect();
                 Transformed::new(
-                    Expr::Case(Case { expr, when_then_expr, else_expr }),
+                    Expr::Case(Case {
+                        expr,
+                        when_then_expr,
+                        else_expr,
+                    }),
                     changed,
                     datafusion::common::tree_node::TreeNodeRecursion::Continue,
                 )
@@ -262,7 +286,10 @@ fn rewrite_expr(e: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
             Expr::Cast(c) => {
                 // a narrow numeric cast to numeric of its scale
                 let from = c.expr.get_type(schema).ok();
-                match (from.as_ref().and_then(numeric_digits), numeric_digits(c.field.data_type())) {
+                match (
+                    from.as_ref().and_then(numeric_digits),
+                    numeric_digits(c.field.data_type()),
+                ) {
                     (Some((p, s)), Some((_, ts))) if p < NUMERIC_PRECISION && s == ts => {
                         let to = c.field.data_type().clone();
                         let from = from.unwrap();
@@ -315,7 +342,11 @@ fn rewrite_plan(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
             let plan = LogicalPlan::Join(j);
             let t = rewrite_exprs(plan)?;
             let changed = changed || t.transformed;
-            let plan = if changed { t.data.recompute_schema()? } else { t.data };
+            let plan = if changed {
+                t.data.recompute_schema()?
+            } else {
+                t.data
+            };
             Ok(Transformed::new_transformed(plan, changed))
         }
         plan => {
@@ -347,7 +378,11 @@ fn rewrite_union(u: Union) -> Result<Transformed<LogicalPlan>> {
         let cols: Vec<Expr> = u
             .inputs
             .iter()
-            .map(|i| Expr::Column(datafusion::common::Column::from(i.schema().qualified_field(c))))
+            .map(|i| {
+                Expr::Column(datafusion::common::Column::from(
+                    i.schema().qualified_field(c),
+                ))
+            })
             .collect();
         let types: Vec<DataType> = u
             .inputs
@@ -360,25 +395,28 @@ fn rewrite_union(u: Union) -> Result<Transformed<LogicalPlan>> {
     if targets.iter().all(Option::is_none) {
         return Ok(Transformed::no(LogicalPlan::Union(u)));
     }
-    let inputs = u
-        .inputs
-        .into_iter()
-        .map(|input| {
-            let schema: DFSchemaRef = input.schema().clone();
-            let exprs: Vec<Expr> = (0..ncols)
-                .map(|c| {
-                    let (q, f) = schema.qualified_field(c);
-                    let col = Expr::Column(datafusion::common::Column::from((q, f)));
-                    match &targets[c] {
-                        Some(to) if f.data_type() != to => {
-                            as_type(col, f.data_type(), to).alias_qualified(q.cloned(), f.name())
+    let inputs =
+        u.inputs
+            .into_iter()
+            .map(|input| {
+                let schema: DFSchemaRef = input.schema().clone();
+                let exprs: Vec<Expr> = (0..ncols)
+                    .map(|c| {
+                        let (q, f) = schema.qualified_field(c);
+                        let col = Expr::Column(datafusion::common::Column::from((q, f)));
+                        match &targets[c] {
+                            Some(to) if f.data_type() != to => as_type(col, f.data_type(), to)
+                                .alias_qualified(q.cloned(), f.name()),
+                            _ => col,
                         }
-                        _ => col,
-                    }
-                })
-                .collect();
-            Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(exprs, input)?)))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Transformed::yes(LogicalPlan::Union(Union::try_new_with_loose_types(inputs)?)))
+                    })
+                    .collect();
+                Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+                    exprs, input,
+                )?)))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    Ok(Transformed::yes(LogicalPlan::Union(
+        Union::try_new_with_loose_types(inputs)?,
+    )))
 }

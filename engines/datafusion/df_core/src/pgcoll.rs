@@ -55,7 +55,9 @@ fn locale(name: &str) -> Result<usize> {
     // SAFETY: a NUL-terminated name and no base locale
     let l = unsafe { libc::newlocale(libc::LC_COLLATE_MASK, c.as_ptr(), std::ptr::null_mut()) };
     if l.is_null() {
-        return Err(DataFusionError::Execution(format!("cannot open locale {name:?}")));
+        return Err(DataFusionError::Execution(format!(
+            "cannot open locale {name:?}"
+        )));
     }
     map.insert(name.to_string(), l as usize);
     Ok(l as usize)
@@ -111,7 +113,10 @@ impl PgCollCmp {
         Ok(ScalarUDF::new_from_impl(PgCollCmp {
             op: op.to_string(),
             locale: locale.to_string(),
-            signature: Signature::exact(vec![DataType::Utf8, DataType::Utf8], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Utf8, DataType::Utf8],
+                Volatility::Immutable,
+            ),
         }))
     }
 
@@ -148,7 +153,12 @@ impl ScalarUDFImpl for PgCollCmp {
         let out: BooleanArray = (0..n)
             .map(|r| {
                 (!a.is_null(r) && !b.is_null(r)).then(|| {
-                    self.holds(compare(loc, a.value(r).as_bytes(), b.value(r).as_bytes(), &mut buf))
+                    self.holds(compare(
+                        loc,
+                        a.value(r).as_bytes(),
+                        b.value(r).as_bytes(),
+                        &mut buf,
+                    ))
                 })
             })
             .collect();
@@ -256,7 +266,9 @@ impl Accumulator for CollMinMax {
     }
 
     fn size(&self) -> usize {
-        std::mem::size_of_val(self) + self.best.as_ref().map_or(0, String::capacity) + self.buf.capacity()
+        std::mem::size_of_val(self)
+            + self.best.as_ref().map_or(0, String::capacity)
+            + self.buf.capacity()
     }
 }
 

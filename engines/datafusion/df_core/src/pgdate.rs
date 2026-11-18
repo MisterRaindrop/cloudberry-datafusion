@@ -150,7 +150,11 @@ pub struct PgExtractDate {
 
 impl PgExtractDate {
     pub fn udf(field: DateField, timestamp: bool) -> ScalarUDF {
-        let arg = if timestamp { DataType::Int64 } else { DataType::Int32 };
+        let arg = if timestamp {
+            DataType::Int64
+        } else {
+            DataType::Int32
+        };
         ScalarUDF::new_from_impl(PgExtractDate {
             field,
             timestamp,
@@ -188,7 +192,10 @@ impl ScalarUDFImpl for PgExtractDate {
         let x = args.args[0].to_array(n)?;
         if self.timestamp {
             let ts = x.as_primitive_opt::<Int64Type>().ok_or_else(|| {
-                DataFusionError::Internal(format!("expected a timestamp column, got {}", x.data_type()))
+                DataFusionError::Internal(format!(
+                    "expected a timestamp column, got {}",
+                    x.data_type()
+                ))
             })?;
             let mut out = Decimal256Builder::with_capacity(ts.len());
             for i in 0..ts.len() {
@@ -264,8 +271,14 @@ mod tests {
         assert_eq!(f(DateField::Hour, -USECS_PER_DAY), Some(0));
         assert_eq!(f(DateField::Day, -USECS_PER_DAY), Some(31));
         assert_eq!(f(DateField::Quarter, 100 * USECS_PER_DAY), Some(2));
-        assert_eq!(extract_timestamp(DateField::Year, i64::MAX), Some(NUMERIC_PINF));
-        assert_eq!(extract_timestamp(DateField::Year, i64::MIN), Some(NUMERIC_NINF));
+        assert_eq!(
+            extract_timestamp(DateField::Year, i64::MAX),
+            Some(NUMERIC_PINF)
+        );
+        assert_eq!(
+            extract_timestamp(DateField::Year, i64::MIN),
+            Some(NUMERIC_NINF)
+        );
         assert_eq!(extract_timestamp(DateField::Minute, i64::MIN), None);
     }
 }
@@ -289,7 +302,11 @@ pub fn add_days(date: i32, days: i32, minus: bool) -> Option<i32> {
     if date == i32::MIN || date == i32::MAX {
         return Some(date);
     }
-    let r = if minus { date as i64 - days as i64 } else { date as i64 + days as i64 };
+    let r = if minus {
+        date as i64 - days as i64
+    } else {
+        date as i64 + days as i64
+    };
     // beyond int32 is date.c's overflow; within it, its range check
     (r >= i32::MIN as i64 && r <= i32::MAX as i64 && valid_date(r)).then_some(r as i32)
 }
@@ -298,7 +315,10 @@ impl PgDateAddDays {
     pub fn udf(minus: bool) -> ScalarUDF {
         ScalarUDF::new_from_impl(PgDateAddDays {
             minus,
-            signature: Signature::exact(vec![DataType::Int32, DataType::Int32], Volatility::Immutable),
+            signature: Signature::exact(
+                vec![DataType::Int32, DataType::Int32],
+                Volatility::Immutable,
+            ),
         })
     }
 }
@@ -324,7 +344,10 @@ impl ScalarUDFImpl for PgDateAddDays {
         let n = args.number_rows;
         let dates = args.args[0].to_array(n)?;
         let days = args.args[1].to_array(n)?;
-        let (dates, days) = (dates.as_primitive::<Int32Type>(), days.as_primitive::<Int32Type>());
+        let (dates, days) = (
+            dates.as_primitive::<Int32Type>(),
+            days.as_primitive::<Int32Type>(),
+        );
         let mut out = Vec::with_capacity(n);
         for r in 0..n {
             if dates.is_null(r) || days.is_null(r) {

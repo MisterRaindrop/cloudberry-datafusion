@@ -48,11 +48,13 @@ use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{internal_err, DFSchemaRef, Result};
 use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore};
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
+use datafusion::logical_expr::{
+    Expr, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use futures::Stream;
 
 /// Nanoseconds since the first call in this process.
@@ -143,7 +145,11 @@ impl UserDefinedLogicalNodeCore for TapNode {
     fn fmt_for_explain(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Tap: nodes {:?}", self.stat.ids)
     }
-    fn with_exprs_and_inputs(&self, _exprs: Vec<Expr>, mut inputs: Vec<LogicalPlan>) -> Result<Self> {
+    fn with_exprs_and_inputs(
+        &self,
+        _exprs: Vec<Expr>,
+        mut inputs: Vec<LogicalPlan>,
+    ) -> Result<Self> {
         match inputs.len() {
             1 => Ok(TapNode {
                 input: inputs.remove(0),
@@ -177,7 +183,10 @@ impl ExtensionPlanner for TapPlanner {
             return Ok(None);
         };
         match physical_inputs {
-            [input] => Ok(Some(Arc::new(TapExec::new(input.clone(), tap.stat.clone())))),
+            [input] => Ok(Some(Arc::new(TapExec::new(
+                input.clone(),
+                tap.stat.clone(),
+            )))),
             _ => internal_err!("a tap takes one input"),
         }
     }
@@ -243,13 +252,20 @@ impl ExecutionPlan for TapExec {
         Ok(TreeNodeRecursion::Continue)
     }
     #[allow(deprecated)]
-    fn with_new_children(self: Arc<Self>, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         match children.as_slice() {
             [c] => Ok(Arc::new(TapExec::new(c.clone(), self.stat.clone()))),
             _ => internal_err!("TapExec takes one input"),
         }
     }
-    fn execute(&self, partition: usize, ctx: Arc<TaskContext>) -> Result<SendableRecordBatchStream> {
+    fn execute(
+        &self,
+        partition: usize,
+        ctx: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
         let input = self.input.execute(partition, ctx)?;
         Ok(Box::pin(TapStream {
             schema: input.schema(),
@@ -277,7 +293,9 @@ impl Stream for TapStream {
                 if batch.num_rows() > 0 {
                     self.stat.first_ns.fetch_min(now_ns(), Ordering::Relaxed);
                 }
-                self.stat.rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                self.stat
+                    .rows
+                    .fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
             }
             Poll::Ready(None) if !self.ended => {
                 self.ended = true;

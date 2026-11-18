@@ -119,7 +119,14 @@ struct Exact {
 }
 
 const SALT: [u32; 8] = [
-    0x47b6_137b, 0x4497_4d91, 0x8824_ad5b, 0xa2b7_289d, 0x7054_95c7, 0x2df1_424b, 0x9efc_4947, 0x5c6b_fb31,
+    0x47b6_137b,
+    0x4497_4d91,
+    0x8824_ad5b,
+    0xa2b7_289d,
+    0x7054_95c7,
+    0x2df1_424b,
+    0x9efc_4947,
+    0x5c6b_fb31,
 ];
 
 impl KeySet {
@@ -129,7 +136,12 @@ impl KeySet {
         if keys.len() <= EXACT_KEYS {
             let mut set = Exact::new(keys.len());
             let len = keys.iter().filter(|&&k| set.insert(k)).count();
-            return KeySet { min, max, len, probe: Probe::Exact(set) };
+            return KeySet {
+                min,
+                max,
+                len,
+                probe: Probe::Exact(set),
+            };
         }
         let mut blocks = vec![[0u32; 8]; (keys.len() * BLOOM_BITS).div_ceil(256)];
         for &k in keys {
@@ -138,7 +150,12 @@ impl KeySet {
                 *w |= m;
             }
         }
-        KeySet { min, max, len: keys.len(), probe: Probe::Bloom(blocks) }
+        KeySet {
+            min,
+            max,
+            len: keys.len(),
+            probe: Probe::Bloom(blocks),
+        }
     }
 
     #[inline]
@@ -193,7 +210,10 @@ fn bloom_bits(k: i64, n: usize) -> (usize, [u32; 8]) {
 
 impl Exact {
     fn new(keys: usize) -> Self {
-        let bits = (keys.max(1) * 2).next_power_of_two().trailing_zeros().max(4);
+        let bits = (keys.max(1) * 2)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(4);
         let size = 1usize << bits;
         Exact {
             has_empty: false,
@@ -248,7 +268,10 @@ impl Exact {
 
 /// Whether a key column of this type can be filtered.
 pub fn key_type(t: &DataType) -> bool {
-    matches!(t, DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Date32)
+    matches!(
+        t,
+        DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Date32
+    )
 }
 
 /// The non-null values of a key column, as i64; None for another type.
@@ -296,7 +319,9 @@ struct Gather {
 impl Gather {
     /// Whether the pool grants `bytes` in all.
     fn reserve(&mut self, bytes: usize) -> bool {
-        self.reservation.as_mut().is_none_or(|r| r.try_resize(bytes).is_ok())
+        self.reservation
+            .as_mut()
+            .is_none_or(|r| r.try_resize(bytes).is_ok())
     }
 
     /// Lets go of the keys gathered and what they took.
@@ -456,7 +481,10 @@ impl KeyFilter {
 
     /// Rows checked and kept so far.
     pub fn counts(&self) -> (u64, u64) {
-        (self.seen.load(Ordering::Relaxed), self.kept.load(Ordering::Relaxed))
+        (
+            self.seen.load(Ordering::Relaxed),
+            self.kept.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -555,7 +583,10 @@ fn trace(
         return trace(f.input(), col, tables, parents);
     }
     if let Some(s) = plan.downcast_ref::<SortExec>() {
-        return s.fetch().is_none().then(|| trace(s.input(), col, tables, parents))?;
+        return s
+            .fetch()
+            .is_none()
+            .then(|| trace(s.input(), col, tables, parents))?;
     }
     if let Some(a) = plan.downcast_ref::<AggregateExec>() {
         let g = a.group_expr();
@@ -666,7 +697,10 @@ mod tests {
 
     #[test]
     fn key_sets_hold_their_keys_only() {
-        let keys: Vec<i64> = (0..10_000).map(|i| i * 7919 - 3).chain([EMPTY, i64::MAX]).collect();
+        let keys: Vec<i64> = (0..10_000)
+            .map(|i| i * 7919 - 3)
+            .chain([EMPTY, i64::MAX])
+            .collect();
         let set = KeySet::new(&keys);
         assert_eq!(set.len(), keys.len());
         for &k in &keys {
@@ -704,7 +738,9 @@ mod tests {
         f.add(Some(0), &[ints(&[Some(1), None, Some(3)])]);
         assert!(f.keep(&ints(&[Some(1)])).is_none());
         f.add(Some(1), &[ints(&[Some(5)])]);
-        let keep = f.keep(&ints(&[Some(1), Some(2), None, Some(3), Some(5)])).unwrap();
+        let keep = f
+            .keep(&ints(&[Some(1), Some(2), None, Some(3), Some(5)]))
+            .unwrap();
         assert_eq!(keep, vec![0, 3, 4]);
     }
 
@@ -760,7 +796,10 @@ mod tests {
         // MAX_KEYS + 1000 rows of 3000 keys: a filter
         let f = KeyFilter::new(1);
         let rows = (MAX_KEYS + 1000) as i32;
-        f.add(None, &[ints(&(0..rows).map(|i| Some(i % 3000)).collect::<Vec<_>>())]);
+        f.add(
+            None,
+            &[ints(&(0..rows).map(|i| Some(i % 3000)).collect::<Vec<_>>())],
+        );
         let keep = f.keep(&ints(&[Some(5), Some(2999), Some(3000)])).unwrap();
         assert_eq!(keep, vec![0, 1]);
         // as many keys: none

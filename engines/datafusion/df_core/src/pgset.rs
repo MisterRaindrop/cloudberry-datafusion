@@ -170,7 +170,8 @@ impl SetHolder {
         if let Ok(mut k) = self.key.lock() {
             *k = key;
         }
-        self.as_set.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.as_set
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn key(&self) -> SetKey {
@@ -280,9 +281,9 @@ impl Hash for ScalarOf {
 
 impl ScalarOf {
     pub fn udf(holder: Arc<SetHolder>, col: usize) -> Result<ScalarUDF> {
-        let ty = holder.column_type(col).ok_or_else(|| {
-            DataFusionError::Internal(format!("a subquery has no column {col}"))
-        })?;
+        let ty = holder
+            .column_type(col)
+            .ok_or_else(|| DataFusionError::Internal(format!("a subquery has no column {col}")))?;
         Ok(ScalarUDF::new_from_impl(ScalarOf {
             holder,
             col,
@@ -309,9 +310,13 @@ impl ScalarUDFImpl for ScalarOf {
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         if args.number_rows == 0 {
-            return Ok(ColumnarValue::Array(datafusion::arrow::array::new_empty_array(&self.ty)));
+            return Ok(ColumnarValue::Array(
+                datafusion::arrow::array::new_empty_array(&self.ty),
+            ));
         }
-        Ok(ColumnarValue::Scalar(self.holder.scalar(self.col, &self.ty)?))
+        Ok(ColumnarValue::Scalar(
+            self.holder.scalar(self.col, &self.ty)?,
+        ))
     }
 }
 
@@ -374,8 +379,13 @@ mod tests {
     fn holder(key: SetKey, col: ArrayRef) -> SetHolder {
         let h = SetHolder::default();
         h.set_key(key);
-        let schema = Arc::new(Schema::new(vec![Field::new("c", col.data_type().clone(), true)]));
-        h.add(&RecordBatch::try_new(schema, vec![col]).unwrap()).unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            col.data_type().clone(),
+            true,
+        )]));
+        h.add(&RecordBatch::try_new(schema, vec![col]).unwrap())
+            .unwrap();
         h.finish();
         h
     }
@@ -383,7 +393,9 @@ mod tests {
     fn look(h: &SetHolder, x: ArrayRef) -> Vec<Option<bool>> {
         let r = h.lookup(&x).unwrap();
         let r = r.as_any().downcast_ref::<BooleanArray>().unwrap();
-        (0..r.len()).map(|i| (!r.is_null(i)).then(|| r.value(i))).collect()
+        (0..r.len())
+            .map(|i| (!r.is_null(i)).then(|| r.value(i)))
+            .collect()
     }
 
     #[test]
@@ -391,7 +403,10 @@ mod tests {
         let x: ArrayRef = Arc::new(Int32Array::from(vec![Some(1), Some(5), None]));
         let plain = holder(SetKey::Plain, Arc::new(Int32Array::from(vec![1, 2, 3])));
         assert_eq!(look(&plain, x.clone()), vec![Some(true), Some(false), None]);
-        let with_null = holder(SetKey::Plain, Arc::new(Int32Array::from(vec![Some(1), None])));
+        let with_null = holder(
+            SetKey::Plain,
+            Arc::new(Int32Array::from(vec![Some(1), None])),
+        );
         assert_eq!(look(&with_null, x.clone()), vec![Some(true), None, None]);
         let empty = holder(SetKey::Plain, Arc::new(Int32Array::from(Vec::<i32>::new())));
         assert_eq!(look(&empty, x), vec![Some(false), Some(false), Some(false)]);
@@ -399,10 +414,16 @@ mod tests {
 
     #[test]
     fn floats_and_characters_compare_as_postgresql() {
-        let f = holder(SetKey::Float, Arc::new(Float64Array::from(vec![0.0, f64::NAN])));
+        let f = holder(
+            SetKey::Float,
+            Arc::new(Float64Array::from(vec![0.0, f64::NAN])),
+        );
         let x: ArrayRef = Arc::new(Float64Array::from(vec![-0.0, -f64::NAN, 1.0]));
         assert_eq!(look(&f, x), vec![Some(true), Some(true), Some(false)]);
-        let b = holder(SetKey::Bpchar, Arc::new(StringArray::from(vec!["ab  ", "c"])));
+        let b = holder(
+            SetKey::Bpchar,
+            Arc::new(StringArray::from(vec!["ab  ", "c"])),
+        );
         let x: ArrayRef = Arc::new(StringArray::from(vec!["ab", "c   ", "ab c"]));
         assert_eq!(look(&b, x), vec![Some(true), Some(true), Some(false)]);
         let t = holder(SetKey::Plain, Arc::new(StringArray::from(vec!["ab  "])));
@@ -413,18 +434,29 @@ mod tests {
     #[test]
     fn a_scalar_subquery_has_one_row() {
         let one = holder_rows(Arc::new(Int32Array::from(vec![7])));
-        assert_eq!(one.scalar(0, &DataType::Int32).unwrap(), ScalarValue::Int32(Some(7)));
+        assert_eq!(
+            one.scalar(0, &DataType::Int32).unwrap(),
+            ScalarValue::Int32(Some(7))
+        );
         let none = holder_rows(Arc::new(Int32Array::from(Vec::<i32>::new())));
-        assert_eq!(none.scalar(0, &DataType::Int32).unwrap(), ScalarValue::Int32(None));
+        assert_eq!(
+            none.scalar(0, &DataType::Int32).unwrap(),
+            ScalarValue::Int32(None)
+        );
         let two = holder_rows(Arc::new(Int32Array::from(vec![1, 2])));
         let e = two.scalar(0, &DataType::Int32).unwrap_err().to_string();
         assert!(e.contains("more than one row"), "{e}");
     }
 
     fn holder_rows(col: ArrayRef) -> SetHolder {
-        let schema = Arc::new(Schema::new(vec![Field::new("c", col.data_type().clone(), true)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            col.data_type().clone(),
+            true,
+        )]));
         let h = SetHolder::with_schema(schema.clone());
-        h.add(&RecordBatch::try_new(schema, vec![col]).unwrap()).unwrap();
+        h.add(&RecordBatch::try_new(schema, vec![col]).unwrap())
+            .unwrap();
         h.finish();
         h
     }

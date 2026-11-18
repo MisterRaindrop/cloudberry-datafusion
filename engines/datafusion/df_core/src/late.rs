@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 //! LT1: the columns of a PAX input that only a Limit's rows need, read
 //! after the Limit.  `SELECT * FROM hits WHERE URL LIKE '%google%' ORDER BY
 //! EventTime LIMIT 10` (ClickBench Q24) decoded all 105 columns of every
@@ -61,7 +60,9 @@ pub const LATE_MAX_ROWS: u64 = 100;
 pub fn late_rows(spec: &Value) -> u64 {
     let limit = spec.get("limit");
     let n = |name: &str| limit.and_then(|l| l.get(name)).and_then(Value::as_u64);
-    n("fetch").unwrap_or(u64::MAX).saturating_add(n("skip").unwrap_or(0))
+    n("fetch")
+        .unwrap_or(u64::MAX)
+        .saturating_add(n("skip").unwrap_or(0))
 }
 
 /// The name of the locators' column above the scan.
@@ -102,7 +103,10 @@ pub fn late_columns(spec: &Value) -> Option<(usize, Vec<usize>)> {
     let node = spec.get("plan")?;
     let (j, pred) = match (node.get("input"), node.get("filter")) {
         (Some(j), None) => (j.as_u64()? as usize, None),
-        (None, Some(f)) => (f.get("input")?.get("input")?.as_u64()? as usize, f.get("pred")),
+        (None, Some(f)) => (
+            f.get("input")?.get("input")?.as_u64()? as usize,
+            f.get("pred"),
+        ),
         _ => return None,
     };
     let outputs = spec.get("output")?.as_array()?;
@@ -125,7 +129,10 @@ pub fn late_columns(spec: &Value) -> Option<(usize, Vec<usize>)> {
             None => columns_of(e, &mut read),
         }
     }
-    let mut late: Vec<usize> = candidates.into_iter().filter(|k| !read.contains(k)).collect();
+    let mut late: Vec<usize> = candidates
+        .into_iter()
+        .filter(|k| !read.contains(k))
+        .collect();
     late.sort_unstable();
     late.dedup();
     (!late.is_empty()).then_some((j, late))
@@ -253,7 +260,11 @@ impl ExecutionPlan for LateFetchExec {
             let in_schema = input.schema();
             let batches: Vec<RecordBatch> = input.execute(0, ctx)?.try_collect().await?;
             let batch = concat_batches(&in_schema, &batches)?;
-            let locs: Vec<i64> = batch.column(loc).as_primitive::<Int64Type>().values().to_vec();
+            let locs: Vec<i64> = batch
+                .column(loc)
+                .as_primitive::<Int64Type>()
+                .values()
+                .to_vec();
             let late = read_late(&scan, &locs, &types)
                 .map_err(|e| DataFusionError::External(Box::new(e)))?;
             let mut cols: Vec<ArrayRef> = batch
@@ -416,7 +427,9 @@ fn read_late(scan: &PaxScan, locs: &[i64], types: &[PgType]) -> Result<Vec<Array
         for _ in 0..groups.len().min(LATE_THREADS) {
             s.spawn(|| loop {
                 let g = next.fetch_add(1, Ordering::Relaxed);
-                let Some((bg, rows)) = groups.get(g) else { break };
+                let Some((bg, rows)) = groups.get(g) else {
+                    break;
+                };
                 let r = catch_unwind(AssertUnwindSafe(|| read_group(*bg, rows)))
                     .unwrap_or_else(|_| Err(PgError::internal("panic while reading late columns")));
                 *results[g].lock().unwrap() = Some(r);

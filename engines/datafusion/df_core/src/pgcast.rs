@@ -206,8 +206,8 @@ fn decimal_string(v: i256, scale: i8) -> String {
 /// path), and needs no string.
 fn numeric_float8(v: i256, scale: i8) -> f64 {
     const POW10: [f64; 23] = [
-        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15,
-        1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+        1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+        1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
     ];
     if let (Some(x), Some(p)) = (v.to_i128(), POW10.get(scale as usize)) {
         if scale >= 0 && x.unsigned_abs() <= 1 << 53 {
@@ -451,7 +451,21 @@ mod tests {
     fn numeric_to_float8_agrees_with_the_decimal_string() {
         let slow = |x: i256, s: i8| decimal_string(x, s).parse::<f64>().unwrap();
         let limit = 1i128 << 53;
-        let mut edges = vec![0, 1, -1, 5, 9, 10, 99, 101, 12345, limit - 1, limit, -limit, limit + 1];
+        let mut edges = vec![
+            0,
+            1,
+            -1,
+            5,
+            9,
+            10,
+            99,
+            101,
+            12345,
+            limit - 1,
+            limit,
+            -limit,
+            limit + 1,
+        ];
         edges.extend((0..40).map(|k| 10i128.pow(k / 2) + (k as i128 % 2) * 7));
         // xorshift: values of every width up to 2^54, either sign
         let mut r = 0x9e37_79b9_7f4a_7c15u64;
@@ -470,7 +484,9 @@ mod tests {
             }
         }
         // past 2^53 and past i128: the decimal string
-        let big = i256::from_i128(i128::MAX).checked_mul(i256::from_i128(1000)).unwrap();
+        let big = i256::from_i128(i128::MAX)
+            .checked_mul(i256::from_i128(1000))
+            .unwrap();
         assert_eq!(numeric_float8(big, 5), slow(big, 5));
     }
 }

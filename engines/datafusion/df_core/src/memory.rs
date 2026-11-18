@@ -198,7 +198,12 @@ impl TrackingPool {
             .fetch_max(state.spillable + state.unspillable, Ordering::Relaxed);
     }
 
-    fn refuse(&self, reservation: &MemoryReservation, additional: usize, available: usize) -> DataFusionError {
+    fn refuse(
+        &self,
+        reservation: &MemoryReservation,
+        additional: usize,
+        available: usize,
+    ) -> DataFusionError {
         DataFusionError::ResourcesExhausted(format!(
             "Failed to allocate additional {} for {} with {} already allocated for this reservation - {} remain available for the total memory pool: {}",
             human_readable_size(additional),
@@ -266,11 +271,13 @@ impl MemoryPool for TrackingPool {
                 .checked_div(state.num_spill)
                 .unwrap_or(spill_available);
             // up to SPILL_FLOOR past its share, within twice the limit
-            let available = share.max(SPILL_FLOOR.min(
-                (self.limit * UNSPILLABLE_FACTOR)
-                    .saturating_sub(state.spillable + state.unspillable)
-                    + reservation.size(),
-            ));
+            let available = share.max(
+                SPILL_FLOOR.min(
+                    (self.limit * UNSPILLABLE_FACTOR)
+                        .saturating_sub(state.spillable + state.unspillable)
+                        + reservation.size(),
+                ),
+            );
             if reservation.size() + additional > available {
                 return Err(self.refuse(reservation, additional, available));
             }
@@ -335,7 +342,9 @@ mod tests {
     }
 
     fn consumer(pool: &Arc<dyn MemoryPool>, name: &str, spill: bool) -> MemoryReservation {
-        MemoryConsumer::new(name).with_can_spill(spill).register(pool)
+        MemoryConsumer::new(name)
+            .with_can_spill(spill)
+            .register(pool)
     }
 
     /// Consumers that can spill share the limit; memory that cannot spill
