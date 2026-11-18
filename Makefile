@@ -43,7 +43,7 @@ EXTENSION = vec_executor
 DATA = vec_executor--1.0.sql
 PGFILEDESC = "vec_executor - vectorized execution backend on Apache DataFusion"
 
-REGRESS = vec_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage parallel
+REGRESS = vec_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage insert parallel
 # The direct PAX reader is only tested when it is built.
 ifdef VX_PAX_SRC
 REGRESS += paxdirect

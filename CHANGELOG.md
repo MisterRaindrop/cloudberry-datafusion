@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- The query of `INSERT ... SELECT`, `CREATE TABLE AS`, `SELECT INTO` and
+  materialized views runs in the engine; the writing stays on PostgreSQL.
+  At SF10, grouping lineitem into 7.9 million rows and inserting them
+  took 5.6 s instead of 11.7 s.  `UPDATE` and `DELETE` still run on
+  PostgreSQL.
+
 ## 0.1.0 (2026-11-17)
 
 The first release: a pure extension that runs the slices of Apache

@@ -45,6 +45,7 @@ import argparse, difflib, os, re, subprocess, sys
 SKIP = {"vec_executor", "engines"}
 MASKS = [
     (re.compile(r"\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)"), "(segN)"),
+    (re.compile(r"\(seg\d+ [\d.]+:\d+ pid=\d+\)"), "(segN)"),
     (re.compile(r"\(vx_\w+\.c:\d+\)"), "(vx_X.c:N)"),
     (re.compile(r"gp_execution_segment\(\) = \d+"), "gp_execution_segment() = N"),
 ]

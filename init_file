@@ -28,6 +28,12 @@ s/\.c:\d+\)/.c:XXX)/
 # An error raised on a segment names the segment, slice, address and pid.
 m/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/
 s/\(seg\d+ slice\d+ [\d.]+:\d+ pid=\d+\)/(segN sliceN host:port pid=N)/
+
+# The same, raised in the slice that runs on every segment's writer QE
+# (a CREATE TABLE AS) names no slice.
+m/\(seg\d+ [\d.]+:\d+ pid=\d+\)/
+s/\(seg\d+ [\d.]+:\d+ pid=\d+\)/(segN host:port pid=N)/
+
 # The planner picks a random segment for an Agg of no groups (OF1).
 m/gp_execution_segment\(\) = \d+/
 s/gp_execution_segment\(\) = \d+/gp_execution_segment() = N/

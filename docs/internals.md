@@ -2001,10 +2001,10 @@ their rows as from any child: ORCA's Result on top, a Sort under the
 database's default collation, a Limit WITH TIES, a combining aggregate
 over a Nested Loop.  Only children their parents run once qualify: below
 Result, Sort, Limit, Unique, Material, ProjectSet, WindowAgg, Agg,
-SubqueryScan, every child of an Append or a Sequence, a Shared Scan's
-producer, both sides of a Hash Join, the
-outer side of a Nested Loop or Merge Join (whose inner side is rescanned
-or marked), never a Hash node itself (its join builds the table through
+SubqueryScan, ModifyTable (an INSERT's query, IN1), every child of an
+Append or a Sequence, a Shared Scan's producer, both sides of a Hash Join,
+the outer side of a Nested Loop or Merge Join (whose inner side is
+rescanned or marked), never a Hash node itself (its join builds the table through
 MultiExecProcNode; its child qualifies).  DataFusion's output is ordered
 only below a Sort of its own, which is what a GroupAggregate or WindowAgg
 above it relies on.  A subtree that only passes rows on (a Motion's, an
@@ -2094,6 +2094,36 @@ before: an aggregate without outputs, a semi join reading its inner side,
 and DataFusion's own join reordering (eliminate_cross_join), which hung
 Q7.  A grouping below ORCA's Result over 30 million rows took 0.27 s
 against 1.39 s.
+
+### INSERT, CREATE TABLE AS and SELECT INTO
+
+IN1: the query of an INSERT, a CREATE TABLE AS, a SELECT INTO or a
+materialized view (created or refreshed) runs in DataFusion as a SELECT's
+does; what writes stays on PostgreSQL.  The slices that only read run
+whole.  An INSERT's ModifyTable refuses its slice, and the highest
+subtrees below it run in DataFusion (T2): grouped by the target's
+distribution key, the final aggregate is there.  CREATE TABLE AS and
+SELECT INTO have no node that writes, only the receiver the executor
+sends the rows to, so every slice can run whole.
+
+The scans read with the statement's snapshot, as PostgreSQL's do: the
+table AM's with `es_snapshot`, and the direct PAX reader lists the
+micro-partitions visible to it when the scan begins.  A statement that
+reads the table it inserts into therefore does not read its own rows;
+the regression tests check it on heap, AO row, AO column and PAX tables,
+and through the direct reader.  An error or a cancel while DataFusion runs
+the query aborts the statement as any other, and nothing is inserted.
+
+UPDATE and DELETE stay on PostgreSQL: ModifyTable finds the rows to change
+by the row identities (ctid, segment) their scans produce, which the
+engine's scans do not return.  So do row locking clauses and data-modifying
+WITH.
+
+Grouping 60 million lineitem rows at SF10 into 7.9 million groups and
+writing them (3 segments, 10 ARM cores): INSERT ... SELECT took 5.6 s
+against 11.7 s, CREATE TABLE AS 5.2 s against 11.2 s; the same query alone
+takes 2.1 s against 19.8 s, so the rest is the writing, which stays on
+PostgreSQL.
 
 ### Correlated aggregate subqueries
 

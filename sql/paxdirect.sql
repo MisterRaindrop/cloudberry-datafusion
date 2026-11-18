@@ -355,6 +355,26 @@ SELECT s.b, count(*), max(n.b) FROM df_pd_str s LEFT JOIN df_pd_num n ON n.id = 
 SELECT count(*), sum(h.w), sum(n.d) FROM df_pd_num n JOIN df_pd_heap h ON h.id = n.id;
 RESET vec.motion_batches;
 
+-- IN1: an INSERT that reads the PAX table it inserts into through the
+-- reader lists the micro-partitions visible to the statement's snapshot,
+-- so it does not read the ones the statement writes.
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
+CREATE TABLE df_pd_ins_off USING pax AS SELECT * FROM df_pd_dist DISTRIBUTED BY (a);
+CREATE TABLE df_pd_ins_on USING pax AS SELECT * FROM df_pd_dist DISTRIBUTED BY (a);
+INSERT INTO df_pd_ins_off SELECT a + 1000000, b, c, e FROM df_pd_ins_off WHERE e < 30;
+INSERT INTO df_pd_ins_off SELECT e, count(*), sum(c), max(e) FROM df_pd_ins_off GROUP BY e;
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
+INSERT INTO df_pd_ins_on SELECT a + 1000000, b, c, e FROM df_pd_ins_on WHERE e < 30;
+INSERT INTO df_pd_ins_on SELECT e, count(*), sum(c), max(e) FROM df_pd_ins_on GROUP BY e;
+SET vec.mode = off;
+SET vec.pax_direct_read = off;
+SELECT (SELECT count(*) FROM df_pd_ins_off) n_off, (SELECT count(*) FROM df_pd_ins_on) n_on,
+  (SELECT count(*) FROM (SELECT * FROM df_pd_ins_off EXCEPT ALL SELECT * FROM df_pd_ins_on) d) off_only,
+  (SELECT count(*) FROM (SELECT * FROM df_pd_ins_on EXCEPT ALL SELECT * FROM df_pd_ins_off) d) on_only;
+DROP TABLE df_pd_ins_off, df_pd_ins_on;
+
 DROP TABLE df_pd_dist, df_pd_str, df_pd_vec, df_pd_vbh, df_pd_vb, df_pd_num, df_pd_vnum, df_pd_wnum, df_pd_vwnum, df_pd_heap, df_pd_lm, df_pd_s2, df_pd_lm3, df_pd_vlm3, df_pd_lt, df_pd_vlt;
 ALTER DATABASE contrib_regression RESET session_preload_libraries;
 DROP EXTENSION vec_executor;

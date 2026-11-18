@@ -7028,10 +7028,20 @@ vx_check_slice_o(PlannedStmt *stmt, Plan *root, bool root_is_sender,
 	cxt.reasonlen = reasonlen;
 	reason[0] = '\0';
 
-	if (stmt->commandType != CMD_SELECT)
-		vx_reject(&cxt, "only SELECT is supported");
-	else if (stmt->intoClause != NULL)
-		vx_reject(&cxt, "SELECT INTO and CREATE TABLE AS are not supported");
+	/*
+	 * IN1: the query of an INSERT, a CREATE TABLE AS or a SELECT INTO runs
+	 * in the engine as a SELECT's does.  The node that writes, ModifyTable
+	 * or the INTO receiver above the plan, stays on PostgreSQL: a slice
+	 * holding ModifyTable is refused at that node, and subtrees below it
+	 * can still be taken over (T2).  The engine's scans read with the
+	 * statement's snapshot (es_snapshot, which the direct PAX reader lists
+	 * micro-partitions with too), so a scan of the table being inserted
+	 * into does not see the statement's own rows.  UPDATE and DELETE stay
+	 * out: their scans would have to produce the row identities ModifyTable
+	 * locates rows by.
+	 */
+	if (stmt->commandType != CMD_SELECT && stmt->commandType != CMD_INSERT)
+		vx_reject(&cxt, "only SELECT and INSERT are supported");
 	else if (stmt->rowMarks != NIL)
 		vx_reject(&cxt, "row locking clauses are not supported");
 	else if (stmt->hasModifyingCTE)
@@ -7174,6 +7184,7 @@ vx_find_attach_o(PlannedStmt *stmt, Plan *plan, Bitmapset *batches, bool locale_
 		case T_Hash:
 		case T_NestLoop:
 		case T_MergeJoin:
+		case T_ModifyTable:		/* IN1: an INSERT's query, run once */
 			vx_find_attach_o(stmt, outerPlan(plan), batches, locale_free, false, points);
 			return;
 		case T_HashJoin:

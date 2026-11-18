@@ -52,6 +52,10 @@ covers:
   `text`, `varchar`, `char(n)`, with PostgreSQL's semantics: the same
   errors (overflow, division by zero) with the same SQLSTATE, the same
   numeric scales and rounding, short-circuit `AND`/`OR`.
+- **Statements**: `SELECT`, and the query of `INSERT ... SELECT`,
+  `CREATE TABLE AS`, `SELECT INTO` and materialized views; what writes
+  stays on PostgreSQL.  `UPDATE`, `DELETE`, row locking clauses and
+  data-modifying `WITH` stay on PostgreSQL.
 - **Motions**: a slice runs below the Motion it sends through and above
   the one it receives from; with `vec.motion_batches` both ends of a
   Motion between engine slices exchange Arrow batches instead of tuples.

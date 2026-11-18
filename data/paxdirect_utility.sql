@@ -64,6 +64,22 @@ ROLLBACK;
 SET vec.mode = on;
 SELECT count(*), sum(a) FROM df_pd;
 
+-- IN1: an INSERT reading the table it inserts into reads it directly,
+-- and only the micro-partitions visible to the statement's snapshot: the
+-- table gains exactly the rows it held that match.
+SET vec.mode = off;
+CREATE TABLE df_pd_ins USING pax AS SELECT * FROM df_pd;
+SELECT count(*) AS n0, count(*) FILTER (WHERE e < 30) AS n30 FROM df_pd_ins \gset
+SELECT vec_debug_pax_direct_scans() AS s0 \gset
+SET vec.mode = on;
+SET vec.pax_direct_read = on;
+INSERT INTO df_pd_ins SELECT a + 1000000, b, c, d, e FROM df_pd_ins WHERE e < 30;
+SELECT vec_debug_pax_direct_scans() - :s0 AS direct_scans;
+SET vec.mode = off;
+SELECT count(*) = :n0 + :n30 AS gained_once, count(*) FILTER (WHERE a > 1000000) = :n30 AS copies
+FROM df_pd_ins;
+DROP TABLE df_pd_ins;
+
 -- Min/max skipping: micro-partitions and groups whose statistics rule out
 -- the scan's qual are not read (4 micro-partitions of 8 groups or fewer).
 -- Only column a has statistics.
