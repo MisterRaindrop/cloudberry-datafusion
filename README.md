@@ -267,6 +267,7 @@ make installcheck-engine ENGINE=datafusion # an engine's results against Postgre
 make df-rust-test                          # the engine's unit tests
 python3 tools/fuzz.py --db DB --setup      # random queries, vec.mode off against on
 python3 tools/stress.py --db DB --queries DIR  # concurrent sessions, cancels, kills
+tools/tpch/load.sh SF DB && tools/tpch/bench.py run --db DB --out run.jsonl  # TPC-H, docs/benchmarks.md
 ```
 
 `tools/fuzz.py` creates tables of every type the engine reads in a
@@ -276,7 +277,7 @@ planners with `vec.mode` off and on, and reports the ones whose rows
 differ or that fail only in the engine; `--seed` repeats a run.
 
 `tools/stress.py` runs the queries of a directory (one per file, such as
-TPC-H's) in several long-lived sessions at once with `vec.mode` on,
+`tools/tpch/queries`) in several long-lived sessions at once with `vec.mode` on,
 cancels some of them with a short `statement_timeout`, terminates a
 session now and then, and checks every completed query against its
 result with `vec.mode` off; at the end no workfile, temporary file or

@@ -42,6 +42,10 @@ and every query returns the same rows with and without the extension.
   (44 of 44).
 - 264 timed runs: no errors, no timeouts.
 
+The raw runs are in
+[`benchmarks/tpch-sf100-2026-11-17.jsonl`](../benchmarks/tpch-sf100-2026-11-17.jsonl),
+in the format of `tools/tpch/bench.py` (see Reproducing, below).
+
 ### Per query (seconds, median of 3)
 
 | Query | Cloudberry | vec_executor | Speedup | Cloudberry, GPORCA | vec_executor, GPORCA | Speedup |
@@ -83,3 +87,38 @@ and every query returns the same rows with and without the extension.
 - Under vec_executor, half the queries varied by 10% or less of their
   median across the three runs; Q8, Q15 and Q3 by a quarter to a third,
   and Q16 (under two seconds) by 70%.
+
+## Reproducing
+
+`tools/tpch` holds what these numbers were measured with: the PAX
+schema, the 22 queries with dbgen's default substitutions (Q15's view is
+created with the tables), a loader and the benchmark.
+
+```
+tools/tpch/load.sh 100 tpch100                      # dbgen, COPY, ANALYZE
+tools/tpch/bench.py run --db tpch100 --out run.jsonl --rounds 5 --label "what is measured"
+tools/tpch/bench.py summary run.jsonl               # the tables of this page
+tools/tpch/bench.py summary run.jsonl --baseline benchmarks/tpch-sf100-2026-11-17.jsonl
+```
+
+- `load.sh SF DB` builds dbgen from tpch-kit at a fixed commit (TPC's
+  license keeps it out of this repository), generates the data in chunks
+  (`CHUNKS`, `JOBS`) and loads each as it is generated, so it needs room
+  for a few chunks only, then makes the database load the extension.
+- `bench.py run` follows the method above: four configurations (pick
+  some with `--configs`), warm-up and timed rounds in rotating order,
+  each query in a psql of its own.  For the configurations without the
+  extension it resets the database's `session_preload_libraries`, and puts
+  the database's own setting back at the end, also after an error or
+  Ctrl-C.  `--set GUC=VALUE` sets anything else for every query (for
+  example `--set work_mem=4GB`).  It checks that every run of a query
+  returns the same rows, keeps the outputs of a query whose rows differ,
+  and exits 1 if one does or a run fails.
+- `bench.py summary` prints the medians, totals and speedups in the form
+  of this page.  With `--baseline` it compares each configuration's total
+  and each query with an earlier run and exits 1 if a total got slower by
+  more than `--threshold` (10%): run it on the same machine and data
+  before and after a change to see whether the change costs time.
+- The runs are JSON lines, the first describing the setup (Cloudberry's
+  version, segments, rows, settings); a run cut short keeps what it
+  measured.  Results worth keeping go to `benchmarks/`.
