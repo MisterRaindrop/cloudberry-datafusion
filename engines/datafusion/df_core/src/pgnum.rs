@@ -352,7 +352,7 @@ pub fn pg_div_rscale(x: i256, sx: i8, dx: i32, y: i256, sy: i8, dy: i32) -> i32 
     let (w1, d1) = weight_first(x, sx);
     let (w2, d2) = weight_first(y, sy);
     let qweight = w1 - w2 - i32::from(d1 <= d2);
-    (16 - 4 * qweight).max(dx).max(dy).max(0).min(1000)
+    (16 - 4 * qweight).max(dx).max(dy).clamp(0, 1000)
 }
 
 /// DN1: numeric_div of `x` (an integer of scale `sx`) by nonzero `y` (of
@@ -1895,7 +1895,7 @@ pub fn from_pg_numeric(bytes: &[u8], scale: i8) -> std::result::Result<i256, Str
             if dscale <= s && 4 * (weight + 1) + s + 3 <= 38 {
                 let mut acc: i128 = 0;
                 let mut n = 0i32;
-                for d in digits.chunks_exact(2) {
+                for d in digits.as_chunks::<2>().0 {
                     acc = acc * 10000 + u16::from_ne_bytes([d[0], d[1]]) as i128;
                     n += 1;
                 }
@@ -2482,7 +2482,10 @@ mod tests {
         let run = |l: ColumnarValue, r: ColumnarValue, n: usize| {
             udf.invoke_with_args(ScalarFunctionArgs {
                 args: vec![l, r],
-                arg_fields: vec![Arc::new(Field::new("a", numeric_type(0), true)); 2],
+                arg_fields: {
+                    let f = Arc::new(Field::new("a", numeric_type(0), true));
+                    vec![f.clone(), f]
+                },
                 number_rows: n,
                 return_field: Arc::new(Field::new("r", numeric_type(0), true)),
                 config_options: Arc::new(ConfigOptions::default()),
@@ -2573,8 +2576,8 @@ mod tests {
             // sums: narrow and general batches into the same groups
             let groups: Vec<usize> = (0..n).map(|_| (next() % 5) as usize).collect();
             let mut g = SumDecimalGroups::new(numeric_type(2));
-            g.update_batch(&[xa.clone()], &groups, None, 5).unwrap();
-            g.update_batch(&[xb.clone()], &groups, None, 5).unwrap();
+            g.update_batch(std::slice::from_ref(&xa), &groups, None, 5).unwrap();
+            g.update_batch(std::slice::from_ref(&xb), &groups, None, 5).unwrap();
             let out = g.evaluate(EmitTo::All).unwrap();
             let out = decimal(&out).unwrap();
             for k in 0..5 {
@@ -2724,7 +2727,7 @@ mod tests {
             None,
         ]);
         let mut g = SumDecimalGroups::new(t.clone());
-        g.update_batch(&[x.clone()], &groups, Some(&filter), 4)
+        g.update_batch(std::slice::from_ref(&x), &groups, Some(&filter), 4)
             .unwrap();
         let out = g.evaluate(EmitTo::All).unwrap();
         let out = decimal(&out).unwrap();
@@ -2732,7 +2735,7 @@ mod tests {
         assert_eq!((out.value(0), out.value(1)), (i(375), NUMERIC_NAN));
         assert!(out.is_null(2) && out.is_null(3));
         // states merge as values; a NaN state keeps the group NaN; First(n) emits the first n
-        g.update_batch(&[x.clone()], &groups, None, 4).unwrap();
+        g.update_batch(std::slice::from_ref(&x), &groups, None, 4).unwrap();
         let st = g.state(EmitTo::All).unwrap();
         let mut m = SumDecimalGroups::new(t.clone());
         m.merge_batch(&st, &[1, 1, 0, 0], 2).unwrap();

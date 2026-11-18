@@ -1508,7 +1508,8 @@ impl StrCond {
                 }
                 _ => return None,
             }
-        } else if let Some(e) = v.get("inlist") {
+        } else {
+            let e = v.get("inlist")?;
             let (Side::Col(k), bp) = side(e)? else {
                 return None;
             };
@@ -1521,8 +1522,6 @@ impl StrCond {
             }
             let negated = v.get("negated").and_then(Value::as_bool).unwrap_or(false);
             (k, bp, values, negated)
-        } else {
-            return None;
         };
         Some(StrCond {
             col,
@@ -2239,7 +2238,9 @@ impl PartitionStream for PaxPartition {
     }
 }
 
-/// Where a query's rows come from.
+/// Where a query's rows come from.  A query has one; Pax's size does not
+/// matter.
+#[allow(clippy::large_enum_variant)]
 pub enum Source {
     /// Batches the main thread pushes (any table AM).
     Pushed,
@@ -5193,9 +5194,9 @@ mod tests {
             (format!("{{{body}"), "none"),
             (format!(r#"{{"ir":2,{body}"#), "2"),
         ] {
-            let e = run(&spec, vec![(vec![1], vec![0])], 1)
-                .err()
-                .expect("refused");
+            let Err(e) = run(&spec, vec![(vec![1], vec![0])], 1) else {
+                panic!("refused");
+            };
             assert!(
                 e.message
                     .contains(&format!("plan IR version {shown} is not supported")),
@@ -6242,12 +6243,12 @@ mod tests {
     fn build_sides_filter_their_probe_scans() {
         for partitions in [1, 4] {
             for on in [true, false] {
-                let spec = format!(
-                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
-                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
-                        "on":[[{{"col":0}},{{"col":0,"input":1}}]],"filter":null}}}},
-                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
+                let spec = String::from(
+                    r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"}]},{"columns":[{"type":"int4"}]}],
+                    "plan":{"aggregate":{"input":{"join":{"type":"inner","left":{"input":0},"right":{"input":1},
+                        "on":[[{"col":0},{"col":0,"input":1}]],"filter":null}},
+                        "group":[],"aggs":[{"fn":"count"}],"having":null}},
+                    "output":[{"expr":{"agg":0},"type":"int8"}]}"#
                 );
                 let fake = FakeScan::default();
                 let scan = PaxScan::new(
@@ -6279,12 +6280,12 @@ mod tests {
     fn joins_of_two_keys_filter_by_each() {
         for partitions in [1, 4] {
             for on in [true, false] {
-                let spec = format!(
-                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}},{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
-                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},"right":{{"input":1}},
-                        "on":[[{{"col":0}},{{"col":0,"input":1}}],[{{"col":1}},{{"col":0,"input":1}}]],"filter":null}}}},
-                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
+                let spec = String::from(
+                    r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"},{"type":"int4"}]},{"columns":[{"type":"int4"}]}],
+                    "plan":{"aggregate":{"input":{"join":{"type":"inner","left":{"input":0},"right":{"input":1},
+                        "on":[[{"col":0},{"col":0,"input":1}],[{"col":1},{"col":0,"input":1}]],"filter":null}},
+                        "group":[],"aggs":[{"fn":"count"}],"having":null}},
+                    "output":[{"expr":{"agg":0},"type":"int8"}]}"#
                 );
                 let fake = FakeScan::default();
                 let scan = PaxScan::new(
@@ -6368,14 +6369,14 @@ mod tests {
     fn swapped_probe_sides_filter_their_build_scans() {
         for partitions in [1, 4] {
             for on in [true, false] {
-                let spec = format!(
-                    r#"{{"ir":1,"inputs":[{{"columns":[{{"type":"int4"}}]}},{{"columns":[{{"type":"int4"}}]}}],
-                    "plan":{{"aggregate":{{"input":{{"join":{{"type":"inner","left":{{"input":0}},
-                        "right":{{"aggregate":{{"input":{{"input":1}},"group":[{{"col":0,"input":1}}],
-                            "aggs":[],"having":null,"name":"s"}}}},
-                        "on":[[{{"col":0}},{{"name":"s_g0"}}]],"filter":null}}}},
-                        "group":[],"aggs":[{{"fn":"count"}}],"having":null}}}},
-                    "output":[{{"expr":{{"agg":0}},"type":"int8"}}]}}"#
+                let spec = String::from(
+                    r#"{"ir":1,"inputs":[{"columns":[{"type":"int4"}]},{"columns":[{"type":"int4"}]}],
+                    "plan":{"aggregate":{"input":{"join":{"type":"inner","left":{"input":0},
+                        "right":{"aggregate":{"input":{"input":1},"group":[{"col":0,"input":1}],
+                            "aggs":[],"having":null,"name":"s"}},
+                        "on":[[{"col":0},{"name":"s_g0"}]],"filter":null}},
+                        "group":[],"aggs":[{"fn":"count"}],"having":null}},
+                    "output":[{"expr":{"agg":0},"type":"int8"}]}"#
                 );
                 let (big, small) = (FakeScan::default(), FakeScan::default());
                 let scan = |f: &FakeScan, n| {

@@ -148,7 +148,7 @@ extern "C" fn set_case_maps(upper: *const u32, nupper: usize, lower: *const u32,
         }
         // SAFETY: the caller passes 2 * n values.
         let v = unsafe { std::slice::from_raw_parts(p, 2 * n) };
-        v.chunks_exact(2).map(|c| (c[0], c[1])).collect()
+        v.as_chunks::<2>().0.iter().map(|c| (c[0], c[1])).collect()
     };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let (u, l) = (pairs(upper, nupper), pairs(lower, nlower));
@@ -1080,7 +1080,9 @@ mod tests {
             vec![Field::new("c0", DataType::Int64, true)].into(),
         ))
         .unwrap();
-        let e = start(engine(), ir, &schema).err().expect("refused");
+        let Err(e) = start(engine(), ir, &schema) else {
+            panic!("refused");
+        };
         assert!(e.contains("input 0: column 0 is \"l\", not \"i\""), "{e}");
     }
 

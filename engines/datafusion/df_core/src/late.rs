@@ -299,10 +299,8 @@ unsafe extern "C" fn late_emit(
     let result = catch_unwind(AssertUnwindSafe(|| -> Result<(), PgError> {
         for (p, &k) in ctx.scan.late.iter().enumerate() {
             let mut c = *cols.add(k);
-            if c.values.is_null() {
-                if fetch(chunk, k as i32, std::ptr::null(), nrows, &mut c) != 0 {
-                    return Err(PgError::internal(String::new()));
-                }
+            if c.values.is_null() && fetch(chunk, k as i32, std::ptr::null(), nrows, &mut c) != 0 {
+                return Err(PgError::internal(String::new()));
             }
             let raw = RawColumn {
                 values: c.values,
@@ -410,7 +408,8 @@ fn read_late(scan: &PaxScan, locs: &[i64], types: &[PgType]) -> Result<Vec<Array
     if *ended {
         return Err(PgError::internal("the PAX scan has ended"));
     }
-    let results: Vec<Mutex<Option<Result<Vec<Vec<ArrayRef>>, PgError>>>> =
+    type GroupColumns = Result<Vec<Vec<ArrayRef>>, PgError>;
+    let results: Vec<Mutex<Option<GroupColumns>>> =
         groups.iter().map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
