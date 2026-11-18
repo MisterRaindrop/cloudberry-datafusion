@@ -8498,8 +8498,10 @@ vx_add_root(VxCollectContext *cxt, int index, Plan *root, bool is_sender)
 }
 
 static bool
-vx_collect_motions(Node *node, VxCollectContext *cxt)
+vx_collect_motions(Node *node, void *context)
 {
+	VxCollectContext *cxt = (VxCollectContext *) context;
+
 	if (node == NULL)
 		return false;
 	if (IsA(node, Motion))
