@@ -5,11 +5,14 @@
 *.dylib
 # Rust build
 /engines/datafusion/target/
+/engines/datafusion/target-asan/
 # pg_regress output
 /results/
 /regression.diffs
 /regression.out
-/results-engine/
 /log/
 /pax_build/
 __pycache__/
+/results-engine/
+/fuzz-*.txt
+/fuzz-*.log

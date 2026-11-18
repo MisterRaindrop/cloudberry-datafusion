@@ -15,10 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# Builds Apache Cloudberry (cached by commit), starts a demo cluster in
-# Cloudberry's build container, builds the extension, the engines and the
-# direct PAX reader, and runs the regression tests, the engine check and
-# the Rust tests.  The steps are ci/ci.sh's.
+# lint: license headers and cargo fmt (ci/lint.sh), without Cloudberry.
+#
+# test: builds Apache Cloudberry (cached by commit), starts a demo cluster
+# in Cloudberry's build container, builds the extension (C warnings fail
+# it), the engines and the direct PAX reader, runs cargo clippy, the
+# regression tests, the engine check and the Rust tests.  The steps are
+# ci/ci.sh's.
+#
+# The weekly run, and a manual one with "full", add a second variant and a
+# soak: "debug" builds Cloudberry with assertions (--enable-cassert) and
+# runs the same tests on it, then the engine's unit tests under
+# AddressSanitizer; "release" also loads TPC-H at scale factor 1 and runs
+# tools/stress.py and tools/fuzz.py for a few minutes.
 #
 # Pushes and pull requests build the Cloudberry commit CLOUDBERRY_PIN, which
 # the expected outputs are for.  The weekly run takes Cloudberry's latest
@@ -38,6 +47,10 @@ on:
       cloudberry_ref:
         description: 'apache/cloudberry branch, tag or commit (default: the pin)'
         default: ''
+      full:
+        description: 'also the debug variant and the soak, as the weekly run'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -50,9 +63,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install rustfmt
+        run: |
+          cd engines/datafusion
+          rustup toolchain install --profile minimal --component rustfmt
+      - name: Lint
+        run: ci/lint.sh
+
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.p.outputs.variants }}
+      full: ${{ steps.p.outputs.full }}
+    steps:
+      - id: p
+        run: |
+          if [ '${{ github.event_name }}' = schedule ] || [ '${{ github.event.inputs.full }}' = true ]; then
+            echo 'variants=["release","debug"]' >> "$GITHUB_OUTPUT"
+            echo 'full=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'variants=["release"]' >> "$GITHUB_OUTPUT"
+            echo 'full=false' >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJSON(needs.plan.outputs.variants) }}
+    env:
+      ENABLE_DEBUG: ${{ matrix.variant == 'debug' }}
     container:
       image: apache/incubator-cloudberry:cbdb-build-rocky9-latest
       options: >-
@@ -103,7 +151,7 @@ jobs:
             /usr/local/cloudberry-db
             cloudberry/gpAux/gpdemo
             cloudberry/contrib/pax_storage/src/cpp
-          key: cloudberry-rocky9-${{ steps.cbdb.outputs.sha }}
+          key: cloudberry-rocky9-${{ matrix.variant }}-${{ steps.cbdb.outputs.sha }}
 
       - name: Check out Cloudberry
         if: steps.cbdb-cache.outputs.cache-hit != 'true'
@@ -122,7 +170,7 @@ jobs:
 
       - name: Build Cloudberry
         if: steps.cbdb-cache.outputs.cache-hit != 'true'
-        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh cloudberry cloudberry"
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && ENABLE_DEBUG=$ENABLE_DEBUG vec_executor/ci/ci.sh cloudberry cloudberry"
 
       - name: Save the Cloudberry build
         if: steps.cbdb-cache.outputs.cache-hit != 'true'
@@ -132,7 +180,7 @@ jobs:
             /usr/local/cloudberry-db
             cloudberry/gpAux/gpdemo
             cloudberry/contrib/pax_storage/src/cpp
-          key: cloudberry-rocky9-${{ steps.cbdb.outputs.sha }}
+          key: cloudberry-rocky9-${{ matrix.variant }}-${{ steps.cbdb.outputs.sha }}
 
       # Saved right after the build (below), not only when the job passes.
       - name: Restore the Rust build
@@ -169,15 +217,28 @@ jobs:
             vec_executor/engines/datafusion/target
           key: cargo-rocky9-${{ hashFiles('vec_executor/engines/datafusion/Cargo.lock', 'vec_executor/engines/datafusion/rust-toolchain.toml') }}-${{ hashFiles('vec_executor/engines/datafusion/**/*.rs') }}
 
+      - name: Clippy
+        if: matrix.variant == 'release'
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh clippy"
+
       - name: Test
         run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh test cloudberry"
+
+      - name: AddressSanitizer
+        if: matrix.variant == 'debug'
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh asan"
+
+      - name: Soak
+        if: matrix.variant == 'release' && needs.plan.outputs.full == 'true'
+        run: su - gpadmin -c "cd '$GITHUB_WORKSPACE' && vec_executor/ci/ci.sh soak cloudberry"
 
       - name: Keep the test output
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: test-output
+          name: test-output-${{ matrix.variant }}
           path: |
+            vec_executor/fuzz-*.txt
             vec_executor/regression.diffs
             vec_executor/regression.out
             vec_executor/results

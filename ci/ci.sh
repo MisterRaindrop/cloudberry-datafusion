@@ -23,15 +23,24 @@
 #
 #   ci/ci.sh cloudberry CBDB   build and install the Cloudberry tree CBDB
 #                              in /usr/local/cloudberry-db, as Cloudberry's
-#                              own CI does
+#                              own CI does; ENABLE_DEBUG=true adds
+#                              assertions (--enable-cassert) and debug
+#                              information
 #   ci/ci.sh cluster CBDB      start a demo cluster (3 primaries, 3 mirrors)
 #                              from CBDB/gpAux/gpdemo
 #   ci/ci.sh rust              install rustup; rust-toolchain.toml picks
 #                              the toolchain
 #   ci/ci.sh build CBDB        build and install the extension, the engines
-#                              and the direct PAX reader
+#                              and the direct PAX reader; a compiler warning
+#                              in the C code fails the build
+#   ci/ci.sh clippy            cargo clippy of the engine, warnings fail
 #   ci/ci.sh test CBDB         the regression tests, the engine check and
 #                              the Rust tests
+#   ci/ci.sh asan              the engine's unit tests under AddressSanitizer
+#                              (a nightly toolchain, installed by the step)
+#   ci/ci.sh soak CBDB         TPC-H at scale factor 1 (tools/tpch), then
+#                              tools/stress.py and tools/fuzz.py for a few
+#                              minutes each (SOAK_MINUTES, default 5)
 #
 # Only 'cloudberry' needs the whole tree; the other steps need its
 # gpAux/gpdemo and contrib/pax_storage/src/cpp, which the workflow caches
@@ -57,7 +66,7 @@ env_cluster() {
 	set -u
 }
 
-step=${1:?usage: ci.sh cloudberry|cluster|rust|build|test [CBDB]}
+step=${1:?usage: ci.sh cloudberry|cluster|rust|build|clippy|test|asan|soak [CBDB]}
 CBDB=${2:-}
 [ -z "$CBDB" ] || CBDB=$(cd "$CBDB" && pwd)
 
@@ -66,7 +75,8 @@ cloudberry)
 	S=$CBDB/devops/build/automation/cloudberry/scripts
 	mkdir -p "$CBDB/build-logs"	# the scripts log there, but do not create it
 	cd "$CBDB"					# and run ./configure and make from there
-	SRC_DIR=$CBDB BUILD_DESTINATION=$GPHOME_DIR "$S/configure-cloudberry.sh"
+	SRC_DIR=$CBDB BUILD_DESTINATION=$GPHOME_DIR ENABLE_DEBUG=${ENABLE_DEBUG:-false} \
+		"$S/configure-cloudberry.sh"
 	SRC_DIR=$CBDB BUILD_DESTINATION=$GPHOME_DIR "$S/build-cloudberry.sh"
 	;;
 cluster)
@@ -90,12 +100,18 @@ rust)
 	export PATH="$HOME/.cargo/bin:$PATH"
 	# with no argument: the toolchain rust-toolchain.toml names
 	cd "$EXT/engines/datafusion" && rustup toolchain install
+	rustup component add rustfmt clippy
 	;;
 build)
 	env_cloudberry
 	cd "$EXT"
-	make VX_PAX_SRC="$CBDB/contrib/pax_storage/src/cpp"
+	make VX_PAX_SRC="$CBDB/contrib/pax_storage/src/cpp" COPT=-Werror
 	make VX_PAX_SRC="$CBDB/contrib/pax_storage/src/cpp" install
+	;;
+clippy)
+	export PATH="$HOME/.cargo/bin:$PATH"
+	cd "$EXT/engines/datafusion"
+	cargo clippy --release --workspace --all-targets -- -D warnings
 	;;
 test)
 	env_cluster
@@ -107,6 +123,45 @@ test)
 	# release, as the engine is built: a debug build of the workspace takes
 	# another 10 GB
 	make df-rust-test DF_CARGO_FLAGS=--release || rc=1
+	exit $rc
+	;;
+asan)
+	export PATH="$HOME/.cargo/bin:$PATH"
+	rustup toolchain install nightly --profile minimal
+	cd "$EXT/engines/datafusion"
+	# a target of its own: the sanitizer applies to what is built for it,
+	# not to the build scripts
+	RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+	ASAN_OPTIONS=detect_leaks=1 CARGO_TARGET_DIR="$EXT/engines/datafusion/target-asan" \
+		cargo +nightly test --workspace --target "$(rustc -vV | sed -n 's/^host: //p')"
+	;;
+soak)
+	env_cluster
+	cd "$EXT"
+	minutes=${SOAK_MINUTES:-5}
+	rc=0
+	tools/tpch/load.sh 1 tpch1 /tmp/tpch-work
+	python3 tools/stress.py --db tpch1 --queries tools/tpch/queries --sessions 4 \
+		--minutes "$minutes" || rc=1
+	psql -X -q -d postgres -c "CREATE DATABASE fuzz"
+	psql -X -q -d postgres -c "ALTER DATABASE fuzz SET session_preload_libraries = 'vec_executor'"
+	# each seed's queries, then the next seed until the time is up; what
+	# differs goes to fuzz-SEED.txt, which the workflow keeps
+	end=$(($(date +%s) + 60 * minutes))
+	seed=1
+	setup=--setup
+	while [ "$(date +%s)" -lt "$end" ]; do
+		if ! python3 tools/fuzz.py --db fuzz $setup --queries 100 --seed "$seed" \
+			--out "fuzz-$seed.txt" >"fuzz-$seed.log"; then
+			rc=1
+			echo "fuzz seed $seed: queries differ or fail in the engine (fuzz-$seed.txt)"
+		fi
+		tail -1 "fuzz-$seed.log"
+		rm -f "fuzz-$seed.log"
+		[ -s "fuzz-$seed.txt" ] || rm -f "fuzz-$seed.txt"
+		setup=
+		seed=$((seed + 1))
+	done
 	exit $rc
 	;;
 *)
