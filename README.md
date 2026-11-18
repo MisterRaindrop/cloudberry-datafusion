@@ -24,10 +24,10 @@ against the same cluster without the extension:
 
 | Planner | Cloudberry | vec_executor | Speedup |
 |---|---:|---:|---:|
-| Postgres planner | 1089 s | 116 s | **9.4x** |
-| GPORCA | 1101 s | 173 s | **6.4x** |
+| Postgres planner | 1104 s | 121 s | **9.1x** |
+| GPORCA | 1090 s | 183 s | **6.0x** |
 
-Every query is faster (3.3x to 67x) and returns the same rows.  Setup,
+Every query is faster (2.8x to 76x) and returns the same rows.  Setup,
 method and per-query times: [`docs/benchmarks.md`](docs/benchmarks.md).
 
 ## What runs in the engine

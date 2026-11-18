@@ -3,12 +3,14 @@
 ## TPC-H, scale factor 100
 
 `vec_executor` against Cloudberry without the extension, on the same
-cluster and the same tables.  Measured on 2026-11-06 at commit `1a20a91`.
+cluster and the same tables.  Measured on 2026-11-17 with the code of
+0.1.0 (`b64d007`) minus its last two commits, which change only spill
+cleanup at exit and the error codes of failed spill I/O.
 
 | Planner | Cloudberry | vec_executor | Speedup | Geometric mean | Smallest |
 |---|---:|---:|---:|---:|---:|
-| Postgres planner | 1089.1 s | 116.2 s | **9.4x** | 8.4x | 3.3x |
-| GPORCA | 1100.7 s | 173.0 s | **6.4x** | 6.4x | 3.4x |
+| Postgres planner | 1103.5 s | 120.8 s | **9.1x** | 8.0x | 3.6x |
+| GPORCA | 1090.1 s | 182.8 s | **6.0x** | 6.0x | 2.8x |
 
 Times are the sums of the 22 queries' medians.  Every query is faster,
 and every query returns the same rows with and without the extension.
@@ -28,43 +30,45 @@ and every query returns the same rows with and without the extension.
 
 - Four configurations: with and without the extension, under each
   planner.
-- One warm-up round, then five timed rounds; the order of the four
-  configurations rotates from round to round.
+- One warm-up round, then three timed rounds; the order of the
+  configurations rotates from round to round.  Cloudberry without the
+  extension and vec_executor ran as two separate sets the same day.
 - Each query runs in its own `psql` and is timed from the client, so
   connection setup and result output are included.
-- The table reports the median of the five runs.  The data was in the
+- The table reports the median of the three runs.  The data was in the
   page cache (warm runs).
-- Each run's output was hashed.  All configurations returned the same
-  output for every query (44 of 44).
-- 440 timed runs: no errors, no timeouts.
+- Each query's output under vec_executor was compared with its output
+  without the extension: the same for every query under both planners
+  (44 of 44).
+- 264 timed runs: no errors, no timeouts.
 
-### Per query (seconds, median of 5)
+### Per query (seconds, median of 3)
 
 | Query | Cloudberry | vec_executor | Speedup | Cloudberry, GPORCA | vec_executor, GPORCA | Speedup |
 |---|---:|---:|---:|---:|---:|---:|
-| Q1 | 93.75 | 10.14 | 9.2x | 95.40 | 12.29 | 7.8x |
-| Q2 | 11.19 | 0.66 | 16.8x | 9.94 | 0.93 | 10.7x |
-| Q3 | 27.84 | 8.41 | 3.3x | 25.60 | 7.49 | 3.4x |
-| Q4 | 23.48 | 2.49 | 9.4x | 48.64 | 6.15 | 7.9x |
-| Q5 | 29.26 | 4.29 | 6.8x | 60.35 | 6.78 | 8.9x |
-| Q6 | 12.02 | 2.66 | 4.5x | 12.14 | 2.49 | 4.9x |
-| Q7 | 32.37 | 3.35 | 9.7x | 34.02 | 5.94 | 5.7x |
-| Q8 | 34.44 | 2.89 | 11.9x | 34.62 | 3.07 | 11.3x |
-| Q9 | 123.85 | 22.30 | 5.6x | 88.20 | 15.23 | 5.8x |
-| Q10 | 25.80 | 5.97 | 4.3x | 26.34 | 4.58 | 5.8x |
-| Q11 | 8.77 | 0.58 | 15.2x | 5.74 | 0.62 | 9.3x |
-| Q12 | 21.65 | 2.44 | 8.9x | 20.38 | 2.41 | 8.5x |
-| Q13 | 40.44 | 7.21 | 5.6x | 40.59 | 7.55 | 5.4x |
-| Q14 | 15.83 | 2.40 | 6.6x | 14.22 | 2.44 | 5.8x |
-| Q15 | 31.54 | 6.31 | 5.0x | 19.86 | 5.92 | 3.4x |
-| Q16 | 7.61 | 1.61 | 4.7x | 7.48 | 1.79 | 4.2x |
-| Q17 | 241.59 | 3.61 | 66.9x | 255.19 | 29.03 | 8.8x |
-| Q18 | 159.99 | 11.13 | 14.4x | 119.16 | 27.18 | 4.4x |
-| Q19 | 25.78 | 5.65 | 4.6x | 26.48 | 6.03 | 4.4x |
-| Q20 | 35.64 | 1.84 | 19.4x | 38.06 | 2.18 | 17.5x |
-| Q21 | 75.03 | 8.21 | 9.1x | 93.96 | 18.67 | 5.0x |
-| Q22 | 11.26 | 2.07 | 5.5x | 24.29 | 4.18 | 5.8x |
-| **Total** | **1089.12** | **116.21** | **9.4x** | **1100.66** | **172.95** | **6.4x** |
+| Q1 | 94.95 | 10.87 | 8.7x | 94.56 | 10.20 | 9.3x |
+| Q2 | 9.42 | 0.71 | 13.3x | 10.40 | 1.00 | 10.4x |
+| Q3 | 26.43 | 7.34 | 3.6x | 25.80 | 9.24 | 2.8x |
+| Q4 | 22.52 | 2.76 | 8.1x | 50.21 | 7.02 | 7.2x |
+| Q5 | 28.40 | 4.34 | 6.5x | 58.53 | 7.64 | 7.7x |
+| Q6 | 14.07 | 2.71 | 5.2x | 13.74 | 2.65 | 5.2x |
+| Q7 | 31.27 | 3.56 | 8.8x | 32.81 | 6.29 | 5.2x |
+| Q8 | 34.29 | 3.30 | 10.4x | 34.01 | 3.63 | 9.4x |
+| Q9 | 122.04 | 21.52 | 5.7x | 87.11 | 17.52 | 5.0x |
+| Q10 | 24.70 | 6.24 | 4.0x | 27.75 | 4.82 | 5.8x |
+| Q11 | 9.31 | 0.61 | 15.2x | 5.30 | 0.69 | 7.7x |
+| Q12 | 19.84 | 2.60 | 7.6x | 20.14 | 2.72 | 7.4x |
+| Q13 | 40.75 | 7.78 | 5.2x | 40.63 | 7.97 | 5.1x |
+| Q14 | 13.81 | 2.54 | 5.4x | 14.61 | 2.42 | 6.0x |
+| Q15 | 31.12 | 7.25 | 4.3x | 17.71 | 6.21 | 2.9x |
+| Q16 | 7.81 | 1.76 | 4.4x | 7.92 | 1.95 | 4.1x |
+| Q17 | 237.32 | 3.12 | 76.2x | 250.91 | 29.52 | 8.5x |
+| Q18 | 180.52 | 11.47 | 15.7x | 118.08 | 26.76 | 4.4x |
+| Q19 | 28.05 | 6.13 | 4.6x | 25.39 | 6.38 | 4.0x |
+| Q20 | 38.31 | 2.02 | 19.0x | 38.16 | 2.33 | 16.4x |
+| Q21 | 75.98 | 9.95 | 7.6x | 92.39 | 21.84 | 4.2x |
+| Q22 | 12.62 | 2.22 | 5.7x | 23.91 | 4.02 | 5.9x |
+| **Total** | **1103.50** | **120.81** | **9.1x** | **1090.10** | **182.84** | **6.0x** |
 
 ### Notes
 
@@ -76,5 +80,6 @@ and every query returns the same rows with and without the extension.
 - Q11's fraction (0.0001) is the one for scale factor 1; it was not
   scaled to scale factor 100 (0.000001), so the query returns no rows
   with or without the extension.
-- Most queries varied by less than 10% of their median across the five
-  runs.
+- Under vec_executor, half the queries varied by 10% or less of their
+  median across the three runs; Q8, Q15 and Q3 by a quarter to a third,
+  and Q16 (under two seconds) by 70%.
