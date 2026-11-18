@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 #
-# lint: license headers and cargo fmt (ci/lint.sh), without Cloudberry.
+# lint: license headers, the extension's scripts, cargo fmt, and cargo
+# deny over the dependencies (ci/lint.sh), without Cloudberry.
 #
 # test: builds Apache Cloudberry (cached by commit), starts a demo cluster
 # in Cloudberry's build container, builds the extension (C warnings fail
@@ -82,6 +83,17 @@ jobs:
           rustup toolchain install --profile minimal --component rustfmt
       - name: Lint
         run: ci/lint.sh
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Dependencies' licenses and sources
+        run: ci/lint.sh deps
+      # A new advisory can come any day, whatever the change: it fails the
+      # weekly run, and only shows on the others.
+      - name: Dependencies' advisories
+        continue-on-error: ${{ github.event_name != 'schedule' }}
+        run: ci/lint.sh deps advisories
 
   plan:
     runs-on: ubuntu-latest

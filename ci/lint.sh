@@ -29,7 +29,11 @@
 #                        file's default_version is reachable: its install
 #                        script, or one of an older version and update
 #                        scripts up to it (README, Versions)
-#   ci/lint.sh           all three
+#   ci/lint.sh deps      cargo deny (engines/datafusion/deny.toml): the
+#                        licenses and sources of the dependencies;
+#                        "deps advisories" checks RustSec's advisories
+#                        instead, which needs the network
+#   ci/lint.sh           license, ext and fmt
 #
 set -euo pipefail
 
@@ -98,6 +102,12 @@ ext() {
 	return "$bad"
 }
 
+deps() {
+	local which=("$@")
+	[ ${#which[@]} -gt 0 ] || which=(licenses bans sources)
+	(cd engines/datafusion && cargo deny check "${which[@]}")
+}
+
 fmt() {
 	(cd engines/datafusion && cargo fmt --check) && echo "cargo fmt: ok"
 }
@@ -106,6 +116,10 @@ case "${1:-all}" in
 license) license ;;
 fmt) fmt ;;
 ext) ext ;;
+deps)
+	shift
+	deps "$@"
+	;;
 all)
 	rc=0
 	license || rc=1
@@ -114,7 +128,7 @@ all)
 	exit $rc
 	;;
 *)
-	echo "usage: ci/lint.sh [license|ext|fmt]" >&2
+	echo "usage: ci/lint.sh [license|ext|fmt|deps [advisories]]" >&2
 	exit 2
 	;;
 esac
