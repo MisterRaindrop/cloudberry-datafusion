@@ -6,6 +6,9 @@
   Cloudberry commit CI builds against) and `install.sh`.
 - `tools/tpch`: the TPC-H schema, queries, loader and benchmark behind
   `docs/benchmarks.md`, with a baseline to compare a change against.
+- `ci/multihost.sh`: a three-host cluster in containers (mirrors on the
+  other host), on which the engine check, TPC-H and a stress run pass,
+  also after a primary fails over and is recovered.
 - CI checks license headers, formatting, compiler warnings and clippy, and
   weekly runs the tests on Cloudberry built with assertions, the engine's
   unit tests under AddressSanitizer, and a stress and fuzz soak.

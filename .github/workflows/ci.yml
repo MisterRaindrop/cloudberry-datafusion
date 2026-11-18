@@ -30,6 +30,11 @@
 # AddressSanitizer; "release" also loads TPC-H at scale factor 1 and runs
 # tools/stress.py and tools/fuzz.py for a few minutes.
 #
+# multihost (weekly and "full" only): the package on a cluster of three
+# containers, coordinator and two segment hosts with mirrors on each other
+# (ci/multihost.sh): the engine check, TPC-H's rows under the four
+# configurations, a stress run, and a primary failing over to its mirror.
+#
 # The release variant packages what it built (ci/ci.sh package), kept as
 # the run's artifact.  A tag v* runs the same and then publishes: a GitHub
 # Release of the tag, its notes the tag's section of CHANGELOG.md, with the
@@ -80,7 +85,8 @@ jobs:
       - name: Install rustfmt
         run: |
           cd engines/datafusion
-          rustup toolchain install --profile minimal --component rustfmt
+          rustup toolchain install --profile minimal
+          rustup component add rustfmt
       - name: Lint
         run: ci/lint.sh
       - name: Install cargo-deny
@@ -277,6 +283,58 @@ jobs:
             vec_executor/results
             vec_executor/results-engine
             cloudberry/gpAux/gpdemo/datadirs/qddir/demoDataDir-1/log
+          if-no-files-found: ignore
+
+  multihost:
+    needs: [plan, test]
+    if: needs.plan.outputs.full == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: vec_executor
+      - name: Find the Cloudberry commit
+        id: cbdb
+        run: |
+          ref='${{ github.event.inputs.cloudberry_ref }}'
+          if [ -z "$ref" ]; then
+            if [ '${{ github.event_name }}' = schedule ]; then ref=main; else ref=$CLOUDBERRY_PIN; fi
+          fi
+          if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then sha=$ref
+          else sha=$(git ls-remote https://github.com/apache/cloudberry "$ref" | head -1 | cut -f1); fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+      # the release variant's Cloudberry installation, onto this host; the
+      # containers mount it
+      - name: Prepare the installation directory
+        run: sudo mkdir -p /usr/local/cloudberry-db && sudo chown "$USER" /usr/local/cloudberry-db
+      - name: Restore the Cloudberry build
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /usr/local/cloudberry-db
+            cloudberry/gpAux/gpdemo
+            cloudberry/contrib/pax_storage/src/cpp
+          key: cloudberry-rocky9-release-${{ steps.cbdb.outputs.sha }}
+          fail-on-cache-miss: true
+      - uses: actions/download-artifact@v7
+        with:
+          name: package
+          path: package
+      - name: Start the hosts
+        run: |
+          export MH_GPHOME=/usr/local/cloudberry-db MH_PACKAGE=$(ls "$PWD"/package/*.tar.gz)
+          vec_executor/ci/multihost.sh up
+      - name: Create the cluster
+        run: vec_executor/ci/multihost.sh init
+      - name: Test
+        run: vec_executor/ci/multihost.sh test
+      - name: Keep the output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: multihost-output
+          path: vec_executor/results-engine
           if-no-files-found: ignore
 
   release:

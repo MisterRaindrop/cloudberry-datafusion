@@ -242,7 +242,7 @@ slice saying whether the engine runs it, and if not, why:
 | Setting | Default | |
 |---|---|---|
 | `vec.mode` | `off` | `off`, `explain` (only report in `EXPLAIN`), `on` (run eligible slices) |
-| `vec.motion_batches` | `on` | Motions between two engine slices carry Arrow batches (tested on one host; not yet across hosts) |
+| `vec.motion_batches` | `on` | Motions between two engine slices carry Arrow batches (tested on one host and on three hosts in containers, `ci/multihost.sh`) |
 | `vec.pax_direct_read` | `on` | Read PAX tables column by column on the engine's threads |
 | `vec.pax_max_decoders` | `0` | PAX groups decoded at once per query; 0 = one per partition |
 | `vec.pax_decode_cache` | empty | Superuser.  Directory for a cache of decoded PAX columns; empty = no cache |
@@ -296,6 +296,13 @@ as errors, `cargo clippy`, the regression tests, the engine check and the
 unit tests.  Weekly it also builds Cloudberry with assertions and runs the
 tests on it, the unit tests under AddressSanitizer, and five minutes each
 of `tools/stress.py` and `tools/fuzz.py` over TPC-H at scale factor 1.
+
+`ci/multihost.sh` (also weekly in CI) makes a cluster of three hosts out
+of containers on one Docker host: the coordinator, and two primaries on
+each of two segment hosts with their mirrors on the other, so that
+Motions cross a network.  On it, the engine check, TPC-H's rows under the
+four configurations, a stress run, and the same after a primary fails
+over to its mirror and after `gprecoverseg`.
 
 ## Versions and releases
 
