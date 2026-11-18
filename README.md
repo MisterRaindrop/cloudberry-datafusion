@@ -318,6 +318,7 @@ sessions load the new ones as they start.
 
 | | |
 |---|---|
+| [`docs/operations.md`](docs/operations.md) | Checking that it works, sizing, errors, upgrading and removing |
 | [`docs/internals.md`](docs/internals.md) | How each part works, what runs where, and what each change measured |
 | [`docs/benchmarks.md`](docs/benchmarks.md) | Benchmark setup, method and results |
 | [`docs/engines.md`](docs/engines.md) | The engine ABI, and adding another engine |
