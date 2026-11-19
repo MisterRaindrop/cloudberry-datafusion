@@ -45,9 +45,14 @@ DATA = $(wildcard vec_executor--*.sql)
 PGFILEDESC = "vec_executor - vectorized execution backend on Apache DataFusion"
 
 REGRESS = vec_executor engines runtime hooks exec memory motion receive batches collation joins types strings numeric expressions sort groupingsets window setops distinct partial rewrite storage insert parallel
-# The direct PAX reader is only tested when it is built.
+# The direct PAX reader is only tested when it is built.  paxdirect_bpchar
+# writes values that fail an assertion of PAX's (sql/paxdirect_bpchar.sql),
+# so not against a Cloudberry built with --enable-cassert.
 ifdef VX_PAX_SRC
 REGRESS += paxdirect
+ifeq ($(findstring --enable-cassert,$(shell $(or $(PG_CONFIG),pg_config) --configure)),)
+REGRESS += paxdirect_bpchar
+endif
 endif
 REGRESS_OPTS = --init-file=$(CURDIR)/init_file
 

@@ -130,7 +130,7 @@ test_all() {
 	local rc=0
 	echo "== 1. engine check"
 	on cdw 'psql -X -q -d postgres -c "DROP DATABASE IF EXISTS contrib_regression" -c "CREATE DATABASE contrib_regression"
-		python3 tools/engine_check.py --engine datafusion $(sed -n "s/^REGRESS = //p" Makefile) paxdirect' || rc=1
+		python3 tools/engine_check.py --engine datafusion $(sed -n "s/^REGRESS = //p" Makefile) paxdirect paxdirect_bpchar' || rc=1
 	echo "== 2. TPC-H, four configurations"
 	local kit=""
 	[ -z "${MH_TPCH_KIT:-}" ] || kit="TPCH_KIT=/home/gpadmin/tpch-kit"
