@@ -29,8 +29,7 @@
 #   ci/multihost.sh down    remove the containers and the network
 #
 # Environment:
-#   MH_IMAGE    the image: Cloudberry's build or sandbox image, whose
-#               containers share one gpadmin SSH key (default
+#   MH_IMAGE    the image: Cloudberry's build or sandbox image (default
 #               apache/incubator-cloudberry:cbdb-build-rocky9-latest)
 #   MH_GPHOME   a Cloudberry installation with the extension installed,
 #               mounted at /usr/local/cloudberry-db on every host; or
@@ -87,6 +86,20 @@ up() {
 				-xzf /tmp/vx-package.tar.gz && chown -R gpadmin:gpadmin /usr/local/cloudberry-db'
 			on "$h" '/tmp/vx-package/install.sh >/dev/null'
 		fi
+	done
+	# one key pair for gpadmin on every host, cdw's (made if it has none:
+	# the build image has none)
+	docker exec -u gpadmin vxmh-cdw bash -c 'mkdir -p ~/.ssh && chmod 700 ~/.ssh
+		[ -f ~/.ssh/id_rsa ] || ssh-keygen -q -t rsa -N "" -f ~/.ssh/id_rsa'
+	local f
+	for h in "${HOSTS[@]}"; do
+		for f in id_rsa id_rsa.pub; do
+			docker exec -u gpadmin vxmh-cdw cat "/home/gpadmin/.ssh/$f" |
+				docker exec -i -u gpadmin "vxmh-$h" bash -c "mkdir -p ~/.ssh && chmod 700 ~/.ssh &&
+					cat > ~/.ssh/$f.new && chmod 600 ~/.ssh/$f.new && mv ~/.ssh/$f.new ~/.ssh/$f"
+		done
+		docker exec -u gpadmin "vxmh-$h" bash -c 'grep -qxF "$(cat ~/.ssh/id_rsa.pub)" ~/.ssh/authorized_keys 2>/dev/null ||
+			cat ~/.ssh/id_rsa.pub >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys'
 	done
 	for h in "${HOSTS[@]}"; do
 		on "$h" 'ssh-keyscan -t rsa cdw sdw1 sdw2 > ~/.ssh/known_hosts 2>/dev/null; chmod 600 ~/.ssh/known_hosts'
