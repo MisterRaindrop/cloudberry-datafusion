@@ -306,8 +306,6 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
       # the release variant's Cloudberry installation, onto this host; the
       # containers mount it
-      - name: Prepare the installation directory
-        run: sudo mkdir -p /usr/local/cloudberry-db && sudo chown "$USER" /usr/local/cloudberry-db
       - name: Restore the Cloudberry build
         uses: actions/cache/restore@v4
         with:
@@ -317,13 +315,22 @@ jobs:
             cloudberry/contrib/pax_storage/src/cpp
           key: cloudberry-rocky9-release-${{ steps.cbdb.outputs.sha }}
           fail-on-cache-miss: true
+      # The test job saved /usr/local/cloudberry-db from its container, as a
+      # path relative to the container's workspace (/__w/R/R); on this host
+      # it lands relative to this workspace instead
+      - name: Find the installation
+        run: |
+          env=$(find "$HOME" /usr/local /home -xdev -path '*/usr/local/cloudberry-db/cloudberry-env.sh' 2>/dev/null | head -1)
+          [ -n "$env" ] || { echo "no cloudberry-env.sh in the restored cache" >&2; exit 1; }
+          echo "Cloudberry installation: ${env%/*}"
+          echo "MH_GPHOME=${env%/*}" >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v7
         with:
           name: package
           path: package
       - name: Start the hosts
         run: |
-          export MH_GPHOME=/usr/local/cloudberry-db MH_PACKAGE=$(ls "$PWD"/package/*.tar.gz)
+          export MH_PACKAGE=$(ls "$PWD"/package/*.tar.gz)
           vec_executor/ci/multihost.sh up
       - name: Create the cluster
         run: vec_executor/ci/multihost.sh init
