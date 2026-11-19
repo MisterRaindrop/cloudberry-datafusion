@@ -142,6 +142,8 @@ tpch_round() {
 test_all() {
 	local rc=0
 	echo "== 1. engine check"
+	# the checkout may belong to another user than the image's gpadmin
+	root cdw 'install -d -o gpadmin -g gpadmin /home/gpadmin/vec_executor/results-engine'
 	on cdw 'psql -X -q -d postgres -c "DROP DATABASE IF EXISTS contrib_regression" -c "CREATE DATABASE contrib_regression"
 		python3 tools/engine_check.py --engine datafusion $(sed -n "s/^REGRESS = //p" Makefile) paxdirect paxdirect_bpchar' || rc=1
 	echo "== 2. TPC-H, four configurations"
