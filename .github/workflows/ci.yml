@@ -172,7 +172,7 @@ jobs:
       # directories under gpAux/gpdemo.
       - name: Restore the Cloudberry build
         id: cbdb-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             /usr/local/cloudberry-db
@@ -201,7 +201,7 @@ jobs:
 
       - name: Save the Cloudberry build
         if: steps.cbdb-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             /usr/local/cloudberry-db
@@ -212,7 +212,7 @@ jobs:
       # Saved right after the build (below), not only when the job passes.
       - name: Restore the Rust build
         id: cargo-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             /home/gpadmin/.cargo/registry
@@ -236,7 +236,7 @@ jobs:
 
       - name: Save the Rust build
         if: steps.cargo-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             /home/gpadmin/.cargo/registry
@@ -307,7 +307,7 @@ jobs:
       # the release variant's Cloudberry installation, onto this host; the
       # containers mount it
       - name: Restore the Cloudberry build
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             /usr/local/cloudberry-db
