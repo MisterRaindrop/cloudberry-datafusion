@@ -324,7 +324,7 @@ jobs:
           [ -n "$env" ] || { echo "no cloudberry-env.sh in the restored cache" >&2; exit 1; }
           echo "Cloudberry installation: ${env%/*}"
           echo "MH_GPHOME=${env%/*}" >> "$GITHUB_ENV"
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: package
           path: package
@@ -352,7 +352,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: package
           path: package
